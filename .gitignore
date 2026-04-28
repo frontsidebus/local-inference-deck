@@ -1,0 +1,18 @@
+# secrets — never commit
+.htpasswd
+api_key
+*.key
+
+# live wireguard configs (only .example files should be committed)
+wireguard/*.conf
+!wireguard/*.conf.example
+
+# live nginx config with real bearer token
+nginx/spark.live.conf
+
+# editor / OS noise
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/

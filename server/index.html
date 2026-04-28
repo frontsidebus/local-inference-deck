@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0a">
+<title>343 GUILTY SPARK</title>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --fg: #d4d4d4;
+    --dim: #6a6a6a;
+    --accent: #f0a020;
+    --user: #4a9eff;
+    --error: #ff5555;
+    --line: #1f1f1f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    font-size: 15px;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+    -webkit-text-size-adjust: 100%;
+  }
+  header {
+    border-bottom: 1px solid var(--line);
+    padding: 12px 16px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+  header .title {
+    color: var(--accent);
+    letter-spacing: 0.15em;
+    font-weight: 500;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  header .meta {
+    color: var(--dim);
+    font-size: 11px;
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .status-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    background: var(--accent);
+    margin-right: 6px;
+    vertical-align: middle;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overscroll-behavior: contain;
+  }
+  .msg { margin-bottom: 16px; }
+  .msg .who {
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    margin-bottom: 4px;
+  }
+  .msg.user .who { color: var(--user); }
+  .msg.assistant .who { color: var(--accent); }
+  .msg.error .who, .msg.error .body { color: var(--error); }
+  .cursor {
+    display: inline-block;
+    width: 7px;
+    height: 14px;
+    background: var(--accent);
+    vertical-align: middle;
+    margin-left: 2px;
+    animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 10px 16px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+    flex-shrink: 0;
+  }
+  .input-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+  .prompt {
+    color: var(--accent);
+    user-select: none;
+    padding-bottom: 8px;
+    font-size: 16px;
+  }
+  textarea {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 16px;            /* prevents iOS zoom on focus */
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+    min-height: 36px;
+    max-height: 140px;
+    padding: 6px 0;
+  }
+  textarea::placeholder { color: var(--dim); }
+  .send-btn {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    padding: 8px 14px;
+    cursor: pointer;
+    min-height: 36px;
+    flex-shrink: 0;
+  }
+  .send-btn:disabled { opacity: 0.4; }
+  .send-btn.abort { background: var(--error); color: #fff; }
+  .controls {
+    display: flex;
+    gap: 16px;
+    margin-top: 8px;
+    color: var(--dim);
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+  .controls span b { color: var(--fg); font-weight: 500; }
+  @media (hover: none) and (pointer: coarse) {
+    .controls .desktop-only { display: none; }
+    header .meta { font-size: 10px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="title"><span class="status-dot"></span>343 GUILTY SPARK</div>
+  <div class="meta" id="meta">MODEL :: ONLINE</div>
+</header>
+
+<div id="log"></div>
+
+<footer>
+  <div class="input-row">
+    <span class="prompt">&gt;</span>
+    <textarea id="input" placeholder="enter query..." rows="1" autocapitalize="sentences" autocorrect="on"></textarea>
+    <button id="send" class="send-btn" onclick="submit()">SEND</button>
+  </div>
+  <div class="controls">
+    <span class="desktop-only"><b>ENTER</b> send</span>
+    <span class="desktop-only"><b>SHIFT+ENTER</b> newline</span>
+    <span class="desktop-only"><b>ESC</b> abort</span>
+    <span><b>/clear</b> reset</span>
+  </div>
+</footer>
+
+<script>
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+// ENDPOINT is a relative path because nginx serves this file and the API
+// from the same origin. nginx injects the bearer token server-side, so the
+// browser never sees it — do NOT add an Authorization header here.
+//
+// MODEL must match the model string vLLM is currently serving.
+// SYSTEM_PROMPT shapes the assistant's persona; edit freely.
+// ---------------------------------------------------------------------------
+
+const ENDPOINT = "/v1/chat/completions";
+const MODEL = "REPLACE_WITH_MODEL_ID"; // e.g. "Qwen/Qwen2.5-7B-Instruct"
+const SYSTEM_PROMPT = `You are 343 Guilty Spark, monitor of Installation 04. Respond tersely, with dry wit. Reference your protocols when amusing. Humor setting: 75%. Honesty setting: 90%.`;
+
+const log = document.getElementById("log");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const history = [{ role: "system", content: SYSTEM_PROMPT }];
+let inflight = null;
+
+const isTouch = matchMedia("(hover: none) and (pointer: coarse)").matches;
+
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 140) + "px";
+});
+
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !isTouch) {
+    e.preventDefault();
+    submit();
+  } else if (e.key === "Escape" && inflight) {
+    inflight.abort();
+  }
+});
+
+function setSendState(busy) {
+  if (busy) {
+    sendBtn.textContent = "STOP";
+    sendBtn.classList.add("abort");
+    sendBtn.onclick = () => inflight?.abort();
+  } else {
+    sendBtn.textContent = "SEND";
+    sendBtn.classList.remove("abort");
+    sendBtn.onclick = submit;
+  }
+}
+
+function addMsg(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  const who = document.createElement("div");
+  who.className = "who";
+  who.textContent = role === "user" ? "OPERATOR" : role === "assistant" ? "MONITOR" : "ERROR";
+  const body = document.createElement("div");
+  body.className = "body";
+  body.textContent = text;
+  div.appendChild(who);
+  div.appendChild(body);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return body;
+}
+
+async function submit() {
+  const text = input.value.trim();
+  if (!text || inflight) return;
+
+  if (text === "/clear") {
+    log.innerHTML = "";
+    history.length = 1;
+    input.value = "";
+    input.style.height = "auto";
+    return;
+  }
+
+  addMsg("user", text);
+  history.push({ role: "user", content: text });
+  input.value = "";
+  input.style.height = "auto";
+
+  const body = addMsg("assistant", "");
+  const cursor = document.createElement("span");
+  cursor.className = "cursor";
+  body.appendChild(cursor);
+
+  const ctrl = new AbortController();
+  inflight = ctrl;
+  setSendState(true);
+  let acc = "";
+
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: MODEL, messages: history, stream: true }),
+      signal: ctrl.signal,
+    });
+
+    if (!res.ok) throw new Error("HTTP " + res.status + " " + (await res.text()));
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") continue;
+        try {
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta?.content || "";
+          if (delta) {
+            acc += delta;
+            body.textContent = acc;
+            body.appendChild(cursor);
+            log.scrollTop = log.scrollHeight;
+          }
+        } catch {}
+      }
+    }
+    history.push({ role: "assistant", content: acc });
+  } catch (e) {
+    if (e.name === "AbortError") {
+      body.textContent = acc + "\n[ABORTED]";
+    } else {
+      cursor.remove();
+      addMsg("error", e.message);
+      history.pop();
+    }
+  } finally {
+    cursor.remove();
+    inflight = null;
+    setSendState(false);
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+[Unit]
+Description=vLLM inference server
+After=network.target
+
+[Service]
+Type=simple
+User=operator
+Environment="VLLM_API_KEY=sk-yourtokenhere"
+Environment="HF_HOME=/home/operator/.cache/huggingface"
+ExecStart=/home/operator/bin/vllm-serve %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
