@@ -1,0 +1,89 @@
+# ollama-preload.service — warm the model at VM boot.
+#
+# WHY THIS EXISTS: Ollama does not load a model until a request asks for
+# one, so the first query after the VM boots pays the full 15-20s cold
+# start (see ARCHITECTURE.md sections 5 and 7). With OLLAMA_KEEP_ALIVE=-1
+# the model then stays resident forever, so that cost only ever needs to be
+# paid once — this unit pays it at boot, unattended, instead of making the
+# first real user wait for it.
+#
+# Install on the VM (`agent-sandbox-3090`):
+#   sudo install -m 0644 ollama-preload.service \
+#       /etc/systemd/system/ollama-preload.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ollama-preload.service
+#
+# Check what it did (it is deliberately incapable of reporting failure —
+# see the Service section — so the journal is the only place the outcome
+# shows up):
+#   journalctl -u ollama-preload.service -b
+#   ollama ps        # the model should be listed, 100% GPU
+#
+# The model tag and URL below are hardcoded to the currently served model.
+# If that alias ever changes, update both here and the UI MODELS dict in
+# index.html — they have to agree.
+
+[Unit]
+Description=Preload the Ollama model into VRAM so the first query is a warm start
+Documentation=https://github.com/frontsidebus/installation-343
+
+# Ollama must be up to accept the warm-up request, and wg-quick@wg0 must be
+# up because OLLAMA_HOST binds Ollama to the WireGuard address 10.100.0.2 —
+# without the tunnel interface that socket does not exist to connect to.
+After=ollama.service wg-quick@wg0.service
+
+# Wants, deliberately NOT Requires: this unit is a latency optimization, and
+# it must never be able to drag either dependency's failure into a hard boot
+# failure. Wants pulls them in if they are not already started, but does not
+# couple our fate to theirs.
+Wants=ollama.service wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+
+# Keeps the unit showing as active (exited) after the one-shot completes, so
+# `systemctl status ollama-preload` reflects "the warm-up has been done this
+# boot" rather than "inactive/dead".
+RemainAfterExit=yes
+
+# Model load is 15-20s in practice, but the second RTX 3090 sits on a PCIe
+# 4.0 x1 link and loading to it is 10-20x slower, so be tolerant rather than
+# clever. 300s is a backstop against hanging forever, not a target.
+TimeoutStartSec=300
+
+# Wait for Ollama to actually answer before asking it for anything.
+#
+# systemd considers ollama.service "started" as soon as the process forks;
+# the listening socket appears some time later, and on this VM it is also
+# gated on wg0 having configured 10.100.0.2. So After= is necessary but not
+# sufficient, and a fixed `sleep` would be either a guess that is too short
+# (race) or too long (wasted boot time). Instead poll /v1/models — the same
+# reachability check ARCHITECTURE.md section 8 uses — once a second, bounded
+# at 60 attempts, and stop as soon as it answers.
+#
+# Two systemd quoting notes, because both bite:
+#   - `$$` is systemd's escape for a literal `$`, so `$$(seq 1 60)` reaches
+#     bash as `$(seq 1 60)`. A bare `$(` would be handed to systemd's own
+#     variable expander.
+#   - `\"` is how a double quote gets inside a double-quoted systemd
+#     argument; the JSON below relies on that.
+# --max-time 2 bounds each individual attempt so an unreachable tunnel
+# cannot stall the loop on a single connect.
+ExecStartPre=-/bin/bash -c "for i in $$(seq 1 60); do curl -sf -o /dev/null --max-time 2 http://10.100.0.2:11434/v1/models && exit 0; sleep 1; done; echo 'ollama-preload: 10.100.0.2:11434 never answered after 60 attempts; skipping warm-up' >&2; exit 1"
+
+# The warm-up itself: a throwaway 1-token completion. The response is
+# discarded — the only point is to make Ollama resolve the model tag and
+# pull ~42 GB of weights onto the two cards. max_tokens 1 and stream false
+# keep generation cost negligible; essentially all the wall time here is the
+# load, not the inference.
+ExecStart=-/bin/bash -c "curl -sf -o /dev/null --max-time 280 -X POST http://10.100.0.2:11434/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\": \"llama3.3-70b-fullgpu:latest\", \"messages\": [{\"role\": \"user\", \"content\": \"ping\"}], \"max_tokens\": 1, \"stream\": false}'"
+
+# The leading `-` on both Exec lines above is the failure tolerance: systemd
+# ignores a non-zero exit from a `-`-prefixed command, so a model that will
+# not load, a tunnel that is not up, or a renamed model tag degrades to
+# "first real query pays the cold start" — exactly today's behaviour — and
+# never to a failed boot or a red `systemctl status`. The reason still lands
+# in the journal via curl's stderr and the ExecStartPre message above.
+
+[Install]
+WantedBy=multi-user.target
