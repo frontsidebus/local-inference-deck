@@ -683,22 +683,44 @@ need a decision or just work.
   serving traffic. Removal is `sudo systemctl disable --now ollama` on the
   **host** (never in the VM).
 - **Ollama binds `0.0.0.0`; ufw is the only control (§2.3, §2.3.1).**
-  The highest-value item on this list. Tightening `OLLAMA_HOST` to
-  `10.100.0.2:11434` adds an independent second control, but introduces a
-  startup-ordering dependency on `wg-quick@wg0.service` (bind fails with
-  `EADDRNOTAVAIL` if wg0 is not up yet). Trade-off and the exact
-  directives are documented in `unit-files/ollama-override.conf`. Must be
-  tested with a **reboot**, not a restart — a restart passes while wg0 is
-  already up and hides the race. Deliberately not applied.
+  The highest-value item on this list. **Fix is now staged**, not applied:
+  `unit-files/ollama-override.conf` binds `10.100.0.2:11434` and adds a
+  `[Unit]` section with `After=` + `Requires=wg-quick@wg0.service`.
+  Apply during a maintenance window via
+  `docs/reboot-validation-checklist.md`; a restart cannot validate it
+  because it passes while wg0 is already up.
+
+  Two details worth carrying forward:
+  - The ordering directives must sit under **`[Unit]`**, not `[Service]`.
+    A drop-in may carry both sections, and `After=`/`Requires=` under
+    `[Service]` is silently ignored — which would leave the race unfixed
+    while appearing fixed.
+  - **`Requires=`, not `Wants=`.** The vendor unit ships
+    `Restart=always` with `RestartUSec=3s`, so under `Wants=` a tunnel
+    failure would let Ollama start, fail to bind, and restart every 3
+    seconds indefinitely — the silent crash-loop §10 warns about.
+    `Requires=` refuses to start it at all, making the failure loud and
+    singular. The trade is that a transient wg0 failure keeps Ollama down
+    until someone intervenes.
 - **~~ufw rule for 11434~~ → already present and required. NOTHING TO DO.**
   Resolved 2026-09-22. The tunnel itself needs no inbound rule (the VM
   dials out), but traffic *arriving* over it does, and
   `11434/tcp on wg0 ALLOW IN` is what makes inference work. It was never
   missing — only undocumented. Now §2.3.1.
-- **Stale ufw rule: `8080/tcp on wg0`.** Port 8080 was the llama.cpp Docker
-  container stopped ~4 months ago (§6 Session 8). Nothing listens there.
-  Safe to remove: `sudo ufw delete allow in on wg0 to any port 8080`.
-  Left in place pending operator confirmation.
+- **Stale ufw rule: `8080/tcp on wg0`.** Confirmed removable. Port 8080
+  served the llama.cpp Docker container retired ~4 months ago (§6 Session
+  8). Verified on the VM: nothing listening, Docker holds **0 containers,
+  0 images, 0 volumes**, and there is no llama.cpp binary or systemd unit
+  — so unlike the vLLM `8000` rule, no artifact exists to revive. That is
+  the distinction between *parked* and *dead*.
+
+  Worth removing rather than ignoring, because it is a **latent grant**:
+  nothing listens today, but `~/.hermes/skills/creative/p5js/scripts/serve.sh`
+  defaults to port 8080 and `python3 -m http.server` binds all interfaces,
+  so running that helper would publish its working directory over the
+  tunnel with no firewall change. Delete by rule *number* (highest first)
+  since numbers shift and an IPv6 twin exists — see
+  `docs/reboot-validation-checklist.md`.
 - **Runbook is stale and uncommitted.** Two identical copies sit in
   `~/Downloads/` (`ubuntu-kernel-nvidia-troubleshooting.md` and
   `...(1).md`, 19426 bytes each). Dated 2026-04-19 and written when the
@@ -867,7 +889,8 @@ Full rebuild would require:
   |---|---|---|
   | `ARCHITECTURE.md` | — | this document |
   | `nginx-configs/spark-ollama.conf` | current | template matching live EC2 |
-  | `unit-files/ollama-override.conf` | current | matches live VM drop-in |
+  | `unit-files/ollama-override.conf` | current | **hardened target, not yet live** (§7.2) |
+  | `docs/reboot-validation-checklist.md` | current | apply + verify procedure |
   | `unit-files/ollama-preload.service` | current | **not yet installed** (§7.3) |
   | `models/Modelfile.llama3.3-70b-fullgpu` | current | matches served model |
   | `scripts/inference-baseline.sh` | current | re-runs §4 measurements |
