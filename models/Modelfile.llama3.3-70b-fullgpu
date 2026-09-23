@@ -1,0 +1,32 @@
+# Modelfile for `llama3.3-70b-fullgpu:latest` — the model the 343 Guilty
+# Spark UI actually targets.
+#
+# Build it on the VM (`agent-sandbox-3090`, user `operator`) after the base
+# tag has been pulled:
+#   ollama pull llama3.3:70b-instruct-q4_K_M
+#   ollama create llama3.3-70b-fullgpu -f Modelfile.llama3.3-70b-fullgpu
+#
+# Keeping the base tag around costs almost nothing — Ollama dedupes blob
+# storage, so both tags together occupy ~42 GB on disk, not ~84 GB.
+#
+# Verify the build offloaded everything with `ollama ps`: the size column
+# should report 100% GPU. Baseline for this build is ~19 tok/s, ~21 GB per
+# card.
+
+FROM llama3.3:70b-instruct-q4_K_M
+
+# WHY: num_gpu is the number of layers to offload to the GPUs. Ollama's
+# autodetection is conservative and will quietly leave a few layers on the
+# CPU, and even a handful of CPU-resident layers drags generation down by an
+# order of magnitude because every token has to cross the PCIe boundary.
+# 999 is the idiomatic "all of them" value — it is clamped to the real layer
+# count — and forces full GPU offload with no CPU spillover.
+PARAMETER num_gpu 999
+
+# WHY: 4096 is deliberately modest, not an oversight. Weights plus KV cache
+# already occupy ~42 GB of the 48 GB VRAM budget (24 GB per RTX 3090),
+# leaving only ~6 GB of headroom. The KV cache scales with context, so
+# raising num_ctx is the fastest way to push the model into CPU spillover
+# and undo the num_gpu 999 above. Lower this further if VRAM ever needs to
+# be freed for a second model.
+PARAMETER num_ctx 4096
