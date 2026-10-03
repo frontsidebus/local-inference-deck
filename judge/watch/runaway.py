@@ -4,8 +4,15 @@
 Polls ``probes/probe.py slots`` every ``--interval`` seconds (default 30; ``--once`` for one pass) and
 alerts when a slot that is processing satisfies EITHER trigger:
 
-  tokens   ``n_predict == -1`` (request had no max_tokens) AND ``n_decoded >= JUDGE_RUNAWAY_TOKENS``
-  minutes  the same ``id_task`` has been processing for ``>= JUDGE_RUNAWAY_MINUTES``
+  tokens   ``n_decoded >= JUDGE_RUNAWAY_TOKENS`` (default 24000), whatever ``n_predict`` is. Since the
+           output cap (gateway ``max_tokens`` clamp + llama-server ``-n``) every slot has ``n_predict > 0``;
+           the alert then shows progress ``n_decoded/n_predict``. ``n_predict == -1`` (no cap: the cap was
+           lost or bypassed) is called out in the reason.
+  minutes  the same ``id_task`` has been processing for ``>= JUDGE_RUNAWAY_MINUTES`` (default 10)
+
+The token default sits above the gateway's default limit (16384, so a request that sets no limit never
+trips it) and below the 32768 model maximum (so a request that asked for a near-maximum generation is
+flagged roughly three quarters of the way through, a few minutes before it ends).
 
 One alert per (model, slot, id_task). Each alert appends a JSONL line to ``$JUDGE_REVIEW_DIR/watch.log``,
 writes a ``runaway`` review request, prints the alert, and runs ``notify-send`` when available and
@@ -34,6 +41,8 @@ sys.dont_write_bytecode = True  # never leave __pycache__ in the judge/ tree
 JUDGE_DIR = Path(__file__).resolve().parent.parent
 PROBE = JUDGE_DIR / "probes" / "probe.py"
 STATE_TTL_S = 24 * 3600
+DEFAULT_TOKENS = 24000   # keep in sync with lib/config.py DEFAULTS
+DEFAULT_MINUTES = 10
 
 
 # ------------------------------------------------------------------ config / queue adapters
@@ -244,8 +253,15 @@ def evaluate(slots: List[Dict[str, Any]], state: Dict[str, Any], now: float, tok
             t["tok_per_s"] = rate
         elapsed_min = (now - t["first_seen"]) / 60.0
         reasons = []
-        if s.get("n_predict") == -1 and (s.get("n_decoded") or 0) >= tokens:
-            reasons.append(f"no max_tokens (n_predict=-1) and n_decoded={s['n_decoded']} >= {tokens}")
+        n_dec, n_pred = s.get("n_decoded") or 0, s.get("n_predict")
+        if n_dec >= tokens:
+            if isinstance(n_pred, int) and n_pred > 0:
+                pct = min(100, round(100 * n_dec / n_pred))
+                reasons.append(f"n_decoded={n_dec} >= {tokens} (cap n_predict={n_pred}: {n_dec}/{n_pred}, {pct}%)")
+            elif n_pred == -1:
+                reasons.append(f"n_decoded={n_dec} >= {tokens} with NO output cap (n_predict=-1)")
+            else:
+                reasons.append(f"n_decoded={n_dec} >= {tokens} (n_predict unknown)")
         if elapsed_min >= minutes:
             reasons.append(f"task {s['id_task']} processing for {elapsed_min:.1f} min >= {minutes:g}")
         if reasons and key not in alerted:
@@ -332,8 +348,8 @@ def run_once(slots_data: Any, out: Any, now: Optional[float] = None) -> List[Dic
     now = time.time() if now is None else now
     state = load_state()
     alerts = evaluate(list(iter_slots(slots_data)), state, now,
-                      _int_setting("JUDGE_RUNAWAY_TOKENS", 20000),
-                      float(_int_setting("JUDGE_RUNAWAY_MINUTES", 10)))
+                      _int_setting("JUDGE_RUNAWAY_TOKENS", DEFAULT_TOKENS),
+                      float(_int_setting("JUDGE_RUNAWAY_MINUTES", DEFAULT_MINUTES)))
     for a in alerts:
         emit(a, now, out)
     save_state(state)

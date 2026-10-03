@@ -141,6 +141,16 @@ def test_slots_summary(env):
     assert "api-key" not in joined and "sudo" not in joined and "127.0.0.1:5801/slots" in joined
 
 
+
+def test_slots_runaway_suspect_ignores_cap(env):
+    """Same token rule as the C6 watcher: a capped slot (output cap) past the threshold is still suspect."""
+    from probe import _slot_fields
+    busy = {"id": 0, "id_task": 9, "is_processing": True, "params": {"n_predict": 32768},
+            "next_token": [{"n_decoded": 24000}]}
+    assert _slot_fields(busy, 24000)["runaway_suspect"] is True
+    busy["next_token"][0]["n_decoded"] = 2000
+    assert _slot_fields(busy, 24000)["runaway_suspect"] is False
+
 def test_slots_probe_cli_shape(env):
     rc, text = probe.run_probe("slots", [], runner=_slots_runner(""))
     body = json.loads(text[text.index("{"):text.rindex("}") + 1])

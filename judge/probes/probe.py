@@ -283,8 +283,8 @@ def _slot_fields(s: Dict, threshold: int) -> Dict:
         "n_decoded": n_decoded,
         "n_predict": n_predict,
         "max_tokens": params.get("max_tokens"),
-        "runaway_suspect": bool(busy and n_predict in (-1, None) and isinstance(n_decoded, int)
-                                and n_decoded >= threshold),
+        # same token rule as the C6 watcher: n_decoded over the threshold, whatever n_predict is
+        "runaway_suspect": bool(busy and isinstance(n_decoded, int) and n_decoded >= threshold),
     }
 
 
@@ -301,9 +301,9 @@ def slots_summary(cfg: Optional[Mapping[str, str]] = None, runner: Optional[Runn
     ctx = ctx or Ctx(cfg, runner or subprocess_runner, timeout or float(cfg.get("JUDGE_PROBE_TIMEOUT") or 20))
     res: Dict = {"_collected": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     try:
-        threshold = int(cfg.get("JUDGE_RUNAWAY_TOKENS") or 20000)
+        threshold = int(cfg.get("JUDGE_RUNAWAY_TOKENS") or 24000)
     except ValueError:
-        threshold = 20000
+        threshold = 24000
     rc, out, err = ctx.ssh("walter", "docker ps --filter label=llama-swap=1 --format '{{.Names}}\t{{.Ports}}'")
     if rc != 0:
         res["_error"] = f"docker ps on walter failed (exit {rc}): {redact(err.strip())[:300]}"
