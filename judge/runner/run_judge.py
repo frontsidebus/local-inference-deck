@@ -125,7 +125,8 @@ def _flatten(messages: List[Dict[str, str]]) -> str:
     return "\n\n".join(out)
 
 
-def call_frontier(messages: List[Dict[str, str]]) -> Tuple[str, str]:
+def call_frontier(messages: List[Dict[str, str]], record_cost: bool = True) -> Tuple[str, str]:
+    """record_cost=False (rejudge --no-budget) leaves usage.json completely untouched."""
     argv = frontier_argv(messages[0]["content"])
     timeout = int(C.setting("JUDGE_FRONTIER_TIMEOUT", "900"))
     with tempfile.TemporaryDirectory(prefix="judge-") as cwd:  # empty cwd: no project CLAUDE.md
@@ -143,7 +144,8 @@ def call_frontier(messages: List[Dict[str, str]]) -> Tuple[str, str]:
     except json.JSONDecodeError:
         env = None
     if isinstance(env, dict) and ("result" in env or env.get("type") == "result"):
-        frontier_cost_add(env.get("total_cost_usd"))  # billed even when the reply is an error
+        if record_cost:
+            frontier_cost_add(env.get("total_cost_usd"))  # billed even when the reply is an error
         if env.get("is_error") or (env.get("subtype") not in (None, "success")):
             raise JudgeError(f"frontier returned an error: {str(env.get('result') or env.get('subtype'))[:300]}")
         usage = env.get("modelUsage")
@@ -503,7 +505,7 @@ def judge_bundle(request_id: str, request: Dict[str, Any], evidence_dir: Path, m
             if mode == "frontier" and use_budget and not frontier_budget_take():
                 mode = "local"
                 notes.append(f"frontier daily cap ({C.setting('JUDGE_FRONTIER_DAILY_MAX', '20')}) reached: fell back to local")
-            raw, model = call_frontier(messages) if mode == "frontier" else call_local(messages)
+            raw, model = call_frontier(messages, record_cost=use_budget) if mode == "frontier" else call_local(messages)
             raws.append(raw)
             parsed: Any = None
             try:

@@ -449,3 +449,28 @@ def test_claims_only_other_rubric_or_single_fragment_still_dropped():
                          item(id="F3", rubric="R6", severity="low", verdict="partial", evidence=S2_INTERNAL)],
                         S2, request={"claims": S2_CLAIMS}, mode="frontier")
     assert f["items"] == [] and len(dropped) == 3
+
+
+def _costly_claude(tmp_path, monkeypatch, reply):
+    """A fake `claude` that also reports total_cost_usd, like the real CLI."""
+    script = tmp_path / "fake-claude-cost"
+    script.write_text(
+        f"#!{sys.executable}\nimport json, sys\nsys.stdin.read()\n"
+        f"print(json.dumps({{'type': 'result', 'subtype': 'success', 'is_error': False, "
+        f"'result': {json.dumps(reply)!r}, 'total_cost_usd': 0.5, "
+        f"'modelUsage': {{'claude-test-model': {{'outputTokens': 10}}}}}}))\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("JUDGE_FRONTIER_CMD", str(script))
+
+
+def test_rejudge_no_budget_leaves_usage_untouched_even_with_cost(env, tmp_path, monkeypatch):
+    """Live finding: --no-budget still added total_cost_usd to usage.json (frontier_usd)."""
+    _costly_claude(tmp_path, monkeypatch, json.dumps({"items": []}))
+    r = rid()
+    _judged(env, r)
+    assert RG.main([r, "--mode", "frontier", "--out", str(tmp_path / "o1"), "--no-budget"]) == 0
+    assert not (env / "usage.json").exists()
+    # without --no-budget the call is counted and its cost recorded
+    assert RG.main([r, "--mode", "frontier", "--out", str(tmp_path / "o2")]) == 0
+    usage = json.loads((env / "usage.json").read_text())
+    assert usage["frontier_runs"] == 1 and abs(usage["frontier_usd"] - 0.5) < 1e-9
