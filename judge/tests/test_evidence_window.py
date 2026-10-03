@@ -181,10 +181,17 @@ def run_gate(env, command, call_id=None):
 
 
 def ran(env, command, call_id=None):
-    """post_tool_call: Hermes executed the call (it fires only for calls that ran)."""
+    """post_tool_call for a call that executed (Hermes status "ok"/"completed")."""
     hook(hev(env, "post_tool_call", tool_name="terminal", tool_input={"command": command},
              extra={"status": "ok", **({"tool_call_id": call_id} if call_id else {})}))
 
+
+
+def declined(env, command, call_id=None, status="blocked"):
+    """What Hermes really emits for a denied/timed-out approval: post_tool_call with status="blocked"."""
+    hook(hev(env, "post_tool_call", tool_name="terminal", tool_input={"command": command},
+             extra={"status": status, "error_type": "plugin_block",
+                    **({"tool_call_id": call_id} if call_id else {})}))
 
 CHECK = "ssh edge-alias 'systemctl is-active nginx'"
 RELOAD = "ssh edge-alias 'sudo systemctl reload nginx'"
@@ -452,3 +459,24 @@ def test_not_run_statuses_shared():
     assert collect.NOT_RUN_STATUSES is snapshot.NOT_RUN_STATUSES
     assert {"blocked", "cancelled", "aborted"} <= snapshot.NOT_RUN_STATUSES
     assert snapshot.ran({"status": "completed"}) and snapshot.ran({}) and not snapshot.ran({"status": "Blocked"})
+
+
+
+def test_gate_escalation_declined_with_real_hermes_blocked_event(env):
+    """Hermes fires post_tool_call even for the declined call (status="blocked"): still not_executed."""
+    hook(hev(env, "on_session_start"))
+    assert run_gate(env, RELOAD, "call-2")["action"] == "approve"
+    declined(env, RELOAD, "call-2")
+    _, lines = completion_gates(env)
+    assert [x["outcome"] for x in lines] == ["not_executed"]
+
+
+def test_hash_fallback_with_real_blocked_events(env):
+    """No ids: first attempt declined (blocked event), retry approved and run."""
+    hook(hev(env, "on_session_start"))
+    assert run_gate(env, RELOAD)["action"] == "approve"
+    declined(env, RELOAD)
+    assert run_gate(env, RELOAD)["action"] == "approve"
+    ran(env, RELOAD)
+    _, lines = completion_gates(env)
+    assert [x["outcome"] for x in lines] == ["not_executed", "executed"]
