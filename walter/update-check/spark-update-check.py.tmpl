@@ -1,0 +1,1138 @@
+#!/usr/bin/env python3
+"""spark-update-check -- weekly REPORT-ONLY update/security checker for Walter.
+
+Never pulls, upgrades or restarts anything. It reads the current pins from
+the compose/config files, asks GitHub (releases + security advisories) and the
+container registries (tag -> digest) what is current upstream, inspects apt
+and the NVIDIA driver, and writes a Markdown report.
+
+  report : /var/lib/spark-update-check/report-YYYY-mm-dd.md (+ latest.md symlink)
+  exit   : 0 OK, 10 updates available, 20 security advisories affect current
+           versions, 1 internal error
+  token  : optional GitHub token in /etc/spark-update-check/github-token
+           (never printed; only sent to api.github.com)
+
+python3 stdlib only.
+"""
+
+import argparse
+import datetime as dt
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+STATE_DIR = "/var/lib/spark-update-check"
+CACHE_DIR = "/var/cache/spark-update-check/http"
+TOKEN_FILE = "/etc/spark-update-check/github-token"
+COMPOSE_GLOBS = ["/srv/*/compose.yaml", "/srv/*/compose.yml",
+                 "/srv/*/docker-compose.yaml", "/srv/*/docker-compose.yml"]
+LLAMA_SWAP_CONFIG = "/etc/llama-swap/config.yaml"
+LLAMA_SWAP_BIN = "/usr/local/bin/llama-swap"
+HERMES_DIR = "/home/${BACKEND_SSH_USER}/.hermes/hermes-agent"
+HERMES_REPO = "NousResearch/hermes-agent"
+UA = "spark-update-check/1.0 (+report-only)"
+HTTP_TIMEOUT = 25
+
+# image repository (registry/path, no tag) -> GitHub repo. Unknown ghcr.io
+# images are guessed as ghcr.io/<owner>/<repo> -> <owner>/<repo>.
+IMAGE_TO_GITHUB = {
+    "ghcr.io/berriai/litellm": "BerriAI/litellm",
+    "ghcr.io/open-webui/open-webui": "open-webui/open-webui",
+    "ghcr.io/pocket-id/pocket-id": "pocket-id/pocket-id",
+    "ghcr.io/ggml-org/llama.cpp": "ggml-org/llama.cpp",
+    # common monitoring images (for /srv/monitoring or similar)
+    "docker.io/prom/prometheus": "prometheus/prometheus",
+    "quay.io/prometheus/prometheus": "prometheus/prometheus",
+    "docker.io/prom/alertmanager": "prometheus/alertmanager",
+    "quay.io/prometheus/alertmanager": "prometheus/alertmanager",
+    "docker.io/prom/node-exporter": "prometheus/node_exporter",
+    "quay.io/prometheus/node-exporter": "prometheus/node_exporter",
+    "docker.io/prom/blackbox-exporter": "prometheus/blackbox_exporter",
+    "quay.io/prometheus/blackbox-exporter": "prometheus/blackbox_exporter",
+    "docker.io/grafana/grafana": "grafana/grafana",
+    "docker.io/grafana/grafana-oss": "grafana/grafana",
+    "docker.io/grafana/loki": "grafana/loki",
+    "docker.io/grafana/promtail": "grafana/loki",
+    "docker.io/grafana/alloy": "grafana/alloy",
+    "gcr.io/cadvisor/cadvisor": "google/cadvisor",
+    "ghcr.io/google/cadvisor": "google/cadvisor",
+    "nvcr.io/nvidia/k8s/dcgm-exporter": "NVIDIA/dcgm-exporter",
+    "docker.io/utkuozdemir/nvidia_gpu_exporter": "utkuozdemir/nvidia_gpu_exporter",
+    "docker.io/victoriametrics/victoria-metrics": "VictoriaMetrics/VictoriaMetrics",
+    "docker.io/louislam/uptime-kuma": "louislam/uptime-kuma",
+}
+# repos whose real releases are rolling build tags (bNNNN) flagged prerelease
+BUILD_TAG_REPOS = {"ggml-org/llama.cpp": r"^b\d+$"}
+# repos whose version is better read from inside the image than from the tag
+PY_VERSION_PROBE = {"BerriAI/litellm": "litellm"}
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+WARNINGS = []
+
+
+def warn(msg):
+    WARNINGS.append(msg)
+    print("warning: " + msg, file=sys.stderr)
+
+
+def run(cmd, timeout=60):
+    """Run a command, return (rc, stdout). Never raises."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=dict(os.environ, LANG="C", LC_ALL="C"))
+        return p.returncode, p.stdout
+    except Exception as e:  # noqa: BLE001
+        return 127, "%s: %s" % (type(e).__name__, e)
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_iso(s):
+    if not s:
+        return None
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def md_escape(s):
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+
+# --------------------------------------------------------------------------
+# version handling (semver-ish, PEP440-ish, llama.cpp build numbers)
+# --------------------------------------------------------------------------
+_PRE_RANK = {"dev": -1, "alpha": 0, "a": 0, "beta": 1, "b": 1, "pre": 2,
+             "preview": 2, "rc": 2, "c": 2}
+_VER_RE = re.compile(
+    r"^(\d+(?:\.\d+)*)"
+    r"(?:[-.]?(?:stable|final|release|ga))?"
+    r"(?:[-.]?(dev|alpha|beta|preview|pre|rc|a|b|c)[-.]?(\d*))?"
+    r"(?:\+[\w.]+)?$", re.I)
+
+
+class Ver:
+    """Comparable version. kind 'build' (bNNNN) never compares to 'semver'."""
+
+    def __init__(self, kind, key, text):
+        self.kind, self.key, self.text = kind, key, text
+
+    def _chk(self, o):
+        if self.kind != o.kind:
+            raise TypeError("incomparable versions %s / %s" % (self.text, o.text))
+
+    def __lt__(self, o): self._chk(o); return self.key < o.key
+    def __le__(self, o): self._chk(o); return self.key <= o.key
+    def __gt__(self, o): self._chk(o); return self.key > o.key
+    def __ge__(self, o): self._chk(o); return self.key >= o.key
+    def __eq__(self, o): return isinstance(o, Ver) and self.kind == o.kind and self.key == o.key
+    def __hash__(self): return hash((self.kind, self.key))
+    def __repr__(self): return self.text
+
+    @property
+    def series(self):
+        return self.key[0][:2] if self.kind == "semver" else None
+
+
+def parse_ver(s):
+    """'v1.2.3', 'v.2.8.0', '1.83.10-stable', '1.104.0rc1', 'b8145', 'v260'."""
+    if s is None:
+        return None
+    t = s.strip().strip("'\"")
+    t = re.sub(r"^[=<>!~^ ]+", "", t).strip()
+    t = re.sub(r"^v\.?", "", t, flags=re.I)
+    m = re.match(r"^b(\d+)$", t, re.I)
+    if m:
+        return Ver("build", (int(m.group(1)),), s.strip())
+    m = _VER_RE.match(t)
+    if not m:
+        return None
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    nums = (nums + (0, 0, 0, 0))[:4]
+    if m.group(2):
+        pre = (_PRE_RANK[m.group(2).lower()], int(m.group(3) or 0))
+    else:
+        pre = (9, 0)  # final release sorts after any pre-release
+    return Ver("semver", (nums, pre), s.strip())
+
+
+def _cmp(cur, op, v):
+    return {"<": cur < v, "<=": cur <= v, ">": cur > v, ">=": cur >= v,
+            "=": cur == v, "==": cur == v, "!=": not cur == v}[op]
+
+
+def in_range(cur, rng):
+    """True/False if cur is inside the advisory range, None if unparseable."""
+    if not rng or not rng.strip():
+        return None
+    norm = re.sub(r"\s*(;|\|\||\bor\b)\s*", "||", rng, flags=re.I)
+    norm = re.sub(r"\s+and\s+", " ", norm, flags=re.I)
+    alts = []
+    for alt in norm.split("||"):
+        parts = [p.strip() for p in alt.split(",") if p.strip()]
+        nops = [len(re.findall(r"[<>]=?|==|!=", p)) for p in parts]
+        # GitHub style '>= 1.0, < 2.0' is AND. Comma-separated exact versions
+        # ('3.10.0, 3.11.0') or comma-separated complete ranges
+        # ('>= 2.24.1 < 2.37.4, >=2.38.0 < 2.40.4') are OR.
+        if len(parts) > 1 and (all(n == 0 for n in nops) or any(n >= 2 for n in nops)):
+            alts.extend(parts)
+        else:
+            alts.append(alt)
+    try:
+        results = []
+        for alt in alts:
+            alt = alt.strip()
+            m = re.match(r"^(\S+)\s+-\s+(\S+)$", alt)  # 'v1.11.0 - v2.9.0'
+            if m:
+                lo, hi = parse_ver(m.group(1)), parse_ver(m.group(2))
+                if not lo or not hi:
+                    return None
+                results.append(lo <= cur <= hi)
+                continue
+            ok = True
+            for part in [p for p in re.split(r",|\s+(?=[<>=!])", alt) if p.strip()]:
+                pm = re.match(r"^\s*(>=|<=|==|!=|>|<|=)?\s*(.+?)\s*$", part)
+                op, v = pm.group(1) or "=", parse_ver(pm.group(2))
+                if v is None:
+                    return None
+                ok = ok and _cmp(cur, op, v)
+            results.append(ok)
+        return any(results)
+    except TypeError:
+        return None
+
+
+def lower_bound_only(rng):
+    """'>= 8.1' style range with no upper bound."""
+    ops = re.findall(r"[<>]=?", rng or "")
+    return bool(ops) and all(o.startswith(">") for o in ops) and " - " not in rng
+
+
+def patched_list(s):
+    if not s:
+        return []
+    out = []
+    for p in re.split(r",|;|\s+and\s+|\s+or\s+", s, flags=re.I):
+        v = parse_ver(p)
+        if v is not None:
+            out.append(v)
+    return out
+
+
+def is_patched(cur, plist):
+    """cur >= a patched version in the same major.minor series (backports),
+    or >= the highest patched version. None if no usable data."""
+    plist = [p for p in plist if p.kind == cur.kind]
+    if not plist:
+        return None
+    if cur >= max(plist):
+        return True
+    for p in plist:
+        if p.series is not None and p.series == cur.series and cur >= p:
+            return True
+    return False
+
+
+def evaluate_advisory(adv, cur, cur_date_fn):
+    """-> (verdict, note). verdict in AFFECTED / not affected / CHECK MANUALLY /
+    likely not affected (manual)."""
+    vulns = adv.get("vulnerabilities") or []
+    verdicts, notes = [], []
+    cur_date = None
+    for v in vulns:
+        pkg = v.get("package") or {}
+        eco = (pkg.get("ecosystem") or "").strip().lower()
+        rng = v.get("vulnerable_version_range") or ""
+        pat = v.get("patched_versions") or ""
+        r = in_range(cur, rng) if cur else None
+        p = is_patched(cur, patched_list(pat)) if cur else None
+        if r is False:
+            verdicts.append("no")
+        elif r is True:
+            if p is True:
+                verdicts.append("no")
+                notes.append("range '%s' includes current but patched '%s' <= current"
+                             % (rng, pat))
+            elif p is None and lower_bound_only(rng):
+                # open-ended range and no fixed version listed: either still
+                # unfixed (recent) or incomplete advisory data (old)
+                pub = parse_iso(adv.get("published_at"))
+                cur_date = cur_date_fn()
+                if pub and cur_date and pub < cur_date:
+                    verdicts.append("manual-old")
+                    notes.append("open-ended range '%s', no patched version listed; "
+                                 "advisory predates current release" % rng)
+                elif not cur_date:
+                    verdicts.append("manual")
+                    notes.append("open-ended range '%s', no patched version listed" % rng)
+                else:
+                    verdicts.append("yes")
+                    notes.append("open-ended range '%s', no patched version listed" % rng)
+            else:
+                verdicts.append("yes")
+        else:  # range unusable
+            if p is not None:
+                verdicts.append("no" if p else "yes")
+                notes.append("range '%s' unparseable; judged by patched '%s'" % (rng, pat))
+            else:
+                verdicts.append("manual")
+                notes.append("unparseable range '%s' / patched '%s'" % (rng, pat))
+        if eco in ("", "other") and verdicts[-1] != "manual":
+            notes.append("ecosystem '%s' (non-standard); version-compared" % (eco or "none"))
+    if not vulns:
+        verdicts.append("manual")
+        notes.append("no version data")
+    if "yes" in verdicts:
+        return "AFFECTED", "; ".join(notes)
+    if "manual-old" in verdicts:
+        return "likely not affected (manual)", "; ".join(notes)
+    if "manual" in verdicts and "no" not in verdicts:
+        pub = parse_iso(adv.get("published_at"))
+        cur_date = cur_date_fn()
+        if pub and cur_date and pub > cur_date:
+            return "CHECK MANUALLY", "; ".join(notes + ["published after current release"])
+        if pub and cur_date:
+            return "likely not affected (manual)", "; ".join(
+                notes + ["published before current release date"])
+        return "CHECK MANUALLY", "; ".join(notes + ["no release date to compare"])
+    return "not affected", "; ".join(notes)
+
+
+# --------------------------------------------------------------------------
+# HTTP with ETag cache + backoff
+# --------------------------------------------------------------------------
+class RateLimited(Exception):
+    pass
+
+
+class Http:
+    def __init__(self, token=None):
+        self.token = token
+        self.gh_exhausted = False
+        self.gh_calls = 0
+        self.gh_remaining = None
+        self.stale = set()
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+
+    def _cache_path(self, url):
+        return os.path.join(CACHE_DIR, hashlib.sha256(url.encode()).hexdigest() + ".json")
+
+    def github(self, path, params=None):
+        """GET api.github.com JSON; follows Link rel=next for lists.
+        Raises RateLimited / RuntimeError."""
+        url = "https://api.github.com" + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        out, first = None, True
+        while url:
+            data, headers = self._gh_get(url)
+            if first and not isinstance(data, list):
+                return data
+            first = False
+            out = (out or []) + list(data)
+            m = re.search(r'<([^>]+)>;\s*rel="next"', headers.get("Link", "") or "")
+            url = m.group(1) if m else None
+        return out
+
+    def _gh_get(self, url):
+        cpath = self._cache_path(url)
+        cached = None
+        try:
+            with open(cpath) as f:
+                cached = json.load(f)
+        except (OSError, ValueError):
+            pass
+        try:
+            return self._gh_fetch(url, cpath, cached)
+        except RateLimited as e:
+            if cached:
+                age = (time.time() - os.path.getmtime(cpath)) / 86400
+                self.stale.add("%s (rate limited; cached copy %.1f d old)" % (
+                    url.split("?")[0].replace("https://api.github.com/repos/", ""), age))
+                return cached["data"], {"Link": cached.get("link", "")}
+            raise
+
+    def _gh_fetch(self, url, cpath, cached):
+        if self.gh_exhausted:
+            raise RateLimited("GitHub rate limit exhausted earlier in this run")
+        hdrs = {"Accept": "application/vnd.github+json", "User-Agent": UA,
+                "X-GitHub-Api-Version": "2022-11-28"}
+        if self.token:
+            hdrs["Authorization"] = "Bearer " + self.token
+        if cached and cached.get("etag"):
+            hdrs["If-None-Match"] = cached["etag"]
+        delay = 2
+        for attempt in range(4):
+            req = urllib.request.Request(url, headers=hdrs)
+            self.gh_calls += 1
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                    body = r.read()
+                    self.gh_remaining = r.headers.get("X-RateLimit-Remaining", self.gh_remaining)
+                    data = json.loads(body)
+                    link = r.headers.get("Link", "")
+                    try:
+                        with open(cpath + ".tmp", "w") as f:
+                            json.dump({"etag": r.headers.get("ETag"), "link": link,
+                                       "data": data}, f)
+                        os.replace(cpath + ".tmp", cpath)
+                    except OSError:
+                        pass
+                    return data, {"Link": link}
+            except urllib.error.HTTPError as e:
+                self.gh_remaining = e.headers.get("X-RateLimit-Remaining", self.gh_remaining)
+                if e.code == 304 and cached:
+                    return cached["data"], {"Link": cached.get("link", "")}
+                if e.code in (403, 429):
+                    ra = e.headers.get("Retry-After")
+                    rem = e.headers.get("X-RateLimit-Remaining")
+                    reset = e.headers.get("X-RateLimit-Reset")
+                    if ra and int(ra) <= 60 and attempt < 3:
+                        time.sleep(int(ra) + 1)
+                        continue
+                    if rem == "0":
+                        wait = int(reset) - int(time.time()) if reset else 9999
+                        if 0 < wait <= 60 and attempt < 3:
+                            time.sleep(wait + 1)
+                            continue
+                        self.gh_exhausted = True
+                        when = (dt.datetime.fromtimestamp(int(reset), dt.timezone.utc)
+                                .strftime("%H:%M UTC") if reset else "?")
+                        raise RateLimited("GitHub API rate limit exhausted (resets %s)" % when)
+                    if attempt < 3:
+                        time.sleep(delay)
+                        delay *= 2
+                        continue
+                    raise RuntimeError("GitHub HTTP %d for %s" % (e.code, url.split("?")[0]))
+                if e.code >= 500 and attempt < 3:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise RuntimeError("GitHub HTTP %d for %s" % (e.code, url.split("?")[0]))
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if attempt < 3:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise RuntimeError("network error for %s: %s" % (url.split("?")[0], e))
+        raise RuntimeError("giving up on %s" % url.split("?")[0])
+
+    # ---- registries (anonymous bearer-token flow, works for ghcr + docker hub)
+    MANIFEST_ACCEPT = ", ".join([
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    ])
+
+    def registry_manifest(self, registry, repo, ref, method="HEAD"):
+        """-> (digest, json-or-None). Raises RuntimeError."""
+        host = "registry-1.docker.io" if registry == "docker.io" else registry
+        url = "https://%s/v2/%s/manifests/%s" % (host, repo, ref)
+        token = None
+        delay = 2
+        for attempt in range(4):
+            hdrs = {"Accept": self.MANIFEST_ACCEPT, "User-Agent": UA}
+            if token:
+                hdrs["Authorization"] = "Bearer " + token
+            req = urllib.request.Request(url, headers=hdrs, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+                    dg = r.headers.get("Docker-Content-Digest")
+                    body = r.read() if method == "GET" else b""
+                    data = json.loads(body) if body else None
+                    if not dg and body:
+                        dg = "sha256:" + hashlib.sha256(body).hexdigest()
+                    return dg, data
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and token is None:
+                    token = self._registry_token(e.headers.get("WWW-Authenticate", ""))
+                    continue
+                if e.code == 404:
+                    raise RuntimeError("tag/manifest not found: %s/%s:%s" % (registry, repo, ref))
+                if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise RuntimeError("registry HTTP %d for %s/%s:%s" % (e.code, registry, repo, ref))
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if attempt < 3:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                raise RuntimeError("registry network error: %s" % e)
+        raise RuntimeError("registry: giving up on %s/%s:%s" % (registry, repo, ref))
+
+    def _registry_token(self, www_auth):
+        m = re.match(r"Bearer\s+(.*)", www_auth or "", re.I)
+        if not m:
+            raise RuntimeError("registry wants unsupported auth: %r" % www_auth[:60])
+        params = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+        realm = params.pop("realm", None)
+        if not realm:
+            raise RuntimeError("registry auth without realm")
+        url = realm + "?" + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            d = json.loads(r.read())
+        return d.get("token") or d.get("access_token")
+
+
+# --------------------------------------------------------------------------
+# discovery of pinned images
+# --------------------------------------------------------------------------
+IMG_RE = re.compile(r"""^\s*image:\s*["']?([^"'\s#]+)""")
+REF_IN_TEXT_RE = re.compile(r"""((?:[\w.-]+(?::\d+)?/)?[\w./-]+(?::[\w][\w.-]*)?@sha256:[0-9a-f]{64})""")
+
+
+def split_ref(ref):
+    """-> dict(registry, repo, tag, digest, name)"""
+    digest = None
+    if "@" in ref:
+        ref, digest = ref.split("@", 1)
+    tag = None
+    last = ref.rsplit("/", 1)[-1]
+    if ":" in last:
+        ref, tag = ref.rsplit(":", 1)
+    parts = ref.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        registry, repo = parts[0], "/".join(parts[1:])
+    else:
+        registry, repo = "docker.io", ref
+    if registry == "docker.io" and "/" not in repo:
+        repo = "library/" + repo
+    name = repo[len("library/"):] if repo.startswith("library/") else repo
+    return {"registry": registry, "repo": repo, "tag": tag, "digest": digest,
+            "name": name, "key": "%s/%s" % (registry, name)}
+
+
+def tag_from_comments(lines, idx, img):
+    """Digest-only refs: find 'name:tag' for this image in nearby comments."""
+    last = img["repo"].rsplit("/", 1)[-1]
+    pat = re.compile(r"([\w./-]*\b%s):([\w][\w.-]*)" % re.escape(last))
+    for j in range(idx - 1, max(-1, idx - 4), -1):
+        if "#" in lines[j]:
+            m = pat.search(lines[j].split("#", 1)[1])
+            if m:
+                return m.group(2)
+    if "#" in lines[idx]:
+        m = pat.search(lines[idx].split("#", 1)[1])
+        if m:
+            return m.group(2)
+    return None
+
+
+def discover_images():
+    found = []
+    files = sorted({f for g in COMPOSE_GLOBS for f in glob.glob(g)})
+    for path in files:
+        try:
+            lines = open(path).read().splitlines()
+        except OSError as e:
+            warn("cannot read %s: %s" % (path, e))
+            continue
+        service = None
+        for i, line in enumerate(lines):
+            sm = re.match(r"^  ([\w.-]+):\s*(#.*)?$", line)
+            if sm:
+                service = sm.group(1)
+            m = IMG_RE.match(line)
+            if not m or "${" in m.group(1):
+                if m:
+                    warn("%s: image uses variable interpolation, skipped: %s" % (path, m.group(1)))
+                continue
+            img = split_ref(m.group(1))
+            img["tag_source"] = "image ref" if img["tag"] else None
+            if not img["tag"]:
+                img["tag"] = tag_from_comments(lines, i, img)
+                img["tag_source"] = "comment" if img["tag"] else None
+            img.update(source="%s (%s)" % (path, service or "?"), ref=m.group(1))
+            found.append(img)
+    try:
+        text = open(LLAMA_SWAP_CONFIG).read()
+        for m in sorted(set(REF_IN_TEXT_RE.findall(text))):
+            img = split_ref(m)
+            img["tag_source"] = "image ref" if img["tag"] else None
+            img.update(source="%s (macro image)" % LLAMA_SWAP_CONFIG, ref=m)
+            found.append(img)
+    except OSError as e:
+        warn("cannot read %s: %s" % (LLAMA_SWAP_CONFIG, e))
+    return files, found
+
+
+def github_repo_for(img):
+    key = img["key"]
+    if key in IMAGE_TO_GITHUB:
+        return IMAGE_TO_GITHUB[key]
+    if img["registry"] == "ghcr.io" and img["repo"].count("/") == 1:
+        return img["repo"]  # guess
+    return None
+
+
+def local_image_labels(ref):
+    rc, out = run(["docker", "image", "inspect", ref, "--format", "{{json .Config.Labels}}"])
+    if rc != 0:
+        return {}
+    try:
+        return json.loads(out) or {}
+    except ValueError:
+        return {}
+
+
+def probe_python_version(ref, dist):
+    """Read a pip distribution version from inside a LOCAL image (no pull, no net)."""
+    code = "import importlib.metadata as m; print(m.version(%r))" % dist
+    rc, out = run(["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                   "--entrypoint", "python3", ref, "-c", code], timeout=120)
+    if rc != 0:
+        rc, out = run(["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                       "--entrypoint", "python", ref, "-c", code], timeout=120)
+    out = out.strip().splitlines()
+    return out[-1].strip() if rc == 0 and out else None
+
+
+# --------------------------------------------------------------------------
+# checks
+# --------------------------------------------------------------------------
+def check_digest(http, img):
+    """Compare pinned digest with what the tag resolves to upstream."""
+    res = {"status": "unknown", "detail": ""}
+    tag = img.get("tag")
+    pinned = img.get("digest")
+    if not pinned:
+        rc, out = run(["docker", "image", "inspect", img["ref"], "--format",
+                       "{{json .RepoDigests}}"])
+        try:
+            rds = json.loads(out) if rc == 0 else []
+        except ValueError:
+            rds = []
+        pinned = rds[0].split("@", 1)[1] if rds else None
+        res["unpinned"] = True
+    if not tag:
+        res["detail"] = "no tag known for digest-only ref (add a '# name:tag' comment)"
+        return res
+    try:
+        up, _ = http.registry_manifest(img["registry"], img["repo"], tag)
+    except Exception as e:  # noqa: BLE001
+        res["detail"] = str(e)
+        return res
+    res["upstream"] = up
+    if not pinned:
+        res.update(status="unknown", detail="image not present locally; upstream %s" % up[:19])
+        return res
+    if up == pinned:
+        res.update(status="current", detail="tag `%s` still resolves to pinned digest" % tag)
+        return res
+    # pinned might be a platform manifest inside the upstream index
+    try:
+        _, idx = http.registry_manifest(img["registry"], img["repo"], up, method="GET")
+        children = [m.get("digest") for m in (idx or {}).get("manifests", [])]
+        if pinned in children:
+            res.update(status="current", detail="pinned digest is a platform manifest of the current index")
+            return res
+    except Exception:  # noqa: BLE001
+        pass
+    res.update(status="newer", detail="tag `%s` now -> %s (pinned %s)" % (tag, up[:19], pinned[:19]))
+    return res
+
+
+def check_github(http, repo, cur_text, cur_date=None):
+    """Latest release + advisories for a repo against the current version."""
+    r = {"repo": repo, "current": cur_text, "latest": None, "latest_date": None,
+         "release_status": "unknown", "advisories": [], "adv_status": "unknown",
+         "errors": [], "cur_date": cur_date}
+    cur = parse_ver(cur_text) if cur_text else None
+    # latest release
+    try:
+        if repo in BUILD_TAG_REPOS:
+            rels = http._gh_get("https://api.github.com/repos/%s/releases?per_page=20" % repo)[0]
+            rels = [x for x in rels if not x.get("draft")
+                    and re.match(BUILD_TAG_REPOS[repo], x.get("tag_name", ""))]
+            rel = rels[0] if rels else None
+        else:
+            rel = http.github("/repos/%s/releases/latest" % repo)
+        if rel:
+            r["latest"], r["latest_date"] = rel.get("tag_name"), rel.get("published_at")
+            lv = parse_ver(r["latest"])
+            if cur and lv and cur.kind == lv.kind:
+                r["release_status"] = "newer" if lv > cur else "current"
+                if repo in BUILD_TAG_REPOS and lv > cur:
+                    r["builds_behind"] = lv.key[0] - cur.key[0]
+            elif cur_text and r["latest"] and cur_text.lstrip("v") == r["latest"].lstrip("v"):
+                r["release_status"] = "current"
+            elif not cur_text:
+                r["release_status"] = "n/a"
+                r["errors"].append("current version not derivable from tag/labels; "
+                                   "latest release is %s" % r["latest"])
+            else:
+                r["release_status"] = "unknown"
+                r["errors"].append("cannot compare current %r with latest %r" % (cur_text, r["latest"]))
+    except RateLimited as e:
+        r["errors"].append(str(e))
+    except Exception as e:  # noqa: BLE001
+        r["errors"].append("releases: %s" % e)
+    # current release date, fetched lazily (only needed for date fallback)
+    def cur_date_fn():
+        if "cur_dt" in r:
+            return r["cur_dt"]
+        if not r["cur_date"] and cur_text:
+            vpref = (r["latest"] or "v").startswith("v")
+            bare = cur_text.lstrip("v")
+            for t in (["v" + bare, bare] if vpref else [bare, "v" + bare]):
+                try:
+                    rel = http.github("/repos/%s/releases/tags/%s" % (repo, urllib.parse.quote(t)))
+                    r["cur_date"] = rel.get("published_at")
+                    break
+                except RateLimited as e:
+                    r["errors"].append(str(e))
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+        r["cur_dt"] = parse_iso(r["cur_date"])
+        return r["cur_dt"]
+    # advisories
+    try:
+        advs = http.github("/repos/%s/security-advisories" % repo,
+                           {"state": "published", "per_page": 100})
+        for a in advs:
+            if a.get("withdrawn_at"):
+                continue
+            if cur is None:
+                verdict, note = "n/a", "current version unknown"
+            else:
+                verdict, note = evaluate_advisory(a, cur, cur_date_fn)
+            r["advisories"].append({
+                "id": a.get("ghsa_id"), "cve": a.get("cve_id"),
+                "severity": a.get("severity"), "published": (a.get("published_at") or "")[:10],
+                "summary": a.get("summary") or "", "url": a.get("html_url"),
+                "ranges": "; ".join("%s -> %s" % (v.get("vulnerable_version_range"),
+                                                   v.get("patched_versions"))
+                                    for v in a.get("vulnerabilities") or []),
+                "verdict": verdict, "note": note})
+        r["adv_status"] = "ok"
+    except RateLimited as e:
+        r["errors"].append(str(e))
+    except Exception as e:  # noqa: BLE001
+        r["errors"].append("advisories: %s" % e)
+    return r
+
+
+def check_hermes(http):
+    res = {"path": HERMES_DIR, "status": "unknown", "errors": []}
+    git = ["git", "-c", "safe.directory=*", "-C", HERMES_DIR]
+    rc, head = run(git + ["rev-parse", "HEAD"])
+    if rc != 0:
+        res["errors"].append("not a git checkout / unreadable")
+        return res
+    res["head"] = head.strip()
+    rc, desc = run(git + ["describe", "--tags", "--always"])
+    res["describe"] = desc.strip() if rc == 0 else "?"
+    rc, cdate = run(git + ["log", "-1", "--format=%cI"])
+    res["head_date"] = cdate.strip()
+    rc, st = run(git + ["status", "--porcelain", "--untracked-files=no"])
+    res["dirty"] = bool(st.strip()) if rc == 0 else None
+    rc, br = run(git + ["rev-parse", "--abbrev-ref", "HEAD"])
+    branch = br.strip() if rc == 0 and br.strip() != "HEAD" else "main"
+    res["branch"] = branch
+    try:
+        cmp_ = http.github("/repos/%s/compare/%s...%s" % (HERMES_REPO, res["head"], branch))
+        res["behind"] = cmp_.get("ahead_by")   # upstream commits we don't have
+        res["ahead"] = cmp_.get("behind_by")   # local commits upstream doesn't have
+        res["status"] = "newer" if res["behind"] else "current"
+    except Exception as e:  # noqa: BLE001
+        res["errors"].append("compare: %s" % e)
+    tagbase = re.sub(r"-\d+-g[0-9a-f]+$", "", res["describe"])
+    gh = check_github(http, HERMES_REPO, tagbase, res["head_date"])
+    res["github"] = gh
+    return res
+
+
+def check_llama_swap():
+    rc, out = run([LLAMA_SWAP_BIN, "--version"])
+    m = re.search(r"version:\s*(\S+)", out or "")
+    return m.group(1) if rc == 0 and m else None
+
+
+def check_os():
+    o = {"errors": []}
+    rc, out = run(["apt", "list", "--upgradable"], timeout=120)
+    pk = []
+    for line in out.splitlines():
+        m = re.match(r"^([^/\s]+)/(\S+)\s+(\S+)\s+\S+\s+\[upgradable from: ([^\]]+)\]", line)
+        if m:
+            pk.append({"name": m.group(1), "suite": m.group(2), "new": m.group(3), "old": m.group(4)})
+    o["upgradable"] = pk
+    o["security"] = [p for p in pk if "-security" in p["suite"]]
+    lists = glob.glob("/var/lib/apt/lists/*InRelease")
+    o["lists_age_h"] = (round((time.time() - max(os.path.getmtime(f) for f in lists)) / 3600, 1)
+                        if lists else None)
+    for unit in ("unattended-upgrades.service", "apt-daily.timer", "apt-daily-upgrade.timer"):
+        rc, out = run(["systemctl", "is-enabled", unit])
+        o[unit] = out.strip() or "unknown"
+    try:
+        with open("/var/log/unattended-upgrades/unattended-upgrades.log") as f:
+            starts = [l[:19] for l in f if "Starting unattended upgrades script" in l]
+        o["uu_last_run"] = starts[-1] if starts else None
+    except OSError:
+        o["uu_last_run"] = None
+    o["reboot_required"] = os.path.exists("/var/run/reboot-required")
+    try:
+        o["reboot_pkgs"] = open("/var/run/reboot-required.pkgs").read().split()
+    except OSError:
+        o["reboot_pkgs"] = []
+    rc, out = run(["apt-mark", "showhold"])
+    o["held"] = out.split() if rc == 0 else []
+    # NVIDIA driver
+    rc, out = run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
+    o["nvidia_loaded"] = sorted(set(out.split())) if rc == 0 else None
+    rc, out = run(["dpkg-query", "-W", "-f", "${Package} ${Version} ${db:Status-Abbrev}\n"])
+    inst = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2].startswith("ii"):
+            inst[parts[0]] = parts[1]
+    o["nvidia_driver_pkgs"] = {k: v for k, v in inst.items() if re.match(r"^nvidia-driver-\d+", k)}
+    watch = list(o["nvidia_driver_pkgs"]) + [p for p in ("nvidia-container-toolkit", "docker-ce",
+                                                         "containerd.io", "docker-ce-cli")
+                                             if p in inst]
+    pol = {}
+    for p in watch:
+        rc, out = run(["apt-cache", "policy", p])
+        m = re.search(r"Candidate:\s*(\S+)", out)
+        pol[p] = {"installed": inst.get(p), "candidate": m.group(1) if m else None}
+    o["policy"] = pol
+    # newer driver branches available (informational)
+    rc, out = run(["apt-cache", "pkgnames", "nvidia-driver-"])
+    br = sorted({int(m.group(1)) for m in re.finditer(r"^nvidia-driver-(\d+)(?:-open)?$", out, re.M)})
+    o["nvidia_branches"] = br
+    return o
+
+
+# --------------------------------------------------------------------------
+# report
+# --------------------------------------------------------------------------
+SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "moderate": 2, "low": 3}
+
+
+def build_report(ctx):
+    L = []
+    comps = ctx["components"]
+    affected = [(c["name"], a) for c in comps for a in (c.get("gh") or {}).get("advisories", [])
+                if a["verdict"] == "AFFECTED"]
+    manual = [(c["name"], a) for c in comps for a in (c.get("gh") or {}).get("advisories", [])
+              if a["verdict"] == "CHECK MANUALLY"]
+    updates = []
+    unknown = []
+    for c in comps:
+        gh = c.get("gh") or {}
+        build_lag = (gh.get("repo") in BUILD_TAG_REPOS
+                     and (c.get("digest") or {}).get("status") == "current")
+        if gh.get("release_status") == "newer" and not c.get("hermes") and not build_lag:
+            updates.append("%s %s→%s" % (c["name"], c.get("current") or "?", gh.get("latest")))
+        if (c.get("digest") or {}).get("status") == "newer":
+            updates.append("%s (newer `%s` build)" % (c["name"], c["tag"]))
+        if c.get("hermes", {}).get("status") == "newer":
+            updates.append("%s %s commits behind upstream (latest release %s)" % (
+                c["name"], c["hermes"]["behind"], gh.get("latest") or "?"))
+        if gh and (gh.get("release_status") == "unknown" or gh.get("adv_status") == "unknown"):
+            unknown.append(c["name"])
+        if c.get("digest") and c["digest"]["status"] == "unknown":
+            unknown.append(c["name"] + " digest")
+        if c.get("hermes") and c["hermes"]["status"] == "unknown":
+            unknown.append(c["name"])
+    os_ = ctx["os"]
+    nsec = len(os_["security"])
+    nup = len(os_["upgradable"])
+    drv_new = [p for p, v in os_["policy"].items() if p.startswith("nvidia-driver-")
+               and v["candidate"] and v["installed"] and v["candidate"] != v["installed"]]
+    if nup:
+        updates.append("apt: %d upgradable (%d security)" % (nup, nsec))
+    if drv_new:
+        updates.append("NVIDIA driver %s→%s" % (os_["policy"][drv_new[0]]["installed"].split("-")[0],
+                                               os_["policy"][drv_new[0]]["candidate"].split("-")[0]))
+    if affected:
+        status = "SECURITY: %d advisories affect current versions" % len(affected)
+        code = 20
+    elif updates:
+        status = "UPDATES AVAILABLE"
+        code = 10
+    else:
+        status = "OK"
+        code = 0
+    extra = []
+    if updates:
+        extra.append("; ".join(updates))
+    if manual:
+        extra.append("%d advisories need manual check" % len(manual))
+    if unknown:
+        extra.append("unknown: " + ", ".join(sorted(set(unknown))))
+    if ctx["http"].stale:
+        extra.append("some GitHub data served from cache (rate limited)")
+    summary = status + (" — " + " | ".join(extra) if extra else "")
+    ctx["summary"], ctx["code"] = summary, code
+
+    ts = ctx["started"].strftime("%Y-%m-%d %H:%M UTC")
+    L.append("# Spark update check — %s (host %s)" % (ts, os.uname().nodename))
+    L.append("")
+    L.append("**Summary:** " + summary)
+    L.append("")
+    L.append("_Report only — nothing was pulled, upgraded or restarted. "
+             "See README.md in this directory for the safe update procedure._")
+    L.append("")
+    if affected:
+        L.append("## ⚠ Advisories affecting current versions")
+        L.append("")
+        L.append("| Component | Advisory | Severity | Published | Range → patched | Summary |")
+        L.append("|---|---|---|---|---|---|")
+        for n, a in sorted(affected, key=lambda x: SEV_ORDER.get(x[1]["severity"], 9)):
+            L.append("| %s | [%s](%s) | %s | %s | %s | %s |" % (
+                n, a["id"], a["url"], a["severity"], a["published"], md_escape(a["ranges"]),
+                md_escape(a["summary"])))
+        L.append("")
+    L.append("## Components")
+    L.append("")
+    L.append("| Component | Current | Latest release | Pinned digest vs upstream tag | Advisories (affecting / manual / total) |")
+    L.append("|---|---|---|---|---|")
+    for c in comps:
+        gh = c.get("gh") or {}
+        rel = "—"
+        if gh:
+            st = gh.get("release_status")
+            rel = "%s (%s)" % (gh.get("latest") or "?", {"newer": "**UPDATE**", "current": "up to date"}.get(st, "unknown"))
+            if gh.get("builds_behind"):
+                rel += ", %d builds behind" % gh["builds_behind"]
+                if (c.get("digest") or {}).get("status") == "current":
+                    rel = rel.replace("**UPDATE**", "newer source builds") + \
+                        " (image tag not rebuilt yet — informational)"
+        if c.get("hermes"):
+            h = c["hermes"]
+            rel += "; %s" % ("**%s commits behind** upstream %s" % (h.get("behind"), h.get("branch"))
+                             if h["status"] == "newer" else
+                             ("in sync with upstream %s" % h.get("branch") if h["status"] == "current"
+                              else "upstream compare unknown"))
+        dg = c.get("digest")
+        dcell = "—"
+        if dg:
+            dcell = {"newer": "**newer build available**", "current": "current",
+                     "unknown": "unknown"}[dg["status"]]
+            if dg.get("unpinned"):
+                dcell += " (NOT digest-pinned)"
+            if dg.get("detail"):
+                dcell += ": " + dg["detail"]
+        adv = "—"
+        if gh:
+            if gh.get("adv_status") == "ok":
+                al = gh["advisories"]
+                adv = "%d / %d / %d" % (sum(a["verdict"] == "AFFECTED" for a in al),
+                                         sum(a["verdict"] == "CHECK MANUALLY" for a in al), len(al))
+            else:
+                adv = "unknown"
+        L.append("| %s | %s | %s | %s | %s |" % (md_escape(c["name"]), md_escape(c.get("current") or "?"),
+                                                md_escape(rel), md_escape(dcell), adv))
+    L.append("")
+    L.append("Sources:")
+    L.append("")
+    for c in comps:
+        L.append("- **%s**: %s" % (c["name"], c["source"]))
+    L.append("")
+    if manual:
+        L.append("## Advisories to check manually")
+        L.append("")
+        L.append("Version data in these advisories could not be compared automatically and they "
+                 "were published after the current release.")
+        L.append("")
+        for n, a in manual:
+            L.append("- %s: [%s](%s) %s (%s) — %s. _%s_" % (n, a["id"], a["url"], a["severity"],
+                                                          a["published"], md_escape(a["summary"]),
+                                                          md_escape(a["note"])))
+        L.append("")
+    # OS
+    L.append("## Walter OS")
+    L.append("")
+    L.append("- apt: **%d upgradable, %d from -security** (package lists %s h old; "
+             "this check does not run `apt update`)" % (nup, nsec, os_["lists_age_h"]))
+    if os_["security"]:
+        L.append("  - security: " + ", ".join("%s %s" % (p["name"], p["new"]) for p in os_["security"]))
+    L.append("- unattended-upgrades: service %s, apt-daily %s, apt-daily-upgrade %s; last run %s" % (
+        os_["unattended-upgrades.service"], os_["apt-daily.timer"], os_["apt-daily-upgrade.timer"],
+        os_["uu_last_run"] or "never/unknown"))
+    L.append("- reboot required: %s%s" % ("**yes**" if os_["reboot_required"] else "no",
+                                         (" (" + ", ".join(os_["reboot_pkgs"]) + ")") if os_["reboot_pkgs"] else ""))
+    if os_["held"]:
+        L.append("- held packages: " + ", ".join(os_["held"]))
+    L.append("- NVIDIA driver loaded: %s; packages: %s" % (
+        ", ".join(os_["nvidia_loaded"] or ["unknown"]),
+        ", ".join("%s %s" % kv for kv in os_["nvidia_driver_pkgs"].items()) or "none"))
+    if len(os_["nvidia_driver_pkgs"]) > 1:
+        L.append("  - note: more than one nvidia-driver-* package installed")
+    for p, v in os_["policy"].items():
+        flag = "**update available**" if v["candidate"] and v["candidate"] != v["installed"] else "current"
+        L.append("  - %s: installed %s, candidate %s (%s)" % (p, v["installed"], v["candidate"], flag))
+    if os_["nvidia_branches"]:
+        L.append("  - driver branches in apt: " + ", ".join(map(str, os_["nvidia_branches"][-4:])))
+    L.append("")
+    # full advisory listing
+    L.append("## Advisory details")
+    L.append("")
+    for c in comps:
+        gh = c.get("gh") or {}
+        if not gh:
+            continue
+        al = gh.get("advisories") or []
+        L.append("<details><summary>%s (%s): %d advisories</summary>" % (c["name"], gh["repo"], len(al)))
+        L.append("")
+        if al:
+            L.append("| Advisory | Sev | Published | Range → patched | Verdict | Note |")
+            L.append("|---|---|---|---|---|---|")
+            for a in sorted(al, key=lambda a: a["published"], reverse=True):
+                L.append("| [%s](%s) | %s | %s | %s | %s | %s |" % (
+                    a["id"], a["url"], a["severity"], a["published"], md_escape(a["ranges"]),
+                    a["verdict"], md_escape(a["note"])))
+        L.append("")
+        L.append("</details>")
+        L.append("")
+    errs = [(c["name"], e) for c in comps for e in (c.get("gh") or {}).get("errors", [])]
+    errs += [(c["name"], e) for c in comps for e in (c.get("hermes") or {}).get("errors", [])]
+    errs = list(dict.fromkeys(errs))
+    errs += [("GitHub cache", s_) for s_ in sorted(ctx["http"].stale)]
+    if errs or WARNINGS:
+        L.append("## Check errors / unknowns")
+        L.append("")
+        for n, e in errs:
+            L.append("- %s: %s" % (n, md_escape(e)))
+        for w in WARNINGS:
+            L.append("- %s" % md_escape(w))
+        L.append("")
+    L.append("---")
+    L.append("Compose files scanned: %s. GitHub API calls: %d (auth: %s, remaining: %s). Runtime %.0fs." % (
+        ", ".join(ctx["compose_files"]) or "none", ctx["http"].gh_calls,
+        "token" if ctx["http"].token else "anonymous", ctx["http"].gh_remaining,
+        (now() - ctx["started"]).total_seconds()))
+    return "\n".join(L) + "\n"
+
+
+# --------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Report-only update/security checker")
+    ap.add_argument("--stdout", action="store_true", help="print report instead of writing files")
+    ap.add_argument("--assume", action="append", default=[], metavar="OWNER/REPO=VERSION",
+                    help="testing: pretend the current version of a GitHub repo is VERSION")
+    ap.add_argument("--simulate-rate-limit", action="store_true",
+                    help="testing: behave as if the GitHub API quota were exhausted")
+    args = ap.parse_args()
+    assume = dict(a.split("=", 1) for a in args.assume)
+    started = now()
+    token = None
+    try:
+        with open(TOKEN_FILE) as f:
+            token = f.read().strip() or None
+    except OSError:
+        pass
+    http = Http(token)
+    if args.simulate_rate_limit:
+        http.gh_exhausted = True
+
+    compose_files, images = discover_images()
+    components = []
+    gh_done = {}
+    merged = {}
+    for img in images:
+        if img["ref"] in merged:
+            merged[img["ref"]]["source"] += "; " + img["source"]
+            continue
+        merged[img["ref"]] = img
+    for img in merged.values():
+        name = img["name"].rsplit("/", 1)[-1] + (":" + img["tag"] if img["tag"] else "")
+        c = {"name": name, "tag": img["tag"], "source": img["source"] +
+             (" — tag from %s" % img["tag_source"] if img.get("tag_source") == "comment" else "")}
+        if not img["digest"]:
+            c["source"] += " — **not digest-pinned**"
+        labels = local_image_labels(img["ref"])
+        repo = github_repo_for(img)
+        cur = None
+        cur_date = None
+        if repo in BUILD_TAG_REPOS:
+            cur = labels.get("org.opencontainers.image.version")
+            cur_date = labels.get("org.opencontainers.image.created")
+        elif img["tag"] and parse_ver(img["tag"]):
+            cur = img["tag"]
+        elif labels.get("org.opencontainers.image.version") and parse_ver(labels["org.opencontainers.image.version"]):
+            cur = labels["org.opencontainers.image.version"]
+        if repo in PY_VERSION_PROBE:
+            pv = probe_python_version(img["ref"], PY_VERSION_PROBE[repo])
+            if pv and cur and parse_ver(pv) != parse_ver(cur):
+                warn("%s: tag/comment says %s but the pinned image contains %s %s; using %s"
+                     % (name, cur, PY_VERSION_PROBE[repo], pv, pv))
+                cur = pv
+            elif pv and not cur:
+                cur = pv
+            elif not pv:
+                warn("%s: could not read package version from the pinned image" % name)
+        if repo in assume:
+            cur = assume[repo]
+        c["current"] = cur
+        c["digest"] = check_digest(http, img)
+        if repo:
+            k = (repo, cur)
+            if k not in gh_done:
+                gh_done[k] = check_github(http, repo, cur, cur_date)
+            c["gh"] = gh_done[k]
+        components.append(c)
+
+    lsv = check_llama_swap()
+    c = {"name": "llama-swap", "current": lsv, "source": LLAMA_SWAP_BIN + " --version"}
+    c["gh"] = check_github(http, "mostlygeek/llama-swap", lsv)
+    components.append(c)
+
+    h = check_hermes(http)
+    components.append({"name": "hermes-agent", "current": "%s (%s)" % (h.get("describe", "?"), (h.get("head") or "?")[:10]),
+                       "source": HERMES_DIR + (" (local changes present)" if h.get("dirty") else ""),
+                       "hermes": h, "gh": h.get("github")})
+
+    ctx = {"started": started, "components": components, "os": check_os(), "http": http,
+           "compose_files": compose_files}
+    report = build_report(ctx)
+    if args.stdout:
+        sys.stdout.write(report)
+    else:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "report-%s.md" % started.strftime("%Y-%m-%d"))
+        with open(path + ".tmp", "w") as f:
+            f.write(report)
+        os.chmod(path + ".tmp", 0o644)
+        os.replace(path + ".tmp", path)
+        link = os.path.join(STATE_DIR, "latest.md")
+        tmp = link + ".tmp"
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        os.symlink(os.path.basename(path), tmp)
+        os.replace(tmp, link)
+        # keep ~1 year of weekly reports
+        for old in sorted(glob.glob(os.path.join(STATE_DIR, "report-*.md")))[:-60]:
+            os.unlink(old)
+    print("spark-update-check: " + ctx["summary"], file=sys.stderr if args.stdout else sys.stdout)
+    return ctx["code"]
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # noqa: BLE001
+        print("spark-update-check: ERROR %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        sys.exit(1)

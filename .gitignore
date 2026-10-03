@@ -16,3 +16,11 @@ nginx/spark.live.conf
 .DS_Store
 .idea/
 .vscode/
+site.env
+*.env
+!*.env.example
+secrets/
+*.key
+*.pem
+.sanitize-extra
+.sanitize-words

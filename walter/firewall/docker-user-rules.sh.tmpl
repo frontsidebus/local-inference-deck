@@ -1,0 +1,43 @@
+#!/bin/sh
+# Restrict Docker-published services on Walter (${BACKEND_WG_IP}:3000/1411/4000/3200).
+# Docker DNATs published ports in PREROUTING, so the traffic is FORWARDed to the
+# container and never hits UFW's INPUT rules. We filter it in DOCKER-USER (which
+# Docker creates if missing but never flushes) by the *original* (pre-DNAT)
+# destination via conntrack.
+#
+#  - wg0: only Covenant (${EDGE_WG_IP}) may connect.
+#  - ${BACKEND_LAN_IF} (LAN): nobody may reach the wg-bound published ports (defence in depth).
+#  - docker bridges / host-originated traffic are untouched (host traffic is
+#    DNAT'd in OUTPUT and never traverses FORWARD).
+#
+# Idempotent: rules live in our own chain WALTER-PUBLISHED, which is flushed and
+# rebuilt; DOCKER-USER gets exactly one jump at the top.
+# Managed by docker-user-rules.service.
+set -eu
+
+IPT=/usr/sbin/iptables
+CHAIN=WALTER-PUBLISHED
+WG_IF=wg0
+LAN_IF=${BACKEND_LAN_IF}
+EDGE=${EDGE_WG_IP}
+SVC_IP=${BACKEND_WG_IP}
+PORTS="3000 1411 4000 3200"   # 3200: telemetry (host-network; effective gate is the ufw rule, this covers a future published port)
+
+$IPT -w -N DOCKER-USER 2>/dev/null || true
+$IPT -w -N "$CHAIN" 2>/dev/null || true
+$IPT -w -F "$CHAIN"
+
+# Covenant over WireGuard is the only allowed external client.
+$IPT -w -A "$CHAIN" -i "$WG_IF" -s "$EDGE" -j RETURN
+for p in $PORTS; do
+  for ifc in "$WG_IF" "$LAN_IF"; do
+    $IPT -w -A "$CHAIN" -i "$ifc" -p tcp -m conntrack --ctdir ORIGINAL \
+      --ctorigdst "$SVC_IP" --ctorigdstport "$p" \
+      -m comment --comment "walter: only $EDGE via $WG_IF -> $SVC_IP:$p" -j DROP
+  done
+done
+$IPT -w -A "$CHAIN" -j RETURN
+
+# Exactly one jump, at the top of DOCKER-USER.
+while $IPT -w -D DOCKER-USER -j "$CHAIN" 2>/dev/null; do :; done
+$IPT -w -I DOCKER-USER 1 -j "$CHAIN"

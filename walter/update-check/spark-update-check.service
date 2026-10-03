@@ -1,0 +1,24 @@
+[Unit]
+Description=Spark stack weekly update/security check (report only, never updates)
+Documentation=file:///var/lib/spark-update-check/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/spark-update-check.py
+# 10 = updates available, 20 = advisories affect current versions: both are
+# normal results, not unit failures. Real errors exit 1.
+SuccessExitStatus=10 20
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+StateDirectory=spark-update-check
+CacheDirectory=spark-update-check
+StateDirectoryMode=0755
+CacheDirectoryMode=0700

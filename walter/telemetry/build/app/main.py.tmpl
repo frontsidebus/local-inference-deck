@@ -1,0 +1,695 @@
+"""Walter telemetry service.
+
+One background collector polls a FIXED, server-side set of PromQL queries (plus llama-swap
+/running and the backup marker) and caches a JSON snapshot. Every HTTP/SSE client is served
+from that cache, so N viewers cost the same Prometheus load as one. The client can never send
+PromQL: there is no endpoint that accepts a query.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import re
+import socket
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
+
+log = logging.getLogger("telemetry")
+
+PROM = os.environ.get("PROM_URL", "http://127.0.0.1:9090").rstrip("/")
+LLAMA_SWAP = os.environ.get("LLAMA_SWAP_URL", "http://${BACKEND_WG_IP}:8080").rstrip("/")
+LLAMA_SWAP_KEY_FILE = os.environ.get("LLAMA_SWAP_KEY_FILE", "/run/secrets/llama-swap-api-key")
+BACKUP_FILE = os.environ.get("BACKUP_STATUS_FILE", "/state/backup.json")
+BIND = os.environ.get("BIND", "${BACKEND_WG_IP}:3200")
+TZ = ZoneInfo(os.environ.get("TZ_DISPLAY", "UTC"))
+FAST_S = float(os.environ.get("PUBLISH_INTERVAL", "2"))  # snapshot push cadence (+ llama-swap /running)
+PROM_FAST_S = float(os.environ.get("PROM_FAST_INTERVAL", "4"))  # scrape interval is 15 s, no point going faster
+SLOW_S = float(os.environ.get("SLOW_INTERVAL", "15"))
+HIST_S = float(os.environ.get("HISTORY_INTERVAL", "30"))
+HIST_WINDOW = int(os.environ.get("HISTORY_WINDOW", "1800"))
+HIST_STEP = int(os.environ.get("HISTORY_STEP", "15"))
+MAX_SSE = int(os.environ.get("MAX_SSE_CLIENTS", "64"))
+HEARTBEAT_S = 15
+STATIC = Path(__file__).parent / "static"
+
+# model id -> alias, GPU placement (fallback when the model isn't running and we can't parse --gpus)
+ALIASES = dict(
+    kv.split("=", 1)
+    for kv in os.environ.get(
+        "MODEL_ALIASES",
+        "qwen3.8-27b=coder,qwen3.6-35b-a3b=coder-fast,qwen3-coder-next=big,gemma-4-31b=vision,hermes-4.3-36b=hermes",
+    ).split(",")
+    if "=" in kv
+)
+STATIC_GPUS = {
+    k: [int(g) for g in v.split("+")]
+    for k, v in (
+        kv.split("=", 1)
+        for kv in os.environ.get(
+            "MODEL_GPUS",
+            "qwen3.8-27b=0,qwen3.6-35b-a3b=1,qwen3-coder-next=0+1,gemma-4-31b=0+1,hermes-4.3-36b=0+1",
+        ).split(",")
+        if "=" in kv
+    )
+}
+
+# ---------------------------------------------------------------------------------------------
+# Fixed PromQL. Keys are internal names; nothing from the client is ever interpolated.
+# ---------------------------------------------------------------------------------------------
+FAST_QUERIES = {
+    "gpu_util": "DCGM_FI_DEV_GPU_UTIL",
+    "gpu_fb_used": "DCGM_FI_DEV_FB_USED",
+    "gpu_fb_free": "DCGM_FI_DEV_FB_FREE",
+    "gpu_fb_reserved": "DCGM_FI_DEV_FB_RESERVED",
+    "gpu_temp": "DCGM_FI_DEV_GPU_TEMP",
+    "gpu_power": "DCGM_FI_DEV_POWER_USAGE",
+    "gpu_sm_clock": "DCGM_FI_DEV_SM_CLOCK",
+    "gpu_fan": "llamaswap_gpu_fan_speed_percent",
+    # decode speed while generating (tokens / seconds spent generating) and raw throughput
+    # llama-server only bumps these when a request completes, so use a 10m window: "recent" speed per model
+    "m_decode_tps": "rate(llamacpp:tokens_predicted_total[10m]) / rate(llamacpp:tokens_predicted_seconds_total[10m]) > 0",
+    "m_prompt_tps": "rate(llamacpp:prompt_tokens_total[10m]) / rate(llamacpp:prompt_seconds_total[10m]) > 0",
+    "m_gen_rate": "rate(llamacpp:tokens_predicted_total[1m])",
+    # llama-server's token counters only move when a request finishes; decode calls move live
+    "m_decode_calls": "rate(llamacpp:n_decode_total[1m])",
+    "m_processing": "llamacpp:requests_processing",
+    "m_deferred": "llamacpp:requests_deferred",
+    "m_last_decode_tps": "llamacpp:predicted_tokens_seconds",
+    "tps_total": "sum(rate(llamacpp:tokens_predicted_total[1m]))",
+    "gw_rpm": "sum(rate(litellm_proxy_total_requests_metric_total[2m])) * 60",
+    "gw_inflight": "sum(litellm_in_flight_requests)",
+    "cpu_pct": '100 * (1 - avg(rate(node_cpu_seconds_total{job="node",mode="idle"}[1m])))',
+    "load1": 'node_load1{job="node"}',
+    "mem_total": 'node_memory_MemTotal_bytes{job="node"}',
+    "mem_avail": 'node_memory_MemAvailable_bytes{job="node"}',
+    "net_rx": 'rate(node_network_receive_bytes_total{job="node",device=~"${BACKEND_LAN_IF}|wg0"}[1m])',
+    "net_tx": 'rate(node_network_transmit_bytes_total{job="node",device=~"${BACKEND_LAN_IF}|wg0"}[1m])',
+}
+
+SLOW_QUERIES = {
+    "fs_size": 'node_filesystem_size_bytes{job="node",mountpoint=~"/|${MODELS_DIR}"}',
+    "fs_avail": 'node_filesystem_avail_bytes{job="node",mountpoint=~"/|${MODELS_DIR}"}',
+    "gw_p50": "histogram_quantile(0.50, sum by (le) (rate(litellm_request_total_latency_metric_bucket[1h])))",
+    "gw_p95": "histogram_quantile(0.95, sum by (le) (rate(litellm_request_total_latency_metric_bucket[1h])))",
+    "gw_ttft_p50": "histogram_quantile(0.50, sum by (le) (rate(litellm_llm_api_time_to_first_token_metric_bucket[1h])))",
+    "gw_req_1h": "sum(increase(litellm_proxy_total_requests_metric_total[1h]))",
+    "gw_err_1h": 'sum(increase(litellm_proxy_total_requests_metric_total{status_code!~"2.."}[1h]))',
+    "gw_tok_in_1h": "sum(increase(litellm_input_tokens_metric_total[1h]))",
+    "gw_tok_out_1h": "sum(increase(litellm_output_tokens_metric_total[1h]))",
+    # per key alias since local midnight; {today} is replaced server-side by an integer of seconds
+    "key_req": "sum by (api_key_alias) (increase(litellm_proxy_total_requests_metric_total[{today}s]))",
+    "key_err": 'sum by (api_key_alias) (increase(litellm_proxy_total_requests_metric_total{status_code!~"2.."}[{today}s]))',
+    "key_in": "sum by (api_key_alias) (increase(litellm_input_tokens_metric_total[{today}s]))",
+    "key_out": "sum by (api_key_alias) (increase(litellm_output_tokens_metric_total[{today}s]))",
+    "probe_ok": "probe_success",
+    "probe_dur": "probe_duration_seconds",
+    "probe_code": "probe_http_status_code",
+    "probe_cert": "probe_ssl_earliest_cert_expiry - time()",
+    "up": "up",
+    "models_cfg": "llamaswap_model_loaded",
+}
+
+HISTORY_QUERIES = {
+    "gpu_util": "DCGM_FI_DEV_GPU_UTIL",
+    "rpm": "sum(rate(litellm_proxy_total_requests_metric_total[2m])) * 60",
+    "tps": "sum(rate(llamacpp:tokens_predicted_total[1m]))",
+    "cpu": '100 * (1 - avg(rate(node_cpu_seconds_total{job="node",mode="idle"}[1m])))',
+}
+
+PROBE_NAMES = {
+    "https://${SPARK_CHAT_HOST}/health": ("chat", "public"),
+    "https://${SPARK_API_HOST}/v1/models": ("api", "public"),
+    "https://${SPARK_ID_HOST}/.well-known/openid-configuration": ("id", "public"),
+    "http://${BACKEND_WG_IP}:4000/health/liveliness": ("litellm", "internal"),
+    "http://${BACKEND_WG_IP}:3000/health": ("open-webui", "internal"),
+    "http://${BACKEND_WG_IP}:1411/healthz": ("pocket-id", "internal"),
+    "http://${BACKEND_WG_IP}:8080/health": ("llama-swap", "internal"),
+}
+
+
+def _num(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) or math.isinf(f) else f
+
+
+def _r(v, nd=2):
+    return None if v is None else round(v, nd)
+
+
+class Collector:
+    def __init__(self) -> None:
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0))
+        self.fast: dict = {}
+        self.slow: dict = {}
+        self.running: list = []
+        self.sources: dict = {
+            "prometheus": {"ok": False, "error": "starting"},
+            "llama_swap": {"ok": False, "error": "starting"},
+            "backup": {"ok": False, "error": "starting"},
+            "alerts": {"ok": False, "error": "starting"},
+        }
+        self.alerts: list = []
+        self.backup: dict | None = None
+        self.history: dict = {"window_s": HIST_WINDOW, "step_s": HIST_STEP, "series": {}}
+        self.snapshot: dict = {}
+        self.snapshot_bytes: bytes = b"{}"
+        self.history_bytes: bytes = b"{}"
+        self.seq = 0
+        self.cond = asyncio.Condition()
+        self.sse_clients = 0
+
+    # ---------------- Prometheus ----------------
+    async def prom_query(self, q: str) -> list:
+        r = await self.client.get(f"{PROM}/api/v1/query", params={"query": q})
+        r.raise_for_status()
+        d = r.json()
+        if d.get("status") != "success":
+            raise RuntimeError(d.get("error", "query failed"))
+        return d["data"]["result"]
+
+    async def prom_batch(self, queries: dict) -> dict:
+        names = list(queries)
+        t0 = time.monotonic()
+        res = await asyncio.gather(*(self.prom_query(queries[n]) for n in names), return_exceptions=True)
+        out, errs = {}, 0
+        for n, r in zip(names, res):
+            if isinstance(r, Exception):
+                errs += 1
+                log.debug("query %s failed: %s", n, r)
+                out[n] = None
+            else:
+                out[n] = r
+        ok = errs < len(names)
+        self.sources["prometheus"] = {
+            "ok": ok,
+            "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+            **({} if ok else {"error": "unreachable"}),
+        }
+        return out
+
+    async def prom_range(self, q: str, start: float, end: float) -> list:
+        r = await self.client.get(
+            f"{PROM}/api/v1/query_range", params={"query": q, "start": start, "end": end, "step": HIST_STEP}
+        )
+        r.raise_for_status()
+        return r.json()["data"]["result"]
+
+    async def refresh_history(self) -> None:
+        end = time.time()
+        start = end - HIST_WINDOW
+        names = list(HISTORY_QUERIES)
+        res = await asyncio.gather(
+            *(self.prom_range(HISTORY_QUERIES[n], start, end) for n in names), return_exceptions=True
+        )
+        series = {}
+        for n, r in zip(names, res):
+            if isinstance(r, Exception):
+                continue
+            for s in r:
+                key = n if n != "gpu_util" else f"gpu{s['metric'].get('gpu', '?')}"
+                series[key] = [[int(float(t)), _r(_num(v), 2)] for t, v in s["values"]]
+        self.history = {"window_s": HIST_WINDOW, "step_s": HIST_STEP, "series": series}
+        self.history_bytes = json.dumps(self.history, separators=(",", ":")).encode()
+
+    async def refresh_alerts(self) -> None:
+        try:
+            r = await self.client.get(f"{PROM}/api/v1/alerts")
+            r.raise_for_status()
+            alerts = []
+            for a in r.json()["data"]["alerts"]:
+                lab = a.get("labels", {})
+                alerts.append(
+                    {
+                        "name": lab.get("alertname", "?"),
+                        "state": a.get("state"),
+                        "severity": lab.get("severity", "none"),
+                        "summary": (a.get("annotations", {}).get("summary") or "")[:200],
+                        "since": a.get("activeAt"),
+                    }
+                )
+            self.alerts = alerts
+            self.sources["alerts"] = {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            self.sources["alerts"] = {"ok": False, "error": type(e).__name__}
+
+    # ---------------- llama-swap ----------------
+    async def refresh_running(self) -> None:
+        try:
+            key = Path(LLAMA_SWAP_KEY_FILE).read_text().strip()
+            r = await self.client.get(f"{LLAMA_SWAP}/running", headers={"Authorization": f"Bearer {key}"})
+            del key
+            r.raise_for_status()
+            running = []
+            for m in r.json().get("running", []):
+                mid = str(m.get("model", ""))
+                gpus = STATIC_GPUS.get(mid, [])
+                mm = re.search(r"device=([0-9,]+)", m.get("cmd", "") or "")
+                if mm:
+                    gpus = [int(x) for x in mm.group(1).split(",") if x.isdigit()]
+                # only pass through safe, non-secret fields (never cmd/proxy)
+                running.append({"id": mid, "state": str(m.get("state", "?"))[:32], "gpus": gpus, "ttl": m.get("ttl")})
+            self.running = running
+            self.sources["llama_swap"] = {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            self.sources["llama_swap"] = {"ok": False, "error": type(e).__name__}
+
+    # ---------------- backup marker (written by the root sidecar) ----------------
+    def refresh_backup(self) -> None:
+        try:
+            d = json.loads(Path(BACKUP_FILE).read_text())
+            ts = datetime.fromisoformat(d["ts"]).timestamp()
+            self.backup = {"name": str(d["name"])[:64], "ts": int(ts)}
+            stale = time.time() - float(d.get("checked", 0)) > 600
+            self.sources["backup"] = {"ok": not stale, **({"error": "status file stale"} if stale else {})}
+        except Exception as e:  # noqa: BLE001
+            self.backup = None
+            self.sources["backup"] = {"ok": False, "error": type(e).__name__}
+
+    # ---------------- snapshot assembly ----------------
+    def build(self) -> dict:
+        f, s = self.fast, self.slow
+
+        def by(res, label):
+            out = {}
+            for x in res or []:
+                out[x["metric"].get(label, "")] = _num(x["value"][1])
+            return out
+
+        def scalar(res):
+            if res:
+                return _num(res[0]["value"][1])
+            return None
+
+        # GPUs
+        gpus = []
+        util, used, free, resv = by(f.get("gpu_util"), "gpu"), by(f.get("gpu_fb_used"), "gpu"), by(
+            f.get("gpu_fb_free"), "gpu"
+        ), by(f.get("gpu_fb_reserved"), "gpu")
+        temp, power, clock = by(f.get("gpu_temp"), "gpu"), by(f.get("gpu_power"), "gpu"), by(f.get("gpu_sm_clock"), "gpu")
+        fan = by(f.get("gpu_fan"), "id")
+        names, buses = {}, {}
+        for x in f.get("gpu_util") or []:
+            names[x["metric"].get("gpu")] = x["metric"].get("modelName", "GPU")
+            buses[x["metric"].get("gpu")] = x["metric"].get("pci_bus_id", "")
+        for g in sorted(util or names, key=lambda k: int(k) if k.isdigit() else 99):
+            tot = None
+            if used.get(g) is not None and free.get(g) is not None:
+                tot = used[g] + free[g] + (resv.get(g) or 0)
+            gi = int(g) if g.isdigit() else -1
+            gpus.append(
+                {
+                    "index": gi,
+                    "name": names.get(g, "GPU"),
+                    "util": util.get(g),
+                    "vram_used_mib": used.get(g),
+                    "vram_total_mib": tot,
+                    "temp_c": temp.get(g),
+                    "power_w": _r(power.get(g), 1),
+                    "fan_pct": fan.get(g),
+                    "sm_clock_mhz": clock.get(g),
+                    "pcie": pcie_link(buses.get(g, "")),
+                    "models": [m["id"] for m in self.running if gi in m["gpus"]],
+                }
+            )
+
+        # Models: every configured model, merged with live state + llama-server metrics
+        cfg = {x["metric"].get("model"): x["metric"].get("model_name", "") for x in (s.get("models_cfg") or [])}
+        run = {m["id"]: m for m in self.running}
+        dec, pre, gen = by(f.get("m_decode_tps"), "model"), by(f.get("m_prompt_tps"), "model"), by(
+            f.get("m_gen_rate"), "model"
+        )
+        calls = by(f.get("m_decode_calls"), "model")
+        proc, dfr, last = by(f.get("m_processing"), "model"), by(f.get("m_deferred"), "model"), by(
+            f.get("m_last_decode_tps"), "model"
+        )
+        models = []
+        for mid in list(dict.fromkeys(list(cfg) + list(run))):
+            if not mid:
+                continue
+            r_ = run.get(mid)
+            models.append(
+                {
+                    "id": mid,
+                    "name": cfg.get(mid) or mid,
+                    "alias": ALIASES.get(mid),
+                    "state": r_["state"] if r_ else "unloaded",
+                    "gpus": r_["gpus"] if r_ else STATIC_GPUS.get(mid, []),
+                    "decode_tps": _r(dec.get(mid), 1),
+                    "prompt_tps": _r(pre.get(mid), 1),
+                    "gen_rate": _r(gen.get(mid), 2),
+                    "decode_calls_s": _r(calls.get(mid), 1) if r_ else None,
+                    "last_decode_tps": _r(last.get(mid), 1) if r_ else None,
+                    "processing": proc.get(mid) if r_ else None,
+                    "deferred": dfr.get(mid) if r_ else None,
+                }
+            )
+        order = {"ready": 0, "starting": 1, "stopping": 2, "unloaded": 9}
+        models.sort(key=lambda m: (order.get(m["state"], 5), m["id"]))
+
+        # Gateway
+        keys = {}
+        for metric, field in (("key_req", "requests"), ("key_err", "errors"), ("key_in", "tokens_in"), ("key_out", "tokens_out")):
+            for alias, v in by(s.get(metric), "api_key_alias").items():
+                a = alias if alias and alias != "None" else "(no alias)"
+                keys.setdefault(a, {"alias": a, "requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0})
+                keys[a][field] += round(v or 0)
+        gateway = {
+            "rpm": _r(scalar(f.get("gw_rpm")), 2),
+            "in_flight": scalar(f.get("gw_inflight")),
+            "p50_s": _r(scalar(s.get("gw_p50")), 3),
+            "p95_s": _r(scalar(s.get("gw_p95")), 3),
+            "ttft_p50_s": _r(scalar(s.get("gw_ttft_p50")), 3),
+            "requests_1h": round(scalar(s.get("gw_req_1h")) or 0),
+            "errors_1h": round(scalar(s.get("gw_err_1h")) or 0),
+            "tokens_in_1h": round(scalar(s.get("gw_tok_in_1h")) or 0),
+            "tokens_out_1h": round(scalar(s.get("gw_tok_out_1h")) or 0),
+            "keys_today": sorted(keys.values(), key=lambda k: -k["requests"]),
+            "today_since": local_midnight().isoformat(),
+        }
+
+        # Host
+        mt, ma = scalar(f.get("mem_total")), scalar(f.get("mem_avail"))
+        size, avail = by(s.get("fs_size"), "mountpoint"), by(s.get("fs_avail"), "mountpoint")
+        rx, tx = by(f.get("net_rx"), "device"), by(f.get("net_tx"), "device")
+        host = {
+            "cpu_pct": _r(scalar(f.get("cpu_pct")), 1),
+            "load1": _r(scalar(f.get("load1")), 2),
+            "mem_total": mt,
+            "mem_used": (mt - ma) if mt is not None and ma is not None else None,
+            "disks": [
+                {"mount": m, "size": size[m], "used": size[m] - (avail.get(m) or 0)}
+                for m in ("/", "${MODELS_DIR}")
+                if size.get(m)
+            ],
+            "net": [{"dev": d, "rx_bps": _r(rx.get(d), 0), "tx_bps": _r(tx.get(d), 0)} for d in ("wg0", "${BACKEND_LAN_IF}") if d in rx],
+        }
+
+        # Services (blackbox probes)
+        ok, dur, code, cert = (by(s.get(k), "instance") for k in ("probe_ok", "probe_dur", "probe_code", "probe_cert"))
+        services = []
+        for inst, v in ok.items():
+            name, scope = PROBE_NAMES.get(inst, (re.sub(r"^https?://", "", inst)[:40], "?"))
+            services.append(
+                {
+                    "name": name,
+                    "scope": scope,
+                    "up": v == 1,
+                    "latency_ms": _r((dur.get(inst) or 0) * 1000, 1),
+                    "status": int(code[inst]) if code.get(inst) else None,
+                    "cert_days": _r(cert[inst] / 86400, 1) if cert.get(inst) else None,
+                }
+            )
+        services.sort(key=lambda x: (x["scope"] != "public", x["name"]))
+
+        # Scrape targets
+        down = []
+        tot_up = 0
+        for x in s.get("up") or []:
+            if _num(x["value"][1]) == 1:
+                tot_up += 1
+            else:
+                down.append(f'{x["metric"].get("job")}/{x["metric"].get("instance")}')
+        targets = {"up": tot_up, "total": tot_up + len(down), "down": down}
+
+        firing = [a for a in self.alerts if a["state"] == "firing"]
+        pending = [a for a in self.alerts if a["state"] == "pending"]
+
+        # Overall status
+        reasons, level = [], "ok"
+        if firing:
+            level = "alert"
+            reasons.append(f"{len(firing)} alert{'s' if len(firing) != 1 else ''} firing")
+        for src, st in self.sources.items():
+            if not st.get("ok"):
+                reasons.append(f"{src.replace('_', '-')} unavailable")
+        for sv in services:
+            if not sv["up"]:
+                reasons.append(f"probe {sv['name']} failing")
+        if down:
+            reasons.append(f"{len(down)} scrape target{'s' if len(down) != 1 else ''} down")
+        if level == "ok" and reasons:
+            level = "degraded"
+
+        now = time.time()
+        backup = None
+        if self.backup:
+            backup = {"name": self.backup["name"], "age_s": int(now - self.backup["ts"])}
+
+        return {
+            "ts": round(now, 3),
+            "seq": self.seq,
+            "status": {"level": level, "reasons": reasons},
+            "sources": self.sources,
+            "gpus": gpus,
+            "models": models,
+            "gateway": gateway,
+            "host": host,
+            "services": services,
+            "targets": targets,
+            "alerts": {"firing": firing, "pending": pending},
+            "backup": backup,
+            "spark": {
+                **{f"gpu{g['index']}": g["util"] for g in gpus},
+                "rpm": gateway["rpm"],
+                "tps": _r(scalar(f.get("tps_total")), 2),
+                "cpu": host["cpu_pct"],
+            },
+        }
+
+    async def publish(self) -> None:
+        self.seq += 1
+        snap = self.build()
+        self.snapshot = snap
+        self.snapshot_bytes = json.dumps(snap, separators=(",", ":")).encode()
+        async with self.cond:
+            self.cond.notify_all()
+
+    async def run(self) -> None:
+        last_fast = last_slow = last_hist = -1e9
+        while True:
+            t0 = time.monotonic()
+            try:
+                now = time.monotonic()
+                do_fast = now - last_fast >= PROM_FAST_S - 0.1
+                do_slow = now - last_slow >= SLOW_S - 0.1
+                today = max(60, int((datetime.now(TZ) - local_midnight()).total_seconds()))
+                slow_q = {k: v.replace("{today}", str(today)) for k, v in SLOW_QUERIES.items()}
+
+                async def nothing():
+                    return None
+
+                res = await asyncio.gather(
+                    self.refresh_running(),
+                    self.prom_batch(FAST_QUERIES) if do_fast else nothing(),
+                    self.prom_batch(slow_q) if do_slow else nothing(),
+                    self.refresh_alerts() if do_slow else nothing(),
+                    return_exceptions=True,
+                )
+                if do_fast and isinstance(res[1], dict):
+                    self.fast, last_fast = res[1], now
+                if do_slow:
+                    if isinstance(res[2], dict):
+                        self.slow = res[2]
+                    self.refresh_backup()
+                    last_slow = now
+                if now - last_hist >= HIST_S:
+                    try:
+                        await self.refresh_history()
+                        last_hist = now
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("history refresh failed: %s", type(e).__name__)
+                await self.publish()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("collector cycle failed")
+            await asyncio.sleep(max(0.2, FAST_S - (time.monotonic() - t0)))
+
+
+def local_midnight() -> datetime:
+    n = datetime.now(TZ)
+    return n.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def pcie_link(bus_id: str) -> dict | None:
+    """Read the PCIe link from sysfs (not exported by DCGM on GeForce). bus id 00000000:05:00.0 -> 0000:05:00.0"""
+    if not bus_id:
+        return None
+    dev = Path("/sys/bus/pci/devices") / bus_id[-12:].lower()
+    try:
+        rd = lambda n: (dev / n).read_text().strip()  # noqa: E731
+        cur_w, max_w = int(rd("current_link_width")), int(rd("max_link_width"))
+        cur_s, max_s = rd("current_link_speed"), rd("max_link_speed")
+    except (OSError, ValueError):
+        return None
+    gen = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5}
+    g = lambda s: gen.get(s.split()[0])  # noqa: E731
+    return {"width": cur_w, "max_width": max_w, "gen": g(cur_s), "max_gen": g(max_s), "speed": cur_s.split(" PCIe")[0]}
+
+
+collector = Collector()
+
+
+def clean_header(v: str | None) -> str | None:
+    """Display-only. The edge sets these; we never use them for authorization."""
+    if not v:
+        return None
+    v = re.sub(r"[^\w.@+\- ]", "", v)[:96]
+    return v or None
+
+
+# ---------------------------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------------------------
+SEC_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    ),
+}
+
+
+def viewer(request: Request) -> dict:
+    return {
+        "user": clean_header(request.headers.get("x-forwarded-user")),
+        "email": clean_header(request.headers.get("x-forwarded-email")),
+    }
+
+
+async def index(request: Request) -> Response:
+    return FileResponse(STATIC / "index.html", headers={**SEC_HEADERS, "Cache-Control": "no-cache"})
+
+
+async def healthz(request: Request) -> Response:
+    return PlainTextResponse("ok")
+
+
+async def telemetry(request: Request) -> Response:
+    body = (
+        b'{"viewer":'
+        + json.dumps(viewer(request)).encode()
+        + b',"history":'
+        + collector.history_bytes
+        + b',"snapshot":'
+        + collector.snapshot_bytes
+        + b"}"
+    )
+    return Response(body, media_type="application/json", headers={"Cache-Control": "no-store", **SEC_HEADERS})
+
+
+async def stream(request: Request) -> Response:
+    if collector.sse_clients >= MAX_SSE:
+        return PlainTextResponse("too many streams", status_code=503)
+
+    async def gen():
+        collector.sse_clients += 1
+        try:
+            yield b"retry: 3000\n\n"
+            seen = -1
+            last_hb = time.monotonic()
+            while True:
+                if collector.seq != seen and collector.snapshot:
+                    seen = collector.seq
+                    yield b"event: snapshot\ndata: " + collector.snapshot_bytes + b"\n\n"
+                timeout = max(0.1, HEARTBEAT_S - (time.monotonic() - last_hb))
+                try:
+                    async with collector.cond:
+                        await asyncio.wait_for(collector.cond.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+                if time.monotonic() - last_hb >= HEARTBEAT_S:
+                    last_hb = time.monotonic()
+                    yield b": hb\n\n"
+        finally:
+            collector.sse_clients -= 1
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+class StaticWithHeaders(StaticFiles):
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers.update(SEC_HEADERS)
+        if path.startswith("fonts/"):
+            resp.headers["Cache-Control"] = "public, max-age=604800, immutable"
+        else:
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(collector.run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await collector.client.aclose()
+
+
+app = Starlette(
+    routes=[
+        Route("/", index),
+        Route("/healthz", healthz),
+        Route("/api/v1/telemetry", telemetry),
+        Route("/api/v1/stream", stream),
+        Mount("/static", StaticWithHeaders(directory=STATIC), name="static"),
+    ],
+    lifespan=lifespan,
+)
+
+
+def make_socket(addr: str) -> socket.socket:
+    host, port = addr.rsplit(":", 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # IP_FREEBIND: bind ${BACKEND_WG_IP} even if wg0 isn't up yet at boot
+    s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_FREEBIND", 15), 1)
+    s.bind((host, int(port)))
+    s.set_inheritable(True)
+    return s
+
+
+def main() -> None:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    socks = [make_socket(a.strip()) for a in BIND.split(",") if a.strip()]
+    config = uvicorn.Config(
+        app,
+        log_level="warning",
+        access_log=False,
+        proxy_headers=False,
+        server_header=False,
+        timeout_graceful_shutdown=3,
+    )
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve(sockets=socks))
+
+
+if __name__ == "__main__":
+    main()

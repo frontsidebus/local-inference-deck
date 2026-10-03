@@ -1,0 +1,29 @@
+# id. -> Pocket-ID (OIDC) on Walter
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${SPARK_ID_HOST};
+    ssl_certificate     /etc/letsencrypt/live/${SPARK_ID_HOST}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SPARK_ID_HOST}/privkey.pem;
+    include snippets/tls-common.conf;
+    client_max_body_size 10m;
+
+    # Temporary: setup paths restricted to owner IP until admin is claimed
+
+    # Interactive auth endpoints - modest per-IP limit
+    location ~ ^/api/(webauthn/login|webauthn/reauthenticate|one-time-access-token|one-time-access-email|signup|device-login)(/|$) {
+        limit_req zone=id_auth burst=20 nodelay;
+        include snippets/proxy-common.conf;
+        proxy_pass http://${BACKEND_WG_IP}:${POCKETID_PORT};
+    }
+    # OIDC token/introspect endpoints (server-to-server) - looser limit
+    location ^~ /api/oidc/ {
+        limit_req zone=id_oidc burst=40 nodelay;
+        include snippets/proxy-common.conf;
+        proxy_pass http://${BACKEND_WG_IP}:${POCKETID_PORT};
+    }
+    location / {
+        include snippets/proxy-common.conf;
+        proxy_pass http://${BACKEND_WG_IP}:${POCKETID_PORT};
+    }
+}

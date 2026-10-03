@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# claude-spark: run Claude Code against the self-hosted Spark gateway
+# (nginx -> LiteLLM -> local Qwen models). Fully isolated from the normal
+# `claude` setup: separate config dir, gateway credential read at runtime.
+#
+# Settings: ~/.config/spark/env (SPARK_API_HOST, optional SPARK_KEY_DIR), written
+# by clients/install.sh. Values already in the environment win over the file.
+set -euo pipefail
+
+SPARK_ENV_FILE="${SPARK_ENV_FILE:-$HOME/.config/spark/env}"
+if [[ -r "$SPARK_ENV_FILE" ]]; then
+  _host="${SPARK_API_HOST-}" _kdir="${SPARK_KEY_DIR-}"
+  # shellcheck source=/dev/null
+  . "$SPARK_ENV_FILE"
+  SPARK_API_HOST="${_host:-${SPARK_API_HOST-}}" SPARK_KEY_DIR="${_kdir:-${SPARK_KEY_DIR-}}"
+fi
+if [[ -z "${SPARK_API_HOST-}" ]]; then
+  echo "claude-spark: SPARK_API_HOST is not set (run clients/install.sh or edit $SPARK_ENV_FILE)" >&2
+  exit 1
+fi
+
+KEY_FILE="${SPARK_KEY_FILE:-${SPARK_KEY_DIR:-$HOME/.config/spark}/claude-code.key}"
+if [[ ! -r "$KEY_FILE" ]]; then
+  echo "claude-spark: cannot read key file $KEY_FILE" >&2
+  exit 1
+fi
+
+# --- isolation -------------------------------------------------------------
+export CLAUDE_CONFIG_DIR="$HOME/.claude-spark"     # own settings/history/auth/.claude.json
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN    # never mix with real creds
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+
+# --- gateway + credential --------------------------------------------------
+export ANTHROPIC_BASE_URL="https://${SPARK_API_HOST}"
+ANTHROPIC_AUTH_TOKEN="$(tr -d '[:space:]' < "$KEY_FILE")"   # sent as Authorization: Bearer
+export ANTHROPIC_AUTH_TOKEN
+
+# --- model routing (gateway aliases) ---------------------------------------
+export ANTHROPIC_MODEL="${SPARK_MODEL:-coder}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="coder"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="coder"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="coder-fast"  # also background tasks (titles, summaries)
+export CLAUDE_CODE_SUBAGENT_MODEL="coder"
+
+# --- context window: Qwen models are 128K; Claude Code assumes 200K for unknown IDs
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85          # compact a bit early (count_tokens is estimated)
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=16384         # output reservation eats into the 128K window
+
+# --- gateway compatibility -------------------------------------------------
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1    # strip anthropic-beta + beta body fields (context_management, defer_loading...)
+# Mid-conversation system messages: Claude Code sends role:"system" entries inside
+# messages[] (env info, reminders, late-tool announcements) to unrecognized models.
+# The Qwen templates reject (coder: "System message must be at the beginning" ->
+# HTTP 500, ~3 min of retries) or silently drop (coder-fast) them. The gateway fixes
+# this itself: a LiteLLM pre-call hook (walter/gateway, spark_hooks.py) rewrites them
+# into user <system-reminder> text, so no client-side override is needed any more.
+# If a future gateway change regresses this, re-add the undocumented knob
+# (found in the Claude Code 2.1.286 binary):
+#   export CLAUDE_CODE_MODEL_CAPABILITIES="-mid_conv_system,-mid_conv_tool_change"
+export API_TIMEOUT_MS=1200000                      # 20 min: cold loads + slow long generations
+
+# --- no traffic outside the gateway ----------------------------------------
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1  # autoupdate, telemetry, error reporting, feature flags...
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_AUTOUPDATER=1
+
+exec "${CLAUDE_BIN:-$HOME/.local/bin/claude}" "$@"

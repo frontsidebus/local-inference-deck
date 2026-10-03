@@ -1,0 +1,42 @@
+# ~/.config/systemd/user/hermes-gateway.service  (OPTIONAL component)
+# Hermes Agent API server for Open WebUI ("Hermes Agent (workstation)").
+# Bind address/port and API_SERVER_KEY come from ~/.hermes/.env (see
+# gateway.env.example.tmpl). %h is the user's home directory.
+#
+# Differs from the unit `hermes gateway install` generates in two ways:
+#  - PATH is generic instead of a snapshot of the installing shell's PATH;
+#  - ExecStart goes through hermes-spark so the gateway key is read from
+#    ~/.config/spark/hermes.key at start (no copy of it in ~/.hermes/.env).
+#
+# SECURITY: tools run unsandboxed on this workstation as this user.
+[Unit]
+Description=Hermes Agent Gateway - Messaging Platform Integration
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hermes-spark gateway run
+WorkingDirectory=%h/.hermes
+Environment="PATH=%h/.hermes/hermes-agent/venv/bin:%h/.hermes/hermes-agent/node_modules/.bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=%h/.hermes/hermes-agent/venv"
+Environment="HERMES_HOME=%h/.hermes"
+Environment="HERMES_SUPERVISED_CHILD=1"
+Environment="HERMES_BIN=%h/.hermes/hermes-agent/venv/bin/hermes"
+Restart=always
+RestartSec=5
+RestartForceExitStatus=75
+SuccessExitStatus=75
+RestartPreventExitStatus=78
+KillMode=mixed
+KillSignal=SIGTERM
+ExecReload=/bin/kill -USR1 $MAINPID
+ExecStop=-%h/.hermes/hermes-agent/venv/bin/python -m gateway.systemd_stop_mark
+ExecStopPost=-%h/.hermes/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
+TimeoutStopSec=210
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

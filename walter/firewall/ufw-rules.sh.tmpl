@@ -1,0 +1,24 @@
+#!/bin/sh
+# ufw-rules.sh -- Walter's host firewall (INPUT). Idempotent: ufw skips rules that exist.
+# Installed to /usr/local/sbin/ufw-rules.sh and run by walter/deploy.sh.
+#
+# Docker-published ports (3000 Open WebUI, 1411 Pocket-ID, 4000 LiteLLM) never reach INPUT
+# (they are DNAT'd and FORWARDed); they are filtered by docker-user-rules.sh instead.
+# Walter is the WireGuard *client* (it dials the edge), so no inbound WireGuard rule is needed.
+set -eu
+
+ufw --force default deny incoming
+ufw --force default allow outgoing
+ufw --force default deny routed
+ufw logging low
+
+# SSH (LAN / hypervisor bridge access for the operator)
+ufw allow 22/tcp
+
+# LiteLLM containers (gateway compose network, pinned subnet) -> llama-swap on the WG address
+ufw allow proto tcp from ${GATEWAY_DOCKER_SUBNET} to ${BACKEND_WG_IP} port 8080 comment 'litellm gateway -> llama-swap'
+
+# Edge -> telemetry app (host network, so it is gated here and not by DOCKER-USER)
+ufw allow in on wg0 proto tcp from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200 comment 'covenant -> telemetry (host-network)'
+
+ufw --force enable

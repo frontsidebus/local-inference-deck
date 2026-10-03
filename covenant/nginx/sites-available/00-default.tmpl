@@ -1,0 +1,32 @@
+# Catch-all: unknown Host headers get 444 (connection closed)
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name _;
+    ssl_certificate     /etc/letsencrypt/live/${SPARK_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SPARK_DOMAIN}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    return 444;
+}
+
+# Port 80 for all known names: ACME http-01 webroot + redirect to https.
+# Never proxies plaintext traffic to backends.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SPARK_DOMAIN} ${SPARK_CHAT_HOST} ${SPARK_API_HOST} ${SPARK_ID_HOST};
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}

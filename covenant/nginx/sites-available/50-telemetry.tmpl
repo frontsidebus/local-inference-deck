@@ -1,0 +1,119 @@
+# telemetry. -> telemetry dashboard on Walter (${BACKEND_WG_IP}:${TELEMETRY_PORT}), gated by
+# oauth2-proxy on 127.0.0.1:4180 (Pocket-ID OIDC client "${OAUTH2_PROXY_CLIENT_ID}",
+# group "${TELEMETRY_GROUP}"). Everything except /oauth2/ requires a session.
+
+# Per-site limit zones (kept separate from the chat/api/id buckets)
+limit_req_zone  $binary_remote_addr zone=telemetry_req:1m  rate=10r/s;
+limit_req_zone  $binary_remote_addr zone=telemetry_auth:1m rate=10r/m;
+limit_conn_zone $binary_remote_addr zone=telemetry_conn:1m;
+
+# Port 80: ACME http-01 webroot + redirect to https (same as 00-default)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SPARK_TELEMETRY_HOST};
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${SPARK_TELEMETRY_HOST};
+    ssl_certificate     /etc/letsencrypt/live/${SPARK_TELEMETRY_HOST}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SPARK_TELEMETRY_HOST}/privkey.pem;
+    include snippets/tls-common.conf;
+
+    client_max_body_size 1m;
+
+    # Identity headers for the upstream come only from auth_request_set; any
+    # client-supplied copies are overwritten in each proxied location.
+    auth_request_set $auth_user  $upstream_http_x_auth_request_user;
+    auth_request_set $auth_email $upstream_http_x_auth_request_email;
+
+    # oauth2-proxy: sign-in, callback, sign-out (not behind auth_request)
+    location /oauth2/ {
+        limit_req zone=telemetry_auth burst=20 nodelay;
+        include snippets/proxy-common.conf;
+        proxy_pass http://127.0.0.1:4180;
+    }
+    # auth_request target (subrequests only; not reachable from clients)
+    location = /oauth2/auth {
+        internal;
+        include snippets/proxy-common.conf;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_pass http://127.0.0.1:4180;
+    }
+
+    # Browser pages: no session -> /oauth2/start?rd=$request_uri, served in the
+    # same response (one 302 straight to Pocket-ID). The return path goes in
+    # X-Auth-Request-Redirect, which avoids having to URL-encode it in ?rd=.
+    location @oauth2_signin {
+        limit_req zone=telemetry_auth burst=20 nodelay;
+        include snippets/proxy-common.conf;
+        proxy_set_header X-Auth-Request-Redirect $request_uri;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        rewrite ^ /oauth2/start? break;
+        proxy_pass http://127.0.0.1:4180;
+    }
+    # API calls: no session -> plain 401 (a redirect to the IdP is useless to fetch/XHR)
+    location @api_unauthorized {
+        default_type application/json;
+        return 401 '{"error":"unauthorized"}\n';
+    }
+
+    # Server-Sent Events: long-lived, unbuffered
+    location = /api/v1/stream {
+        auth_request /oauth2/auth;
+        error_page 401 = @api_unauthorized;
+        limit_req  zone=telemetry_req burst=10 nodelay;
+        limit_conn telemetry_conn 10;
+
+        include snippets/proxy-common.conf;
+        proxy_set_header Connection        "";
+        proxy_set_header X-Forwarded-User  $auth_user;
+        proxy_set_header X-Forwarded-Email $auth_email;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Email "";
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_pass http://${BACKEND_WG_IP}:${TELEMETRY_PORT};
+    }
+
+    location /api/ {
+        auth_request /oauth2/auth;
+        error_page 401 = @api_unauthorized;
+        limit_req zone=telemetry_req burst=40 nodelay;
+
+        include snippets/proxy-common.conf;
+        proxy_set_header X-Forwarded-User  $auth_user;
+        proxy_set_header X-Forwarded-Email $auth_email;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Email "";
+        proxy_pass http://${BACKEND_WG_IP}:${TELEMETRY_PORT};
+    }
+
+    # SPA and everything else (including /healthz) requires a session
+    location / {
+        auth_request /oauth2/auth;
+        error_page 401 = @oauth2_signin;
+        limit_req zone=telemetry_req burst=40 nodelay;
+
+        include snippets/proxy-common.conf;
+        proxy_set_header X-Forwarded-User  $auth_user;
+        proxy_set_header X-Forwarded-Email $auth_email;
+        proxy_set_header X-Auth-Request-User  "";
+        proxy_set_header X-Auth-Request-Email "";
+        proxy_pass http://${BACKEND_WG_IP}:${TELEMETRY_PORT};
+    }
+}

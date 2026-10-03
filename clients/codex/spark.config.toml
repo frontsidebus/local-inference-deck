@@ -1,0 +1,3 @@
+# Profile "spark": codex --profile spark  (same as the default here)
+model_provider = "home"
+model = "coder"

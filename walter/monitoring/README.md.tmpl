@@ -1,0 +1,102 @@
+# Walter monitoring stack (`/srv/monitoring`)
+
+Prometheus, Grafana, node-exporter, cAdvisor, dcgm-exporter, blackbox_exporter, and a small llama-swap discovery sidecar.
+Everything runs with `network_mode: host` and **listens on 127.0.0.1 only**. Nothing is published on ${BACKEND_WG_IP}, the LAN, or 0.0.0.0,
+and no UFW or DOCKER-USER rule was added.
+
+## Access (SSH tunnel from the workstation)
+
+```bash
+ssh -N -L 3001:127.0.0.1:3001 -L 9090:127.0.0.1:9090 ${BACKEND_SSH_USER}@${BACKEND_LAN_IP}
+```
+
+- Grafana: http://localhost:3001. User `admin`; the password is in `/srv/monitoring/grafana-admin-password` (root 600): `sudo cat /srv/monitoring/grafana-admin-password`
+- Prometheus: http://localhost:9090 (targets: `/targets`, alerts: `/alerts`). It has no auth, so it is reachable only through the tunnel.
+
+Dashboards (folder **Spark**):
+| Dashboard | UID | Source |
+|---|---|---|
+| Spark overview (home) | `spark-overview` | built here: `grafana/build_spark_overview.py` |
+| Node Exporter Full | `rYdddlPWk` | grafana.com ID 1860 rev 45, JSON committed |
+| NVIDIA DCGM Exporter Dashboard | `Oxed_c6Wz` | grafana.com ID 12239 rev 2, JSON committed |
+
+Alerts: `prometheus/rules/spark-alerts.yml`. There is no Alertmanager. Firing alerts show in Prometheus `/alerts` and in Grafana
+(Alerting → Alert rules, data source-managed "Prometheus").
+
+## Layout
+
+```
+compose.yaml                         all services, images pinned by digest
+prometheus/prometheus.yml            scrape config        prometheus/rules/*.yml  alert rules
+blackbox/blackbox.yml                probe modules (http_2xx, http_401)
+llamaswap-sd/llamaswap_sd.py         polls llama-swap /running + /v1/models every 15 s
+grafana/provisioning/                datasource + dashboards (json/)
+grafana/build_spark_overview.py      generator for spark-overview.json (edit + re-run; Grafana reloads in 60 s)
+grafana-admin-password               root 600 (canonical)
+secrets/  (root 700)                 container copies: grafana-admin-password (uid 472, 0400),
+                                     llama-swap-api-key (uid 65534, 0400)
+```
+
+Named volumes: `monitoring_prometheus-data` (30 d retention), `monitoring_grafana-data`, `monitoring_llamaswap-sd`.
+
+## Ports (all 127.0.0.1)
+
+| Port | Service |
+|---|---|
+| 3001 | Grafana |
+| 9090 | Prometheus |
+| 9100 | node-exporter |
+| 8081 | cAdvisor |
+| 9400 | dcgm-exporter |
+| 9115 | blackbox_exporter |
+
+## What is scraped
+
+| Job | Target | Notes |
+|---|---|---|
+| prometheus, node, cadvisor, dcgm, blackbox-exporter | 127.0.0.1 | |
+| llama-swap | ${BACKEND_WG_IP}:8080/metrics | Bearer key from `secrets/llama-swap-api-key`. v260 exports host CPU/mem/net/load and per-GPU util/VRAM/temp/power/fan (`llamaswap_*`) |
+| llama-server | 127.0.0.1:<port> of each **ready** model | file_sd written by `llamaswap-sd`, label `model`. Exports `llamacpp:*` (tokens, tokens/s, requests processing/deferred, decode calls) |
+| litellm | ${BACKEND_WG_IP}:4000/metrics/ | unauthenticated (`require_auth_for_metrics_endpoint: false` + `callbacks: [..., "prometheus"]` in litellm.yaml); reachable only from the backend and the edge, and the edge nginx does not expose it |
+| blackbox-http / -401 | chat/id health (public, 2xx), api /v1/models (public, must be 401), LiteLLM/Open WebUI/Pocket-ID/llama-swap health (internal) | TLS expiry from `probe_ssl_earliest_cert_expiry` |
+
+Why llama-server is not scraped via `/upstream/<model>/metrics`: in llama-swap v260 that path **loads the model** if it
+isn't running, so a stale target could swap out a model that is in use. The sidecar only emits targets for models in state `ready`.
+The sidecar also writes `llamaswap_model_loaded{model}` (0/1 for every configured model) and `llamaswap_sd_*`
+heartbeat metrics, which node-exporter's textfile collector exposes.
+
+## Operations
+
+```bash
+cd /srv/monitoring
+sudo docker compose ps                     # all should be (healthy); llamaswap-sd-init is a one-shot (Exited 0)
+sudo docker compose up -d                  # apply compose changes
+curl -s -X POST http://127.0.0.1:9090/-/reload   # reload prometheus.yml / rules after edits
+sudo docker compose exec prometheus promtool check config /etc/prometheus/prometheus.yml
+```
+
+**Add a scrape target:** add a `scrape_configs` entry in `prometheus/prometheus.yml`, bound to 127.0.0.1 or ${BACKEND_WG_IP}
+(Prometheus is on the host network, so no firewall change is needed), then reload as above. For a new blackbox probe, add the
+URL under the right `blackbox-http*` job's `targets`.
+
+**Add an alert:** edit `prometheus/rules/spark-alerts.yml`, check with the promtool command above, then reload.
+
+**Add a dashboard:** drop the JSON into `grafana/provisioning/dashboards/json/`. Replace `${DS_PROMETHEUS}` with
+`{"type":"prometheus","uid":"prometheus"}` and remove `__inputs`. Grafana picks it up within 60 s. Provisioned dashboards are
+read-only in the UI, so edit the files instead.
+
+**Key rotation:**
+- llama-swap key changed: `sudo install -m 400 -o 65534 -g 65534 /etc/llama-swap/api-key secrets/llama-swap-api-key`.
+  Prometheus re-reads it on every scrape, and the sidecar re-reads it on every poll.
+- Grafana admin password: the `__FILE` env only applies when the DB is first created. To change it later:
+  `sudo cat grafana-admin-password | sudo docker compose exec -T grafana grafana cli admin reset-admin-password --password-from-stdin`, then
+  re-copy it into `secrets/` (uid 472, 0400).
+
+**Upgrade an image:** `docker pull <image>:<newtag>`, take the digest from `docker image inspect -f '{{index .RepoDigests 0}}'`,
+update `compose.yaml`, then run `docker compose up -d`.
+
+## Known limitations
+
+- GeForce GPUs: DCGM has no profiling (DCP) metrics such as tensor activity or DRAM active, and VRAM temperature reads 0 (not
+  exposed via NVML). Fan speed comes from llama-swap's `llamaswap_gpu_fan_speed_percent`.
+- `GPUVRAMNearlyFull` (> 98 % for 10 min) can trigger on legitimate full-context splits. Tune the threshold if it gets noisy.

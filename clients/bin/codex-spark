@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run Codex CLI against the Spark gateway. The key is read at runtime and
+# exported only into codex's environment (never stored in config or shell rc).
+# The gateway URL lives in ~/.codex/config.toml ([model_providers.home].base_url),
+# rendered by clients/install.sh.
+#
+# Settings: ~/.config/spark/env (optional SPARK_KEY_DIR). Environment wins over the file.
+set -euo pipefail
+
+SPARK_ENV_FILE="${SPARK_ENV_FILE:-$HOME/.config/spark/env}"
+if [[ -r "$SPARK_ENV_FILE" ]]; then
+  _kdir="${SPARK_KEY_DIR-}"
+  # shellcheck source=/dev/null
+  . "$SPARK_ENV_FILE"
+  SPARK_KEY_DIR="${_kdir:-${SPARK_KEY_DIR-}}"
+fi
+
+keyfile="${SPARK_CODEX_KEY_FILE:-${SPARK_KEY_DIR:-$HOME/.config/spark}/codex.key}"
+if [[ ! -r "$keyfile" ]]; then
+  echo "codex-spark: cannot read key file $keyfile" >&2
+  exit 1
+fi
+SPARK_CODEX_KEY="$(tr -d '[:space:]' < "$keyfile")"
+export SPARK_CODEX_KEY
+exec "${CODEX_BIN:-$HOME/.local/bin/codex}" "$@"

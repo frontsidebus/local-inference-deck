@@ -1,0 +1,44 @@
+# api. -> LiteLLM gateway on Walter. Only inference endpoints under /v1/ are exposed.
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${SPARK_API_HOST};
+    ssl_certificate     /etc/letsencrypt/live/${SPARK_API_HOST}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${SPARK_API_HOST}/privkey.pem;
+    include snippets/tls-common.conf;
+
+    location /v1/ {
+        default_type application/json;
+        # cheap pre-filter: no credentials at all -> 401 before touching the backend
+        if ($api_no_credentials) {
+            return 401 '{"error":{"type":"authentication_error","message":"missing API key"}}\n';
+        }
+        limit_req  zone=api_req burst=40 nodelay;
+        limit_conn api_conn 20;
+
+        client_max_body_size     50m;
+        proxy_buffering          off;
+        proxy_request_buffering  off;
+        proxy_cache              off;
+        proxy_read_timeout       900s;
+        proxy_send_timeout       900s;
+
+        include snippets/proxy-common.conf;
+        proxy_set_header Connection "";
+        # Authorization, x-api-key, anthropic-version, anthropic-beta are
+        # forwarded unchanged (nginx passes client request headers by default).
+
+        # Allowlist of inference routes; anything else under /v1/ (incl. any
+        # admin-ish /v1/* routes) is 404.
+        location ~ ^/v1/(chat/completions|responses(/.*)?|models(/.*)?|messages|messages/count_tokens)$ {
+            if ($api_no_credentials) {
+                return 401 '{"error":{"type":"authentication_error","message":"missing API key"}}\n';
+            }
+            proxy_pass http://${BACKEND_WG_IP}:${LITELLM_PORT};
+        }
+        return 404;
+    }
+    location / {
+        return 404;
+    }
+}

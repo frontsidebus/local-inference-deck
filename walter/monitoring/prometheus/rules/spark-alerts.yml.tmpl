@@ -1,0 +1,93 @@
+# Alert rules for Walter. No Alertmanager yet: alerts show as pending/firing in
+# Prometheus (/alerts) and Grafana (Alerting > Alert rules, data source-managed).
+groups:
+  - name: gpu
+    rules:
+      - alert: GPUTemperatureHigh
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "GPU {{ $labels.gpu }} temperature {{ $value }} C (> 85 C)"
+      - alert: GPUVRAMNearlyFull
+        expr: |
+          DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE + DCGM_FI_DEV_FB_RESERVED) > 0.98
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "GPU {{ $labels.gpu }} VRAM {{ $value | humanizePercentage }} used for 10 min"
+      - alert: GPUExporterDown
+        expr: up{job="dcgm"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "dcgm-exporter is not being scraped"
+
+  - name: host
+    rules:
+      - alert: DiskSpaceHigh
+        expr: |
+          (1 - node_filesystem_avail_bytes{job="node",mountpoint=~"/|${MODELS_DIR}",fstype!~"tmpfs|overlay"}
+               / node_filesystem_size_bytes{job="node",mountpoint=~"/|${MODELS_DIR}",fstype!~"tmpfs|overlay"}) > 0.85
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Filesystem {{ $labels.mountpoint }} is {{ $value | humanizePercentage }} full"
+
+  - name: endpoints
+    rules:
+      - alert: EndpointProbeFailing
+        expr: probe_success == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Probe {{ $labels.instance }} ({{ $labels.job }}) failing for 5 min"
+      - alert: TLSCertExpiringSoon
+        expr: (probe_ssl_earliest_cert_expiry - time()) < 14 * 86400
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "TLS cert for {{ $labels.instance }} expires in {{ $value | humanizeDuration }}"
+
+  - name: services
+    rules:
+      - alert: LlamaSwapTargetDown
+        expr: up{job="llama-swap"} == 0 or absent(up{job="llama-swap"})
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "llama-swap /metrics (${BACKEND_WG_IP}:8080) is not scrapeable"
+      - alert: LiteLLMTargetDown
+        expr: up{job="litellm"} == 0 or absent(up{job="litellm"})
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "LiteLLM /metrics (${BACKEND_WG_IP}:4000) is not scrapeable"
+      - alert: LlamaServerTargetDown
+        expr: up{job="llama-server"} == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "llama-server for model {{ $labels.model }} is loaded but /metrics fails"
+      - alert: LlamaSwapDiscoveryStale
+        expr: time() - llamaswap_sd_last_success_timestamp_seconds > 120 or llamaswap_sd_up == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "llamaswap-sd sidecar has not polled llama-swap /running successfully for > 2 min"
+      - alert: MonitoringTargetDown
+        expr: up{job=~"prometheus|node|cadvisor|blackbox-exporter"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Monitoring target {{ $labels.job }} ({{ $labels.instance }}) down"
+
+  - name: containers
+    rules:
+      - alert: ContainerRestarting
+        # same container (id) started >= 2 times in 15 min = restart loop. llama-swap model swaps
+        # create a fresh container (new id) each time, so they don't count.
+        expr: changes(container_start_time_seconds{name!=""}[15m]) >= 2
+        labels: { severity: warning }
+        annotations:
+          summary: "Container {{ $labels.name }} restarted {{ $value }} times in 15 min"

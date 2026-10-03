@@ -1,0 +1,58 @@
+# Walter telemetry (`/srv/telemetry`)
+
+Live dashboard for the inference stack, published as https://${SPARK_TELEMETRY_HOST}. Covenant handles TLS and
+Pocket-ID OIDC (oauth2-proxy + nginx) and proxies to `http://${BACKEND_WG_IP}:3200` over WireGuard.
+
+| Path | What it does |
+|---|---|
+| `GET /` | dashboard SPA (vanilla JS, inline SVG, self-hosted OFL fonts, strict CSP) |
+| `GET /api/v1/telemetry` | `{viewer, history, snapshot}`: 30 min history from range queries plus the current snapshot |
+| `GET /api/v1/stream` | SSE `event: snapshot` every ~2 s, plus a `: hb` comment every 15 s |
+| `GET /healthz` | `ok` |
+
+## Layout
+```
+compose.yaml                 app (host network, uid 10001, read-only, cap_drop ALL) + backup-status sidecar
+build/Dockerfile             python:3.13-alpine pinned by digest; deps pinned in build/requirements.txt
+build/app/main.py            collector + HTTP (fixed server-side PromQL; the client never sends a query)
+build/app/static/            index.html, app.css, app.js, fonts/ (Orbitron, Inter, JetBrains Mono + OFL licenses)
+secrets/llama-swap-api-key   copy of /etc/llama-swap/api-key (root:10001 0440). NOT for backups in plain text
+```
+Back up these config files: `compose.yaml`, `build/**`, `README.md`. Do not back up `secrets/`, which is re-creatable.
+
+## How it works
+- One collector loop. llama-swap `/running` is polled every 2 s, the fast PromQL set every 4 s (Prometheus scrapes every 15 s),
+  the slow set (latency, 1 h totals, per-key today, probes, up, alerts) every 15 s, and range queries every 30 s.
+  The JSON is serialised once per cycle and every HTTP/SSE client gets the same bytes, so N viewers add no Prometheus load.
+- Host networking is used because Prometheus listens only on 127.0.0.1:9090 (host network). There is no monitoring docker
+  network to join. The app binds ${BACKEND_WG_IP}:3200 itself (IP_FREEBIND, so it starts even before wg0 is up).
+- `backup-status` (alpine, root without capabilities, no network, read-only) reads `${MODELS_DIR}/backups/LAST_OK` every 60 s
+  and writes only `{ts, name}` to a tmpfs volume.
+- PCIe link width and speed come from `/sys/bus/pci/devices/<bus>/current_link_*`, because DCGM doesn't export them on GeForce.
+- X-Forwarded-User/Email are only displayed, after being sanitised. They are never used for authorisation.
+
+## Firewall
+- ufw: `ALLOW IN on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200/tcp`. This is the effective gate, because host-network
+  traffic goes through INPUT.
+- `/usr/local/sbin/docker-user-rules.sh`: 3200 was added to `PORTS` (WALTER-PUBLISHED), in case the app is ever
+  switched to a docker-published port. Backup: `docker-user-rules.sh.bak-20261002-221738`.
+
+## Operations
+```bash
+cd /srv/telemetry
+sudo docker compose ps                 # both (healthy)
+sudo docker compose up -d --build      # after editing build/
+sudo docker compose logs -f app
+# llama-swap key rotated:
+sudo install -m 0440 -o root -g 10001 /etc/llama-swap/api-key secrets/llama-swap-api-key   # read on every poll
+```
+
+## Rollback
+```bash
+cd /srv/telemetry && sudo docker compose down -v && sudo docker image rm walter-telemetry:local
+sudo ufw delete allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200 proto tcp
+sudo cp -a /usr/local/sbin/docker-user-rules.sh.bak-20261002-221738 /usr/local/sbin/docker-user-rules.sh
+sudo systemctl restart docker-user-rules.service && sudo iptables -S WALTER-PUBLISHED   # no 3200 lines
+sudo rm -rf /srv/telemetry
+```
+Then remove the telemetry vhost and oauth2-proxy config on Covenant. That is owned by the edge agent.

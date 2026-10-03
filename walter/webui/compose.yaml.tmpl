@@ -1,0 +1,45 @@
+name: webui
+
+services:
+  pocket-id:
+    # v2.16.0 (2026-09-20)
+    image: ghcr.io/pocket-id/pocket-id:v2.16.0@sha256:9366436f3fd21619ed7e5709fa0acac88130f73414ec8ee1caf768fc487111ea
+    container_name: pocket-id
+    restart: unless-stopped
+    env_file:
+      - pocket-id.env
+    ports:
+      - "${BACKEND_WG_IP}:1411:1411"
+    volumes:
+      - pocket-id-data:/app/data
+    healthcheck:
+      test: ["CMD", "/app/pocket-id", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  open-webui:
+    # v0.11.4 (2026-09-21)
+    image: ghcr.io/open-webui/open-webui:v0.11.4@sha256:9591b13f13843c7721c2b8eaf7382846c81b3ffe126526d1888d1fed50c6a33f
+    container_name: open-webui
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${BACKEND_WG_IP}:3000:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+      # Cyberpunk theme: copied from build/static into /static at startup (config.py)
+      - ./theme/custom.css:/app/build/static/custom.css:ro
+      - ./theme/fonts:/app/build/static/fonts:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health | jq -ne \"input.status == true\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+volumes:
+  pocket-id-data:
+  open-webui-data:

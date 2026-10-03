@@ -1,0 +1,56 @@
+# Codex CLI config for the self-hosted Spark gateway (LiteLLM behind nginx).
+# Codex 0.159.3. No secrets here: the key is read from $SPARK_CODEX_KEY,
+# which the ~/.local/bin/codex-spark wrapper exports from ~/.config/spark/codex.key.
+#
+# NOTE: since Codex 0.134 profiles are separate files (~/.codex/<name>.config.toml,
+# selected with --profile <name>); [profiles.*] tables in this file are ignored.
+# Profiles defined here: spark (coder), spark-fast (coder-fast).
+
+# ---- top-level keys (must precede any [table]) ----
+model_provider = "home"
+model = "coder"
+# Custom catalog so Codex knows our aliases (context window, no reasoning
+# summaries, no verbosity/web-search/freeform tools, text-only input).
+model_catalog_json = "${HOME}/.codex/spark-models.json"
+model_context_window = 131072
+model_auto_compact_token_limit = 110000
+model_reasoning_summary = "none"
+# Hosted web search is an OpenAI-only tool; the gateway can't serve it.
+web_search = "disabled"
+# Qwen emits raw reasoning_text (no summaries); show it in the TUI.
+show_raw_agent_reasoning = true
+hide_agent_reasoning = false
+check_for_update_on_startup = false
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[model_providers.home]
+name = "Spark gateway (LiteLLM)"
+base_url = "https://${SPARK_API_HOST}/v1"
+wire_api = "responses"            # the only value supported by this Codex version
+env_key = "SPARK_CODEX_KEY"
+env_key_instructions = "Run codex via ~/.local/bin/codex-spark, which exports SPARK_CODEX_KEY from ~/.config/spark/codex.key"
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 600000   # cold model loads ~30 s; long reasoning gaps
+supports_websockets = false
+
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false
+
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"
+log_user_prompt = false
+
+[features]
+# Keep the tool surface small for local Qwen models.
+multi_agent = false
+goals = false
+
+
+

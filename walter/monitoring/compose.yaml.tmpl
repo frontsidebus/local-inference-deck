@@ -1,0 +1,197 @@
+# /srv/monitoring/compose.yaml - Walter monitoring stack
+# Every service uses network_mode: host and listens on 127.0.0.1 only, so nothing is published on
+# ${BACKEND_WG_IP}/LAN/0.0.0.0 and no UFW/DOCKER-USER change is needed. Host networking is also what lets
+# Prometheus reach the llama-server containers, which llama-swap binds to 127.0.0.1:<dynamic port>.
+# Access is through an SSH tunnel (see README.md). Secrets live in ./secrets (root 0700) and are never inlined here.
+name: monitoring
+
+x-common: &common
+  restart: unless-stopped
+  network_mode: host
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  prometheus:
+    <<: *common
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.listen-address=127.0.0.1:9090
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./secrets/llama-swap-api-key:/etc/prometheus/secrets/llama-swap-api-key:ro
+      - llamaswap-sd:/etc/prometheus/llamaswap:ro
+      - prometheus-data:/prometheus
+    mem_limit: 2g
+    cpus: 2
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  node-exporter:
+    <<: *common
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    pid: host
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9100
+      - --collector.textfile.directory=/llamaswap/textfile
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|run/credentials/.+|sys|var/lib/docker/.+|var/lib/containerd/.+|var/lib/kubelet/.+)($|/)
+    volumes:
+      - /:/host:ro,rslave
+      - llamaswap-sd:/llamaswap:ro   # textfile collector reads the sidecar's llamaswap.prom
+    mem_limit: 128m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  cadvisor:
+    <<: *common
+    image: ghcr.io/google/cadvisor:0.60.6@sha256:b8e7d1093144fd088f425ff003d75a4aa405de075db78dae3bc563730b1bd07a
+    privileged: true
+    devices: ["/dev/kmsg"]
+    command:
+      - -listen_ip=127.0.0.1
+      - -port=8081
+      - -docker_only=true
+      - -housekeeping_interval=15s
+      - -max_housekeeping_interval=30s
+      - -store_container_labels=false
+      - -whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service,llama-swap
+      - -disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp,disk,perf_event
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    mem_limit: 256m
+    cpus: 1
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  dcgm-exporter:
+    <<: *common
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:4.8.4@sha256:148b0c025e5f2850256816fa33754fbf4733b7a086697a95613fc0ba3db5b003
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility   # NVML only, no CUDA compute context
+      DCGM_EXPORTER_LISTEN: 127.0.0.1:9400
+      DCGM_EXPORTER_INTERVAL: "10000"
+    mem_limit: 768m
+    cpus: 1
+    healthcheck:
+      test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9400 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $$l == *200* ]]"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  blackbox-exporter:
+    <<: *common
+    image: prom/blackbox-exporter:v0.28.0@sha256:e753ff9f3fc458d02cca5eddab5a77e1c175eee484a8925ac7d524f04366c2fc
+    command:
+      - --config.file=/etc/blackbox/blackbox.yml
+      - --web.listen-address=127.0.0.1:9115
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    mem_limit: 64m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9115/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # one-shot: make the shared volume writable by the sidecar's unprivileged user
+  llamaswap-sd-init:
+    image: python:3.13-alpine@sha256:79e7a9b9ff1cbceff819f856fb374477792a5967759d94df266de7b7b4120e6f
+    network_mode: none
+    restart: "no"
+    user: "0:0"
+    command: ["sh", "-c", "mkdir -p /out/sd /out/textfile && chown -R 65534:65534 /out"]
+    volumes:
+      - llamaswap-sd:/out
+
+  llamaswap-sd:
+    <<: *common
+    image: python:3.13-alpine@sha256:79e7a9b9ff1cbceff819f856fb374477792a5967759d94df266de7b7b4120e6f
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      llamaswap-sd-init: { condition: service_completed_successfully }
+    command: ["python3", "-u", "/app/llamaswap_sd.py"]
+    environment:
+      LLAMA_SWAP_URL: http://${BACKEND_WG_IP}:8080
+      KEY_FILE: /run/secrets/llama-swap-api-key
+      SD_FILE: /out/sd/llama-server.json
+      TEXTFILE: /out/textfile/llamaswap.prom
+      INTERVAL: "15"
+    volumes:
+      - ./llamaswap-sd/llamaswap_sd.py:/app/llamaswap_sd.py:ro
+      - ./secrets/llama-swap-api-key:/run/secrets/llama-swap-api-key:ro
+      - llamaswap-sd:/out
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,sys,time; sys.exit(time.time()-os.path.getmtime('/out/textfile/llamaswap.prom')>90)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  grafana:
+    <<: *common
+    image: grafana/grafana:13.2.3@sha256:b28bae15e219c998fb0e0424ed724930cc61b1f61fb404d47c862f9a23f9e572
+    depends_on:
+      prometheus: { condition: service_healthy }
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: "3001"
+      GF_SERVER_ROOT_URL: http://localhost:3001/
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana-admin-password
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_ANALYTICS_FEEDBACK_LINKS_ENABLED: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"   # no grafana.com fetches at runtime
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/json/spark-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./secrets/grafana-admin-password:/run/secrets/grafana-admin-password:ro
+      - grafana-data:/var/lib/grafana
+    mem_limit: 512m
+    cpus: 1
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  llamaswap-sd:

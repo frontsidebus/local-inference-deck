@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Hermes Agent against the Spark gateway (https://$SPARK_API_HOST/v1).
+# Loads the API key from a mode-600 key file into the env var referenced by
+# custom_providers[spark].key_env in ~/.hermes/config.yaml, then execs hermes.
+# The gateway URL lives in ~/.hermes/config.yaml, rendered by clients/install.sh.
+#
+# Settings: ~/.config/spark/env (optional SPARK_KEY_DIR). Environment wins over the file.
+set -euo pipefail
+
+SPARK_ENV_FILE="${SPARK_ENV_FILE:-$HOME/.config/spark/env}"
+if [[ -r "$SPARK_ENV_FILE" ]]; then
+  _kdir="${SPARK_KEY_DIR-}"
+  # shellcheck source=/dev/null
+  . "$SPARK_ENV_FILE"
+  SPARK_KEY_DIR="${_kdir:-${SPARK_KEY_DIR-}}"
+fi
+
+KEY_FILE="${SPARK_HERMES_KEY_FILE:-${SPARK_KEY_DIR:-$HOME/.config/spark}/hermes.key}"
+if [[ ! -r "$KEY_FILE" ]]; then
+  echo "hermes-spark: key file $KEY_FILE not readable" >&2
+  exit 1
+fi
+SPARK_HERMES_API_KEY="$(tr -d '[:space:]' < "$KEY_FILE")"
+export SPARK_HERMES_API_KEY
+# Cold model loads on the gateway can take ~30 s; long generations more.
+export HERMES_API_TIMEOUT="${HERMES_API_TIMEOUT:-900}"
+export HERMES_API_CALL_STALE_TIMEOUT="${HERMES_API_CALL_STALE_TIMEOUT:-900}"
+exec "${HERMES_BIN:-$HOME/.local/bin/hermes}" "$@"

@@ -1,0 +1,85 @@
+# /srv/telemetry/compose.yaml - Walter telemetry dashboard (${SPARK_TELEMETRY_HOST} via Covenant)
+#
+# Networking: the app uses network_mode: host. Prometheus (and the rest of /srv/monitoring) runs
+# with host networking bound to 127.0.0.1 only; there is no monitoring docker network to join, and a
+# bridged container cannot reach the host's loopback. The app binds ${BACKEND_WG_IP}:3200 itself (with
+# IP_FREEBIND so it starts even before wg0 is up). Because it is not a docker-published port, the
+# traffic hits INPUT (ufw), not FORWARD/DOCKER-USER: ufw allows only ${EDGE_WG_IP} on wg0 to 3200.
+# 3200 is also listed in WALTER-PUBLISHED (docker-user-rules.sh) in case it is ever switched to a
+# published port.
+name: telemetry
+
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "2" }
+
+services:
+  app:
+    <<: *hardening
+    build: { context: ./build }
+    image: walter-telemetry:local
+    network_mode: host
+    user: "10001:10001"
+    environment:
+      BIND: ${BACKEND_WG_IP}:3200
+      PROM_URL: http://127.0.0.1:9090
+      LLAMA_SWAP_URL: http://${BACKEND_WG_IP}:8080
+      LLAMA_SWAP_KEY_FILE: /run/secrets/llama-swap-api-key
+      BACKUP_STATUS_FILE: /state/backup.json
+      TZ_DISPLAY: UTC              # "today" boundary for the per-key breakdown
+    volumes:
+      - ./secrets/llama-swap-api-key:/run/secrets/llama-swap-api-key:ro
+      - state:/state:ro
+    depends_on:
+      backup-status: { condition: service_started }
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://${BACKEND_WG_IP}:3200/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Reads the root-only ${MODELS_DIR}/backups/LAST_OK and publishes ONLY {snapshot name, timestamp} to a
+  # tmpfs volume the app can read. Root (file owner) but no capabilities, no network, read-only.
+  backup-status:
+    <<: *hardening
+    image: alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+    network_mode: none
+    user: "0:0"
+    volumes:
+      - ${MODELS_DIR}/backups:/backups:ro
+      - state:/state
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while :; do
+          if read -r ts name _ < /backups/LAST_OK 2>/dev/null; then
+            case "$$ts$$name" in *[!A-Za-z0-9_.:+-]*) ts=""; name="" ;; esac
+            printf '{"ts":"%s","name":"%s","checked":%s}\n' "$$ts" "$$name" "$$(date +%s)" > /state/.backup.json.tmp \
+              && chmod 0644 /state/.backup.json.tmp && mv -f /state/.backup.json.tmp /state/backup.json
+          fi
+          sleep 60
+        done
+    mem_limit: 16m
+    cpus: 0.05
+    pids_limit: 8
+    healthcheck:
+      test: ["CMD-SHELL", "test $$(( $$(date +%s) - $$(stat -c %Y /state/backup.json) )) -lt 180"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  state:
+    driver: local
+    driver_opts: { type: tmpfs, device: tmpfs, o: "size=64k,mode=0755" }

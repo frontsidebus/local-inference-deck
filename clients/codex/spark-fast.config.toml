@@ -1,0 +1,3 @@
+# Profile "spark-fast": codex --profile spark-fast
+model_provider = "home"
+model = "coder-fast"

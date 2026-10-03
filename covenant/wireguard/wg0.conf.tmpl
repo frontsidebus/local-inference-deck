@@ -1,0 +1,11 @@
+[Interface]
+Address    = ${EDGE_WG_IP}/24
+ListenPort = ${WG_PORT}
+PrivateKey = @WG_PRIVATE_KEY@
+
+[Peer]
+# backend (Walter). It sits behind NAT and initiates the tunnel to this edge
+# (its own config has Endpoint = <edge public IP>:WG_PORT + PersistentKeepalive),
+# so no Endpoint here: the edge learns it from the first handshake.
+PublicKey  = ${WG_BACKEND_PUBLIC_KEY}
+AllowedIPs = ${BACKEND_WG_IP}/32

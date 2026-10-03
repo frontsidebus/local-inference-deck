@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# spark-backup-restore-test.sh [snapshot-dir]
+# Non-destructive restore test of a spark-backup snapshot (default: newest in LAST_OK).
+# Uses throwaway containers/volumes/networks only (no published ports); cleans up on exit.
+set -euo pipefail
+umask 077
+
+BACKUP_ROOT=${MODELS_DIR}/backups
+GATEWAY_COMPOSE=/srv/gateway/compose.yaml
+HELPER_IMAGE='spark-backup-helper:alpine-5291449c'
+SNAP=${1:-$BACKUP_ROOT/$(awk '{print $2}' "$BACKUP_ROOT/LAST_OK")}
+T=sbrt-$$
+FAIL=0
+
+say()  { echo "[restore-test] $*"; }
+pass() { echo "[restore-test] PASS: $*"; }
+fail() { echo "[restore-test] FAIL: $*"; FAIL=1; }
+
+cleanup() {
+  docker rm -f "$T-pg" "$T-pid" >/dev/null 2>&1 || true
+  docker volume rm "$T-pidvol" "$T-owuvol" >/dev/null 2>&1 || true
+  docker network rm "$T-net" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+[[ -d "$SNAP" ]] || { echo "no snapshot $SNAP"; exit 1; }
+say "snapshot $SNAP"
+docker image inspect "$HELPER_IMAGE" >/dev/null
+
+# ---------------------------------------------------------------- checksums
+if (cd "$SNAP" && sha256sum --quiet -c SHA256SUMS); then pass "SHA256SUMS ($(wc -l < "$SNAP/SHA256SUMS") files)"; else fail "SHA256SUMS"; fi
+
+# ---------------------------------------------------------------- Postgres
+PG_IMAGE=$(awk '/^ *image: *postgres/ {print $2}' "$GATEWAY_COMPOSE")
+say "postgres image $PG_IMAGE"
+docker network create --internal "$T-net" >/dev/null
+docker run -d --name "$T-pg" --network "$T-net" \
+  -e POSTGRES_USER=litellm -e POSTGRES_DB=litellm -e POSTGRES_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=')" \
+  "$PG_IMAGE" >/dev/null
+for _ in $(seq 60); do
+  docker exec "$T-pg" pg_isready -U litellm -d litellm -q 2>/dev/null && break; sleep 1
+done
+sleep 2  # initdb restarts the server once
+docker exec "$T-pg" pg_isready -U litellm -d litellm -q
+docker exec -i "$T-pg" pg_restore -U litellm -d litellm --no-owner --exit-on-error < "$SNAP/pg-litellm.dump" \
+  && pass "pg_restore completed" || fail "pg_restore"
+q() { echo "select count(*) from \"$1\";"; }
+for tbl in LiteLLM_VerificationToken LiteLLM_UserTable LiteLLM_TeamTable LiteLLM_SpendLogs; do
+  r=$(docker exec "$T-pg" psql -U litellm -d litellm -tAc "$(q "$tbl")" 2>/dev/null || echo ERR)
+  l=$(docker compose -f "$GATEWAY_COMPOSE" exec -T db psql -U litellm -d litellm -tAc "$(q "$tbl")" 2>/dev/null || echo ERR)
+  say "$tbl restored=$r live=$l"
+  case $tbl in
+    LiteLLM_VerificationToken) [[ $r =~ ^[0-9]+$ && $r -ge 13 && $r == "$l" ]] && pass "$tbl $r>=13 == live" || fail "$tbl" ;;
+    LiteLLM_UserTable)         [[ $r =~ ^[0-9]+$ && $r -ge 8  && $r == "$l" ]] && pass "$tbl $r>=8 == live"  || fail "$tbl" ;;
+    *) [[ $r =~ ^[0-9]+$ ]] || fail "$tbl unreadable" ;;  # informational (live may have advanced)
+  esac
+done
+
+# ---------------------------------------------------------------- SQLite checks
+sq() { # <db file in snapshot> <sql>
+  docker run --rm --network none -v "$SNAP:/s:ro" "$HELPER_IMAGE" sqlite3 "file:/s/$1?immutable=1" "$2"
+}
+[[ $(sq webui.db 'PRAGMA integrity_check;') == ok ]] && pass "webui.db integrity_check" || fail "webui.db integrity"
+n=$(sq webui.db "select count(*) from user where role='admin';")
+say "open-webui users=$(sq webui.db 'select count(*) from user;') admins=$n"
+[[ $n -ge 1 ]] && pass "webui.db has admin user" || fail "webui.db admin"
+
+[[ $(sq pocket-id.db 'PRAGMA integrity_check;') == ok ]] && pass "pocket-id.db integrity_check" || fail "pocket-id.db integrity"
+nu=$(sq pocket-id.db 'select count(*) from users;')
+na=$(sq pocket-id.db 'select count(*) from users where is_admin=1;')
+nc=$(sq pocket-id.db "select count(*) from oidc_clients where id='open-webui' or lower(name) in ('open-webui','open webui');")
+say "pocket-id users=$nu admins=$na client(open-webui)=$nc"
+[[ $nu -ge 1 && $na -ge 1 ]] && pass "pocket-id has admin user" || fail "pocket-id users"
+[[ $nc -ge 1 ]] && pass "pocket-id OIDC client open-webui exists" || fail "pocket-id client"
+python3 - "$SNAP/pocket-id-export.zip" <<'EOF' && pass "pocket-id-export.zip valid" || fail "pocket-id-export.zip"
+import sys, zipfile, json
+z = zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None
+json.loads(z.read("database.json"))
+EOF
+
+# ---------------------------------------------------------------- volume restore + Pocket-ID boot
+# Recreate the Pocket-ID volume exactly as the RESTORE.md procedure does, then boot the
+# pinned Pocket-ID image on it with no network and wait for its own healthcheck.
+docker volume create "$T-pidvol" >/dev/null
+zstd -dc "$SNAP/vol-pocket-id-data.tar.zst" | docker run --rm -i --network none -v "$T-pidvol:/v" "$HELPER_IMAGE" \
+  tar -C /v --numeric-owner --xattrs -xf -
+docker run --rm --network none -v "$T-pidvol:/v" -v "$SNAP:/s:ro" "$HELPER_IMAGE" sh -euc \
+  'cp /s/pocket-id.db /v/pocket-id.db && chown "$(stat -c %u:%g /v/uploads)" /v/pocket-id.db
+   # The copy holds the LIVE instance'"'"'s cluster heartbeat (francis_hosts). In a real restore the
+   # old host is gone; simulate that in this throwaway copy so the single-replica guard passes.
+   sqlite3 /v/pocket-id.db "DELETE FROM francis_hosts;"'
+PID_IMAGE=$(docker inspect -f '{{.Config.Image}}' pocket-id)
+docker run -d --name "$T-pid" --network none --env-file /srv/webui/pocket-id.env \
+  -v "$T-pidvol:/app/data" "$PID_IMAGE" >/dev/null
+ok=0
+for _ in $(seq 30); do
+  if docker exec "$T-pid" /app/pocket-id healthcheck >/dev/null 2>&1; then ok=1; break; fi
+  sleep 2
+done
+[[ $ok -eq 1 ]] && pass "restored Pocket-ID volume boots and is healthy (isolated, no network)" \
+  || { fail "restored Pocket-ID boot"; docker logs --tail 20 "$T-pid" 2>&1 | sed 's/^/  pid: /'; }
+
+docker volume create "$T-owuvol" >/dev/null
+zstd -dc "$SNAP/vol-open-webui-data.tar.zst" | docker run --rm -i --network none -v "$T-owuvol:/v" "$HELPER_IMAGE" \
+  tar -C /v --numeric-owner --xattrs -xf -
+docker run --rm --network none -v "$T-owuvol:/v" -v "$SNAP:/s:ro" "$HELPER_IMAGE" sh -euc \
+  'cp /s/webui.db /v/webui.db && test "$(sqlite3 /v/webui.db "PRAGMA integrity_check;")" = ok && ls /v' \
+  | tr '\n' ' ' | sed 's/^/[restore-test] open-webui volume restored: /'; echo
+pass "open-webui volume untar + db copy"
+
+# ---------------------------------------------------------------- config tarball
+list=$(zstd -dc "$SNAP/config.tar.zst" | tar -tf -)
+for p in srv/gateway/compose.yaml srv/gateway/.env srv/gateway/litellm.yaml srv/gateway/keys/ \
+         srv/webui/compose.yaml srv/webui/.env srv/webui/pocket-id.env srv/webui/admin-password \
+         etc/llama-swap/config.yaml etc/llama-swap/api-key etc/systemd/system/llama-swap.service \
+         etc/systemd/system/docker-user-rules.service usr/local/sbin/docker-user-rules.sh \
+         etc/systemd/system/nvidia-persistenced.service.d/ etc/ufw/user.rules etc/ufw/user6.rules \
+         etc/fstab home/${BACKEND_SSH_USER}/.hermes/config.yaml; do
+  grep -qxF "$p" <<<"$list" || fail "config tarball missing $p"
+done
+nk=$(grep -c '^srv/gateway/keys/.' <<<"$list" || true)
+# Every path recorded in the snapshot manifest must be in the tarball.
+while read -r mp; do
+  m=${mp#/}; grep -qxF "$m" <<<"$list" || grep -qxF "$m/" <<<"$list" || fail "config tarball missing $m (listed in manifest)"
+done < <(sed -n '/^## config paths/,/^$/p' "$SNAP/manifest.txt" | grep '^/')
+# /srv dirs that appeared after the snapshot are picked up by the next run: warn only.
+for d in /srv/*/; do grep -qxF "${d#/}" <<<"$list" || say "WARN: ${d} exists now but is newer than this snapshot"; done
+say "config tarball: $(wc -l <<<"$list") entries, gateway keys=$nk"
+[[ $nk -ge 13 ]] && pass "config tarball has expected paths (+$nk key files)" || fail "gateway keys count $nk"
+
+if [[ $FAIL -eq 0 ]]; then say "ALL CHECKS PASSED"; else say "SOME CHECKS FAILED"; exit 1; fi

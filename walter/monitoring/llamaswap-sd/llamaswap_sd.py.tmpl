@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""llama-swap -> Prometheus file_sd + textfile exporter (stdlib only).
+
+Every INTERVAL seconds:
+  * GET {LLAMA_SWAP}/running   (Bearer key from KEY_FILE)
+  * GET {LLAMA_SWAP}/v1/models (to know every configured model, not just loaded ones)
+  * write SD_FILE: one target per *ready* model = its llama-server on 127.0.0.1:<port>
+    (taken from the "proxy" field), labels model/model_name. Prometheus (host network)
+    scrapes llama-server /metrics there directly, so a stale target can never make
+    llama-swap load a model (unlike /upstream/<model>/metrics, which triggers a swap).
+  * write TEXTFILE (node-exporter textfile collector):
+      llamaswap_model_loaded{model,model_name}       1 if ready, 0 otherwise (all configured models)
+      llamaswap_model_state{model,state}             1 for each running model's current state
+      llamaswap_sd_last_success_timestamp_seconds    heartbeat
+      llamaswap_sd_up                                1 if the last poll succeeded
+Files are written atomically (tmp + rename).
+"""
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+LLAMA_SWAP = os.environ.get("LLAMA_SWAP_URL", "http://${BACKEND_WG_IP}:8080")
+KEY_FILE = os.environ.get("KEY_FILE", "/run/secrets/llama-swap-api-key")
+SD_FILE = os.environ.get("SD_FILE", "/out/sd/llama-server.json")
+TEXTFILE = os.environ.get("TEXTFILE", "/out/textfile/llamaswap.prom")
+INTERVAL = float(os.environ.get("INTERVAL", "15"))
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%dT%H:%M:%S"), msg, flush=True)
+
+
+def get(path, key):
+    req = urllib.request.Request(LLAMA_SWAP + path, headers={"Authorization": "Bearer " + key})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
+def atomic_write(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(data)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def esc(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def poll(key):
+    running = get("/running", key).get("running", [])
+    models = get("/v1/models", key).get("data", [])
+    configured = {}
+    for m in models:
+        meta = (m.get("meta") or {}).get("llamaswap") or {}
+        if meta.get("type", "model") == "model":
+            configured[m["id"]] = m.get("name") or m["id"]
+
+    targets, state_lines, ready = [], [], set()
+    for r in running:
+        model, state = r.get("model"), r.get("state", "unknown")
+        if not model:
+            continue
+        configured.setdefault(model, r.get("name") or model)
+        state_lines.append('llamaswap_model_state{model="%s",state="%s"} 1' % (esc(model), esc(state)))
+        u = urllib.parse.urlparse(r.get("proxy") or "")
+        if state == "ready" and u.hostname and u.port:
+            ready.add(model)
+            targets.append({
+                "targets": ["%s:%d" % (u.hostname, u.port)],
+                "labels": {"model": model, "model_name": configured[model]},
+            })
+    return targets, state_lines, configured, ready
+
+
+def main():
+    log("llamaswap-sd starting: %s every %ss" % (LLAMA_SWAP, INTERVAL))
+    last_ok = 0.0
+    while True:
+        ok = 0
+        try:
+            with open(KEY_FILE) as f:
+                key = f.read().strip()
+            targets, state_lines, configured, ready = poll(key)
+            atomic_write(SD_FILE, json.dumps(targets, indent=1) + "\n")
+            last_ok, ok = time.time(), 1
+        except Exception as e:  # keep the previous SD file; Prometheus keeps last good targets
+            log("poll failed: %s" % e)
+            state_lines, configured, ready = [], {}, set()
+        lines = [
+            "# HELP llamaswap_model_loaded 1 if the llama-swap model is loaded and ready.",
+            "# TYPE llamaswap_model_loaded gauge",
+        ]
+        lines += ['llamaswap_model_loaded{model="%s",model_name="%s"} %d' % (esc(m), esc(n), m in ready)
+                  for m, n in sorted(configured.items())]
+        lines += ["# HELP llamaswap_model_state Current llama-swap process state of running models.",
+                  "# TYPE llamaswap_model_state gauge"] + state_lines
+        lines += ["# HELP llamaswap_sd_up 1 if the last llama-swap poll succeeded.",
+                  "# TYPE llamaswap_sd_up gauge", "llamaswap_sd_up %d" % ok,
+                  "# HELP llamaswap_sd_last_success_timestamp_seconds Unix time of the last successful poll.",
+                  "# TYPE llamaswap_sd_last_success_timestamp_seconds gauge",
+                  "llamaswap_sd_last_success_timestamp_seconds %f" % last_ok]
+        try:
+            atomic_write(TEXTFILE, "\n".join(lines) + "\n")
+        except Exception as e:
+            log("textfile write failed: %s" % e)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

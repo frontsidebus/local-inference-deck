@@ -1,0 +1,67 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "spark/coder",
+  "small_model": "spark/coder-fast",
+  "enabled_providers": ["spark"],
+  "share": "disabled",
+  "autoupdate": false,
+  "provider": {
+    "spark": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Spark gateway (${SPARK_API_HOST})",
+      "options": {
+        "baseURL": "https://${SPARK_API_HOST}/v1",
+        "apiKey": "{file:${SPARK_KEY_DIR_TILDE}/opencode.key}"
+      },
+      "models": {
+        "coder": {
+          "name": "coder (Qwen3.8-27B, reasoning)",
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "attachment": false,
+          "temperature": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 131072, "output": 32768 }
+        },
+        "coder-fast": {
+          "name": "coder-fast (Qwen3.6-35B-A3B, reasoning)",
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "attachment": false,
+          "temperature": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 131072, "output": 32768 }
+        },
+        "big": {
+          "name": "big (Qwen3-Coder-Next)",
+          "tool_call": true,
+          "reasoning": false,
+          "attachment": false,
+          "temperature": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 131072, "output": 32768 }
+        },
+        "vision": {
+          "name": "vision (Gemma 4 31B, image input)",
+          "tool_call": true,
+          "reasoning": false,
+          "attachment": true,
+          "temperature": true,
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "limit": { "context": 131072, "output": 32768 }
+        },
+        "hermes": {
+          "name": "hermes (64K)",
+          "tool_call": true,
+          "reasoning": false,
+          "attachment": false,
+          "temperature": true,
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 65536, "output": 16384 }
+        }
+      }
+    }
+  }
+}

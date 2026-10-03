@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Generates provisioning/dashboards/json/spark-overview.json. Re-run after editing; Grafana reloads within 60 s."""
+import json
+import os
+
+DS = {"type": "prometheus", "uid": "prometheus"}
+panels = []
+_id = [0]
+y = [0]
+
+
+def nid():
+    _id[0] += 1
+    return _id[0]
+
+
+def row(title):
+    panels.append({"type": "row", "title": title, "id": nid(), "collapsed": False,
+                   "gridPos": {"h": 1, "w": 24, "x": 0, "y": y[0]}, "panels": []})
+    y[0] += 1
+
+
+def tgt(expr, legend="", instant=False, ref="A", fmt=None):
+    t = {"datasource": DS, "expr": expr, "legendFormat": legend, "refId": ref,
+         "range": not instant, "instant": instant}
+    if fmt:
+        t["format"] = fmt
+    return t
+
+
+def panel(kind, title, targets, x, w, h, unit=None, desc=None, **opts):
+    p = {"type": kind, "title": title, "id": nid(), "datasource": DS,
+         "gridPos": {"h": h, "w": w, "x": x, "y": y[0]},
+         "targets": targets if isinstance(targets, list) else [targets],
+         "fieldConfig": {"defaults": {}, "overrides": []}, "options": {}}
+    if unit:
+        p["fieldConfig"]["defaults"]["unit"] = unit
+    if desc:
+        p["description"] = desc
+    for k, v in opts.items():
+        if k == "defaults":
+            p["fieldConfig"]["defaults"].update(v)
+        elif k == "overrides":
+            p["fieldConfig"]["overrides"] = v
+        else:
+            p["options"].update(v) if k == "options" else p.__setitem__(k, v)
+    panels.append(p)
+    return p
+
+
+def ts(title, targets, x, w, h=8, unit=None, desc=None, stack=False, **kw):
+    d = {"custom": {"lineWidth": 1, "fillOpacity": 10, "showPoints": "never",
+                    "stacking": {"mode": "normal" if stack else "none"}}}
+    d.update(kw.pop("defaults", {}))
+    return panel("timeseries", title, targets, x, w, h, unit, desc, defaults=d,
+                 options={"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]},
+                          "tooltip": {"mode": "multi", "sort": "desc"}}, **kw)
+
+
+def thresholds(*steps):
+    return {"mode": "absolute", "steps": [{"color": c, "value": v} for v, c in steps]}
+
+
+UPDOWN = [{"type": "value", "options": {"0": {"text": "DOWN", "color": "red"},
+                                         "1": {"text": "UP", "color": "green"}}}]
+LOADED = [{"type": "value", "options": {"0": {"text": "unloaded", "color": "text"},
+                                         "1": {"text": "LOADED", "color": "green"}}}]
+
+# ---------------------------------------------------------------- status
+row("Status")
+panel("stat", "llama-swap models", tgt('max by (model) (llamaswap_model_loaded)', "{{model}}", instant=True),
+      0, 9, 6, desc="From llama-swap /running via the llamaswap-sd sidecar (node-exporter textfile).",
+      defaults={"mappings": LOADED, "color": {"mode": "thresholds"},
+                "thresholds": thresholds((None, "text"), (1, "green"))},
+      options={"colorMode": "background", "graphMode": "none", "textMode": "value_and_name",
+               "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "values": False}})
+panel("stat", "Endpoint probes", tgt('probe_success', "{{instance}}", instant=True), 9, 9, 6,
+      desc="blackbox_exporter HTTP probes (public via Covenant, internal on ${BACKEND_WG_IP}). api/v1/models expects 401.",
+      defaults={"mappings": UPDOWN, "color": {"mode": "thresholds"},
+                "thresholds": thresholds((None, "red"), (1, "green"))},
+      options={"colorMode": "background", "graphMode": "none", "textMode": "value_and_name",
+               "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "values": False}})
+panel("stat", "TLS cert expiry", tgt('(probe_ssl_earliest_cert_expiry - time()) / 86400', "{{instance}}", instant=True),
+      18, 3, 6, unit="d", desc="Days until the earliest cert in the chain expires (public probes).",
+      defaults={"decimals": 0, "color": {"mode": "thresholds"},
+                "thresholds": thresholds((None, "red"), (14, "orange"), (30, "green"))},
+      options={"colorMode": "value", "graphMode": "none", "textMode": "value_and_name",
+               "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "values": False}})
+panel("stat", "Alerts firing", tgt('count(ALERTS{alertstate="firing"}) or vector(0)', "", instant=True),
+      21, 3, 3, desc="Prometheus alert rules currently firing (see Prometheus /alerts).",
+      defaults={"color": {"mode": "thresholds"}, "thresholds": thresholds((None, "green"), (1, "red"))},
+      options={"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"]}})
+panel("stat", "Targets down", tgt('count(up == 0) or vector(0)', "", instant=True), 21, 3, 3,
+      desc="Scrape targets with up == 0 (litellm is expected down until its metrics change is applied).",
+      defaults={"color": {"mode": "thresholds"}, "thresholds": thresholds((None, "green"), (1, "orange"))},
+      options={"colorMode": "background", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"]}})
+panels[-1]["gridPos"]["y"] += 3
+y[0] += 6
+
+panel("state-timeline", "Loaded models over time", tgt('max by (model) (llamaswap_model_loaded)', "{{model}}"),
+      0, 24, 6, defaults={"mappings": LOADED, "color": {"mode": "thresholds"},
+                          "thresholds": thresholds((None, "transparent"), (1, "green"))},
+      options={"showValue": "never", "mergeValues": True, "rowHeight": 0.8, "legend": {"showLegend": False}})
+y[0] += 6
+
+# ---------------------------------------------------------------- GPU
+row("GPUs (dcgm-exporter)")
+ts("GPU utilization", tgt('DCGM_FI_DEV_GPU_UTIL', "GPU{{gpu}} {{modelName}}"), 0, 8, unit="percent",
+   defaults={"min": 0, "max": 100})
+ts("VRAM used %", tgt('100 * DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE + DCGM_FI_DEV_FB_RESERVED)',
+                      "GPU{{gpu}}"), 8, 8, unit="percent",
+   defaults={"min": 0, "max": 100, "thresholds": thresholds((None, "green"), (98, "red")),
+             "custom": {"lineWidth": 1, "fillOpacity": 10, "showPoints": "never",
+                        "thresholdsStyle": {"mode": "line"}}})
+ts("VRAM used", tgt('DCGM_FI_DEV_FB_USED * 1024 * 1024', "GPU{{gpu}}"), 16, 8, unit="bytes", defaults={"min": 0})
+y[0] += 8
+ts("GPU temperature", tgt('DCGM_FI_DEV_GPU_TEMP', "GPU{{gpu}}"), 0, 8, unit="celsius",
+   desc="Core temperature. VRAM (GDDR6X) temperature is not exposed via NVML on GeForce (DCGM/llama-swap report 0).", defaults={"thresholds": thresholds((None, "green"), (85, "red")),
+                                   "custom": {"lineWidth": 1, "fillOpacity": 0, "showPoints": "never",
+                                              "thresholdsStyle": {"mode": "line"}}})
+ts("Power draw", tgt('DCGM_FI_DEV_POWER_USAGE', "GPU{{gpu}}"), 8, 8, unit="watt", defaults={"min": 0})
+ts("SM clock / fan", [tgt('DCGM_FI_DEV_SM_CLOCK', "GPU{{gpu}} SM MHz"),
+                      tgt('llamaswap_gpu_fan_speed_percent', "GPU{{gpu}} fan %", ref="B")], 16, 8,
+   desc="SM clock from DCGM; fan % from llama-swap's own /metrics (DCGM doesn't report fan on GeForce).")
+y[0] += 8
+
+# ---------------------------------------------------------------- llama-server
+row("llama-server (loaded models)")
+ts("Generation tokens/s", tgt('rate(llamacpp:tokens_predicted_total[1m])', "{{model}}"), 0, 8, unit="none",
+   desc="Generated tokens per second across all requests (rate of llamacpp:tokens_predicted_total).")
+ts("Prompt tokens/s (uncached)", tgt('rate(llamacpp:prompt_tokens_total[1m])', "{{model}}"), 8, 8, unit="none")
+ts("Avg throughput per request", [tgt('llamacpp:predicted_tokens_seconds', "{{model}} gen"),
+                                  tgt('llamacpp:prompt_tokens_seconds', "{{model}} prompt", ref="B")], 16, 8,
+   unit="none", desc="llama-server's own average tokens/s for generation and prompt processing.")
+y[0] += 8
+ts("Requests in flight / deferred", [tgt('llamacpp:requests_processing', "{{model}} processing"),
+                                     tgt('llamacpp:requests_deferred', "{{model}} deferred", ref="B")], 0, 8)
+ts("Decode calls/s", tgt('rate(llamacpp:n_decode_total[1m])', "{{model}}"), 8, 8,
+   desc="Approximates request activity: llama_decode() calls per second.")
+ts("Prompt cache reuse", tgt('rate(llamacpp:prompt_tokens_cached_total[5m]) / (rate(llamacpp:prompt_tokens_cached_total[5m]) + rate(llamacpp:prompt_tokens_total[5m]))',
+                             "{{model}}"), 16, 8, unit="percentunit", defaults={"min": 0, "max": 1})
+y[0] += 8
+
+# ---------------------------------------------------------------- host
+row("Host (node-exporter)")
+ts("CPU", tgt('100 * (1 - avg(rate(node_cpu_seconds_total{job="node",mode="idle"}[1m])))', "CPU busy"), 0, 6,
+   unit="percent", defaults={"min": 0, "max": 100})
+ts("Memory", [tgt('node_memory_MemTotal_bytes{job="node"} - node_memory_MemAvailable_bytes{job="node"}', "used"),
+              tgt('node_memory_MemTotal_bytes{job="node"}', "total", ref="B")], 6, 6, unit="bytes")
+panel("bargauge", "Disk usage",
+      tgt('100 * (1 - node_filesystem_avail_bytes{job="node",mountpoint=~"/|${MODELS_DIR}"} / node_filesystem_size_bytes{job="node",mountpoint=~"/|${MODELS_DIR}"})',
+          "{{mountpoint}}", instant=True), 12, 6, 8, unit="percent",
+      defaults={"min": 0, "max": 100, "thresholds": thresholds((None, "green"), (75, "orange"), (85, "red"))},
+      options={"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"]}})
+ts("Disk I/O", [tgt('sum by (device) (rate(node_disk_read_bytes_total{job="node",device=~"vd.*"}[1m]))', "{{device}} read"),
+                tgt('-sum by (device) (rate(node_disk_written_bytes_total{job="node",device=~"vd.*"}[1m]))', "{{device}} write", ref="B")],
+   18, 6, unit="Bps", desc="vda = / , vdb = ${MODELS_DIR} (990 PRO)")
+y[0] += 8
+
+# ---------------------------------------------------------------- containers
+row("Containers (cAdvisor)")
+ts("Container memory (working set)", tgt('container_memory_working_set_bytes{job="cadvisor",name!=""}', "{{name}}"),
+   0, 12, h=9, unit="bytes")
+ts("Container CPU", tgt('rate(container_cpu_usage_seconds_total{job="cadvisor",name!=""}[1m])', "{{name}}"),
+   12, 12, h=9, unit="cores")
+y[0] += 9
+
+# ---------------------------------------------------------------- probes
+row("Probes (blackbox)")
+ts("Probe duration", tgt('probe_duration_seconds', "{{instance}}"), 0, 12, unit="s")
+panel("table", "Probe details", [
+    tgt('probe_http_status_code', "", instant=True, ref="A", fmt="table"),
+    tgt('(probe_ssl_earliest_cert_expiry - time()) / 86400', "", instant=True, ref="B", fmt="table"),
+], 12, 12, 8,
+    options={"showHeader": True},
+    transformations=[{"id": "merge", "options": {}},
+                     {"id": "organize", "options": {"excludeByName": {"Time": True, "__name__": True, "host": True},
+                                                    "renameByName": {"Value #A": "HTTP status", "Value #B": "cert days left"}}}])
+y[0] += 8
+
+dash = {
+    "uid": "spark-overview", "title": "Spark overview", "tags": ["spark", "walter"],
+    "timezone": "browser", "schemaVersion": 41, "version": 1, "editable": True,
+    "refresh": "30s", "time": {"from": "now-6h", "to": "now"}, "graphTooltip": 1,
+    "panels": panels, "templating": {"list": []}, "annotations": {"list": []},
+    "links": [{"title": "Node Exporter Full", "url": "/d/rYdddlPWk", "type": "link"},
+              {"title": "NVIDIA DCGM", "url": "/d/Oxed_c6Wz", "type": "link"}],
+}
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "provisioning/dashboards/json/spark-overview.json")
+json.dump(dash, open(out, "w"), indent=1)
+print("wrote", out, len(panels), "panels")
