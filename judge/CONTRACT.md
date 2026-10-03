@@ -101,7 +101,21 @@ snapshot changes (paths only, at most 200; `detail.changed_by_others_total` when
 (rules in `lib/config.py`: hermes config/skills/memories/plans, ~/.ssh/config, the deck repo, /etc, /srv).
 A request without paths is `infra` only when the session cwd is infra (`classify([], cfg, cwd)`), or when it is a
 `gate` request whose `detail.rules` are all host rules (`lib/config.HOST_RULES`: `remote-mutation`,
-`remote-opaque`, `remote-copy`; shared by `hooks/gate.py` and the collector).
+`remote-opaque`, `remote-copy`; shared by `hooks/gate.py` and the collector), or when it is a C6 watcher
+request (see below).
+
+### C6 watcher requests (`watch/runaway.py`)
+The watcher polls llama-server `/slots` (probe `slots`) and alerts once per `(model, slot, id_task)` when a
+processing slot has `n_decoded >= JUDGE_RUNAWAY_TOKENS` (default 24000, **whatever `n_predict` is**; with the
+output cap every slot has `n_predict > 0` and the alert shows `n_decoded/n_predict` progress; `n_predict = -1`
+means the cap was lost or bypassed and the reason says so) or has run the same task for
+`>= JUDGE_RUNAWAY_MINUTES` (default 10). An alert appends to `watch.log`, prints the unload command for a
+human, and writes a request `kind=runaway`, `source_event=watch`, `session=watch-task<id_task>`,
+`changed_paths=[]`, no `detail.cwd`, `data_class=infra`, `claims` = the alert text, `detail` = the slot fields.
+It never cancels or unloads anything. That request carries slot telemetry only, no agent content, so the
+collector keeps its `infra` label (`collect._watch_runaway`: all of those fields must match; any path still
+forces re-classification) and it goes to the frontier judge, not `coder-fast`, which may be the very model
+that is running away. Its `hermes-log.txt` omits untagged lines (they belong to other sessions).
 
 ### Attribution (agent vs others)
 Snapshot diffs show every change to a watched path, whoever made it. A changed path is the agent's when
@@ -194,7 +208,7 @@ in an `infra` bundle); `{}` when nothing is withheld.
 | File | Content | Time |
 |---|---|---|
 | `manifest.json` | request copy, `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, changed_by_others, omitted_after_window, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`) | — |
-| `hermes-log.txt` | agent.log/errors.log lines of this session (plus untagged lines) in the window, secrets redacted | window |
+| `hermes-log.txt` | agent.log/errors.log lines of this session (plus untagged lines, except for a C6 watcher request) in the window, secrets redacted | window |
 | `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires for every call; Hermes reports a denied or timed-out approval as `status="blocked"`, interrupted calls as `cancelled`/`aborted`) matches the decision by `tool_call_id`, else by tool + `call_hash`, and its status is not in `NOT_RUN_STATUSES` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
 | `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (session tool events up to the window end; request `changed_paths` only with a backing event, see Attribution). Content only when `data_class=infra`; otherwise `# content withheld` lines (see above). A file modified after the window gets a `# NOTE:` line; a truncated or missing opted-in dir gets a `# NOTE: opted-in dir ...` header line | point in time (current content) |
 | `others-changed.txt` | snapshot changes **not** made by the agent: `<status> <path> \| +N -M` lines, never content. In an `infra` bundle, non-infra paths are withheld (count only). Changes made after the window (by anyone) are omitted (count only) | point in time |
@@ -206,7 +220,7 @@ in an `infra` bundle); `{}` when nothing is withheld.
 | `probes/judge-<probe>-<n>.txt` | probes the judge requested, saved by the runner | point in time |
 
 `data_class` of the bundle: the stricter of the request's class and the collector's own classification of the
-agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request keeps the hook's class; any other
+agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request or a C6 watcher request (shape above) keeps its own class; any other
 request is classified with `classify([], cfg, cwd)`, so an `infra` label on a path-less request (forged or
 buggy) comes out `sensitive` unless the cwd is infra. For `data_class=sensitive`: diffs replaced by
 `# content withheld` stat lines; no file contents.
@@ -376,7 +390,7 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 ## site.env variables (add to site.env.example under `# --- judge`)
 `JUDGE_MODE=frontier` (frontier|local), `JUDGE_LOCAL_MODEL=big`, `JUDGE_FRONTIER_CMD=claude`,
 `JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
-`EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=20000`, `JUDGE_RUNAWAY_MINUTES=10`,
+`EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
 `JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
 `JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`.
 Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).

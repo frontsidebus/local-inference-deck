@@ -24,7 +24,7 @@ def test_parse_env_file(env):
 def test_load_config_defaults_and_paths(env, monkeypatch):
     cfg = config.load_config()
     assert cfg["JUDGE_MODE"] == "frontier"
-    assert cfg["JUDGE_RUNAWAY_TOKENS"] == "20000"
+    assert cfg["JUDGE_RUNAWAY_TOKENS"] == "24000"
     assert cfg["HERMES_HOME"] == str(env["hermes"])
     assert cfg["JUDGE_REVIEW_DIR"] == str(env["review"])
     assert cfg["SITE_ENV"] == str(env["site"])

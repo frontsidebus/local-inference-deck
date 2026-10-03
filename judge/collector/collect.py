@@ -170,15 +170,19 @@ def window(req: Dict, cfg: Mapping[str, str], root: Optional[Path] = None) -> Tu
 # ---------------------------------------------------------------- pieces
 def hermes_log(req: Dict, cfg: Mapping[str, str], since: datetime, until: datetime) -> str:
     tz = hermeslog.log_tz(cfg)
-    out = [f"# Hermes log lines for session {req['session']} (plus untagged lines), "
-           f"window {q.utc_now_iso(since)} .. {q.utc_now_iso(until)} UTC; log tz {tz}; secrets redacted"]
+    # a C6 watcher request belongs to no Hermes session: untagged lines would only add unrelated (possibly
+    # agent-content) context to a bundle that may go to the frontier judge
+    untagged = not _watch_runaway(req)
+    out = [f"# Hermes log lines for session {req['session']}"
+           + (" (plus untagged lines)" if untagged else " (untagged lines omitted: C6 watcher request)")
+           + f", window {q.utc_now_iso(since)} .. {q.utc_now_iso(until)} UTC; log tz {tz}; secrets redacted"]
     for name in ("agent.log", "errors.log"):
         p = Path(cfg["HERMES_HOME"]) / "logs" / name
         out.append(f"\n===== {name} =====")
         if not p.is_file():
             out.append("(missing)")
             continue
-        lines = hermeslog.session_lines(p, req["session"], since, until, tz)
+        lines = hermeslog.session_lines(p, req["session"], since, until, tz, include_untagged=untagged)
         if len(lines) > LOG_MAX_LINES:
             out.append(f"# {len(lines) - LOG_MAX_LINES} earlier lines omitted (showing the last {LOG_MAX_LINES})")
             lines = lines[-LOG_MAX_LINES:]
@@ -548,13 +552,28 @@ def _host_rule_gate(req: Dict) -> bool:
             and all(isinstance(r, str) for r in rules) and set(rules) <= config.HOST_RULES)
 
 
+WATCH_SESSION_RE = re.compile(r"^watch-task-?\d+$")  # session name the C6 watcher gives its requests
+
+
+def _watch_runaway(req: Dict) -> bool:
+    """A C6 runaway request as watch/runaway.py writes it: slot telemetry only (no agent content, no paths).
+    Shape-checked (kind, source_event, session name, no changed_paths, no cwd) so a request merely labelled
+    `runaway` does not qualify."""
+    detail = req.get("detail") if isinstance(req.get("detail"), dict) else {}
+    return (req.get("kind") == "runaway" and req.get("source_event") == "watch"
+            and isinstance(req.get("session"), str) and bool(WATCH_SESSION_RE.match(req["session"]))
+            and not req.get("changed_paths") and not detail.get("cwd"))
+
+
 def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
     """The stricter of the request's own data_class and the collector's independent classification of the
     agent-attributed paths (request changed_paths + *agent_paths*, Hermes bookkeeping noise excluded).
     Request paths rejected by attribution still count here: they can only make the bundle stricter.
 
     With no paths, only a host-rule gate request keeps the hook's answer (its evidence is the redacted
-    command). Any other path-less request is classified from the session cwd (classify([], cfg, cwd)), so
+    command), and a C6 watcher runaway request keeps its own (slot telemetry, no agent content: it should
+    reach the frontier judge, not `coder-fast`, which may be the very model that is running away). Any
+    other path-less request is classified from the session cwd (classify([], cfg, cwd)), so
     an `infra` label alone never lets a request reach the frontier judge."""
     cwd = (req.get("detail") or {}).get("cwd") or None
     noise = snapshot.noise_globs(cfg)
@@ -562,7 +581,7 @@ def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
                    if isinstance(p, str) and p.strip() and not snapshot.is_noise(p, noise))
     if paths:
         mine = config.classify(paths, cfg, cwd)
-    elif _host_rule_gate(req):
+    elif _host_rule_gate(req) or _watch_runaway(req):
         mine = req.get("data_class")
     else:
         mine = config.classify([], cfg, cwd)

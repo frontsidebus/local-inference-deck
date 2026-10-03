@@ -438,6 +438,73 @@ def test_host_rule_gate_request_is_still_infra(env):
     assert json.loads((ev / "manifest.json").read_text())["data_class"] == "infra"
 
 
+
+# --- C6 watcher runaway requests: slot telemetry only -> keep `infra` so the frontier judge reviews them
+# (the local judge, coder-fast, may be the very model that is running away) ---
+
+def watch_req(**over):
+    req = {"kind": "runaway", "session": "watch-task4711", "source_event": "watch", "changed_paths": [],
+           "data_class": "infra", "claims": "RUNAWAY m slot 0 task 4711: n_decoded=25000 >= 24000",
+           "detail": {"model": "m", "slot": 0, "id_task": 4711, "n_decoded": 25000, "n_predict": 32768}}
+    req.update(over)
+    return req
+
+
+def test_watch_runaway_request_is_infra(env):
+    assert collect.effective_class(watch_req(), config.load_config()) == "infra"
+    assert collect.effective_class(watch_req(session="watch-task-1"), config.load_config()) == "infra"
+
+
+@pytest.mark.parametrize("over", [
+    {"data_class": "sensitive"},                                  # never relaxes a sensitive label
+    {"source_event": "on_session_end"},                          # not from the watcher
+    {"kind": "completion"},
+    {"session": SESSION},                                        # a Hermes session, not watch-task<N>
+    {"session": "watch-taskX"},
+    {"changed_paths": ["/home/x/company/app.py"]},               # paths are always re-classified
+    {"detail": {"cwd": "/home/x/company"}},                      # a cwd means agent context
+])
+def test_watch_runaway_shape_is_narrow(env, over):
+    assert collect.effective_class(watch_req(**over), config.load_config()) == "sensitive"
+
+
+def test_watch_runaway_agent_paths_still_rechecked(env):
+    assert collect.effective_class(watch_req(), config.load_config(), ["/home/x/company/app.py"]) == "sensitive"
+
+
+def test_watcher_request_bundle_is_infra_without_untagged_log(env, monkeypatch):
+    """End to end: the request the real watcher writes is collected as an infra bundle (-> frontier judge)
+    and its Hermes log carries no untagged lines (agent context of other sessions)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("judge_runaway_e2e", JUDGE_DIR / "watch" / "runaway.py")
+    w = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(w)
+    now = T0 + timedelta(minutes=12)
+    write_log(env, [(T0 + timedelta(minutes=5), "WARNING agent.message_sanitization: untagged secret-ish text"),
+                    (T0 + timedelta(minutes=6), f"INFO [{SESSION}] agent.conversation_loop: other session")])
+    slots = {"coder-fast": [{"id": 0, "id_task": 4711, "is_processing": True, "n_ctx": 131072,
+                             "params": {"n_predict": 32768},
+                             "next_token": [{"has_next_token": True, "n_decoded": 25000}]}]}
+    out = io.StringIO()
+    assert len(w.run_once(slots, out, now=now.timestamp())) == 1 and "could not write" not in out.getvalue()
+    [req] = [r for r in q.list_pending() if r["kind"] == "runaway"]
+    assert req["data_class"] == "infra" and req["source_event"] == "watch"
+    ev = collect.collect(req["id"], runner=runner(), now=now + timedelta(minutes=1))
+    man = json.loads((ev / "manifest.json").read_text())
+    assert man["data_class"] == "infra"
+    log = (ev / "hermes-log.txt").read_text()
+    assert "untagged lines omitted" in log and "secret-ish" not in log and "other session" not in log
+    sys.path.insert(0, str(JUDGE_DIR / "runner"))
+    import run_judge
+    assert run_judge.bundle_data_class(req, man) == "infra"
+
+
+def test_hermes_session_bundle_keeps_untagged_lines(env):
+    write_log(env, [(T0 + timedelta(minutes=1), "WARNING agent.message_sanitization: untagged note")])
+    req = {"session": SESSION, "kind": "completion", "source_event": "on_session_end"}
+    text = collect.hermes_log(req, config.load_config(), T0, T0 + timedelta(minutes=5))
+    assert "untagged note" in text and "(plus untagged lines)" in text
+
 # --- calls that never ran (Hermes emits post_tool_call with status="blocked" for a denied/timed-out
 # approval, "cancelled"/"aborted" for interrupted calls) must not count as the agent touching a file ---
 

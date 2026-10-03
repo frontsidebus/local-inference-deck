@@ -56,7 +56,7 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_SSH_ALIASES": "",               # ssh aliases that reach the edge (space-separated)
     "EDGE_SSH_USER": "ubuntu",
     "EDGE_SSH_KEY": "~/.ssh/edge.pem",
-    "JUDGE_RUNAWAY_TOKENS": "20000",
+    "JUDGE_RUNAWAY_TOKENS": "24000",        # C6: n_decoded threshold, any n_predict (README)
     "JUDGE_RUNAWAY_MINUTES": "10",
     "JUDGE_PROBE_TIMEOUT": "20",           # seconds, per probe
     "JUDGE_SSH_CONNECT_TIMEOUT": "8",       # seconds, ssh ConnectTimeout
