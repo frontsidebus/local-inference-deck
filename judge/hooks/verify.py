@@ -833,7 +833,23 @@ def verify(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Result, Dict[str, A
     return out, res, ctx
 
 
-def since_for(paths: List[str], now: datetime) -> str:
+def session_started(session: str) -> Optional[datetime]:
+    """`started` from the session-start snapshot's meta.json (lib/snapshot.py), or None."""
+    base = snapshot_dir(session)
+    if base is None:
+        return None
+    try:
+        meta = json.loads((base / "meta.json").read_text(encoding="utf-8"))
+        return datetime.strptime(str(meta.get("started") or ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def since_for(paths: List[str], now: datetime, session_start: Optional[datetime] = None) -> str:
+    """Start of a completion request's evidence window: earliest mtime of the changed paths - 5 min (no paths
+    readable: now - 1 h), never more than 24 h back, and clamped to the session start when it is known
+    (bug #20: the 5-minute margin used to reach into earlier sessions). A late snapshot (`started` after the
+    earliest edit) never cuts off an edit: the clamp is then the edit's own mtime."""
     mtimes = []
     for p in paths:
         try:
@@ -841,10 +857,15 @@ def since_for(paths: List[str], now: datetime) -> str:
         except OSError:
             pass
     if mtimes:
-        start = datetime.fromtimestamp(min(mtimes), timezone.utc) - timedelta(minutes=5)
+        first = datetime.fromtimestamp(min(mtimes), timezone.utc)
+        start = first - timedelta(minutes=5)
         start = max(start, now - timedelta(hours=24))
+        if session_start is not None:
+            start = max(start, min(session_start, first.replace(microsecond=0)))
     else:
         start = now - timedelta(hours=1)
+        if session_start is not None:
+            start = max(start, min(session_start, now))
     return _utc_iso(start)
 
 
@@ -857,7 +878,7 @@ def enqueue(res: Result, ctx: Dict[str, Any]) -> Optional[str]:
         "kind": "completion",
         "session": session,
         "created": _utc_iso(now),
-        "since": since_for(ctx["paths"], now),
+        "since": since_for(ctx["paths"], now, session_started(session)),
         "changed_paths": ctx["paths"],
         "claims": ctx["final_response"][:MAX_CLAIMS],
         "plan": None,

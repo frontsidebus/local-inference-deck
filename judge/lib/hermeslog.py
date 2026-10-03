@@ -9,6 +9,10 @@ are continuations of the previous line.
 
     log_tz(cfg) -> tzinfo
     session_lines(path, session, since_utc, until_utc, tz, include_untagged=True, max_bytes=...) -> list[str]
+    split_lines(path, session, since_utc, until_utc, tz, noise=...) -> (tagged, context, dropped_counts)
+                                                                        session lines / untagged context /
+                                                                        untagged noise dropped per logger
+    is_noise(logger, msg, extra_loggers=()) -> bool                       untagged startup/housekeeping noise
     tool_activity(path, session, since_utc, until_utc, tz) -> int        tool_executor lines for the session
     tools_used(path, session, since_utc, until_utc, tz) -> set[str]     tool names in those lines
     last_assistant_message(hermes_home, session) -> str | None            from state.db (opened read-only)
@@ -85,6 +89,76 @@ def session_lines(path, session: str, since: datetime, until: datetime, tz: tzin
         if keep:
             out.append(line)
     return out
+
+
+# Untagged lines that are startup / housekeeping chatter of *any* Hermes process (the messaging gateway,
+# other one-shot sessions, this process before its session id exists). They say nothing about what a session
+# did, and in run 2 they pushed every session line out of the runner's per-file budget (bug #19). Only
+# untagged lines are ever classified: a session-tagged line is always kept.
+NOISE_LOGGERS = (
+    "hermes_cli.plugins", "hermes_cli.plugin_capabilities", "hermes_cli.mem_trim",
+    "hermes_cli.gateway_multiplex_mode", "hermes_cli.main", "tools.registry", "tools.tool_search",
+    "tools.skills_sync", "agent.shell_hooks", "agent.auxiliary_client", "agent.credential_pool",
+    "cron.*", "gateway.*", "botocore.*", "plugins.*",
+)
+NOISE_MESSAGES = (
+    re.compile(r"^state\.db: linked SQLite .* vulnerable"),            # hermes_state, every process start
+    re.compile(r"^Background MCP discovery previously exited"),        # cli, every process start
+    re.compile(r"^Loaded environment variables from "),                # run_agent, every process start
+    re.compile(r"^OpenAI client created \((?:agent_init|chat_completion_stream_request)"),  # run_agent, per client
+)
+
+
+def _logger_matches(logger: str, pattern: str) -> bool:
+    if pattern.endswith(".*"):
+        return logger == pattern[:-2] or logger.startswith(pattern[:-1])
+    return logger == pattern
+
+
+def is_noise(logger: str, msg: str, extra_loggers=()) -> bool:
+    """True for an UNTAGGED line that is process startup/housekeeping noise (NOISE_LOGGERS, NOISE_MESSAGES,
+    plus *extra_loggers*, e.g. from JUDGE_LOG_NOISE_LOGGERS). Everything else untagged (warnings such as
+    agent.message_sanitization "Unrepairable ...", untagged agent.tool_executor / tools.* / run_agent lines)
+    is context and is kept."""
+    if any(_logger_matches(logger, p) for p in tuple(NOISE_LOGGERS) + tuple(extra_loggers)):
+        return True
+    return any(rx.search(msg) for rx in NOISE_MESSAGES)
+
+
+def split_lines(path, session: str, since: datetime, until: datetime, tz: tzinfo, noise=(),
+                max_bytes: int = DEFAULT_MAX_BYTES):
+    """Lines (with continuations) in [since, until], split into
+    (tagged: lines tagged with *session*, context: untagged non-noise lines, dropped: {logger: n} of the
+    untagged noise lines left out). Lines tagged with another session are excluded entirely. *noise* adds
+    logger names (or `prefix.*`) to NOISE_LOGGERS."""
+    tagged: List[str] = []
+    context: List[str] = []
+    dropped: dict = {}
+    dest: Optional[List[str]] = None
+    for line in _read_tail(Path(path), max_bytes):
+        m = LINE_RE.match(line)
+        if not m:
+            if dest is not None:
+                dest.append(line)
+            continue
+        try:
+            ts = _parse_ts(m.group("ts"), tz)
+        except ValueError:
+            dest = None
+            continue
+        dest = None
+        if not since <= ts <= until:
+            continue
+        tag = m.group("session")
+        if tag:
+            dest = tagged if tag == session else None
+        elif is_noise(m.group("logger"), m.group("msg"), noise):
+            dropped[m.group("logger")] = dropped.get(m.group("logger"), 0) + 1
+        else:
+            dest = context
+        if dest is not None:
+            dest.append(line)
+    return tagged, context, dropped
 
 
 def tool_activity(path, session: str, since: datetime, until: datetime, tz: tzinfo) -> int:
