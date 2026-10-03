@@ -168,7 +168,7 @@ def entry(**kw):
     return kw
 
 desired = {
-    "pre_tool_call":    [entry(matcher="terminal|write_file|patch", command=cmd("gate"), timeout=10, fail_closed=True)],
+    "pre_tool_call":    [entry(matcher="terminal|write_file|patch|read_file", command=cmd("gate"), timeout=10, fail_closed=True)],
     "post_tool_call":   [entry(matcher="write_file|patch|terminal|memory|skill_manage", command=cmd("enqueue"))],
     "on_session_start": [entry(command=cmd("enqueue"))],
     "on_session_end":   [entry(command=cmd("enqueue"))],

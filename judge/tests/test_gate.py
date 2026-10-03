@@ -109,6 +109,10 @@ def P(path, old, new):
     return ("patch", {"path": path, "old_string": old, "new_string": new})
 
 
+def R(path, **kw):
+    return ("read_file", dict({"path": path}, **kw))
+
+
 def V4A(body):
     return ("patch", {"mode": "patch", "patch": "*** Begin Patch\n" + body + "\n*** End Patch"})
 
@@ -290,6 +294,91 @@ CASES = [
     ("judge-install-apply", T("bash {JUDGE}/install.sh --apply"), "block", "oversight-path"),
 ]
 
+# #14: read-only `hermes` subcommands pass; mutating forms on oversight state stay blocked; anything else under
+# config/hooks still escalates (when in doubt, escalate).
+HERMES_CLI_CASES = [
+    ("hermes-config-set-help", T("hermes config set --help 2>&1 | head -40"), "pass", None),
+    ("hermes-config-set-key-help", T("hermes config set command_allowlist -h"), "pass", None),
+    ("hermes-config-help", T("hermes config --help"), "pass", None),
+    ("hermes-hooks-revoke-help", T("hermes hooks revoke --help"), "pass", None),
+    ("hermes-config-get-allowlist", T("hermes config get command_allowlist"), "pass", None),
+    ("hermes-config-get-json", T("hermes config get --json hooks"), "pass", None),
+    ("hermes-config-bare", T("hermes config"), "pass", None),
+    ("hermes-config-show", T("hermes config show"), "pass", None),
+    ("hermes-config-path", T("hermes config path"), "pass", None),
+    ("hermes-config-env-path", T("hermes config env-path"), "pass", None),
+    ("hermes-config-check", T("hermes config check"), "pass", None),
+    ("hermes-hooks-list", T("hermes hooks list"), "pass", None),
+    ("hermes-hooks-ls", T("hermes hooks ls"), "pass", None),
+    ("hermes-hooks-doctor", T("~/.local/bin/hermes hooks doctor"), "pass", None),
+    ("hermes-hooks-help", T("hermes hooks --help"), "pass", None),
+    ("hermes-version", T("hermes --version"), "pass", None),
+    ("hermes-approvals-suggest", T("hermes approvals suggest --days 30"), "pass", None),
+    ("hermes-approvals-test", T("hermes approvals test -- rm -rf ./build"), "pass", None),
+    ("hermes-status", T("hermes status"), "pass", None),
+    # still blocked
+    ("hermes-config-set-allowlist", T("hermes config set command_allowlist '[\"ssh *\"]'"), "block",
+     "oversight-config"),
+    ("hermes-config-set-hooks", T("hermes config set hooks_auto_accept true"), "block", "oversight-config"),
+    ("hermes-config-set-security", T("hermes config set security.tirith false"), "block", "oversight-config"),
+    ("hermes-config-unset-approvals", T("hermes config unset approvals"), "block", "oversight-config"),
+    ("hermes-config-set-help-after-dashdash", T("hermes config set approvals.mode -- --help"), "block",
+     "oversight-config"),
+    ("hermes-config-edit", T("hermes config edit"), "block", "oversight-config"),
+    ("hermes-hooks-revoke", T("hermes hooks revoke '/usr/bin/python3 /opt/judge/hooks/gate.py'"), "block",
+     "oversight-config"),
+    ("hermes-hooks-rm", T("hermes hooks rm /opt/judge/hooks/gate.py"), "block", "oversight-config"),
+    ("hermes-approvals-apply", T("hermes approvals suggest --apply 1,2"), "block", "oversight-config"),
+    ("hermes-import", T("hermes import --force /tmp/backup.zip"), "block", "oversight-config"),
+    ("hermes-yolo-help", T("hermes --yolo --help"), "block", "oversight-config"),
+    # still escalated
+    ("hermes-config-set-model-2", T("hermes config set display.theme light"), "approve", "hermes-config"),
+    ("hermes-config-migrate", T("hermes config migrate"), "approve", "hermes-config"),
+    ("hermes-config-unknown", T("hermes config frobnicate"), "approve", "hermes-config"),
+    ("hermes-hooks-test", T("hermes hooks test pre_tool_call --for-tool terminal"), "approve", "hermes-config"),
+    ("hermes-migrate", T("hermes migrate xai"), "approve", "hermes-config"),
+    ("hermes-config-get-raw", T("hermes config get --raw providers"), "approve", "secret-output"),
+    ("hermes-config-get-raw-captured", T("V=$(hermes config get --raw model.default)"), "pass", None),
+]
+
+# #17: read_file is gated (matcher terminal|write_file|patch|read_file). Secret-shaped paths escalate under
+# secret-output, with the same heuristics as the terminal rule; every other read passes.
+READ_FILE_CASES = [
+    ("read-spark-key", R("~/.config/spark/hermes.key"), "approve", "secret-output"),
+    ("read-ssh-private-key", R("~/.ssh/id_ed25519"), "approve", "secret-output"),
+    ("read-ssh-private-key-sk", R("{HOME}/.ssh/id_ed25519_sk"), "approve", "secret-output"),
+    ("read-dotenv-relative", R(".env"), "approve", "secret-output"),
+    ("read-hermes-env", R("{HH}/.env", offset=1, limit=20), "approve", "secret-output"),
+    ("read-hermes-env-var", R("$HERMES_HOME/.env"), "approve", "secret-output"),
+    ("read-pem", R("/srv/certs/edge.pem"), "approve", "secret-output"),
+    ("read-llama-swap-api-key", R("/etc/llama-swap/api-key"), "approve", "secret-output"),
+    ("read-admin-password", R("/srv/secrets/admin-password"), "approve", "secret-output"),
+    ("read-wg-conf", R("/etc/wireguard/wg0.conf"), "approve", "secret-output"),
+    ("read-spark-other", R("~/.config/spark/client.toml"), "approve", "secret-output"),
+    ("read-ssh-host-key", R("/etc/ssh/ssh_host_ed25519_key"), "approve", "secret-output"),
+    ("read-ssh-public-key", R("~/.ssh/id_ed25519.pub"), "pass", None),
+    ("read-ssh-config", R("~/.ssh/config"), "pass", None),
+    ("read-readme", R("README.md"), "pass", None),
+    ("read-hermes-config", R("{HH}/config.yaml"), "pass", None),
+    ("read-hermes-config-tilde", R("~/.hermes/config.yaml", offset=40, limit=40), "pass", None),
+    ("read-sandbox-notes", R("~/work/judge-sandbox/notes.md"), "pass", None),
+    ("read-sandbox-check", R("~/work/judge-sandbox/check.sh"), "pass", None),
+    ("read-sandbox-config-sample", R("~/work/judge-sandbox/config-sample.json"), "pass", None),
+    ("read-sandbox-pristine", R("~/work/judge-sandbox/.pristine/notes.md"), "pass", None),
+    ("read-env-example", R("{PROJ}/site.env.example"), "pass", None),
+    ("read-judge-policy", R("{JUDGE}/policy/gate-policy.json.tmpl"), "pass", None),
+    ("read-gate-source", R("{JUDGE}/hooks/gate.py"), "pass", None),
+    ("read-etc-hosts", R("/etc/hosts"), "pass", None),
+]
+# the terminal secret-output rule now shares the path heuristics
+SECRET_PATH_TERMINAL_CASES = [
+    ("cat-spark-client", T("cat ~/.config/spark/client.toml"), "approve", "secret-output"),
+    ("cat-ssh-id-sk", T("cat ~/.ssh/id_ed25519_sk"), "approve", "secret-output"),
+    ("cat-ssh-pub", T("cat ~/.ssh/id_ed25519.pub"), "pass", None),
+    ("spark-key-into-var", T("K=$(cat ~/.config/spark/hermes.key)"), "pass", None),
+]
+CASES += HERMES_CLI_CASES + READ_FILE_CASES + SECRET_PATH_TERMINAL_CASES
+
 
 @pytest.mark.parametrize("cid,call,expected,rule", CASES, ids=[c[0] for c in CASES])
 def test_corpus(env, cid, call, expected, rule):
@@ -411,7 +500,7 @@ def test_cli_prerendered_policy_wins(env):
 
 
 def test_cli_ignores_other_tools_and_events(env):
-    r = run_cli(json.dumps(payload("read_file", {"path": "~/.ssh/k.pem"})), env)
+    r = run_cli(json.dumps(payload("search_files", {"pattern": "key", "path": "~/.ssh"})), env)
     assert r.returncode == 0 and json.loads(r.stdout) == {}
     p = payload("terminal", {"command": "git push"})
     p["hook_event_name"] = "post_tool_call"
@@ -548,3 +637,69 @@ def test_cli_secret_output_request_stays_sensitive(env):
     assert json.loads(r.stdout)["action"] == "approve"
     req = json.loads(next((Path(env["JUDGE_REVIEW_DIR"]) / "queue").glob("*-gate.json")).read_text())
     assert req["data_class"] == "sensitive"
+
+
+# ---------------------------------------------------------------- read_file (#17)
+def test_read_file_rule_key_per_path(env):
+    def key(ti):
+        out, _, _ = gate.run(payload("read_file", ti, cwd=env["HOME"]), side_effects=False)
+        return out["rule_key"]
+    a = key({"path": "~/.config/spark/hermes.key"})
+    assert a.startswith("judge-gate:secret-output:")
+    # same file, other spelling / page: same key (an [a]lways answer covers that one file)
+    assert key({"path": env["HOME"] + "/.config/spark/hermes.key", "offset": 50, "limit": 10}) == a
+    assert key({"path": ".config/spark/hermes.key"}) == a
+    # another secret: another key
+    assert key({"path": "~/.ssh/id_ed25519"}) != a
+
+
+def test_read_file_symlink_to_secret(env):
+    home = Path(env["HOME"])
+    (home / ".ssh" / "id_ed25519").write_text("not a real key\n")
+    (home / "notes.md").symlink_to(home / ".ssh" / "id_ed25519")
+    out, _, rec = gate.run(payload("read_file", {"path": "~/notes.md"}), side_effects=False)
+    assert out["action"] == "approve" and rec["rules"] == ["secret-output"]
+
+
+@pytest.mark.parametrize("ti", [{}, {"path": ""}, {"path": 7}])
+def test_read_file_missing_path_fails_closed(env, ti):
+    r = run_cli(json.dumps(payload("read_file", ti)), env)
+    assert r.returncode == 2 and json.loads(r.stdout)["action"] == "block"
+
+
+def test_cli_read_file_secret_logs_and_enqueues(env):
+    r = run_cli(json.dumps(payload("read_file", {"path": "~/.config/spark/hermes.key"}, cwd=env["HOME"])), env)
+    assert r.returncode == 0
+    out = json.loads(r.stdout)
+    assert out["action"] == "approve" and out["rule_key"].startswith("judge-gate:secret-output:")
+    rd = Path(env["JUDGE_REVIEW_DIR"])
+    line = json.loads((rd / "gate.log").read_text().splitlines()[-1])
+    assert line["tool"] == "read_file" and line["rule"] == "secret-output" and "hermes.key" in line["excerpt"]
+    reqs = list((rd / "queue").glob("*-gate.json"))
+    assert len(reqs) == 1
+    req = json.loads(reqs[0].read_text())
+    assert req["data_class"] == "sensitive" and req["detail"]["tool"] == "read_file"
+
+
+def test_cli_read_file_normal_pass(env):
+    r = run_cli(json.dumps(payload("read_file", {"path": "README.md", "offset": 1, "limit": 200},
+                                   cwd=env["HOME"])), env)
+    assert r.returncode == 0 and json.loads(r.stdout) == {}
+    assert not (Path(env["JUDGE_REVIEW_DIR"]) / "gate.log").exists()
+
+
+def test_old_prerendered_policy_without_new_keys(env):
+    """A gate-policy.json rendered before #14/#17 (no hermes_cli / secret_paths) still gets the fixes."""
+    rd = Path(env["JUDGE_REVIEW_DIR"])
+    rd.mkdir(parents=True, exist_ok=True)
+    pol = json.loads(gate._render((JUDGE / "policy" / "gate-policy.json.tmpl").read_text(), EXAMPLE_SITE))
+    for r in pol["rules"]:
+        r.pop("hermes_cli", None)
+        r.pop("secret_paths", None)
+    (rd / "gate-policy.json").write_text(json.dumps(pol))
+    out, _, _ = gate.run(payload("terminal", {"command": "hermes config get command_allowlist"}), side_effects=False)
+    assert out == {}
+    out, _, _ = gate.run(payload("terminal", {"command": "hermes hooks revoke x"}), side_effects=False)
+    assert out["action"] == "block"
+    out, _, _ = gate.run(payload("read_file", {"path": "~/.config/spark/client.toml"}), side_effects=False)
+    assert out["action"] == "approve"

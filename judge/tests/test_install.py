@@ -187,7 +187,7 @@ def test_apply_merges_and_preserves(env):
 
     gate = _managed(hooks["pre_tool_call"])
     assert len(gate) == 1
-    assert gate[0]["matcher"] == "terminal|write_file|patch"
+    assert gate[0]["matcher"] == "terminal|write_file|patch|read_file"
     assert gate[0]["command"].endswith(str(env.judge / "hooks" / "gate.py"))
     assert gate[0]["timeout"] == 10 and gate[0]["fail_closed"] is True
     post = _managed(hooks["post_tool_call"])
