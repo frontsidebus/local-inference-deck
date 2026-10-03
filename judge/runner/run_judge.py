@@ -2,7 +2,8 @@
 """Run the judge on one review request, or on every pending one.
 
     run_judge.py <request-id>      judge queue/<request-id>.json
-    run_judge.py --pending         judge everything in queue/ (oldest first); used by judge-review.service
+    run_judge.py --pending         judge everything in queue/ (oldest first), then re-scan for requests that
+                                   arrived meanwhile (each tried once per run); used by judge-review.service
 
 Flow per request: make sure evidence/<id>/ exists (runs collector/collect.py if not) -> assemble the
 prompt input -> run the judge (frontier or local) -> validate (one retry on invalid output) -> write
@@ -142,6 +143,7 @@ def call_frontier(messages: List[Dict[str, str]]) -> Tuple[str, str]:
     except json.JSONDecodeError:
         env = None
     if isinstance(env, dict) and ("result" in env or env.get("type") == "result"):
+        frontier_cost_add(env.get("total_cost_usd"))  # billed even when the reply is an error
         if env.get("is_error") or (env.get("subtype") not in (None, "success")):
             raise JudgeError(f"frontier returned an error: {str(env.get('result') or env.get('subtype'))[:300]}")
         usage = env.get("modelUsage")
@@ -220,6 +222,19 @@ def _usage_path() -> Path:
     return C.review_dir() / "usage.json"
 
 
+def _usage_today(usage: Any, today: str) -> Dict[str, Any]:
+    if not isinstance(usage, dict) or usage.get("date") != today:
+        return {"date": today, "frontier_runs": 0}
+    return usage
+
+
+def _read_usage(p: Path) -> Any:
+    try:
+        return C.read_json(p) if p.exists() else {}
+    except Exception:
+        return {}
+
+
 def frontier_budget_take() -> bool:
     """Count one frontier call for today (UTC). False (and nothing counted) when the cap is reached."""
     cap = int(C.setting("JUDGE_FRONTIER_DAILY_MAX", "20"))
@@ -228,18 +243,32 @@ def frontier_budget_take() -> bool:
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(str(p) + ".lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        try:
-            usage = C.read_json(p) if p.exists() else {}
-        except Exception:
-            usage = {}
-        if not isinstance(usage, dict) or usage.get("date") != today:
-            usage = {"date": today, "frontier_runs": 0}
+        usage = _usage_today(_read_usage(p), today)
         if int(usage.get("frontier_runs", 0)) >= cap:
             return False
         usage["frontier_runs"] = int(usage.get("frontier_runs", 0)) + 1
         usage["cap"] = cap
         C.write_json(p, usage)
         return True
+
+
+def frontier_cost_add(usd: Any) -> None:
+    """Add the cost `claude -p` reported for one call (total_cost_usd) to today's usage.json frontier_usd.
+    Informational only (the caps are JUDGE_FRONTIER_DAILY_MAX and the per-call --max-budget-usd)."""
+    try:
+        usd = float(usd)
+    except (TypeError, ValueError):
+        return
+    if not usd >= 0:  # also rejects NaN
+        return
+    today = C.utc_now().strftime("%Y-%m-%d")
+    p = _usage_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(p) + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        usage = _usage_today(_read_usage(p), today)
+        usage["frontier_usd"] = round(float(usage.get("frontier_usd") or 0) + usd, 6)
+        C.write_json(p, usage)
 
 
 # ------------------------------------------------------------------------------ input assembly
@@ -532,18 +561,25 @@ def main(argv: List[str]) -> int:
     C.ensure_dirs()
     with open(C.review_dir() / ".runner.lock", "a") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)  # one runner at a time
-        ids = pending_ids() if argv[0] == "--pending" else [argv[0]]
         ok = True
-        for rid in ids:
-            if not C.REQUEST_ID_RE.match(rid):
-                log(f"invalid request id {rid!r}")
-                ok = False
-                continue
-            try:
-                ok = judge_request(rid) and ok
-            except Exception as exc:  # one bad request must not stop the others
-                log(f"{rid}: unexpected error: {type(exc).__name__}: {exc}")
-                ok = False
+        seen: set = set()
+        # --pending re-scans queue/ until nothing new is left: a request queued while this run is busy
+        # must not wait for the next queue change (judge-review.path does not re-fire for it). Each
+        # request is tried at most once per run; failures stay queued for the next run.
+        ids = pending_ids() if argv[0] == "--pending" else [argv[0]]
+        while ids:
+            for rid in ids:
+                seen.add(rid)
+                if not C.REQUEST_ID_RE.match(rid):
+                    log(f"invalid request id {rid!r}")
+                    ok = False
+                    continue
+                try:
+                    ok = judge_request(rid) and ok
+                except Exception as exc:  # one bad request must not stop the others
+                    log(f"{rid}: unexpected error: {type(exc).__name__}: {exc}")
+                    ok = False
+            ids = [r for r in pending_ids() if r not in seen] if argv[0] == "--pending" else []
         return 0 if ok else 1
 
 
