@@ -127,7 +127,9 @@ def _write_manifest(ev: Path, req: Dict, data_class: str, extra: Optional[Dict] 
 
 def effective_class(req: Dict, cfg: Mapping[str, str]) -> str:
     cwd = (req.get("detail") or {}).get("cwd") or None
-    mine = config.classify(req.get("changed_paths") or [], cfg, cwd)
+    paths = req.get("changed_paths") or []
+    # With no paths there is nothing to re-check; keep the hook's own classification (gate host rules).
+    mine = config.classify(paths, cfg, cwd) if paths else req.get("data_class")
     return "infra" if req.get("data_class") == "infra" and mine == "infra" else "sensitive"
 
 

@@ -1882,15 +1882,32 @@ def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Rules whose evidence is a command aimed at Walter/Covenant: infrastructure by definition.
+HOST_RULES = frozenset({"remote-mutation", "remote-opaque", "remote-copy"})
+
+
+def gate_data_class(jconfig, rules, paths, cwd):
+    """'infra' only when every fired rule is a host rule and every involved local path (if any) is infra.
+
+    Anything else (secret-output, sensitive-path, public-push, oversight, unknown) stays 'sensitive',
+    which keeps the request with the local judge.
+    """
+    try:
+        if not rules or not set(rules) <= HOST_RULES:
+            return "sensitive"
+        if paths and jconfig.classify(paths, cwd=cwd) != "infra":
+            return "sensitive"
+        return "infra"
+    except Exception:
+        return "sensitive"
+
+
 def enqueue_review(rd, session, tool, decision, rules, rule_key, exc, paths, cwd):
     """Write a `gate` review request via judge/lib/queue.py (the only place that touches the queue)."""
     _lib()
     from lib import config as jconfig
     from lib import queue as jqueue
-    try:
-        data_class = jconfig.classify(paths, cwd=cwd) if paths else "sensitive"
-    except Exception:
-        data_class = "sensitive"
+    data_class = gate_data_class(jconfig, rules, paths, cwd)
     now = _now()
     req = jqueue.make_request(
         "gate", session or "", now, source_event="pre_tool_call", changed_paths=paths,
