@@ -358,3 +358,69 @@ def test_with_real_lib_modules(env, monkeypatch):
     from lib import queue as q  # type: ignore
     assert q.validate_request(req) == []
     assert not (env["review"] / "hook-errors.log").exists()
+
+
+# ---------------------------------------------------------------- C3 results -> snapshots/<session>/c3-results.jsonl
+def c3_lines(env, session="20261002_165907_abc123"):
+    p = env["review"] / "snapshots" / session / "c3-results.jsonl"
+    return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+
+def test_c3_results_format_pass_and_fail(v, env):
+    good = write(env["work"] / "ok.py", "x = 1\n")
+    bad = write(env["work"] / "bad.json", "{")
+    sh = write(env["work"] / "ok.sh", "#!/bin/bash\necho ok\n")
+    call(v, env, [good, bad, sh])
+    rows = c3_lines(env)
+    by = {(r["path"], r["check"]): r for r in rows}
+    assert by[(str(good), "py-compile")]["ok"] is True
+    assert by[(str(bad), "json")]["ok"] is False and "line 1" in by[(str(bad), "json")]["detail"]
+    assert by[(str(sh), "bash-n")]["ok"] is True
+    for r in rows:
+        assert set(r) == {"t", "attempt", "path", "check", "ok", "detail"}
+        assert r["attempt"] == 0 and isinstance(r["ok"], bool) and len(r["detail"]) <= 300
+        assert v._parse_iso(r["t"]) is not None and os.path.isabs(r["path"])
+    p = env["review"] / "snapshots" / "20261002_165907_abc123" / "c3-results.jsonl"
+    assert p.stat().st_mode & 0o777 == 0o600
+
+
+def test_c3_results_retry_records_fixed_state_without_nudge(v, env):
+    sh = write(env["work"] / "s.sh", "#!/bin/bash\nif true; then\necho x\n")
+    out = call(v, env, [sh], attempt=0)
+    assert out["action"] == "continue"
+    write(sh, "#!/bin/bash\nif true; then\necho x\nfi\n")
+    n_requests = len(queued(env))
+    assert call(v, env, [sh], attempt=1) == {}
+    assert len(queued(env)) == n_requests  # record-only: nothing enqueued on a re-fire
+    rows = [r for r in c3_lines(env) if r["check"] == "bash-n"]
+    assert [(r["attempt"], r["ok"]) for r in rows] == [(0, False), (1, True)]
+
+
+def test_c3_results_detail_redacted_and_truncated(v, env):
+    rec = {"t": "2026-10-03T13:34:00Z", "path": "/x", "check": "bash-n", "ok": False,
+           "detail": "token=" + "s3cr3tvalue" * 3 + " " + "y" * 600}
+    line = json.loads(v.c3_line(rec, 0))
+    assert "s3cr3tvalue" not in line["detail"] and len(line["detail"]) <= 300
+
+
+def test_c3_results_claim_records(v, env):
+    old = write(env["work"] / "old.conf", "a=1\n")
+    _age(old, 10 * 86400)
+    new = write(env["work"] / "new.py", "x = 1\n")
+    call(v, env, [new], response="Updated new.py and fixed old.conf.")
+    claims = {r["path"]: r["ok"] for r in c3_lines(env) if r["check"] == "claim"}
+    assert claims == {str(new): True, str(old): False}
+
+
+def test_c3_results_write_failure_never_breaks_hook(v, env, monkeypatch):
+    monkeypatch.setattr(v, "c3_results_path", lambda s: env["work"] / "nodir" / "\0bad")
+    f = write(env["work"] / "x.py", "x=1\n")
+    assert call(v, env, [f]) == {}
+    assert "c3-results" in (env["review"] / "hook-errors.log").read_text()
+
+
+def test_c3_results_unsafe_session_name(v, env):
+    f = write(env["work"] / "x.py", "x=1\n")
+    call(v, env, [f], session="../../etc/evil")
+    assert not (env["tmp"] / "etc").exists()
+    assert list((env["review"] / "snapshots").glob("*/c3-results.jsonl"))
