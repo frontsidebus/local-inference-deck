@@ -308,13 +308,22 @@ def _iter_all_requests(root=None):
                 yield req
 
 
+def _turn_id(req: Dict[str, Any]) -> str:
+    t = (req.get("detail") or {}).get("turn_id")
+    return str(t).strip() if isinstance(t, (str, int)) and str(t).strip() else ""
+
+
 def is_duplicate(req: Dict[str, Any], window_s: Optional[float] = None, root=None) -> Optional[str]:
     """Completion dedupe rule shared by hooks/verify.py (pre_verify) and hooks/enqueue.py (on_session_end,
     which fires after pre_verify in the same turn).
 
     R duplicates an existing request E (pending in queue/ or in done/) when E.kind == R.kind == "completion",
     E.session == R.session, |E.created - R.created| <= window_s (default JUDGE_COMPLETION_DEDUPE_SECONDS, 900),
-    and set(R.changed_paths) <= set(E.changed_paths) (empty counts as a subset). Returns E's id, or None."""
+    and set(R.changed_paths) <= set(E.changed_paths) (empty counts as a subset). Returns E's id, or None.
+
+    When both requests carry a Hermes turn id (detail.turn_id), the turn decides alone: same turn ->
+    duplicate, different turn -> not. The time-window rule only applies when one side has no turn id
+    (pre_verify payloads don't carry one)."""
     if req.get("kind") != "completion":
         return None
     if window_s is None:
@@ -327,8 +336,16 @@ def is_duplicate(req: Dict[str, Any], window_s: Optional[float] = None, root=Non
     except ValueError:
         created = datetime.now(timezone.utc)
     mine = set(req.get("changed_paths") or [])
+    my_turn = _turn_id(req)
     for e in _iter_all_requests(root):
         if e.get("kind") != "completion" or e.get("session") != req.get("session") or e.get("id") == req.get("id"):
+            continue
+        their_turn = _turn_id(e)
+        if my_turn and their_turn:
+            # Both carry Hermes' turn id: same turn is a duplicate, a different turn never is
+            # (two clean read-only turns in a row must both be reviewed).
+            if my_turn == their_turn:
+                return str(e.get("id"))
             continue
         try:
             ec = parse_utc(e.get("created") or "")

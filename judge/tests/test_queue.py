@@ -136,3 +136,23 @@ def test_is_duplicate(env):
     assert q.is_duplicate(dict(later, session="other")) is None
     q.move_done(first["id"])
     assert q.is_duplicate(later) == first["id"]
+
+
+def test_is_duplicate_turn_aware(env):
+    """Live bug: two clean read-only turns (no changed paths) in one session within 900 s; the second
+    turn's review was dropped as a 'duplicate'. Different Hermes turn ids are never duplicates."""
+    t1 = _req(changed_paths=[], source_event="on_session_end", detail={"turn_id": "sess:sess:aaaa"})
+    q.write_request(t1)
+    t2 = _req(changed_paths=[], source_event="on_session_end", created="2026-10-03T04:00:00Z",
+              detail={"turn_id": "sess:sess:bbbb"})
+    assert q.is_duplicate(t2) is None                                    # different turn: keep it
+    assert q.is_duplicate(dict(t2, detail={"turn_id": "sess:sess:aaaa"})) == t1["id"]  # same turn: dup
+
+
+def test_is_duplicate_pre_verify_without_turn_id_still_dedupes(env):
+    """pre_verify payloads carry no turn id; the session_end request of the same turn still dedupes."""
+    pv = _req(changed_paths=["/etc/a"], source_event="pre_verify")       # no detail.turn_id
+    q.write_request(pv)
+    end = _req(changed_paths=[], source_event="on_session_end", created="2026-10-03T04:00:00Z",
+               detail={"turn_id": "sess:sess:aaaa"})
+    assert q.is_duplicate(end) == pv["id"]
