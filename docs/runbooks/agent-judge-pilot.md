@@ -60,7 +60,7 @@ JUDGE_INFRA_REPOS="/path/to/judge-sandbox"
 - Name **only** the sandbox, never a parent directory that holds other material. Each entry becomes the glob `<dir>/*`, so a sibling such as `judge-sandbox-x/` stays `sensitive`, and a path ending in `/.env` is never infra.
 - Hooks read the value when they write a request. Set it before the scenario and restart Hermes.
 - A completion with no edited files is still classified by the session's working directory. Start Hermes from inside the sandbox if you want those requests to be frontier-eligible too.
-- Opted-in directories are snapshotted, so the bundle carries a real diff of sandbox files. <!-- TODO(area B1) -->
+- Opted-in directories are snapshotted at session start, so the bundle carries a real diff of sandbox files (in run 1's S3 the judges would have seen the actual typo fixes). A root over `JUDGE_SNAPSHOT_MAX_FILES` files is truncated and new files in it are not detected; keep the sandbox small.
 - The cost: sandbox requests then use frontier calls (up to `JUDGE_FRONTIER_MAX_USD` each, counted against `JUDGE_FRONTIER_DAILY_MAX`), and they no longer test the default data boundary.
 
 Undo: delete the line. Requests already written keep their class.
