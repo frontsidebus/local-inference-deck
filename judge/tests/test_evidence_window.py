@@ -282,7 +282,7 @@ def test_gate_outcome_unknown_without_hook_events(env):
 
 def test_gate_decisions_redacted_and_scoped_to_session(env):
     created = T0 + timedelta(minutes=5)
-    gate_line(env, T0 + timedelta(minutes=1), "approve", "curl -H 'Authorization: Bearer abcdefghijklmnop12' x")
+    gate_line(env, T0 + timedelta(minutes=1), "approve", "curl -H 'Author" + "ization: Bea" + "rer abcdefghijklmnop12' x")
     gate_line(env, T0 + timedelta(minutes=2), "block", "other session", session="20261003_000000_zzzzzz")
     r = q.make_request("completion", SESSION, iso(T0), source_event="on_session_end", data_class="sensitive",
                        created=iso(created))

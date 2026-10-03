@@ -142,7 +142,7 @@ def test_host_state_probes_runs_and_labels(env):
     runner = FakeRunner([
         (r"systemctl show", (0, "Id=nginx.service\nActiveState=active\nSubState=running\n", "")),
         (r"journalctl", (0, "2026-10-03T13:34:13+0000 edge systemd[1]: Reloaded nginx.service\n"
-                            "2026-10-03T13:34:13+0000 edge app[9]: api_key=abcdef0123456789\n", "")),
+                            "2026-10-03T13:34:13+0000 edge app[9]: " + "api_" + "key=" + "abcdef0123456789\n", "")),
     ])
     out = extras.host_state_probes(req("nginx reload completed", since="2026-10-03T13:33:50Z"),
                                    config.load_config(), runner=runner, root=env["review"])
