@@ -413,3 +413,49 @@ def test_bundle_cap(tmp_path):
     assert text.startswith("=== FILE: manifest.json ===")
     assert "truncated by runner" in text and "previous judge output" not in text
     assert len(text) < 12000
+
+
+def test_pending_rescans_queue_for_requests_added_during_the_run(env, local, monkeypatch):
+    """judge-review.path does not re-fire for a request queued while the oneshot is running, so --pending
+    must pick it up before it exits; a failing request is still tried only once per run."""
+    monkeypatch.setenv("JUDGE_MODE", "local")
+    r1, r2, bad = rid(t="035210"), rid(t="035211"), rid(t="035212")
+    enqueue(env, r1)
+    real = RJ.judge_request
+    order = []
+
+    def spy(request_id):
+        order.append(request_id)
+        if request_id == r1:
+            enqueue(env, r2)                      # lands while r1 is being judged
+            enqueue(env, bad, evidence=False)     # its backend will fail: stays queued
+        if request_id == bad:
+            return False
+        return real(request_id)
+    monkeypatch.setattr(RJ, "judge_request", spy)
+    assert RJ.main(["--pending"]) == 1
+    assert order == [r1, r2, bad]
+    assert (env / "done" / f"{r2}.json").exists() and (env / "queue" / f"{bad}.json").exists()
+
+
+def test_frontier_cost_is_added_to_usage(env, frontier, monkeypatch, tmp_path):
+    monkeypatch.setenv("JUDGE_MODE", "frontier")
+    script = tmp_path / "fake-claude-cost"
+    script.write_text(textwrap.dedent(f"""\
+        #!{sys.executable}
+        import json, sys
+        sys.stdin.read()
+        print(json.dumps({{"type": "result", "subtype": "success", "is_error": False,
+                          "result": {json.dumps(json.dumps(GOOD))}, "total_cost_usd": 0.125}}))
+        """))
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("JUDGE_FRONTIER_CMD", str(script))
+    r1, r2 = rid(t="035210"), rid(t="035211")
+    enqueue(env, r1)
+    enqueue(env, r2)
+    assert RJ.main(["--pending"]) == 0
+    usage = json.loads((env / "usage.json").read_text())
+    assert usage["frontier_runs"] == 2 and usage["frontier_usd"] == pytest.approx(0.25)
+    RJ.frontier_cost_add("not a number")
+    RJ.frontier_cost_add(float("nan"))
+    assert json.loads((env / "usage.json").read_text())["frontier_usd"] == pytest.approx(0.25)

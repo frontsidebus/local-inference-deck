@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -314,3 +315,30 @@ def test_with_units_installs_files_and_only_prints_systemctl(env):
     p = env.run("--uninstall", "--with-units")
     assert not any(env.units.iterdir())
     assert "systemctl --user disable --now" in p.stdout
+
+
+def test_real_units_render_completely(env):
+    """The shipped units: every ${...} is rendered, both services use the installer's interpreter, the
+    review service finds `claude` in ~/.local/bin and never inherits a gateway endpoint."""
+    for sub, names in (("runner/units", ("judge-review.service", "judge-review.path")),
+                       ("watch", ("judge-runaway-watch.service",))):
+        (env.judge / sub).mkdir(parents=True, exist_ok=True)
+        for n in names:
+            shutil.copy2(JUDGE / sub / n, env.judge / sub / n)
+    py = env.tmp / "bin" / "python3"            # not /usr/bin/python3: catches a hardcoded interpreter
+    py.parent.mkdir()
+    py.symlink_to(sys.executable)
+    p = env.run("--apply", "--with-units", "--python", str(py))
+    assert "systemctl --user enable --now judge-review.path judge-runaway-watch.service" in p.stdout
+    rendered = {n: (env.units / n).read_text() for n in
+                ("judge-review.service", "judge-review.path", "judge-runaway-watch.service")}
+    for n, text in rendered.items():
+        body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+        assert "${" not in body, f"{n} has an unrendered variable"
+    svc = rendered["judge-review.service"]
+    assert f"ExecStart={py} {env.judge}/runner/run_judge.py --pending" in svc
+    assert "Environment=PATH=%h/.local/bin:" in svc
+    assert "UnsetEnvironment=ANTHROPIC_BASE_URL" in svc
+    assert f"Environment=JUDGE_REVIEW_DIR={env.review}" in svc
+    assert f"PathChanged={env.review}/queue" in rendered["judge-review.path"]
+    assert f"ExecStart={py} {env.judge}/watch/runaway.py" in rendered["judge-runaway-watch.service"]

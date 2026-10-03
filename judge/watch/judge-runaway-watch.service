@@ -1,6 +1,6 @@
 # systemd USER unit template for the C6 runaway-generation watcher (judge/watch/runaway.py).
-# ${JUDGE_DIR} is the absolute path of the judge/ directory; judge/install.sh renders it
-# (envsubst with an explicit variable list) and installs to ~/.config/systemd/user/.
+# ${JUDGE_DIR} (absolute path of judge/) and ${JUDGE_PYTHON} (the 3.10+ interpreter the installer checked)
+# are rendered by judge/install.sh --with-units, which installs the result to ~/.config/systemd/user/.
 # Read-only: the watcher only polls the slots probe and alerts; it never cancels or unloads.
 #   systemctl --user daemon-reload && systemctl --user enable --now judge-runaway-watch.service
 #   journalctl --user -u judge-runaway-watch -f      # alerts also land in $JUDGE_REVIEW_DIR/watch.log
@@ -14,7 +14,7 @@ Type=simple
 EnvironmentFile=-%h/.config/judge/judge.env
 # notify-send needs the session's display; harmless when there is none
 PassEnvironment=DISPLAY DBUS_SESSION_BUS_ADDRESS
-ExecStart=/usr/bin/python3 ${JUDGE_DIR}/watch/runaway.py --interval 30
+ExecStart=${JUDGE_PYTHON} ${JUDGE_DIR}/watch/runaway.py --interval 30
 Restart=on-failure
 RestartSec=30
 NoNewPrivileges=yes
