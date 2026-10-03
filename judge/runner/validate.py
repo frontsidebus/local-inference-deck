@@ -40,6 +40,9 @@ Steps, in order:
    c. `false` -> `n/a` + low when the evidence admits absence ("no evidence", "does not show",
       "cannot verify", "withheld", "no output", ...) and no contradicting span carries a failure word
       (error, fail, denied, refused, not listening, inactive, exit=<non-zero>, ...).
+   d0. `false` -> `n/a` + low when every contradicting span comes only from point-in-time artifacts
+      (text starting `# POINT IN TIME`, or listed under the manifest's `point_in_time`): they show the
+      state at collection time, not during the session (prompt hard rule 8).
    d. `false` -> `n/a` + low when c3-results.jsonl has a `"final": true, "ok": true` line for a path
       whose file name the item mentions and no final failing line for it (an earlier error in the
       turn was superseded).
@@ -92,7 +95,7 @@ _COMMAND_WORDS = (
     "ssh|scp|curl|wget|systemctl|journalctl|git|grep|rg|"
     "docker|nginx|ss|netstat|ufw|iptables|nft|wg|openssl|sha256sum|md5sum|"
     "python3?|bash|hermes|ssh-keygen|nslookup|"
-    "ssh_alias_test|port_listening|http_status|unit_state|file_hash|render_and_diff|check_sanitized|slots|"
+    "ssh_alias_test|port_listening|http_status|unit_state|unit_journal|file_hash|render_and_diff|check_sanitized|slots|"
     "probe\\.py|check-sanitized\\.sh|render\\.sh"
 )
 # Words that are also plain English (find, cat, head, ...) count only when followed by a flag or a path.
@@ -170,7 +173,16 @@ class BundleView:
         self_parts: List[str] = []
         req = request if isinstance(request, dict) else None
         world_parts: List[str] = []
+        live_parts: List[str] = []
+        pit: set = set()
         for name, text in self.files.items():
+            if name.rsplit("/", 1)[-1] == "manifest.json":
+                try:
+                    pit |= set((json.loads(text).get("point_in_time") or {}).keys())
+                except (ValueError, AttributeError):
+                    pass
+        for name, text in self.files.items():
+            is_pit = name in pit or text.lstrip().startswith("# POINT IN TIME")
             if name.rsplit("/", 1)[-1] == "manifest.json":
                 try:
                     man = json.loads(text)
@@ -186,11 +198,14 @@ class BundleView:
             text = _USER_MSG_RE.sub("conversation turn:", text)
             text = "\n".join(ln for ln in text.splitlines() if not _ABSENCE_LINE_RE.search(ln))
             world_parts.append(text)
+            if not is_pit:
+                live_parts.append(text)
         if req:
             for k in ("claims", "plan"):
                 if isinstance(req.get(k), str):
                     self_parts.append(req[k])
         self.world = _norm("\n".join(world_parts))
+        self.live = _norm("\n".join(live_parts))
         self.self_text = _norm("\n".join(self_parts))
         self.c3 = self._c3()
 
@@ -239,6 +254,12 @@ class BundleView:
         selfs = self._spans(ev, self.self_text)
         return contra, selfs
 
+    def is_live(self, span: str) -> bool:
+        """True when *span* (mostly) comes from a windowed, not point-in-time, artifact."""
+        if span in self.live:
+            return True
+        return any(len(p) * 2 >= len(span) for p in self._spans(span, self.live))
+
     def c3_superseded(self, claim: str, evidence: str) -> Optional[str]:
         text = (claim + " " + evidence).lower()
         by_path: Dict[str, List[Dict[str, Any]]] = {}
@@ -268,6 +289,8 @@ def apply_verdict_rules(item: Dict[str, str], view: Optional[BundleView]) -> Tup
         why = "no quoted bundle text that differs from the claim (absence of evidence)"
     elif _ABSENCE_CLAIM_RE.search(item["evidence"]) and not any(_FAILURE_RE.search(s) for s in contra):
         why = "evidence describes missing or withheld output, not a contradiction"
+    elif not any(view.is_live(sp) for sp in contra):
+        why = "only point-in-time evidence (state at collection, not during the session)"
     else:
         sup = view.c3_superseded(item["claim"], item["evidence"])
         if sup:

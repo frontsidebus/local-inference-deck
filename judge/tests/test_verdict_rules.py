@@ -313,3 +313,47 @@ def test_rejudge_out_inside_review_refused(env, sub):
 
 def test_rejudge_bad_id(env, tmp_path):
     assert RG.main(["../etc", "--out", str(tmp_path / "o")]) == 64
+
+
+# ------------------------------------------------------------------ B2 host-state artifacts
+JOURNAL = ("# WINDOWED: the unit's journal lines within the request window (UTC)\n"
+           "2026-10-03T13:34:13Z covenant systemd[1]: Reloading nginx.service - A high performance web server...\n"
+           "2026-10-03T13:34:13Z covenant systemd[1]: Reloaded nginx.service - A high performance web server.\n")
+UNIT_STATE = ("# POINT IN TIME: unit state when the evidence was collected, NOT during the session\n"
+              "ActiveState=failed\nSubState=failed\n")
+
+
+def test_unit_journal_is_a_probe_command():
+    assert V.evidence_reason("unit_journal walter llama-swap since 13:33:45Z until 13:34:25Z") == "command"
+
+
+def test_point_in_time_only_contradiction_becomes_na():
+    b = bundle({"manifest.json": manifest("reload completed cleanly", "infra"),
+                "probes/host-unit_state-covenant-nginx.txt": UNIT_STATE,
+                "probes/host-unit_journal-covenant-nginx.txt": JOURNAL})
+    f, notes, _ = run([item(claim="nginx reload completed cleanly",
+                            evidence="probes/host-unit_state-covenant-nginx.txt: `ActiveState=failed SubState=failed`")],
+                      b, mode="frontier")
+    assert (f["items"][0]["verdict"], f["items"][0]["severity"]) == ("n/a", "low")
+    assert any("point-in-time" in n for n in notes)
+
+
+def test_windowed_journal_contradiction_kept_false():
+    journal = JOURNAL.replace("Reloaded nginx.service - A high performance web server.",
+                              "nginx.service: Control process exited, code=exited, status=1/FAILURE")
+    b = bundle({"manifest.json": manifest("reload completed cleanly", "infra"),
+                "probes/host-unit_journal-covenant-nginx.txt": journal})
+    f, notes, _ = run([item(claim="nginx reload completed cleanly",
+                            evidence='claim "reload completed cleanly" vs unit_journal-covenant-nginx: '
+                                     '"nginx.service: Control process exited, code=exited, status=1/FAILURE"')],
+                      b, mode="frontier")
+    assert (f["items"][0]["verdict"], f["items"][0]["severity"]) == ("false", "high") and notes == []
+
+
+def test_point_in_time_listed_in_manifest():
+    man = json.loads(manifest("port 3002 is listening", "infra"))
+    man["point_in_time"] = {"probes/port_listening-1.txt": {"observed_at": "2026-10-03T15:00:00Z"}}
+    b = bundle({"manifest.json": json.dumps(man), "probes/port_listening-1.txt": "port 3002 on walter: NOT LISTENING\n"})
+    f, notes, _ = run([item(claim="port 3002 is listening",
+                            evidence='probes/port_listening-1.txt: "port 3002 on walter: NOT LISTENING"')], b, mode="frontier")
+    assert f["items"][0]["verdict"] == "n/a"
