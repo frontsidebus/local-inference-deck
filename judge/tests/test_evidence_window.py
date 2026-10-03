@@ -480,3 +480,20 @@ def test_hash_fallback_with_real_blocked_events(env):
     ran(env, RELOAD)
     _, lines = completion_gates(env)
     assert [x["outcome"] for x in lines] == ["not_executed", "executed"]
+
+
+@pytest.mark.parametrize("tool,sub,status,expect_agent", [
+    ("memory", "memories/MEMORY.md", "completed", True),
+    ("skill_manage", "skills/demo/SKILL.md", "completed", True),
+    ("memory", "memories/MEMORY.md", "blocked", False),      # never ran: not the agent's change
+])
+def test_memory_and_skill_hook_events_attribute(tmp_path, tool, sub, status, expect_agent):
+    """post_tool_call for memory/skill_manage (installer matcher) attributes HERMES_HOME/<dir>/ changes."""
+    from lib import snapshot
+    hh = tmp_path / "hermes"
+    d = tmp_path / "snap"
+    snapshot.record_event(d, tool, [], status)
+    paths, prefixes = snapshot.agent_touched(d, {"HERMES_HOME": str(hh)})
+    target = str(hh / sub)
+    agent, others = snapshot.attribute([target], paths, prefixes)
+    assert (agent == [target]) is expect_agent and (others == [target]) is (not expect_agent)
