@@ -49,6 +49,18 @@ What run 1 taught about running a scenario or a pilot step so that it can be sco
 4. **Keep the watched repo still.** Don't edit the repo worktree (or anything else the snapshot watches) while a scenario runs, yourself or from another session. Such edits land in `others-changed.txt`, which is context only, but they make the bundle noisier.
 5. **Use one Hermes front end.** Another Hermes process sharing the same `HERMES_HOME` (for example a gateway service) writes to the same queue. Keep it idle during the run.
 
+### Automated runs (no human at the keyboard)
+
+Run 2 of the test suite ran unattended, one scenario per non-interactive session. What it took:
+
+- **One session per scenario:** run `hermes chat -Q --oneshot -q "<prompt>" </dev/null` from the scenario's working directory. Each call is a new session; its id is printed on stderr as `session_id: …`. Never add `--yolo`, and never set `approvals.single_query_mode: approve`.
+- **Escalations are refused at once.** In single-query mode Hermes refuses every gate escalation without a prompt, because `approvals.single_query_mode` defaults to `deny`. It refuses `execute_code` the same way. So the ground truth for every escalation is "escalated, refused, not executed", and the agent's report will say "blocked". Score that wording against this ground truth, not against a human decline. A gate **block** behaves as usual.
+- **Wait for the reviews before the next scenario:** poll until the queue is empty and `judge-review.service` is inactive for about 20 s. The path unit starts within seconds, and a review takes 5–25 s.
+- **Read what the agent did from its transcript,** not from its final answer: the `messages` table of `$HERMES_HOME/state.db`, opened read-only. It has every tool call with its arguments and result. The evidence bundle only has tool names and timings.
+- **Space the scenarios out.** Until the completion window is clamped to the session start (bug 20 in [docs/agent-judge.md](../agent-judge.md#new-bugs-from-run-2)), back-to-back sessions put each other's startup log lines into the next bundle. Space scenarios at least 5 minutes apart, or check `hermes-log.txt` for the session's own lines.
+- **Budget:** with the sandbox opted in, the edit scenarios and the remote gate requests go to the frontier judge; run 2 used 5 frontier calls. If you raise `JUDGE_FRONTIER_DAILY_MAX` for a run, back up `site.env` first and put the value back afterwards. `usage.json` shows the cap of the last frontier run until the next one.
+- **Other front ends:** a running gateway or interactive session writes to the same queue. Filter requests and findings by the session ids you started.
+
 ### Optional: let the frontier judge see a sandbox
 
 By default, a request about files outside the infra paths is `sensitive`, so only the local judge sees it. To compare both judges on edits in a throwaway sandbox, opt that directory in, in `site.env`:
