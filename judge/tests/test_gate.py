@@ -377,7 +377,63 @@ SECRET_PATH_TERMINAL_CASES = [
     ("cat-ssh-pub", T("cat ~/.ssh/id_ed25519.pub"), "pass", None),
     ("spark-key-into-var", T("K=$(cat ~/.config/spark/hermes.key)"), "pass", None),
 ]
-CASES += HERMES_CLI_CASES + READ_FILE_CASES + SECRET_PATH_TERMINAL_CASES
+# #22 (run-2 N5): shell keywords and control structures are parsed; the commands inside loops, ifs and cases are
+# judged one by one. A read-only body passes; a body with a mutation still escalates.
+S5_LOOP = (f"ssh -o ConnectTimeout=10 {B} 'for p in 3001 3002; do echo \"== port $p ==\"; curl -s -m 5 -o /dev/null "
+           "-w \"HTTP %{http_code}\\n\" http://127.0.0.1:$p/api/health; curl -s -m 5 http://127.0.0.1:$p/api/health; "
+           "echo; done'")
+SHELL_STRUCTURE_CASES = [
+    ("s5-for-curl-loop", T(S5_LOOP), "pass", None),
+    ("for-curl", T(f"ssh {B} 'for p in 8080 8081; do curl -s localhost:$p/health; done'"), "pass", None),
+    ("for-systemctl-restart", T(f"ssh {B} 'for u in llama-swap litellm; do sudo systemctl restart $u; done'"),
+     "approve", "remote-mutation"),
+    ("for-status-then-restart", T(f"ssh {B} 'for u in a b; do systemctl is-active $u || systemctl restart $u; "
+                                  "done'"), "approve", "remote-mutation"),
+    ("for-no-in", T(f"ssh {B} 'set -- a b; for u do systemctl status $u --no-pager; done'"), "pass", None),
+    ("for-arith", T(f"ssh {B} 'for ((i=0; i<3; i++)); do curl -s localhost:8080/health; sleep 1; done'"),
+     "pass", None),
+    ("for-list-subst-mutation", T(f"ssh {B} 'for f in $(sudo rm -v /tmp/x); do echo $f; done'"), "approve",
+     "remote-mutation"),
+    ("for-body-redirect", T(f"ssh {B} 'for i in 1 2; do echo $i; done > /tmp/out'"), "approve", "remote-mutation"),
+    ("while-read-ro", T(f"ssh {B} 'ls /etc/systemd/system | while read -r u; do echo \"$u\"; "
+                        "systemctl is-enabled \"$u\"; done'"), "pass", None),
+    ("while-read-mutation", T(f"ssh {B} 'cat /tmp/list | while read -r f; do sudo rm -f \"$f\"; done'"), "approve",
+     "remote-mutation"),
+    ("while-true-poll", T(f"ssh {B} 'n=0; while true; do curl -sf localhost:8080/health && break; n=$((n+1)); "
+                          "[ $n -ge 5 ] && exit 1; sleep 2; done'"), "pass", None),
+    ("until-loop", T(f"ssh {B} 'until curl -sf localhost:8080/health; do sleep 1; done'"), "pass", None),
+    ("nested-if-ro", T(f"ssh {B} 'if systemctl is-active -q nginx; then if [ -f /etc/nginx/nginx.conf ]; then "
+                       "sudo nginx -t; else echo missing; fi; elif test -d /srv; then ls /srv; fi'"), "pass", None),
+    ("nested-if-mutation", T(f"ssh {E} 'if sudo nginx -t; then if [[ -f /etc/nginx/x && -r /etc/nginx/y ]]; then "
+                             "sudo systemctl reload nginx; fi; fi'"), "approve", "remote-mutation"),
+    ("dbl-bracket-ops", T(f"ssh {B} '[[ -n $X && $(id -u) -eq 0 || -z $Y ]] && echo root'"), "pass", None),
+    ("case-ro", T(f"ssh {B} 'case $(hostname) in walter|lab) df -h ;; (*) uptime ;; esac'"), "pass", None),
+    ("case-mutation", T(f"ssh {B} 'case $1 in start) sudo systemctl start x;; *) echo no;; esac'"), "approve",
+     "remote-mutation"),
+    ("assign-and-test", T(f"ssh {B} 'X=1; Y=$X; true && : && test -n \"$Y\" && false || echo $X'"), "pass", None),
+    ("function-ro", T(f"ssh {B} 'h() {{ curl -s localhost:$1/health; }}; h 8080; h 8081'"), "pass", None),
+    ("function-mutation", T(f"ssh {B} 'function r {{ sudo systemctl restart $1; }}; r llama-swap'"), "approve",
+     "remote-mutation"),
+    ("heredoc-bash-s-loop-ro", T(f"ssh {B} bash -s <<'EOF'\nfor p in 3001 3002; do\n  curl -s -m 5 "
+                                 "http://127.0.0.1:$p/api/health\n  echo\ndone\nEOF"), "pass", None),
+    ("heredoc-ssh-stdin-loop-ro", T(f"ssh {B} <<'EOF'\nwhile read -r u; do\n  systemctl is-active $u\n"
+                                    "done <<'UNITS'\nnginx\nllama-swap\nUNITS\nEOF"), "pass", None),
+    ("heredoc-bash-s-loop-mutation", T(f"ssh {B} bash -s <<'EOF'\nfor u in a b; do\n  if ! systemctl is-active "
+                                       "-q $u; then\n    sudo systemctl start $u\n  fi\ndone\nEOF"), "approve",
+     "remote-mutation"),
+    ("heredoc-in-loop-writes", T(f"ssh {B} 'for f in a b; do cat <<EOF > /etc/x-$f\nk=v\nEOF\ndone'"), "approve",
+     "remote-mutation"),
+    ("arith-expansion-subst", T(f"ssh {B} 'echo $(( $(sudo rm -v /tmp/x | wc -l) + 1 ))'"), "approve",
+     "remote-mutation"),
+    ("arith-command-subst", T(f"ssh {B} '(( $(touch /tmp/flag; echo 1) )) && echo y'"), "approve",
+     "remote-mutation"),
+    ("nested-subshells-not-arith", T(f"ssh {B} '( (sudo reboot) )'"), "approve", "remote-mutation"),
+    ("keyword-as-argument", T(f"ssh {B} 'echo for do done; grep -c done /var/log/x'"), "pass", None),
+    ("local-loop-sensitive-write", T("for f in a b; do cp ./$f ~/.ssh/config; done"), "approve", "sensitive-path"),
+    ("local-if-push", T("if git diff --quiet; then git push; fi"), "approve", "public-push"),
+    ("local-loop-ro", T("for f in *.py; do wc -l $f; done"), "pass", None),
+]
+CASES += HERMES_CLI_CASES + READ_FILE_CASES + SECRET_PATH_TERMINAL_CASES + SHELL_STRUCTURE_CASES
 
 
 @pytest.mark.parametrize("cid,call,expected,rule", CASES, ids=[c[0] for c in CASES])
@@ -540,6 +596,16 @@ def test_redact():
 def test_preprocess_heredoc_and_subst():
     body, subs, hds = gate.preprocess("cat <<'EOF' > f\nline $(rm x)\nEOF\necho $(id -u) `whoami`")
     assert hds == ["line $(rm x)"] and subs == ["id -u", "whoami"]
+
+
+def test_shell_structure_tokens():
+    toks, funcs = gate.shell_structure(gate.tokenize(gate.preprocess(
+        "for p in a b; do echo done; done; case $x in a|b) ls;; esac; f() { id; }; [[ a > b ]] && echo in")[0]))
+    words = [v for k, v in toks if k == "w"]
+    assert words == ["echo", "done", "ls", "id", "echo", "in"] and funcs == {"f"}
+    # unparseable structure is left in place (judged as an unknown command, i.e. escalated remotely)
+    toks, _ = gate.shell_structure(gate.tokenize("case x"))
+    assert ("w", "case") in toks
 
 
 def test_tokenize_quotes_and_fd_redirects():

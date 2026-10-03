@@ -192,7 +192,7 @@ def test_apply_merges_and_preserves(env):
     assert gate[0]["command"].endswith(str(env.judge / "hooks" / "gate.py"))
     assert gate[0]["timeout"] == 10 and gate[0]["fail_closed"] is True
     post = _managed(hooks["post_tool_call"])
-    assert len(post) == 1 and post[0]["matcher"] == "write_file|patch|terminal|memory|skill_manage" and post[0]["command"].endswith("enqueue.py")
+    assert len(post) == 1 and post[0]["matcher"] == "write_file|patch|terminal|memory|skill_manage|read_file" and post[0]["command"].endswith("enqueue.py")
     for ev in ("on_session_start", "on_session_end"):
         assert len(hooks[ev]) == 1 and hooks[ev][0]["command"].endswith("hooks/enqueue.py")
     assert hooks["pre_verify"][0]["command"].endswith("hooks/verify.py") and hooks["pre_verify"][0]["timeout"] == 60

@@ -6,9 +6,12 @@ stdout: always `{}`. Never raises, never exits non-zero; errors go to $JUDGE_REV
 
 Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
   on_session_start   snapshot watched paths into snapshots/<session>/ (idempotent)
-  post_tool_call     matcher "write_file|patch|terminal": records touched paths in snapshots/<session>/
-                     events.jsonl (write_file/patch targets; for terminal, the path-like tokens of the
-                     command, used only to attribute snapshot changes to the agent); a successful write_file/patch of */.hermes/plans/*.md enqueues a `plan`
+  post_tool_call     matcher "write_file|patch|terminal|memory|skill_manage|read_file": records each call in
+                     snapshots/<session>/events.jsonl with its call markers (call_id/call_hash, matched
+                     against gate.log for gate `outcome`) and touched paths (write_file/patch targets; for
+                     terminal, the path-like tokens of the command, used only to attribute snapshot changes
+                     to the agent; read_file records no paths: a read is not a change by the agent);
+                     a successful write_file/patch of */.hermes/plans/*.md enqueues a `plan`
                      request (a still-pending plan request for the same session+plan is refreshed instead
                      of duplicated)
   on_session_end     fires once per turn: enqueues a `completion` request for the window since the previous
@@ -139,7 +142,7 @@ def post_tool_call(payload, cfg, root):
     elif tool == "terminal" and isinstance(tinput, dict):
         paths = terminal_paths(tinput.get("command"), str(tinput.get("workdir") or cwd or ""))
     else:
-        paths = []
+        paths = []  # read_file/memory/...: marker only. A read must never attribute a change to the agent.
     if not session:
         return None
     d = _snapdir(cfg, session, cwd or None, root)

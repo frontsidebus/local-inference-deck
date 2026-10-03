@@ -124,6 +124,47 @@ def test_session_end_dedupes_against_pre_verify(env):
     assert [r["id"] for r in q.list_pending()] == [first["id"]]
 
 
+def test_read_file_records_call_marker_not_a_change(env):
+    """#23 (run-2 N6): read_file is in the post_tool_call matcher so gated reads get an outcome. The event
+    carries call_id/call_hash for the gate.log match, but no paths: a read never makes a change the agent's."""
+    from lib import redact
+    sys.path.insert(0, str(JUDGE_DIR / "collector"))
+    try:
+        import collect
+    finally:
+        sys.path.remove(str(JUDGE_DIR / "collector"))
+    run(ev(env, "on_session_start"))
+    mem = env["hermes"] / "memories" / "MEMORY.md"
+    ti = {"path": str(mem), "offset": 1, "limit": 50}
+    run(ev(env, "post_tool_call", tool_name="read_file", tool_input=ti,
+           extra={"status": "ok", "tool_call_id": "call-read-1"}))
+    blocked = {"path": str(env["home"] / ".ssh" / "id_ed25519")}
+    run(ev(env, "post_tool_call", tool_name="read_file", tool_input=blocked,
+           extra={"status": "blocked", "tool_call_id": "call-read-2"}))
+    d = env["review"] / "snapshots" / SESSION
+    evs = snapshot.events(d)
+    assert [(e["tool"], e["paths"], e["status"], e["call_id"]) for e in evs] == [
+        ("read_file", [], "ok", "call-read-1"), ("read_file", [], "blocked", "call-read-2")]
+    assert evs[0]["call_hash"] == redact.call_hash("read_file", ti)
+    assert evs[1]["call_hash"] == redact.call_hash("read_file", blocked)
+    # the executed read matches its gate decision (by id, and by hash when Hermes sent no id); the blocked one not
+    from datetime import timedelta
+    t = q.parse_utc(evs[0]["t"])
+    recs = [{"tool": "read_file", "tool_call_id": "call-read-1", "call_hash": evs[0]["call_hash"], "_ts": t},
+            {"tool": "read_file", "call_hash": evs[0]["call_hash"], "_ts": t - timedelta(seconds=1)},
+            {"tool": "read_file", "tool_call_id": "call-read-2", "call_hash": evs[1]["call_hash"], "_ts": t}]
+    executed = [dict(e, _t=q.parse_utc(e["t"])) for e in evs if snapshot.ran(e)]
+    assert collect._match_executions(recs, executed) == {0: "tool_call_id"}
+    no_id = [dict(e, _t=q.parse_utc(e["t"]), call_id=None) for e in evs if snapshot.ran(e)]
+    assert collect._match_executions(recs[1:], no_id) == {0: "call_hash"}
+    # someone else changes the file the agent only read: not the agent's change
+    mem.write_text("changed by someone else\n")
+    run(ev(env, "on_session_end", extra={"completed": True}))
+    (r,) = q.list_pending()
+    assert str(mem) not in r["changed_paths"]
+    assert str(mem) in r["detail"]["changed_by_others"]
+
+
 def test_never_crashes(env, monkeypatch):
     run("not json at all")
     run({"hook_event_name": "post_tool_call", "tool_input": "weird", "session_id": SESSION, "tool_name": "patch"})
