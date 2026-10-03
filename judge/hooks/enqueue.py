@@ -18,6 +18,9 @@ Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
                      tool events (lib/snapshot.agent_touched) plus this turn's write_file/patch targets.
                      Every other snapshot change goes to detail.changed_by_others (paths only) and does not
                      count for data_class.
+                     When the same turn's pre_verify completion request is still pending (created since
+                     the previous on_session_end, not yet being judged), this request is merged into it
+                     (lib/queue.merge_into_pending_completion) instead of being written separately.
 """
 from __future__ import annotations
 
@@ -230,6 +233,13 @@ def on_session_end(payload, cfg, root):
         "completion", session, q.utc_now_iso(since), source_event="on_session_end",
         changed_paths=changed_paths, claims=_trunc(redact.redact(claims)), plan=plans[-1] if plans else None,
         data_class=config.classify(changed_paths, cfg, cwd or None), detail=detail, root=root)
+    # The same turn's pre_verify request is still pending: fold this one into it (#12, one review per
+    # turn). Already judged or being judged -> a new request as before, subject to is_duplicate.
+    if q.merge_into_pending_completion(req, since=q.utc_now_iso(since), root=root):
+        meta["last_end"] = req["created"]
+        meta["last_changed"] = changed
+        snapshot.save_meta(d, meta)
+        return None
     dup = q.is_duplicate(req, root=root)
     if dup:
         meta["last_end"] = req["created"]

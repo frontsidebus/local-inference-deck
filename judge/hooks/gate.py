@@ -2,13 +2,17 @@
 """judge/hooks/gate.py: C2 synchronous safety gate (Hermes ``pre_tool_call`` shell hook).
 
 Deterministic policy, no model calls, stdlib only. Installed with ``fail_closed: true`` and matcher
-``terminal|write_file|patch``.
+``terminal|write_file|patch|read_file``.
 
 stdin   {"hook_event_name","tool_name","tool_input","session_id","cwd","profile","extra"}
           terminal:   tool_input = {"command": str, "workdir"?: str, "background"?: bool, ...}
           write_file: tool_input = {"path": str, "content": str}
           patch:      tool_input = {"path","old_string","new_string","replace_all"?}  (replace mode)
                       or {"mode": "patch", "patch": "*** Begin Patch ..."}            (V4A mode)
+          read_file:  tool_input = {"path": str, "offset"?: int, "limit"?: int}  (tools/file_tools.py
+                      READ_FILE_SCHEMA). Only the path matters: a secret-shaped path escalates
+                      (secret-output, rule_key per resolved path, so paging with offset/limit or a
+                      `[a]lways` answer covers that one file only); every other read passes.
 stdout  {}                                                    pass, exit 0
         {"action":"approve","message":...,"rule_key":...}     escalate to the human, exit 0
         {"action":"block","message":...}                      refuse, exit 2 (and the message on stderr)
@@ -38,7 +42,17 @@ SITE_VARS = ("BACKEND_LAN_IP", "BACKEND_WG_IP", "EDGE_PUBLIC_IP", "EDGE_WG_IP", 
              "BACKEND_SSH_USER", "EDGE_SSH_USER", "JUDGE_SSH_ALIASES")
 KNOWN_KINDS = ("oversight_config", "oversight_path", "hermes_config", "sensitive_path", "remote_mutation",
                "remote_copy", "remote_opaque", "public_push", "secret_output")
-GATED_TOOLS = ("terminal", "write_file", "patch")
+GATED_TOOLS = ("terminal", "write_file", "patch", "read_file")
+# Fallbacks when an older pre-rendered $JUDGE_REVIEW_DIR/gate-policy.json lacks these keys (the template has them).
+DEFAULT_HERMES_CLI = {
+    "config_readonly": ["", "show", "get", "path", "env-path", "check"], "config_block": ["edit"],
+    "hooks_readonly": ["", "list", "ls", "doctor"],
+    "hooks_block": ["revoke", "remove", "rm", "approve", "accept", "allow"],
+    "block_subcommands": ["import"], "approve_subcommands": ["setup", "migrate"],
+}
+DEFAULT_SECRET_PATHS = ["~/.config/spark/**", "$HERMES_HOME/.env", "~/.ssh/id_*", "/etc/llama-swap/api-key",
+                        "/etc/wireguard/**", "/etc/ssh/ssh_host_*_key", "~/.git-credentials",
+                        "~/.docker/config.json", "~/.config/gh/hosts.yml"]
 MAX_DEPTH = 8
 MAX_SCRIPT_PEEK = 512 * 1024
 DEV_SINKS = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "-")
@@ -706,6 +720,7 @@ class Gate:
         self.hits = []
         self._pat_cache = {}
         self.full_text = ""
+        self.subject = None  # rule_key subject override (read_file: the resolved path)
 
     # ------------------------------------------------------------ hit bookkeeping
     def hit(self, kind, reason, subject=""):
@@ -720,6 +735,8 @@ class Gate:
         ck = (kind, key)
         if ck not in self._pat_cache:
             vals = (self.rules.get(kind) or {}).get(key) or []
+            if not vals and (kind, key) == ("secret_output", "secret_paths") and kind in self.rules:
+                vals = DEFAULT_SECRET_PATHS
             out = []
             for v in ([vals] if isinstance(vals, str) else vals):
                 glob = v.endswith("/**")
@@ -770,11 +787,26 @@ class Gate:
                 return "sensitive"
         return None
 
-    def is_secret_file(self, word):
-        b = os.path.basename(word.rstrip("/"))
-        if not b or any(fnmatch.fnmatch(b, x) for x in self.not_secret):
+    def is_secret_file(self, word, cwd=None):
+        """Secret-shaped file: basename in secret_names, or the path under secret_paths (~/.config/spark/**,
+        ~/.ssh/id_*, ...); not_secret_names (*.pub, *.example, ...) wins. The symlink target counts too.
+        Shared by the terminal secret-output checks and read_file."""
+        if not word or word in DEV_SINKS:
             return False
-        return any(fnmatch.fnmatch(b, x) for x in self.secret_names)
+        b = os.path.basename(word.rstrip("/"))
+        if b and not any(fnmatch.fnmatch(b, x) for x in self.not_secret) and \
+                any(fnmatch.fnmatch(b, x) for x in self.secret_names):
+            return True
+        if any(t in word for t in ("__GATE_SUB", "`")):
+            return False
+        pats = self._pats("secret_output", "secret_paths")
+        for p in variants(expand(word, self.rt, cwd)):
+            pb = os.path.basename(p)
+            if not pb or any(fnmatch.fnmatch(pb, x) for x in self.not_secret):
+                continue
+            if any(fnmatch.fnmatch(pb, x) for x in self.secret_names) or any(path_match(p, x) for x in pats):
+                return True
+        return False
 
     # ------------------------------------------------------------ write classification
     def local_write(self, raw, cwd, tool, how, text_for_keys=None, tree=False):
@@ -870,7 +902,7 @@ class Gate:
                     self.hit("remote_opaque", f"interactive root shell on {remote} (sudo -i/-s)", "sudo -s")
                 return False
             # `$(<file)` / `x=$(<file)`: a bare input redirect reads the file into the capture.
-            reads = [t for op, t in sc.redirects if op == "<" and self.is_secret_file(t)]
+            reads = [t for op, t in sc.redirects if op == "<" and self.is_secret_file(t, ctx["cwd"])]
             if reads and not ctx["captured"]:
                 self.hit("secret_output", f"prints {reads[0]}", reads[0])
             for t in sc.out_targets():
@@ -1107,7 +1139,7 @@ class Gate:
             else:
                 files = positional(args, "nNcwsk" if name in ("head", "tail", "base64", "cut", "fold") else "")
             files += [t for op, t in sc.redirects if op == "<"]
-            hits = [f for f in files if self.is_secret_file(f)]
+            hits = [f for f in files if self.is_secret_file(f, ctx["cwd"])]
             if hits:
                 reads = True
                 if not ctx["captured"]:
@@ -1124,11 +1156,11 @@ class Gate:
         elif name == "openssl" and args and args[0] in ("rsa", "pkey", "ec", "pkcs12") and not ctx["captured"]:
             if not any(a in ("-pubout", "-noout") for a in args):
                 ins = [args[k + 1] for k, a in enumerate(args[:-1]) if a == "-in"]
-                if any(self.is_secret_file(x) for x in ins):
+                if any(self.is_secret_file(x, ctx["cwd"]) for x in ins):
                     self.hit("secret_output", f"openssl {args[0]} prints a private key", args[0])
         if name == "read":
             for op, t in sc.redirects:
-                if op == "<" and self.is_secret_file(t):
+                if op == "<" and self.is_secret_file(t, ctx["cwd"]):
                     for v in positional(args, "adnNptu"):
                         ctx.setdefault("secret_vars", set()).add(v)
                     reads = True
@@ -1499,7 +1531,7 @@ class Gate:
         elif name == "gh":
             self._gh(args)
         elif name == "hermes":
-            self._hermes_cli(args, sc)
+            self._hermes_cli(args, sc, ctx)
         elif name in ("python", "python3", "perl", "ruby", "node", "php") or re.fullmatch(r"python3\.\d+", name):
             code = opt_values(args, "ce" if name != "php" else "r")
             if not code and sc.stdin is not None and (not positional(args) or "-" in args):
@@ -1565,27 +1597,55 @@ class Gate:
                     has_flag(args, "fF", ("field", "raw-field", "input")):
                 self.hit("public_push", "gh api write request", "gh api")
 
-    def _hermes_cli(self, args, sc):
+    def _hermes_cli(self, args, sc, ctx):
+        """`hermes ...` on the terminal. Read-only forms pass (see the hermes_cli map in the oversight-config
+        rule, verified against `hermes <sub> --help` and hermes_cli/{config,hooks}.py); mutating forms on
+        oversight state block; any other config/hooks action escalates (when in doubt, escalate)."""
         oc = self.rules.get("oversight_config") or {}
         for f in oc.get("hermes_cli_block_flags") or ():
             if f in args:
                 self.hit("oversight_config", f"hermes {f} bypasses approvals/hook consent", f"hermes {f}")
+        opts = args[:args.index("--")] if "--" in args else args
+        if any(a in ("-h", "--help") for a in opts):
+            return  # argparse prints help and exits before any action runs
+        cli = oc.get("hermes_cli") or DEFAULT_HERMES_CLI
         pos = positional(args, "zmtsr", ("usage-file", "model", "provider", "reasoning", "resume", "in",
-                                         "toolsets", "skills", "continue"))
-        if len(pos) >= 2 and pos[0] == "config":
-            act = pos[1]
+                                           "toolsets", "skills", "continue", "apply", "days", "min-count",
+                                           "limit", "db", "for-tool", "payload-file", "env-type"))
+        if not pos:
+            return  # bare `hermes` / `hermes --version`
+        sub, act = pos[0], (pos[1] if len(pos) > 1 else "")
+        if sub == "config":
             key = pos[2] if len(pos) > 2 else ""
             if act in ("set", "unset"):
                 top = key.split(".", 1)[0]
                 if top in self.config_top or key in self.config_keys or key.rsplit(".", 1)[-1] in self.config_nested:
                     self.hit("oversight_config", f"hermes config {act} {key}", key)
                 else:
-                    self.hit("hermes_config", f"hermes config {act} {key}", key)
-            elif act in ("edit", "migrate"):
-                self.hit("oversight_config" if act == "edit" else "hermes_config",
-                         f"hermes config {act} (can change any setting)", act)
-        if len(pos) >= 2 and pos[0] == "hooks" and pos[1] in ("revoke", "approve", "accept", "allow"):
-            self.hit("oversight_config", f"hermes hooks {pos[1]} changes hook consent", "hooks " + pos[1])
+                    self.hit("hermes_config", f"hermes config {act} {key}".rstrip(), key or act)
+            elif act in (cli.get("config_block") or ()):
+                self.hit("oversight_config", f"hermes config {act} (can change any setting)", act)
+            elif act == "get" and has_flag(args, "", ("raw",)):
+                if not ctx["captured"]:
+                    self.hit("secret_output", "hermes config get --raw prints credential values unmasked",
+                             "hermes config get --raw")
+            elif act in (cli.get("config_readonly") or ()):
+                pass
+            else:
+                self.hit("hermes_config", f"hermes config {act} (not on the read-only list)", act)
+        elif sub == "hooks":
+            if act in (cli.get("hooks_block") or ()):
+                self.hit("oversight_config", f"hermes hooks {act} changes hook consent", "hooks " + act)
+            elif act not in (cli.get("hooks_readonly") or ()):
+                self.hit("hermes_config", f"hermes hooks {act} (not on the read-only list; `test` fires the "
+                         "oversight hooks with a synthetic payload)", "hooks " + act)
+        elif sub == "approvals" and act == "suggest" and has_flag(args, "", ("apply",)):
+            self.hit("oversight_config", "hermes approvals suggest --apply writes command_allowlist",
+                     "approvals suggest --apply")
+        elif sub in (cli.get("block_subcommands") or ()):
+            self.hit("oversight_config", f"hermes {sub} overwrites the Hermes home (config, hook consent)", sub)
+        elif sub in (cli.get("approve_subcommands") or ()):
+            self.hit("hermes_config", f"hermes {sub} rewrites the Hermes config", sub)
 
     # ------------------------------------------------------------ file tools
     def file_write(self, tool, path, cwd, new_content=None, old_new=None):
@@ -1776,6 +1836,15 @@ class Gate:
             content = ti.get("content")
             paths.append(self.file_write("write_file", ti.get("path"), cwd,
                                          new_content=content if isinstance(content, str) else ""))
+        elif tool == "read_file":
+            path = ti.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise GateError("read_file: tool_input.path missing")
+            p = expand(path.strip(), self.rt, cwd)
+            paths.append(p)
+            self.subject = p
+            if self.is_secret_file(p):
+                self.hit("secret_output", f"read_file {p} returns a secret into the transcript", p)
         else:
             if ti.get("mode") == "patch" or (isinstance(ti.get("patch"), str) and not ti.get("path")):
                 if not isinstance(ti.get("patch"), str):
@@ -1844,7 +1913,8 @@ def decide(gate, tool, ti):
         msg = f"Judge gate escalation: {head}. Detail: {detail}."
         if "public-push" in rules:
             msg += " Note: the deck repo is PUBLIC; confirm scripts/check-sanitized.sh is clean."
-    subject = ti.get("command") if tool == "terminal" else (ti.get("path") or str(ti.get("patch") or "")[:400])
+    subject = gate.subject or (ti.get("command") if tool == "terminal"
+                               else (ti.get("path") or str(ti.get("patch") or "")[:400]))
     digest = hashlib.sha256(f"{tool}\0{subject}".encode("utf-8", "replace")).hexdigest()[:12]
     rule_key = f"judge-gate:{rules[0]}:{digest}"
     return decision, msg, rule_key, rules

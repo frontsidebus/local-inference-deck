@@ -114,12 +114,13 @@ def test_ack(env):
     rid = "20261003T035210Z-fdc8ec-completion"
     assert not q.is_acked(rid, "F1")
     assert len(q.unacked_items()) == 2
-    p = q.ack(rid, "F1", "fixed in place\nsecond line ignored")
-    assert p.read_text() == "fixed in place\n" and (p.stat().st_mode & 0o777) == 0o600
+    p = q.ack(rid, "F1", "fixed in place\nsecond line ignored", now=NOW)
+    assert json.loads(p.read_text()) == {"actor": "human", "reason": "fixed in place", "ts": "2026-10-03T03:52:10Z"}
+    assert (p.stat().st_mode & 0o777) == 0o600
     assert q.is_acked(rid, "F1") and not q.is_acked(rid, "F2")
     assert [i["id"] for _, i in q.unacked_items()] == ["F2"]
     q.write_ack(rid, "F2")
-    assert q.is_acked(rid, "F2") and (env["review"] / "acks" / f"{rid}.F2").read_text() == ""
+    assert q.is_acked(rid, "F2") and json.loads((env["review"] / "acks" / f"{rid}.F2").read_text())["reason"] == ""
     with pytest.raises(ValueError):
         q.ack(rid, "../x")
     assert q.is_acked(rid, "../x") is False

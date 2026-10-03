@@ -132,7 +132,9 @@ def test_turn1_bundle_has_no_turn2_evidence_even_when_collected_later(env):
     fr = runner()
     ev1 = collect.collect(r1["id"], runner=fr, now=t2_end + timedelta(minutes=10))
     man = json.loads((ev1 / "manifest.json").read_text())
-    assert man["window"] == {"since": iso(T0), "until": iso(t1_end + timedelta(seconds=10)), "grace_seconds": 10}
+    # no `conversation turn:` log lines here, so turn 2's request (since = t1_end) bounds turn 1's window (#16)
+    assert man["window"] == {"since": iso(T0), "until": iso(t1_end), "grace_seconds": 10,
+                             "until_basis": "next_request", "next_turn_start": iso(t1_end)}
     log = (ev1 / "hermes-log.txt").read_text()
     assert "TURN1 reload blocked" in log and "TURN1-check" in log
     assert "TURN2" not in log
@@ -140,7 +142,7 @@ def test_turn1_bundle_has_no_turn2_evidence_even_when_collected_later(env):
     assert "reload nginx" in gates and "TURN2" not in gates
     # host find is bounded on both sides, in UTC
     finds = [c["argv"][-1] for c in fr.calls if "find /etc" in c["argv"][-1]]
-    assert finds and all("-newermt '2026-10-03 03:20:00 UTC' ! -newermt '2026-10-03 03:30:10 UTC'" in f
+    assert finds and all("-newermt '2026-10-03 03:20:00 UTC' ! -newermt '2026-10-03 03:30:00 UTC'" in f
                          for f in finds)
     # turn 2's memory edit is neither the agent's turn-1 change nor someone else's
     diff = (ev1 / "agent-diff.patch").read_text()
