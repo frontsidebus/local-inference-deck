@@ -21,9 +21,23 @@ Leading system messages are left alone (the templates merge them).
 
 Covers /v1/messages (anthropic_messages, incl. the native llama-server
 passthrough), /v1/chat/completions and /v1/responses.
+
+Second job: output cap. llama-server treats a request without max_tokens as
+"generate until the context is full" (n_predict -1; one such request ran for
+21 minutes to 131072 tokens). Every request therefore leaves the gateway with
+an explicit output limit:
+  no limit, or a non-positive / non-integer one -> DEFAULT_MAX_OUTPUT
+  a limit above the model's maximum             -> clamped to that maximum
+  a smaller limit                               -> passed through unchanged
+Fields: max_tokens / max_completion_tokens (chat, text completion),
+max_output_tokens (responses), max_tokens (messages). The per-model maxima
+match model_info.max_tokens in litellm.yaml and the `-n` backstop in the
+llama-swap config (llama-server's -n is only a default: a request that asks
+for more gets more, so the clamp has to happen here).
 """
 
 import logging
+import os
 
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -180,6 +194,104 @@ def _responses_is_user(m):
     )
 
 
+# --- output cap -------------------------------------------------------------
+# Default output limit for a request that sets none.
+DEFAULT_MAX_OUTPUT = int(os.environ.get("SPARK_DEFAULT_MAX_OUTPUT", "16384"))
+# Per-alias maximum = litellm.yaml model_info.max_tokens = llama-swap `-n`.
+MODEL_MAX_OUTPUT = {
+    "coder": 32768,
+    "coder-fast": 32768,
+    "big": 32768,
+    "vision": 16384,
+    "hermes": 16384,
+}
+# local/<llama-swap model ID> -> the alias that ID serves
+LOCAL_ID_ALIAS = {
+    "qwen3.8-27b": "coder",
+    "qwen3.6-35b-a3b": "coder-fast",
+    "qwen3-coder-next": "big",
+    "gemma-4-31b": "vision",
+    "hermes-4.3-36b": "hermes",
+}
+# anything else (unknown local/* IDs): the smallest maximum
+FALLBACK_MAX_OUTPUT = min(MODEL_MAX_OUTPUT.values())
+
+# call_type -> (field to set when missing, all fields that carry a limit)
+_CAP_FIELDS = {
+    "completion": ("max_tokens", ("max_tokens", "max_completion_tokens")),
+    "acompletion": ("max_tokens", ("max_tokens", "max_completion_tokens")),
+    "text_completion": ("max_tokens", ("max_tokens",)),
+    "atext_completion": ("max_tokens", ("max_tokens",)),
+    "anthropic_messages": ("max_tokens", ("max_tokens",)),
+    "responses": ("max_output_tokens", ("max_output_tokens",)),
+    "aresponses": ("max_output_tokens", ("max_output_tokens",)),
+}
+
+
+def model_max_output(model):
+    """Maximum output tokens for a requested model name (alias, claude-*, local/<id>)."""
+    if not isinstance(model, str):
+        return FALLBACK_MAX_OUTPUT
+    if model in MODEL_MAX_OUTPUT:
+        return MODEL_MAX_OUTPUT[model]
+    if model.startswith("claude-"):  # safety-net route -> coder
+        return MODEL_MAX_OUTPUT["coder"]
+    if model.startswith("local/"):
+        alias = LOCAL_ID_ALIAS.get(model[len("local/"):])
+        if alias:
+            return MODEL_MAX_OUTPUT[alias]
+    return FALLBACK_MAX_OUTPUT
+
+
+def _as_limit(v):
+    """A usable positive int limit, or None (missing, -1, 0, junk)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    if isinstance(v, float) and v.is_integer():
+        return int(v) if v > 0 else None
+    if isinstance(v, str) and v.strip().isdigit():
+        n = int(v.strip())
+        return n if n > 0 else None
+    return None
+
+
+def cap_output(data, call_type):
+    """Give the request an explicit, bounded output limit. Returns a list of changes (for the log)."""
+    spec = _CAP_FIELDS.get(call_type)
+    if spec is None or not isinstance(data, dict):
+        return []
+    primary, fields = spec
+    limit = model_max_output(data.get("model"))
+    default = min(DEFAULT_MAX_OUTPUT, limit)
+    changes = []
+    have = False
+    for f in fields:
+        if f not in data or data[f] is None:
+            if f in data:
+                del data[f]
+            continue
+        n = _as_limit(data[f])
+        if n is None:
+            changes.append("%s=%r dropped" % (f, data[f]))
+            del data[f]
+            continue
+        have = True
+        if n > limit:
+            changes.append("%s %d->%d" % (f, n, limit))
+            n = limit
+        if data[f] != n:
+            data[f] = n
+    if not have:
+        data[primary] = default
+        changes.append("%s=%d (default)" % (primary, default))
+    elif primary not in data:
+        # only max_completion_tokens was given: mirror it into max_tokens, which llama-server reads
+        data[primary] = min(_as_limit(data[f]) for f in fields if f in data)
+    return changes
+
+
 class SparkHooks(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         try:
@@ -203,7 +315,7 @@ class SparkHooks(CustomLogger):
                     if n:
                         data["input"] = new
             else:
-                return data
+                n = 0
             if n:
                 log.info(
                     "spark_hooks: rewrote %d mid-conversation system message(s) as user <system-reminder> (%s, model=%s)",
@@ -211,6 +323,12 @@ class SparkHooks(CustomLogger):
                 )
         except Exception as e:  # never break a request because of the hook
             log.warning("spark_hooks: normalization skipped: %r", e)
+        try:
+            changes = cap_output(data, call_type)
+            if changes:
+                log.info("spark_hooks: output cap %s (%s, model=%s)", ", ".join(changes), call_type, data.get("model"))
+        except Exception as e:
+            log.warning("spark_hooks: output cap skipped: %r", e)
         return data
 
 

@@ -2,7 +2,7 @@
 
 ## 2026-10-01: MTP speculative decoding for `coder` (qwen3.8-27b, GPU0)
 
-Setup: llama.cpp b11277 (pinned digest), Qwen3.8-27B-UD-Q4_K_XL with its embedded MTP head (`blk.64.nextn.*`, no separate draft GGUF needed). Flags: `-c 131072 -ctk/-ctv q8_0 -np 1 --fit off -ngl all -sm none`. Sampling is the server default (temp 0.6, top-p 0.95, top-k 20). Requests went straight to llama-swap `$BACKEND_WG_IP:8080` from Walter. Numbers are from `timings.predicted_per_second`. Thinking off: 3 prompts x 3 runs (mean). Thinking on: 1 run per prompt, capped at 4096 tokens.
+Setup: llama.cpp b11277 (pinned digest), Qwen3.8-27B-UD-Q4_K_XL with its embedded MTP head (`blk.64.nextn.*`, no separate draft GGUF needed). Flags: `-c 131072 -ctk/-ctv q8_0 -np 1 --fit off -ngl all -sm none`. Sampling is the server default (temp 0.6, top-p 0.95, top-k 20). Requests went straight to llama-swap `$BACKEND_WG_IP:8080` from Walter. Numbers are from `timings.predicted_per_second`. Thinking off: 3 prompts x 3 runs (mean). Thinking on: 1 run per prompt, capped at 4096 tokens. (Since 2026-10-03 the live config also passes `-n 32768`, an output backstop; it does not change speed, and every benchmark request set its own limit anyway.)
 Prompts: code = LRU cache plus pytest (~1000 tokens), prose = speculative decoding explainer (~550 tokens), refactor = 2070-token prompt holding a ~170-line module (~1000 tokens out).
 
 | config | code tok/s | prose tok/s | refactor tok/s | mean (think off) | think-on mean (code/prose/refactor) | acceptance (code/prose/refactor) | GPU0 VRAM | ctx |
