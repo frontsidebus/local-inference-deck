@@ -24,6 +24,10 @@ Every probe validates each argument against a regex before anything runs; an unk
 argument exits 64 with no execution. Commands are fixed and read-only; each step has a timeout
 (JUDGE_PROBE_TIMEOUT, default 20 s). Output: the commands, their stdout+stderr (redacted) and exit codes.
 Exit status: 0 if every step succeeded, else the first failing step's code (124 = timeout).
+Remote steps on walter/covenant are shown as `$ ssh <walter> '<remote command>'` under a `# host:` header line
+(host_header): the logical name IS the target, reached via its configured ssh target (site.env); the address,
+user or alias is never printed (bug #24: the old `$ ssh covenant ...` line read like a different host than
+the `user@address` argv another probe printed). The remote command follows verbatim (ssh joins its args).
 
 For tests/other callers: run_probe(name, args, cfg=None, runner=None) -> (exit_code, text) and
 slots_summary(cfg=None, runner=None) -> dict. A runner is `runner(argv, timeout, cwd=None) -> (rc, out, err)`.
@@ -55,6 +59,18 @@ Runner = Callable[..., Tuple[int, str, str]]
 
 class UsageError(Exception):
     pass
+
+
+HOST_ROLES = {"walter": "backend / inference host", "covenant": "edge / reverse-proxy host"}
+
+
+def host_header(host: str) -> str:
+    """One `# host:` line that ties the logical host name to the machine the probe reached, without
+    revealing the configured address/alias."""
+    role = HOST_ROLES.get(host, "host")
+    return (f"# host: {host} ({role}, via the configured ssh target from site.env; address/alias not shown). "
+            f"`ssh <{host}>` below means exactly that host. Output lines may carry the machine's own "
+            f"hostname, which can differ from the logical name '{host}'; that is not a mismatch.")
 
 
 def subprocess_runner(argv: Sequence[str], timeout: float, cwd: Optional[str] = None) -> Tuple[int, str, str]:
@@ -131,10 +147,11 @@ class Ctx:
         self.rc = 0
 
     def step(self, argv: Sequence[str], cwd: Optional[str] = None, show: bool = True,
-             timeout: Optional[float] = None) -> Tuple[int, str, str]:
+             timeout: Optional[float] = None, display: Optional[str] = None) -> Tuple[int, str, str]:
         rc, out, err = self.runner(list(argv), timeout or self.timeout, cwd=cwd)
         if show:
-            self.lines.append("$ " + " ".join(shlex.quote(a) for a in argv) + (f"   (cwd {cwd})" if cwd else ""))
+            self.lines.append("$ " + (display if display is not None else " ".join(shlex.quote(a) for a in argv))
+                              + (f"   (cwd {cwd})" if cwd else ""))
             if out:
                 self.lines.append(out.rstrip("\n"))
             if err:
@@ -147,8 +164,18 @@ class Ctx:
     def note(self, text: str) -> None:
         self.lines.append(text)
 
+    def ssh_display(self, host: str, remote_cmd: str) -> str:
+        """`ssh <host> '<remote command>'` (logical host; see host_header). Adds the host header once."""
+        hdr = host_header(host)
+        if hdr not in self.lines:
+            self.lines.append(hdr)
+        return f"ssh <{host}> {remote_cmd}"  # ssh joins its args: the remote command, verbatim
+
     def ssh(self, host: str, remote_cmd: str, **kw) -> Tuple[int, str, str]:
-        return self.step(config.host_ssh(host, self.cfg) + [remote_cmd], **kw)
+        argv = config.host_ssh(host, self.cfg) + [remote_cmd]  # raises ValueError before any header
+        if kw.get("show", True):
+            kw.setdefault("display", self.ssh_display(host, remote_cmd))
+        return self.step(argv, **kw)
 
 
 def p_ssh_alias_test(ctx: Ctx, alias: str) -> None:
@@ -187,7 +214,7 @@ def p_unit_journal(ctx: Ctx, host: str, unit: str, since: str, until: str) -> No
     jc = (f"journalctl --no-pager -q --utc -o short-iso -n {JOURNAL_MAX_LINES} -u {q(unit)} "
           f"--since {q(_journal_ts(since))} --until {q(_journal_ts(until))}")
     rc, out, err = ctx.ssh(host, f"sudo -n {jc} || {jc}", show=False)
-    ctx.note(f"$ ssh {host} 'sudo -n {jc} || {jc}'")
+    ctx.note("$ " + ctx.ssh_display(host, f"sudo -n {jc} || {jc}"))
     kept, withheld = [], 0
     for line in out.splitlines():
         if redact(line) != line:  # secret-shaped: withhold the whole line, not just the value
@@ -243,7 +270,7 @@ def p_render_and_diff(ctx: Ctx, template: str, live: Optional[str] = None) -> No
         return
     host, lpath = LIVE_RE.match(live).groups()
     rc, out, _ = ctx.ssh(host, f"cat -- {shlex.quote(lpath)}", show=False)
-    ctx.note(f"$ ssh {host} cat -- {lpath}   (output redacted, shown as diff)\n# exit {rc}")
+    ctx.note(f"$ {ctx.ssh_display(host, f'cat -- {shlex.quote(lpath)}')}   (output redacted, shown as diff)\n# exit {rc}")
     if rc != 0:
         return
     diff = list(difflib.unified_diff(rendered.splitlines(), redact(out).splitlines(),

@@ -9,7 +9,8 @@ Usage:
 Bundle (judge/CONTRACT.md):
     manifest.json        request copy, artifact list, collector version, data_class, window, attribution,
                          point_in_time (what was observed at collection time), notes
-    hermes-log.txt       agent.log + errors.log lines in the window (this session + untagged), redacted
+    hermes-log.txt       agent.log + errors.log lines in the window, redacted: this session's lines FIRST, then
+                         untagged context lines (startup/housekeeping noise of all Hermes processes dropped)
     gate-decisions.jsonl gate.log lines of this session in the window (+ a gate request's own decision), redacted,
                          each with `outcome` executed | not_executed | unknown (matched against events.jsonl)
     agent-diff.patch     watched paths vs the session-start snapshot, only paths the agent touched
@@ -168,25 +169,66 @@ def window(req: Dict, cfg: Mapping[str, str], root: Optional[Path] = None) -> Tu
 
 
 # ---------------------------------------------------------------- pieces
+SESSION_SECTION = "SESSION LINES"
+CONTEXT_SECTION = "UNTAGGED CONTEXT"
+
+
 def hermes_log(req: Dict, cfg: Mapping[str, str], since: datetime, until: datetime) -> str:
+    """hermes-log.txt (CONTRACT.md "hermes-log.txt layout"): every line of the window that is tagged with the
+    session comes FIRST (agent.log, then errors.log), then the untagged context lines. Untagged lines are
+    classified by lib/hermeslog.is_noise: startup/housekeeping chatter of any Hermes process (plugin and
+    tool registration, memory trim, gateway, ...) is dropped and only counted; every other untagged line
+    (e.g. agent.message_sanitization "Unrepairable ..." warnings, untagged agent.tool_executor lines) is kept
+    as context. errors.log lines that also appear in agent.log are not repeated."""
     tz = hermeslog.log_tz(cfg)
     # a C6 watcher request belongs to no Hermes session: untagged lines would only add unrelated (possibly
     # agent-content) context to a bundle that may go to the frontier judge
     untagged = not _watch_runaway(req)
+    extra_noise = tuple((cfg.get("JUDGE_LOG_NOISE_LOGGERS") or "").split())
     out = [f"# Hermes log lines for session {req['session']}"
-           + (" (plus untagged lines)" if untagged else " (untagged lines omitted: C6 watcher request)")
-           + f", window {q.utc_now_iso(since)} .. {q.utc_now_iso(until)} UTC; log tz {tz}; secrets redacted"]
+           + (" (plus untagged context lines, after the session lines)" if untagged
+              else " (untagged lines omitted: C6 watcher request)")
+           + f", window {q.utc_now_iso(since)} .. {q.utc_now_iso(until)} UTC; log tz {tz}; secrets redacted",
+           f"# Layout: '{SESSION_SECTION}' sections hold every line tagged [{req['session']}] (agent.log, then "
+           "errors.log)" + (f"; '{CONTEXT_SECTION}' sections follow: lines without a session tag, which may come "
+                            "from this or any other Hermes process; startup/housekeeping noise of all Hermes "
+                            "processes is dropped and only counted" if untagged else "")]
+    parts: Dict[str, Tuple] = {}
     for name in ("agent.log", "errors.log"):
         p = Path(cfg["HERMES_HOME"]) / "logs" / name
-        out.append(f"\n===== {name} =====")
-        if not p.is_file():
+        parts[name] = hermeslog.split_lines(p, req["session"], since, until, tz, extra_noise) if p.is_file() else None
+    seen = set()
+    if parts.get("agent.log"):
+        seen = set(parts["agent.log"][0]) | set(parts["agent.log"][1])
+
+    def section(name: str, idx: int, title: str) -> None:
+        got = parts[name]
+        if got is None:
+            out.append(f"\n===== {name}: {title} =====")
             out.append("(missing)")
-            continue
-        lines = hermeslog.session_lines(p, req["session"], since, until, tz, include_untagged=untagged)
+            return
+        lines = got[idx]
+        dup = 0
+        if name == "errors.log" and seen:
+            kept = [ln for ln in lines if ln not in seen]
+            dup, lines = len(lines) - len(kept), kept
+        extra = []
+        if dup:
+            extra.append(f"{dup} line(s) also in agent.log not repeated")
+        if idx == 1 and got[2]:
+            extra.append(f"{sum(got[2].values())} noise line(s) dropped: "
+                         + ", ".join(f"{k} x{v}" for k, v in sorted(got[2].items(), key=lambda kv: (-kv[1], kv[0]))))
+        out.append(f"\n===== {name}: {title} ({len(lines)} line(s){'; ' if extra else ''}{'; '.join(extra)}) =====")
         if len(lines) > LOG_MAX_LINES:
             out.append(f"# {len(lines) - LOG_MAX_LINES} earlier lines omitted (showing the last {LOG_MAX_LINES})")
             lines = lines[-LOG_MAX_LINES:]
         out.append("\n".join(redact(ln[:4000]) for ln in lines) if lines else "(no lines in window)")
+
+    for name in ("agent.log", "errors.log"):
+        section(name, 0, SESSION_SECTION)
+    if untagged:
+        for name in ("agent.log", "errors.log"):
+            section(name, 1, CONTEXT_SECTION)
     return "\n".join(out) + "\n"
 
 
@@ -259,13 +301,19 @@ def gate_decisions(req: Dict, root: Path, since: datetime, until: datetime,
     # executions the hook saw; for a completion/plan request only those up to its window end
     ev_end = now if req.get("kind") == "gate" else until
     evs = []
+    refused: Dict[str, str] = {}  # call_id -> status of a post_tool_call event saying the call never ran
     for ev in snapshot.events(d):
         try:
             ev["_t"] = q.parse_utc(str(ev.get("t") or ""))
         except ValueError:
             continue
-        if ev["_t"] <= ev_end and str(ev.get("status") or "").lower() not in NOT_RUN_STATUSES:
+        if ev["_t"] > ev_end:
+            continue
+        status = str(ev.get("status") or "").lower()
+        if status not in NOT_RUN_STATUSES:
             evs.append(ev)
+        elif ev.get("call_id"):
+            refused[str(ev["call_id"])] = status
     hit = _match_executions(recs, evs)
     markers = any(ev.get("call_hash") or ev.get("call_id") for ev in snapshot.events(d))
     try:
@@ -282,6 +330,10 @@ def gate_decisions(req: Dict, root: Path, since: datetime, until: datetime,
         dec = rec.get("decision")
         if i in hit:
             rec["outcome"], rec["outcome_basis"] = "executed", f"post_tool_call event matched by {hit[i]}"
+        elif rec.get("tool_call_id") and str(rec["tool_call_id"]) in refused:
+            rec["outcome"], rec["outcome_basis"] = (
+                "not_executed", f"post_tool_call reported status={refused[str(rec['tool_call_id'])]} for this "
+                                "call (matched by tool_call_id): it never ran")
         elif not meta:
             rec["outcome"], rec["outcome_basis"] = "unknown", "no session snapshot/events (hook not installed?)"
         elif not (rec.get("call_hash") or rec.get("tool_call_id")) or not markers:
@@ -415,7 +467,7 @@ def host_command(since: str, until: str) -> str:
 
 def host_diff(name: str, req: Dict, cfg: Mapping[str, str], runner, since: str, until: str) -> str:
     hdr = f"# host {name}: changes in [{since}, {until}] (UTC); read-only; find over /etc /srv /usr/local is " \
-          f"limited to what the ssh user can read; first {FIND_MAX} paths\n"
+          f"limited to what the ssh user can read; first {FIND_MAX} paths\n" + probe.host_header(name) + "\n"
     try:
         argv = config.host_ssh(name, cfg) + [host_command(since, until)]
     except ValueError as e:

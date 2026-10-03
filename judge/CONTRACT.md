@@ -92,6 +92,10 @@ removes the duplicate whenever the session end arrives first.
  "source_event": "post_tool_call|pre_tool_call|pre_verify|on_session_end|watch", "detail": {}}
 ```
 `changed_paths` lists only paths **the agent touched** (see "Attribution" below), never every snapshot change.
+`since` of a `pre_verify` completion (`hooks/verify.py::since_for`): earliest mtime of the changed paths − 5 min
+(no readable path: now − 1 h; never more than 24 h back), **clamped to the session start** (`started` in
+`snapshots/<session>/meta.json`, bug #20), except that a late snapshot never moves `since` past the earliest
+edit itself. An `on_session_end` completion starts at the previous turn's end (`last_end`) or the session start.
 The collector does **not** trust a request's `changed_paths` (see "Attribution"): a path without a backing tool
 event is rejected and never reaches `agent-diff.patch`, but still counts for `data_class`.
 A `completion` request from `hooks/enqueue.py` also carries `detail.changed_by_others`: the session's other
@@ -224,16 +228,35 @@ in an `infra` bundle); `{}` when nothing is withheld.
 | File | Content | Time |
 |---|---|---|
 | `manifest.json` | request copy, `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, changed_by_others, omitted_after_window, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`) | — |
-| `hermes-log.txt` | agent.log/errors.log lines of this session (plus untagged lines, except for a C6 watcher request) in the window, secrets redacted | window |
-| `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires for every call; Hermes reports a denied or timed-out approval as `status="blocked"`, interrupted calls as `cancelled`/`aborted`) matches the decision by `tool_call_id`, else by tool + `call_hash`, and its status is not in `NOT_RUN_STATUSES` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
+| `hermes-log.txt` | agent.log/errors.log lines in the window, secrets redacted: **this session's tagged lines first**, then untagged context lines with startup/housekeeping noise dropped (none for a C6 watcher request); layout below | window |
+| `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires for every call; Hermes reports a denied or timed-out approval as `status="blocked"`, interrupted calls as `cancelled`/`aborted`) matches the decision by `tool_call_id`, else by tool + `call_hash`, and its status is not in `NOT_RUN_STATUSES` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); not_executed also as soon as an event with a `NOT_RUN_STATUSES` status (e.g. Hermes' `blocked` for a refused approval) carries the decision's `tool_call_id` (basis `post_tool_call reported status=<s> ...`); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
 | `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (session tool events up to the window end; request `changed_paths` only with a backing event, see Attribution). Content only when `data_class=infra`; otherwise `# content withheld` lines (see above). A file modified after the window gets a `# NOTE:` line; a truncated or missing opted-in dir gets a `# NOTE: opted-in dir ...` header line | point in time (current content) |
 | `others-changed.txt` | snapshot changes **not** made by the agent: `<status> <path> \| +N -M` lines, never content. In an `infra` bundle, non-infra paths are withheld (count only). Changes made after the window (by anyone) are omitted (count only) | point in time |
-| `host-<name>.txt` | UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local, then `systemctl --failed` and the host clock (both at collection time) | find: window |
+| `host-<name>.txt` | `# host:` header (see Probes), then UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local, then `systemctl --failed` and the host clock (both at collection time) | find: window |
 | `c3-results.jsonl` | the C3 verifier runs of this session from `since` to the turn end, from `snapshots/<session>/c3-results.jsonl` (format below), re-redacted; every line has `final`, `true` on the latest per `(path, check)` | window (to turn end) |
 | `probes/host-<name>.txt` | read-only host-state probes chosen from the request's claims and the window's gate excerpts by `extras.host_state_probes` (`<name>` = `unit_state-<host>-<unit>`, `unit_journal-<host>-<unit>`, `port_listening-<host>-<port>`, sanitized to `[A-Za-z0-9_.-]`; at most 4 per request), re-redacted; text starting `# WINDOWED` is listed in `windowed`, the rest in `point_in_time` | unit_state, port_listening: point in time; unit_journal: window |
 | `slots.json` | llama-server slots summary (`{"<model>": [slot, ...], "_collected": "...Z", "_error": "..."}`; `_`-prefixed keys are string metadata) | point in time |
 | `probes/<probe>-<n>.txt` | stdout+stderr+exit code; written by `collect.py <id> --probe <name> [args]` (adds a `point_in_time` entry) | point in time |
 | `probes/judge-<probe>-<n>.txt` | probes the judge requested, saved by the runner | point in time |
+
+**`hermes-log.txt` layout** (`collect.hermes_log`, bug #19). Line 1: `# Hermes log lines for session <id> (plus
+untagged context lines, after the session lines), window ... UTC; log tz ...`; line 2: `# Layout: ...`. Then, in
+this order: `===== agent.log: SESSION LINES (N line(s)) =====`, `===== errors.log: SESSION LINES (...) =====`,
+`===== agent.log: UNTAGGED CONTEXT (M line(s); K noise line(s) dropped: <logger> xN, ...) =====`,
+`===== errors.log: UNTAGGED CONTEXT (...) =====`. SESSION LINES = every line tagged `[<session>]` (with its
+continuation lines); lines tagged with another session never appear. UNTAGGED CONTEXT = lines without a session
+tag, which may come from this or any other Hermes process; those `lib/hermeslog.is_noise` classifies as
+startup/housekeeping noise are dropped and only counted: loggers `hermes_cli.plugins`,
+`hermes_cli.plugin_capabilities`, `hermes_cli.mem_trim`, `hermes_cli.gateway_multiplex_mode`, `hermes_cli.main`,
+`tools.registry`, `tools.tool_search`, `tools.skills_sync`, `agent.shell_hooks`, `agent.auxiliary_client`,
+`agent.credential_pool`, `cron.*`, `gateway.*`, `botocore.*`, `plugins.*`, plus `JUDGE_LOG_NOISE_LOGGERS`; and the
+per-process-start messages `state.db: linked SQLite ... vulnerable`, `Background MCP discovery previously exited`,
+`Loaded environment variables from`, `OpenAI client created (agent_init|chat_completion_stream_request ...`.
+Every other untagged line is kept, e.g. `agent.message_sanitization` "Unrepairable tool_call arguments" warnings
+(Hermes does not tag them) and untagged `agent.tool_executor` lines of parallel tool calls. errors.log lines that
+also appear in agent.log are counted (`also in agent.log not repeated`), not repeated. At most 3000 lines per
+section (the last ones). A C6 watcher request has SESSION LINES sections only. S9 (run 2) went from 32.6K chars
+with the session's first line at char ~26K to 5.2K chars with the 17 session lines on top.
 
 `data_class` of the bundle: the stricter of the request's class and the collector's own classification of the
 agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request or a C6 watcher request (shape above) keeps its own class; any other
@@ -306,6 +329,27 @@ Read-only, stdlib-only helpers the collector calls; if the module is missing the
     starts with `# POINT IN TIME: ...` (unit_state, port_listening) or `# WINDOWED: ...` (unit_journal), then
     `# selected because: ...`.
 
+## Runner: bundle budget and collection timing (`runner/run_judge.py`)
+- **Collection timing** (bug #21). Before running the collector for a request without a bundle,
+  `wait_for_window` sleeps until `request.created + JUDGE_WINDOW_GRACE_SECONDS + 3 s` (`COLLECT_MARGIN_SECONDS`:
+  log flush and 1 s log/journal timestamp resolution). It sleeps only the remainder, at most grace + margin
+  (13 s by default, also for a `created` in the future); an existing bundle is never waited for. Chosen over
+  re-checking outcomes at judge time because the window is already fixed (`window_info`), so waiting makes the
+  one collection complete (log, gate outcomes, `unit_journal` probes, C3 lines) without rewriting a bundle or
+  probing hosts twice; `judge-review.service` (`TimeoutStartSec=3600`) tolerates the pause. A gate decision
+  whose call is still waiting for a human after that stays `unknown (decision too recent to tell)`, which is
+  then true; a refusal Hermes already reported (`status=blocked`) is `not_executed` (see `gate-decisions.jsonl`).
+- **Bundle budget** (bug #19). `JUDGE_BUNDLE_MAX_CHARS` (150000 frontier, 60000 local). `manifest.json` first,
+  then files in path order. Priority content is reserved first and never head-truncated:
+  `hermes-log.txt`'s session-tagged lines (with continuations; recognised by the session tag from the manifest,
+  so older interleaved bundles work too) up to 50% of the budget, and `gate-decisions.jsonl` up to 20%. Only
+  beyond those shares are they cut **in the middle** (first and last lines kept, one
+  `[... runner omitted N session-tagged|gate decision line(s) from the middle ...]` line). Every other file, and
+  `hermes-log.txt`'s untagged context, gets an equal share of the rest (at least 4000 chars): other files are
+  head-truncated (`[... truncated by runner: N more chars ...]`), the context is middle-cut, and structure
+  lines (headers, section titles) always stay. A non-priority file that no longer fits is listed as
+  `[omitted by runner: bundle size cap]`.
+
 ## Probes (`judge/probes/probe.py <name> [args...]`)
 Allowlisted names with per-arg regex validation; each runs read-only with a timeout (default 20s):
 `ssh_alias_test <alias>`, `port_listening <host:walter|covenant> <port>`, `http_status <https-url-on-SPARK_DOMAIN>`,
@@ -316,6 +360,12 @@ exit 64, no execution.
   falling back to plain `journalctl` when sudo needs a password. `since`/`until` must be strict
   `YYYY-MM-DDTHH:MM:SSZ`, `since <= until`, span at most 7 days. Lines the redactor would change are withheld
   whole (the count is printed); the output is redacted again as for every probe.
+- **Host header** (bug #24). Remote steps on `walter`/`covenant` print one line
+  `# host: <name> (<role>, via the configured ssh target from site.env; address/alias not shown). ...` and then
+  `$ ssh <<name>> <remote command>` (the remote command verbatim). The logical name *is* the target; the real
+  argv (from `config.host_ssh`) runs but its address, user and alias are never printed. Output lines may show the
+  machine's own hostname, which can differ from the logical name; the header says that is not a mismatch.
+  `host-<name>.txt` carries the same header. (`ssh_alias_test` prints its alias's `ssh -G` summary by design.)
 - Unit names (`unit_state`, `unit_journal`): `^[A-Za-z0-9@._-]+\.?(service|timer|socket)?$`, starting with a letter
   or digit, at most 128 chars. systemd-escaped names (with `:` or `\`) are refused.
 
@@ -424,7 +474,7 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
 `EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
 `JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
-`JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`.
+`JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`.
 Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

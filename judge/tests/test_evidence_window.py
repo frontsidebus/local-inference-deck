@@ -503,7 +503,7 @@ def test_hermes_session_bundle_keeps_untagged_lines(env):
     write_log(env, [(T0 + timedelta(minutes=1), "WARNING agent.message_sanitization: untagged note")])
     req = {"session": SESSION, "kind": "completion", "source_event": "on_session_end"}
     text = collect.hermes_log(req, config.load_config(), T0, T0 + timedelta(minutes=5))
-    assert "untagged note" in text and "(plus untagged lines)" in text
+    assert "untagged note" in text and "(plus untagged context lines" in text
 
 # --- calls that never ran (Hermes emits post_tool_call with status="blocked" for a denied/timed-out
 # approval, "cancelled"/"aborted" for interrupted calls) must not count as the agent touching a file ---

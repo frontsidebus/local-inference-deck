@@ -5,8 +5,8 @@
     run_judge.py --pending         judge everything in queue/ (oldest first), then re-scan for requests that
                                    arrived meanwhile (each tried once per run); used by judge-review.service
 
-Flow per request: make sure evidence/<id>/ exists (runs collector/collect.py if not) -> assemble the
-prompt input -> run the judge (frontier or local) -> validate (one retry on invalid output) -> write
+Flow per request: make sure evidence/<id>/ exists (if not: wait until request.created +
+JUDGE_WINDOW_GRACE_SECONDS + 3 s has passed, then run collector/collect.py) -> assemble the prompt input -> run the judge (frontier or local) -> validate (one retry on invalid output) -> write
 findings/<id>.json + .md -> move the request to done/.
 
 Mode selection:
@@ -34,6 +34,8 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
+import time
 import shlex
 import subprocess
 import sys
@@ -274,23 +276,157 @@ def frontier_cost_add(usd: Any) -> None:
 
 
 # ------------------------------------------------------------------------------ input assembly
+# Priority content (bug #19): session-tagged Hermes log lines and gate decisions must never be truncated away
+# by the per-file budget. They get first call on the budget (up to these shares of max_chars; beyond that
+# they are cut in the middle with a marker, keeping their first and last lines), and hermes-log.txt's
+# untagged context lines share the rest like any other file but are cut in the MIDDLE, never by a head cut
+# that drops whatever comes after them.
+SESSION_LOG_SHARE = 0.5
+GATE_SHARE = 0.2
+MIN_PER_FILE = 4000
+_LOG_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{1,6})? [A-Z]+ (?:\[(?P<session>[^\]\s]+)\] )?\S+:")
+
+
+def _middle_cut(lines: List[str], budget: int, what: str) -> List[str]:
+    """Keep the first and last lines of *lines* within *budget* chars; one marker line for the cut."""
+    total = sum(len(ln) + 1 for ln in lines)
+    if total <= budget:
+        return lines
+    half = max(0, budget // 2)
+    head: List[str] = []
+    used = 0
+    for ln in lines:
+        if used + len(ln) + 1 > half:
+            break
+        head.append(ln)
+        used += len(ln) + 1
+    tail: List[str] = []
+    used = 0
+    for ln in reversed(lines[len(head):]):
+        if used + len(ln) + 1 > half:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    tail.reverse()
+    if not head and lines:  # a single line longer than the half budget: keep its start
+        clip = max(0, budget - 80)
+        head = [lines[0][:clip] + f" [... truncated by runner: {len(lines[0]) - clip} more chars ...]"]
+        tail = [ln for ln in tail if ln is not lines[0]] if len(lines) > 1 else []
+        if len(lines) == 1:
+            return head
+    cut = len(lines) - len(head) - len(tail)
+    return head + [f"[... runner omitted {cut} {what} line(s) from the middle to fit the bundle budget ...]"] + tail
+
+
+def split_hermes_log(text: str, session: str) -> Tuple[List[Tuple[str, str]], int]:
+    """Classify each line of hermes-log.txt: "session" (tagged with *session*, and its continuation lines),
+    "struct" (headers, section titles, placeholders) or "context" (everything else: untagged lines and their
+    continuations). Works for the run-2 layout (session sections first) and for older interleaved bundles.
+    Returns ([(kind, line)], number of session lines)."""
+    out: List[Tuple[str, str]] = []
+    cur = "context"
+    n = 0
+    for ln in text.split("\n"):
+        m = _LOG_LINE_RE.match(ln)
+        if m:
+            cur = "session" if session and m.group("session") == session else "context"
+            kind = cur
+        elif ln.startswith(("# ", "===== ")) or ln in ("", "(missing)", "(no lines in window)"):
+            kind = "struct"
+            if ln.startswith("===== "):
+                cur = "context"
+        else:
+            kind = cur  # continuation of the previous line
+        n += kind == "session"
+        out.append((kind, ln))
+    return out, n
+
+
+def _fit_hermes_log(text: str, session: str, session_budget: int, context_budget: int) -> str:
+    """hermes-log.txt with its session lines cut to *session_budget* and its context lines to *context_budget*
+    (each middle-cut, see _middle_cut), in the original order; structure lines always kept."""
+    rows, _ = split_hermes_log(text, session)
+    plan = {}
+    for kind, budget, what in (("session", session_budget, "session-tagged"),
+                               ("context", context_budget, "untagged context")):
+        orig = [ln for k, ln in rows if k == kind]
+        kept = _middle_cut(orig, budget, what)
+        if kept == orig:
+            plan[kind] = (None, 0, "", [])
+        elif not any(ln.startswith("[... runner omitted") for ln in kept):  # one overlong line, clipped
+            plan[kind] = (0, len(orig), "", kept)
+        else:  # kept = head + [marker] + tail
+            pos = next(i for i, ln in enumerate(kept) if ln.startswith("[... runner omitted"))
+            plan[kind] = (pos, len(orig) - (len(kept) - pos - 1), kept[pos], kept[:pos])
+    out: List[str] = []
+    idx = {"session": 0, "context": 0}
+    for kind, ln in rows:
+        if kind == "struct":
+            out.append(ln)
+            continue
+        i = idx[kind]
+        idx[kind] += 1
+        head_end, tail_start, marker, head = plan[kind]
+        if head_end is None or i >= tail_start:
+            out.append(ln)
+        elif i < head_end:
+            out.append(head[i])
+        elif i == head_end:
+            out.extend(head[head_end:] + [marker] if marker else head[head_end:])
+    return "\n".join(out)
+
+
 def bundle_text(evidence_dir: Path, max_chars: int) -> str:
+    """The evidence bundle as one text, at most about *max_chars*. manifest.json comes first. hermes-log.txt's
+    session-tagged lines and gate-decisions.jsonl are priority content (see SESSION_LOG_SHARE); every other
+    file (and hermes-log.txt's untagged context) gets an equal share of what is left, at least MIN_PER_FILE,
+    head-truncated (context: middle-cut). Files that no longer fit at all are listed as omitted."""
     files = [p for p in sorted(evidence_dir.rglob("*")) if p.is_file() and p.name not in OWN_FILES]
     files.sort(key=lambda p: (p.name != "manifest.json", str(p)))
     if not files:
         return "(evidence bundle is empty)"
-    per_file = max(4000, max_chars // len(files))
-    parts, used = [], 0
+    texts: Dict[str, str] = {}
     for p in files:
         rel = p.relative_to(evidence_dir).as_posix()
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
+            texts[rel] = p.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            text = f"(unreadable: {exc.strerror})"
+            texts[rel] = f"(unreadable: {exc.strerror})"
+    session = ""
+    try:
+        session = str((json.loads(texts.get("manifest.json") or "{}").get("request") or {}).get("session") or "")
+    except (ValueError, AttributeError):
+        session = ""
+
+    priority: Dict[str, str] = {}
+    if "gate-decisions.jsonl" in texts:
+        g = texts["gate-decisions.jsonl"]
+        priority["gate-decisions.jsonl"] = "\n".join(_middle_cut(g.split("\n"), int(max_chars * GATE_SHARE),
+                                                                 "gate decision"))
+    log_ctx_len = sess_budget = 0
+    sess_text = ""
+    if "hermes-log.txt" in texts:
+        rows, _ = split_hermes_log(texts["hermes-log.txt"], session)
+        sess_len = sum(len(ln) + 1 for k, ln in rows if k in ("session", "struct"))
+        log_ctx_len = sum(len(ln) + 1 for k, ln in rows if k == "context")
+        sess_text = texts["hermes-log.txt"]
+        sess_budget = min(sess_len, int(max_chars * SESSION_LOG_SHARE))
+    used_priority = sum(len(t) for t in priority.values()) + (sess_budget if sess_text else 0)
+    others = [r for r in texts if r not in priority]  # hermes-log.txt counts here for its context share
+    per_file = max(MIN_PER_FILE, (max_chars - used_priority) // max(1, len(others)))
+    if sess_text:
+        priority["hermes-log.txt"] = _fit_hermes_log(sess_text, session, sess_budget, min(log_ctx_len, per_file))
+
+    chunks = {rel: f"=== FILE: {rel} ===\n{priority[rel]}\n" for rel in priority}
+    parts, used = [], sum(len(c) for c in chunks.values())  # priority content is reserved up front
+    for rel, text in texts.items():
+        if rel in chunks:
+            parts.append(chunks[rel])
+            continue
         if len(text) > per_file:
             text = text[:per_file] + f"\n[... truncated by runner: {len(text) - per_file} more chars ...]"
         chunk = f"=== FILE: {rel} ===\n{text}\n"
-        if used + len(chunk) > max_chars:
+        if rel != "manifest.json" and used + len(chunk) > max_chars:
             parts.append(f"=== FILE: {rel} ===\n[omitted by runner: bundle size cap]\n")
             continue
         parts.append(chunk)
@@ -392,10 +528,41 @@ def bump_attempts(request_id: str) -> int:
 
 
 # ------------------------------------------------------------------------------ main flow
-def ensure_evidence(request_id: str) -> Tuple[Path, Optional[str]]:
+COLLECT_MARGIN_SECONDS = 3  # past the window end, for log flushes and 1 s log/journal timestamp resolution
+
+
+def _grace_seconds() -> int:
+    try:
+        return max(0, int(float(C.setting("JUDGE_WINDOW_GRACE_SECONDS", "10") or 10)))
+    except ValueError:
+        return 10
+
+
+def wait_for_window(request: Dict[str, Any], now_fn=None, sleep_fn=None) -> float:
+    """Bug #21: block until request.created + JUDGE_WINDOW_GRACE_SECONDS + COLLECT_MARGIN_SECONDS has passed, so
+    the collector sees the whole evidence window (gate outcomes, journal lines, C3 re-runs) instead of
+    collecting the moment the request appears. Sleeps only for the remainder (at most grace + margin, also
+    when `created` lies in the future); returns the seconds slept. An unparsable `created` never waits."""
+    now_fn = now_fn or C.utc_now
+    sleep_fn = sleep_fn or time.sleep
+    created = C.parse_iso(request.get("created"))
+    if created is None:
+        return 0.0
+    cap = _grace_seconds() + COLLECT_MARGIN_SECONDS
+    remaining = (created - now_fn()).total_seconds() + cap
+    remaining = min(remaining, float(cap))
+    if remaining <= 0:
+        return 0.0
+    sleep_fn(remaining)
+    return remaining
+
+
+def ensure_evidence(request_id: str, request: Optional[Dict[str, Any]] = None) -> Tuple[Path, Optional[str]]:
     ev = C.sub("evidence") / request_id
     if (ev / "manifest.json").exists():
         return ev, None
+    if request is not None:
+        wait_for_window(request)
     if not COLLECTOR.exists():
         return ev, "collector not installed (collector/collect.py missing)"
     try:
@@ -435,7 +602,7 @@ def judge_request(request_id: str) -> bool:
         log(f"{request_id}: unreadable request: {exc}")
         return False
 
-    evidence_dir, ev_err = ensure_evidence(request_id)
+    evidence_dir, ev_err = ensure_evidence(request_id, request)
     manifest: Dict[str, Any] = {}
     try:
         manifest = C.read_json(evidence_dir / "manifest.json") if not ev_err else {}
