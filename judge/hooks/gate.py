@@ -220,6 +220,12 @@ SEPS = {";", ";;", "&&", "||", "|", "|&", "&", "(", ")"}
 OUT_REDIRS = {">", ">>", ">|", "&>", "&>>", "<>"}
 SUB_RE = re.compile(r"__GATE_SUB(\d+)__")
 HD_TOKEN_RE = re.compile(r"__GATE_HD(\d+)__")
+ARITH = "__GATE_ARITH__"      # an arithmetic command (( ... )) (runs nothing)
+ARITH_NUM = "__GATE_NUM__"    # an arithmetic expansion $(( ... )) (a number)
+# Reserved words (recognized only in command position). Openers are followed by a command; closers end a
+# compound command and may only be followed by redirects/separators.
+KW_OPEN = {"if", "then", "else", "elif", "while", "until", "do", "!", "{", "time"}
+KW_CLOSE = {"fi", "done", "esac", "}"}
 
 
 def _match_close(s, i):
@@ -257,6 +263,7 @@ def preprocess(s):
     alone (no local expansion there), comments and line continuations are dropped."""
     out, substs, heredocs, pending = [], [], [], []
     i, n, sq, dq = 0, len(s), False, False
+    arith = True  # after one `((` that does not close as `))`, stop trying (keeps odd input linear)
     while i < n:
         c = s[i]
         if sq:
@@ -272,11 +279,17 @@ def preprocess(s):
             out.append(s[i:i + 2])
             i += 2
             continue
-        if c == "$" and s.startswith("$((", i):
+        if arith and c == "$" and s.startswith("$((", i):
             j = _match_close(s, i + 2)
-            out.append(s[i:j + 1])
-            i = j + 1
-            continue
+            if j < n and _match_close(s, i + 3) == j - 1:
+                # arithmetic expansion: a number; only substitutions inside it can run anything
+                inner = s[i + 3:j - 1]
+                if "$(" in inner or "`" in inner:
+                    substs.extend(preprocess(inner)[1])
+                out.append(ARITH_NUM)
+                i = j + 1
+                continue
+            arith = False
         if c == "$" and s.startswith("$(", i):
             j = _match_close(s, i + 2)
             substs.append(s[i + 2:j])
@@ -301,6 +314,18 @@ def preprocess(s):
             sq = True
         elif c == '"':
             dq = True
+        elif c == "(" and arith and s.startswith("((", i):
+            # arithmetic command `(( ... ))` / `for (( ...; ...; ... ))`: one inert word; substitutions inside it
+            # are still pulled out and analyzed. `( (a) )`-style nested subshells don't close with `))`.
+            j = _match_close(s, i + 1)
+            if j < n and _match_close(s, i + 2) == j - 1:
+                inner = s[i + 2:j - 1]
+                if "$(" in inner or "`" in inner:
+                    substs.extend(preprocess(inner)[1])
+                out.append(f" {ARITH} ")
+                i = j + 1
+                continue
+            arith = False
         elif c in "<>" and i + 1 < n and s[i + 1] == "(":
             j = _match_close(s, i + 2)
             substs.append(s[i + 2:j])
@@ -409,6 +434,97 @@ def tokenize(s):
         i += 1
     flush()
     return toks
+
+
+def shell_structure(toks):
+    """Reduce compound commands (if/while/until/for/select/case, { }, [[ ]], (( )), function definitions) to
+    the simple commands they run, so each body command is judged on its own.
+
+    Returns (tokens, function names defined). Reserved words count only in command position, as in bash
+    (`echo done` keeps its argument). Loop/case headers (`for x in a b`, `case $v in`, case patterns) are
+    dropped: they run nothing except substitutions, which preprocess() already pulled out and analyzes.
+    Anything that does not parse as expected is left in place, so it is judged as an (unknown) command."""
+    out, funcs, stack = [], set(), []  # stack: "pattern" | "body" per open `case`
+    i, n, cmdpos = 0, len(toks), True
+    close_dbl, nxt = [None] * n, None  # index of the next `]]` word (one backward pass: linear on big scripts)
+    for k in range(n - 1, -1, -1):
+        close_dbl[k] = nxt
+        if toks[k] == ("w", "]]"):
+            nxt = k
+    while i < n:
+        kind, val = toks[i]
+        if stack and stack[-1] == "pattern":
+            if kind == "w" and val == "esac":
+                stack.pop()
+                i, cmdpos = i + 1, False
+                continue
+            if kind == "op" and val == ")":
+                stack[-1] = "body"
+                i, cmdpos = i + 1, True
+                continue
+            if kind == "w" or val in ("(", "|", ";"):
+                i += 1
+                continue
+            stack.pop()  # malformed pattern list: stop treating it as a case
+        if kind == "op":
+            if stack and stack[-1] == "body" and (val == ";;" or (val == ";" and toks[i + 1:i + 2] == [("op", "&")])):
+                stack[-1] = "pattern"  # ;; / ;& / ;;& end a case arm
+                out.append(("op", ";"))
+                i += 1 if val == ";;" else 2
+                if toks[i:i + 1] == [("op", "&")]:
+                    i += 1
+                cmdpos = True
+                continue
+            out.append((kind, val))
+            cmdpos = val in SEPS
+            i += 1
+            continue
+        if not cmdpos:
+            out.append((kind, val))
+            i += 1
+            continue
+        if val in KW_OPEN:
+            i += 1
+            continue
+        if val in KW_CLOSE or val == ARITH:
+            if val == "esac" and stack and stack[-1] == "body":
+                stack.pop()
+            i, cmdpos = i + 1, False
+            continue
+        if val in ("for", "select") and i + 1 < n and toks[i + 1][0] == "w":
+            j = i + 2  # `for x do`, `for x in a b ...`, `for (( ... ))` (ARITH): drop the header words
+            if j < n and toks[j] != ("w", "do"):
+                while j < n and toks[j][0] == "w":
+                    j += 1
+            i = j
+            continue
+        if val == "case":
+            j = i + 1
+            while j < n and toks[j][0] == "w" and toks[j][1] != "in":
+                j += 1
+            if j < n and toks[j] == ("w", "in") and j > i + 1:
+                stack.append("pattern")
+                i = j + 1
+                continue
+        if val == "[[":
+            j = close_dbl[i]
+            if j is not None:  # a conditional expression: its && || < > ( ) are not shell operators
+                i, cmdpos = j + 1, False
+                continue
+        if val == "function" and i + 1 < n and toks[i + 1][0] == "w":
+            funcs.add(toks[i + 1][1])
+            i += 2
+            if toks[i:i + 2] == [("op", "("), ("op", ")")]:
+                i += 2
+            continue
+        if toks[i + 1:i + 3] == [("op", "("), ("op", ")")] and re.fullmatch(r"[A-Za-z_][\w.:-]*", val):
+            funcs.add(val)  # name() { body; }: the body is judged where it is defined
+            i += 3
+            continue
+        out.append((kind, val))
+        cmdpos = False
+        i += 1
+    return out, funcs
 
 
 class SC:
@@ -850,7 +966,9 @@ class Gate:
         sub_secret = {}
         for k, src in enumerate(substs):
             sub_secret[k] = self.analyze(src, dict(ctx, captured=True), depth + 1)
-        cmds = simple_commands(tokenize(body), heredocs, stdin)
+        toks, funcs = shell_structure(tokenize(body))
+        ctx.setdefault("functions", set()).update(funcs)
+        cmds = simple_commands(toks, heredocs, stdin)
         reads_secret = False
         cwd = ctx["cwd"]
         secret_vars = ctx.setdefault("secret_vars", set())
@@ -913,6 +1031,15 @@ class Gate:
             return bool(reads)
         name = base(argv[0])
         args = argv[1:]
+        if name in (ctx.get("functions") or ()) and "/" not in argv[0]:
+            # call of a function defined in this script: its body was judged at the definition; the
+            # call's own redirects still count.
+            for t in sc.out_targets():
+                if remote:
+                    self.hit("remote_mutation", f"redirect > {t} on {remote}", t)
+                else:
+                    self._write_target(t, ctx, "redirect >", sc)
+            return False
 
         # Shells and eval: recurse into the code they run.
         if name in ("bash", "sh", "zsh", "dash", "ksh", "ash", "busybox") or name == "eval":

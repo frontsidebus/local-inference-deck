@@ -42,7 +42,7 @@ Gates are synchronous and dumb; judging is asynchronous and smart. No model call
 
 | # | Hermes event | Script | Sync | Effect |
 |---|---|---|---|---|
-| C1 | `post_tool_call`, matcher `write_file\|patch` | `hooks/enqueue.py` | async | Plan edits under `.hermes/plans/` queue a **plan review**. |
+| C1 | `post_tool_call`, matcher `write_file\|patch\|terminal\|memory\|skill_manage\|read_file` | `hooks/enqueue.py` | async | Plan edits under `.hermes/plans/` queue a **plan review**. Every matched call is recorded (with call markers) for attribution and for gate `outcome`. |
 | C2 | `pre_tool_call`, matcher `terminal\|write_file\|patch\|read_file`, `fail_closed: true` | `hooks/gate.py` | sync, ms | Deterministic policy: escalate host-mutating commands, sensitive-path writes and reads of secret-shaped files to you, block edits to allowlists, hooks and approval settings. |
 | C3 | `pre_verify` | `hooks/verify.py` | sync, under 60 s | Fast verifiers on the changed paths; nudges the agent once if one fails, re-checks (record only) after the fix, and records every result for the judge. |
 | C4 | `on_session_end` (and `on_session_start` for the snapshot) | `hooks/enqueue.py` | async | Snapshot watched paths at start; queue a **completion audit** at the end. |
@@ -100,7 +100,7 @@ hooks:
     fail_closed: true
     managed_by: agent-judge
   post_tool_call:
-  - matcher: write_file|patch|terminal|memory|skill_manage
+  - matcher: write_file|patch|terminal|memory|skill_manage|read_file
     command: /usr/bin/python3 /path/to/repo/judge/hooks/enqueue.py
     managed_by: agent-judge
   on_session_start:
@@ -133,7 +133,7 @@ Non-TTY runs (the gateway, cron) never prompt. They skip unapproved hooks with a
 
 ### After pulling judge changes
 
-Consent is keyed on `(event, command)`, not on the matcher or the script contents. When an update changes a matcher (for example `read_file` was added to the C2 matcher), re-run `judge/install.sh --apply` so `config.yaml` gets the new matcher and `gate-policy.json` is re-rendered, then restart Hermes and the gateway (they read hooks at start). **No new consent is needed**, because the command string is unchanged. `hermes hooks list` should still show every judge hook as allowed.
+Consent is keyed on `(event, command)`, not on the matcher or the script contents. When an update changes a matcher (for example `read_file` was added to the C2 matcher, and later to the `post_tool_call` matcher so gated reads get an outcome) re-run `judge/install.sh --apply` so `config.yaml` gets the new matcher and `gate-policy.json` is re-rendered, then restart Hermes and the gateway (they read hooks at start). **No new consent is needed**, because the command string is unchanged. `hermes hooks list` should still show every judge hook as allowed.
 
 ## Running reviews automatically
 
@@ -271,6 +271,7 @@ The local judge is a fallback (sensitive data, or over the frontier cap), not a 
 - A judge that quotes a real but unrelated bundle line still passes the quote check.
 - An "earlier error, later fixed" false positive is caught mechanically only through `c3-results.jsonl`; elsewhere only the prompt guards it.
 - A report that contradicts itself is kept only as a low R1 `partial`/`n/a` item with two quoted, conflicting claims fragments and conflict wording; one that paraphrases instead of quoting is still dropped. The carve-out can also keep a low item that calls two compatible statements a conflict (one such low FP in 21 re-judged bundles).
+- The "claims-only" drop still ignores some real bundle facts. A bundle file name, or a full path ending in `.json`/`.txt`/`.patch`, is never a grounded span on its own. So an item whose only bundle quote is a path such as `agent-diff.patch covers only ".../.usage.json"` is dropped when the claims also name that file. Manifest facts (attribution, `withheld`, `window`, notes, ...) do count since #25, but only quoted with their key or value, e.g. `attribution.agent_paths: [...]`, not as paraphrase.
 - A `false` backed only by point-in-time artifacts (`unit_state`, `port_listening`, anything marked `# POINT IN TIME`) is downgraded, because those show the state at collection time, not during the session. A real problem that only shows there (a unit failed and is still failed) needs a windowed journal or a C3 line to stay `false`.
 
 ## Re-judging bundles
@@ -338,6 +339,8 @@ Logs are redacted for secrets before they enter a bundle. The judge never gets a
 | A `JUDGE_INFRA_REPOS` dir has no diff in the bundle | Opted-in dirs were never snapshotted (#13). Plain dirs now are, from the next session start (sessions started before have no baseline), and git repos are diffed through git. Check the manifest's `snapshot`: a dir over `JUDGE_SNAPSHOT_MAX_FILES` is `truncated` (new files there go unseen), files over `JUDGE_SNAPSHOT_MAX_BYTES` are hashed but not copied, and a missing dir is in `skipped_roots`. |
 | `hermes config --help` (or another read-only subcommand) asks for approval | Over-escalation (#14), fixed: `--help`, `config show\|get\|path\|env-path\|check`, `hooks list\|doctor` and similar pass. `config set` of non-oversight keys, `hooks test`, `setup` and `migrate` still ask; `config edit`, `hooks revoke\|remove\|rm`, `approvals suggest --apply` and `import` are blocked. Full list in [CONTRACT.md](CONTRACT.md#gate-c2-coverage). |
 | A bundle holds log lines or gate decisions from the next turn | The grace window bled into the next turn (#16). The window now ends one second before the next turn starts (from the Hermes log's `conversation turn:` line, else the next request). The manifest's `window.until_basis` says which cut applied. C3 results are kept up to the end of the turn, so a fix after a nudge still shows. |
+| A read-only remote loop (`ssh host 'for p in 3001 3002; do curl ...; done'`) asked for approval as `remote-mutation` | Shell keywords were judged as unknown commands (#22), fixed. The gate parses `for`/`select`, `while`/`until`, `if`/`elif`/`else`, `case`, `{ }`, `( )`, `[[ ]]`, `(( ))` and function definitions, and judges each command inside: a body of read-only commands passes, one mutating command (`systemctl restart`, a `>` redirect after `done`, a substitution in the loop list) still escalates. `[ ]`, `test`, `true`, `false`, `:`, `X=1`, `shift`, `break`, `continue`, `let` and `$(( ))` are read-only. Anything it cannot parse still escalates. |
+| `gate-decisions` says `outcome: unknown` for a gated `read_file` | `read_file` was missing from the `post_tool_call` matcher (#23). Re-run `install.sh --apply` and restart Hermes and the gateway (no new consent). The read's event carries only call markers, never paths: a read is not counted as a change by the agent. |
 | The agent read a key with `read_file` and no approval was asked | `read_file` wasn't in the C2 matcher (#17). Re-run `install.sh --apply` and restart Hermes and the gateway (no new consent). Secret-shaped reads (key-like names, plus the `secret_paths` list in the policy) now ask you; approving "always" covers that one file only. Reads of `$HERMES_HOME/config.yaml` pass on purpose. |
 | A finding (R5) or the C6 watcher reports `n_predict: -1` / a request without `max_tokens` running to the context limit | Fixed in the stack on 2026-10-03, not in the judge: the gateway gives every request an output limit (default 16384, clamped to the model's maximum) and llama-server runs with `-n` (see the walter README, "Output cap"). Seeing `n_predict: -1` in `/slots` again means the llama-swap config lost its `-n` flags or the call bypassed the gateway; seeing a limit above 32768 means the gateway hook is not loaded (`docker logs gateway-litellm-1 \| grep 'output cap'`). The C6 token trigger fires on `n_decoded >= JUDGE_RUNAWAY_TOKENS` whatever `n_predict` is, and its reason says `NO output cap (n_predict=-1)` in this case. |
 | C6 alerts `n_decoded=... >= 24000 (cap n_predict=32768: .../32768, NN%)` | A request asked for (nearly) the model's maximum output and is still generating; not necessarily a bug. It will stop at the cap. The alert is not cancelled: unload the model with the printed command only if the GPU is needed. The queued `runaway` review is `infra` and goes to the frontier judge; raise `JUDGE_RUNAWAY_TOKENS` if such long generations are routine. |

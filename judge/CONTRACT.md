@@ -166,11 +166,21 @@ contradicting evidence, an unapproved host or oversight change, or secret exposu
 **Validator rules** (`runner/validate.py`, docstring step 4; applied when bundle text is supplied, which
 `run_judge.py` always does and the CLI does with `--bundle`). *World text* = the bundle's `=== FILE:` sections
 minus the manifest's `request` copy, the user's `msg=` text and absence-marker lines (withheld, stat only, no
-lines in window, ...), normalized (lower case, quotes/backticks/backslashes stripped, whitespace collapsed). A
+lines in window, ...), normalized (lower case, quotes/backticks/backslashes stripped, whitespace collapsed).
+**manifest.json counts** (#25): every field except `request` (the agent's claims) is collector output and world
+text: `attribution` (`agent_paths`, `changed_by_others`, `rejected_request_paths` ...), `window`, `extras`,
+`point_in_time`, `notes`, `snapshot` and so on. It is matched in the forms judges quote: the pretty-printed JSON
+and one line per leaf as `a.b.c: value`, `a b c: value` and `a.b.c=value` (e.g.
+`attribution.rejected_request_paths: ["/x"]`). The manifest's `withheld`, `data_class`, `request_data_class` and
+`content_policy` fields, and manifest lines that are absence markers, *ground* an item (it is not dropped) but are
+never a contradiction. A span found only in the manifest must still carry a key path or a value (a digit or one
+of `_ / . : = [ ] { }`) or be 24+ characters once file names are removed, so a plain English run from the
+manifest's notes does not count. The manifest's `point_in_time` entries are point-in-time text (rule d0). A
 *grounded span* is 12+ normalized evidence chars found verbatim in the world text (a bare bundle file name does
 not count); it is *contradicting* when it is not contained in the item's claim, the request claims or plan, or
 the user message.
-- **Drop** an item whose evidence quotes only the claims, plan or user message (no contradicting span).
+- **Drop** an item whose evidence quotes only the claims, plan or user message (no contradicting span and no
+  manifest grounding fact such as `withheld`).
   **Carve-out (report consistency):** kept, with a `kept, report-consistency finding` note, when the item is
   R1, verdict `partial` or `n/a`, severity `low`, its evidence names a conflict (vs / conflicts / contradicts /
   inconsistent / but / while / next to ...) and quotes either two distinct claims fragments (>= 8 chars each in
@@ -270,7 +280,8 @@ via git); plain dirs are copied (`snapshot.dir_roots`), skipping `.git`, `node_m
 directory), `snapshot_caps: {max_files, max_bytes}` and `noise_globs`. `meta.json`,
 `index.json` (`{abs_path: {"sha256", "size"}}`, plus `"skipped"` when a file was not copied), `files/<abs path>`
 copies, `events.jsonl` (tool calls seen by post_tool_call: `{"t","tool","paths","status"}`; `paths` are the
-write_file/patch targets, or the path-like tokens of a terminal command, used only for attribution; plus
+write_file/patch targets, or the path-like tokens of a terminal command, used only for attribution, and empty
+for read_file/memory/skill_manage; plus
 `call_id` = Hermes `extra.tool_call_id` when sent and `call_hash` = `lib/redact.call_hash(tool, tool_input)`;
 never the command text).
 
@@ -382,6 +393,21 @@ exit 64, no execution.
   - escalate as `secret-output`: `config get --raw` (prints credentials unmasked; passes when captured).
   - escalate as `hermes-config`: any other `config` action (`migrate`, `set|unset` of a non-oversight key,
     unknown), any other `hooks` action (e.g. `test`), `setup`, `migrate`.
+- **Shell structure** (`gate.shell_structure`, terminal commands local and remote, #22): reserved words count
+  only in command position. `if then elif else fi`, `while until do done`, `{ }`, `!`, `time` are dropped and
+  the commands between them judged one by one; `for`/`select` headers (`for x in ...`, `for x do`,
+  `for (( ... ))`) and `case WORD in` + patterns (`a|b)`, `(c)`) are dropped (arms end at `;;`, `;&`, `;;&`);
+  `[[ ... ]]` is dropped whole (its `&& || < > ( )` are not shell operators); `(( ... ))` and `$(( ... ))` are
+  inert, except command substitutions inside them, which are analyzed like any other; `name() {...}` /
+  `function name {...}`: the body is judged where it is defined, and a later call of that name is not an
+  unknown command (its own redirects still count). Redirects after `done`/`fi`/`esac`/`}` apply as written
+  (remote `done > f` = `remote-mutation`). Unparseable structure is left as words, i.e. an unknown command,
+  which escalates remotely. Read-only remote builtins added to the policy: `typeset`, `readonly`, `shift`,
+  `break`, `continue`, `let`, `wait` (`[`, `test`, `true`, `false`, `:` were already there; a bare `X=1` never
+  was a command).
+- **post_tool_call matcher** (`install.sh`): `write_file|patch|terminal|memory|skill_manage|read_file`. A
+  `read_file` event in `events.jsonl` has `paths: []` plus `call_id`/`call_hash`, so a gated read gets an
+  `outcome` (#23); it never attributes a change to the agent.
 - Hermes keys consent on `(event, command)` (`agent/shell_hooks.py` `_entry_matches`), not the matcher, so the
   matcher change needs `install.sh --apply` (re-renders `gate-policy.json`, rewrites the hooks block) and a
   restart of Hermes and the gateway, but no new consent.
