@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "_doc": [
+    "C2 gate policy (judge/hooks/gate.py). Deterministic: no model calls.",
+    "Render-time placeholders use the brace form and come from site.env (rendered by install.sh, or at",
+    "runtime by gate.py when $JUDGE_REVIEW_DIR/gate-policy.json is absent).",
+    "Run-time path variables use the bare form and are expanded by gate.py on every call:",
+    "  ~  $HOME  $HERMES_HOME  $JUDGE_REVIEW_DIR  $JUDGE_DIR (the judge/ directory gate.py lives in).",
+    "Each rule: id, description, kind (selects the matcher engine in gate.py), action (approve|block),",
+    "plus kind-specific matcher data. approve = escalate to the human; block = refuse outright.",
+    "Precedence: any block beats any approve; no hit = pass ({})."
+  ],
+  "hosts": {
+    "backend": {
+      "label": "Walter",
+      "addresses": ["${BACKEND_LAN_IP}", "${BACKEND_WG_IP}"],
+      "domains": [],
+      "users": ["${BACKEND_SSH_USER}"],
+      "aliases": []
+    },
+    "edge": {
+      "label": "Covenant",
+      "addresses": ["${EDGE_PUBLIC_IP}", "${EDGE_WG_IP}"],
+      "domains": ["${SPARK_DOMAIN}"],
+      "users": ["${EDGE_SSH_USER}"],
+      "aliases": ["${JUDGE_SSH_ALIASES}"]
+    }
+  },
+  "rules": [
+    {
+      "id": "oversight-config",
+      "kind": "oversight_config",
+      "action": "block",
+      "description": "Change to oversight settings in the Hermes config (allowlist, hooks, security, approvals, verify nudges)",
+      "path": "$HERMES_HOME/config.yaml",
+      "keys": ["command_allowlist", "hooks", "hooks_auto_accept", "security", "approvals", "agent.max_verify_nudges"],
+      "hermes_cli_block_flags": ["--yolo", "--accept-hooks"],
+      "hermes_cli_block_env": ["HERMES_ACCEPT_HOOKS", "HERMES_YOLO_MODE"]
+    },
+    {
+      "id": "oversight-path",
+      "kind": "oversight_path",
+      "action": "block",
+      "description": "Write to the agent's own oversight machinery (hook consent allowlist, hook scripts, judge/, review dir)",
+      "paths": [
+        "$HERMES_HOME/shell-hooks-allowlist.json",
+        "$HERMES_HOME/agent-hooks/**",
+        "$JUDGE_DIR/**",
+        "$JUDGE_REVIEW_DIR/**"
+      ],
+      "except": ["$JUDGE_REVIEW_DIR/acks/**"],
+      "judge_dir_markers": ["hooks/gate.py", "CONTRACT.md"]
+    },
+    {
+      "id": "hermes-config",
+      "kind": "hermes_config",
+      "action": "approve",
+      "description": "Edit to the Hermes config that does not touch oversight keys (still a human decision)",
+      "path": "$HERMES_HOME/config.yaml"
+    },
+    {
+      "id": "sensitive-path",
+      "kind": "sensitive_path",
+      "action": "approve",
+      "description": "Write to a sensitive local path (ssh config/keys, Hermes .env, spark client config, /etc)",
+      "paths": ["~/.ssh/**", "$HERMES_HOME/.env", "~/.config/spark/**", "/etc/**"]
+    },
+    {
+      "id": "remote-mutation",
+      "kind": "remote_mutation",
+      "action": "approve",
+      "description": "Command that changes state on Walter or Covenant",
+      "readonly_commands": [
+        "cat", "tac", "ls", "ll", "dir", "tree", "grep", "egrep", "fgrep", "rg", "zgrep", "zcat", "bzcat", "xzcat",
+        "head", "tail", "less", "more", "wc", "stat", "file", "du", "df", "free", "uptime", "uname", "whoami",
+        "id", "groups", "ps", "pgrep", "pidof", "top", "ss", "netstat", "lsof", "lsblk", "blkid", "findmnt",
+        "echo", "printf", "true", "false", "test", "[", "[[", "]]", "sleep", "which", "whereis", "type",
+        "readlink", "realpath", "dirname", "basename", "sha256sum", "sha1sum", "sha512sum", "md5sum", "b2sum",
+        "cksum", "diff", "cmp", "sort", "uniq", "cut", "tr", "column", "jq", "paste", "nl", "fold", "fmt", "seq",
+        "expr", "bc", "namei", "getfacl", "lsattr", "getent", "last", "lastlog", "w", "who", "lscpu", "lspci",
+        "lsusb", "lsmod", "modinfo", "nproc", "vmstat", "iostat", "mpstat", "sensors", "ping", "dig", "host",
+        "nslookup", "getconf", "locale", "printenv", "systemd-analyze", "cd", "pwd", "export", "set", "unset",
+        "local", "declare", "read", "exit", "return", ":", "iptables-save", "ip6tables-save", "apt-cache",
+        "dpkg-query", "base64", "xxd", "od", "hexdump", "strings", "rev", "comm", "join", "env", "nvidia-smi"
+      ],
+      "readonly_subcommands": {
+        "systemctl": ["", "status", "is-active", "is-enabled", "is-failed", "is-system-running", "show", "cat",
+                      "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies",
+                      "list-jobs", "get-default", "show-environment", "help"],
+        "docker": ["", "ps", "logs", "inspect", "images", "top", "port", "stats", "version", "info", "events",
+                   "diff", "history", "image ls", "image list", "image inspect", "image history",
+                   "container ls", "container list", "container inspect", "container logs", "container top",
+                   "container port", "container stats", "container diff", "network ls", "network list",
+                   "network inspect", "volume ls", "volume list", "volume inspect", "system df", "system info",
+                   "system events", "context ls", "context list", "context show", "context inspect",
+                   "buildx ls", "plugin ls", "compose"],
+        "docker compose": ["", "ps", "logs", "config", "images", "ls", "top", "version", "port", "events"],
+        "ufw": ["status", "show", "version", "app"],
+        "certbot": ["certificates", "plugins"],
+        "apt": ["list", "show", "policy", "search", "depends", "rdepends", "showsrc"],
+        "wg": ["", "show"],
+        "fail2ban-client": ["status", "ping", "version", "get", "banned"],
+        "timedatectl": ["", "status", "show", "list-timezones", "timesync-status", "show-timesync"],
+        "hostnamectl": ["", "status", "hostname"],
+        "resolvectl": ["", "status", "query", "statistics", "dns", "domain"],
+        "loginctl": ["", "list-sessions", "list-users", "list-seats", "show-session", "show-user", "session-status", "user-status"],
+        "git": ["status", "log", "diff", "show", "rev-parse", "ls-files", "ls-remote", "describe", "blame",
+                "shortlog", "grep", "cat-file", "ls-tree", "reflog", "remote", "branch", "tag", "config"],
+        "nft": ["list"]
+      },
+      "certbot_dry_run": "approve",
+      "certbot_dry_run_note": "certbot renew --dry-run still runs --pre-hook/--post-hook (which commonly stop/start nginx) and writes logs, so it is escalated, not passed."
+    },
+    {
+      "id": "remote-copy",
+      "kind": "remote_copy",
+      "action": "approve",
+      "description": "File transfer TO Walter or Covenant (scp/rsync/sftp destination on the host)"
+    },
+    {
+      "id": "remote-opaque",
+      "kind": "remote_opaque",
+      "action": "approve",
+      "description": "Remote session whose commands the gate cannot see (interactive ssh, script piped from a local file)"
+    },
+    {
+      "id": "public-push",
+      "kind": "public_push",
+      "action": "approve",
+      "description": "Publishing to a remote: git push (the deck repo is PUBLIC), gh pr merge, gh repo/release mutations, gh api writes",
+      "gh_mutations": {
+        "pr": ["merge"],
+        "repo": ["create", "delete", "edit", "rename", "archive", "unarchive", "fork", "sync", "deploy-key"],
+        "release": ["create", "delete", "edit", "upload", "delete-asset"],
+        "secret": ["set", "delete", "remove"],
+        "variable": ["set", "delete"]
+      }
+    },
+    {
+      "id": "secret-output",
+      "kind": "secret_output",
+      "action": "approve",
+      "description": "Command that would print a secret into the transcript (reading it into a variable or a pipe to a hash/count is fine)",
+      "secret_names": [
+        "*.key", "*.pem", ".env", "*.env", "api-key", "api_key", "apikey", "*-api-key", "*_api_key",
+        "*secret*", "admin-password", "*password*", "shadow", "gshadow", "id_rsa", "id_ecdsa", "id_ed25519",
+        "id_dsa", "*.p12", "*.pfx", "*.keystore", "credentials", "credentials.json", ".netrc", ".pgpass",
+        "auth.json", "wg*.conf", "token", "*.token", "*-token", "*_token", "privkey*", "*.age", "*.kdbx"
+      ],
+      "not_secret_names": [
+        "*.pub", "*.example", "*.sample", "*.tmpl", "*.template", "*.md", "*.sh", "*.py", "*.rs", "*.go",
+        "*.js", "*.ts", "*.d", "*.service", "*.j2", "*.html", "*.css"
+      ],
+      "print_commands": [
+        "cat", "tac", "less", "more", "head", "tail", "bat", "batcat", "nl", "xxd", "od", "hexdump", "strings",
+        "base64", "base32", "view", "grep", "egrep", "fgrep", "rg", "zgrep", "awk", "gawk", "mawk", "sed", "diff",
+        "cut", "sort", "uniq", "column", "jq", "yq", "rev", "fold", "paste", "dd"
+      ],
+      "safe_sinks": ["wc", "sha256sum", "sha1sum", "sha512sum", "md5sum", "b2sum", "cksum", "true", "test"],
+      "secret_grep_pattern": "(?i)(api[_-]?key|secret|passw(or)?d|private[_ -]?key|bearer|master[_-]?key|auth[_-]?token|access[_-]?token)"
+    }
+  ]
+}

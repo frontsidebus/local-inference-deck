@@ -1,0 +1,14 @@
+# systemd USER path unit: run the judge whenever review requests land in queue/.
+# ${JUDGE_REVIEW_DIR} is rendered by judge/install.sh --with-units (default %h/.hermes/review).
+#   systemctl --user daemon-reload && systemctl --user enable --now judge-review.path
+[Unit]
+Description=judge: watch the review queue and run the judge on new requests
+
+[Path]
+PathChanged=${JUDGE_REVIEW_DIR}/queue
+MakeDirectory=yes
+DirectoryMode=0700
+Unit=judge-review.service
+
+[Install]
+WantedBy=default.target

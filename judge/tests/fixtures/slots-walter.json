@@ -1,0 +1,2 @@
+[{"id": 0, "id_task": 4711, "is_processing": true, "params": {"n_predict": -1, "max_tokens": -1}, "next_token": [{"has_next_token": true, "n_remain": -1, "n_decoded": 48213}]},
+ {"id": 1, "id_task": -1, "is_processing": false, "params": {"n_predict": 2048, "max_tokens": 2048}, "next_token": [{"has_next_token": false, "n_remain": 0, "n_decoded": 0}]}]

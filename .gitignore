@@ -24,3 +24,8 @@ secrets/
 *.pem
 .sanitize-extra
 .sanitize-words
+
+# python bytecode
+__pycache__/
+*.pyc
+.pytest_cache/

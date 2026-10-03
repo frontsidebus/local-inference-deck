@@ -8,6 +8,7 @@ walter/      backend VM: llama-swap, gateway (LiteLLM+Postgres), webui (Open Web
              monitoring, telemetry app, backups, update-check, systemd units/drop-ins, firewall
 covenant/    edge: nginx sites/snippets, oauth2-proxy, fail2ban, ufw, wireguard, certbot hooks
 clients/     workstation harness wrappers/configs (claude/codex/hermes/opencode) + hermes-gateway
+judge/       agent judge: gates, evidence collector and reviewer for a local agent (self-contained; see judge/CONTRACT.md)
 hypervisor/  requirements for the host layer (managed in a separate IaC project)
 docs/        architecture, runbooks, history (old Ollama-era docs move to docs/history/)
 scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh

@@ -1,0 +1,21 @@
+# systemd USER service: judge every pending request once (oneshot), triggered by judge-review.path.
+# ${JUDGE_DIR}, ${JUDGE_PYTHON}, ${HERMES_HOME}, ${JUDGE_REVIEW_DIR} are rendered by judge/install.sh.
+# Run by hand:  systemctl --user start judge-review.service ; journalctl --user -u judge-review
+[Unit]
+Description=judge: review pending agent-judge requests (frontier or local judge)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HERMES_HOME=${HERMES_HOME}
+Environment=JUDGE_REVIEW_DIR=${JUDGE_REVIEW_DIR}
+# `claude` usually lives in ~/.local/bin, which the user manager's PATH may lack.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional overrides (JUDGE_MODE, JUDGE_FRONTIER_DAILY_MAX, JUDGE_LOCAL_MAX_TOKENS, ...)
+EnvironmentFile=-%h/.config/judge/judge.env
+# Never point the frontier judge at the local gateway; run_judge.py also strips these from the child.
+UnsetEnvironment=ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+ExecStart=${JUDGE_PYTHON} ${JUDGE_DIR}/runner/run_judge.py --pending
+TimeoutStartSec=3600
+Nice=10
+NoNewPrivileges=yes
