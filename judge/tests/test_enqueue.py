@@ -95,14 +95,17 @@ def test_v4a_patch_paths(env):
 def test_session_end_completion(env):
     install_logs(env["hermes"])
     run(ev(env, "on_session_start"))
-    (env["hermes"] / "memories" / "MEMORY.md").write_text("fact one\nfact two\n")
+    mem = env["hermes"] / "memories" / "MEMORY.md"
+    mem.write_text("fact one\nfact two\n")
+    run(ev(env, "post_tool_call", tool_name="patch",
+           tool_input={"path": str(mem), "old_string": "one", "new_string": "one\nfact two"}, extra={"status": "ok"}))
     run(ev(env, "post_tool_call", tool_name="terminal", tool_input={"command": "ls"}, extra={"status": "ok"}))
     run(ev(env, "on_session_end", extra={"completed": True, "turn_id": "t1", "model": "coder"}))
     pending = q.list_pending()
     assert len(pending) == 1
     r = pending[0]
     assert r["kind"] == "completion" and r["source_event"] == "on_session_end"
-    assert str(env["hermes"] / "memories" / "MEMORY.md") in r["changed_paths"]
+    assert str(mem) in r["changed_paths"] and r["detail"]["changed_by_others"] == []
     assert r["data_class"] == "infra" and r["detail"]["completed"] is True
     # next turn with no activity and no new changes: skipped
     run(ev(env, "on_session_end", extra={"completed": True}))

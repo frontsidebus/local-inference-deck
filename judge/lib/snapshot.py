@@ -5,7 +5,7 @@ Layout of snapshots/<session>/ (dir 700, files 600):
                     "late": bool, "last_end": "...Z" | absent}
     index.json     {abs_path: {"sha256", "size"} | {"skipped": reason, "size"}}
     files/<abs path without leading />   copies of watched files
-    events.jsonl   one line per recorded tool call: {"t","tool","paths","status"}
+    events.jsonl   one line per executed tool call: {"t","tool","paths","status","call_id"?,"call_hash"?}
 
 Watched: $HERMES_HOME/{config.yaml,skills/,memories/,plans/}, ~/.ssh/config, <cwd>/.hermes/plans/, and the
 git repos containing cwd and JUDGE_REPO_DIR (HEAD + status recorded; diffs come from git).
@@ -16,7 +16,17 @@ git repos containing cwd and JUDGE_REPO_DIR (HEAD + status recorded; diffs come 
     record_event(snapdir, tool, paths, status)
     events(snapdir) -> list[dict]
     changed_files(snapdir, cfg) -> list[(status, path)]   status in A|M|D ; includes repo changes
-    diff_text(snapdir, cfg, sensitive) -> str             unified diff (infra) or stat summary (sensitive)
+    agent_touched(snapdir, cfg, until=None, tools=()) -> (paths, prefixes)   what the agent's tool calls touched
+    attribute(changed, paths, prefixes=()) -> (agent, others)                split changed paths by who touched them
+    diff_text(snapdir, cfg, sensitive, include=None, until=None) -> str
+                                                          unified diff (infra) or stat summary (sensitive),
+                                                          optionally restricted to *include* paths
+    stat_lines(snapdir, cfg, paths) -> list[str]          "<status> <path> | +N -M" per path, never content
+
+Attribution: snapshot diffs show every change to a watched path, whoever made it (the human, other tools,
+a `git pull`). A changed path counts as the agent's only when one of the session's recorded tool events
+(events.jsonl: write_file/patch targets, path-like tokens of terminal commands) names it, or when it lies
+under a HERMES_HOME dir written by a Hermes self-write tool the session ran (SELF_WRITE_TOOLS).
 """
 from __future__ import annotations
 
@@ -170,9 +180,17 @@ def take(session: str, cwd: Optional[str], cfg: Mapping[str, str], root=None, la
     return d
 
 
-def record_event(snapdir: Path, tool: str, paths: List[str], status: str = "", now: Optional[datetime] = None) -> None:
+def record_event(snapdir: Path, tool: str, paths: List[str], status: str = "", now: Optional[datetime] = None,
+                 call_id: Optional[str] = None, call_hash: Optional[str] = None) -> None:
+    """Append one executed tool call. call_id (Hermes tool_call_id) / call_hash (lib/redact.call_hash) mark
+    the call for matching with gate.log; no command text is stored."""
     q.ensure_dir(snapdir)
-    line = json.dumps({"t": _now_iso(now), "tool": tool, "paths": paths, "status": status}) + "\n"
+    ev = {"t": _now_iso(now), "tool": tool, "paths": paths, "status": status}
+    if call_id:
+        ev["call_id"] = str(call_id)[:200]
+    if call_hash:
+        ev["call_hash"] = call_hash
+    line = json.dumps(ev) + "\n"
     fd = os.open(str(Path(snapdir) / "events.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, line.encode("utf-8"))
@@ -191,6 +209,50 @@ def events(snapdir: Path) -> List[Dict]:
     except OSError:
         pass
     return out
+
+
+# Hermes tools that write the agent's own state without a path argument (so no write_file/patch event):
+# a change under HERMES_HOME/<dir> is the agent's when the session ran the tool (seen in events.jsonl if the
+# post_tool_call matcher includes it, or in the session's agent.log tool_executor lines).
+SELF_WRITE_TOOLS = {"memory": "memories", "skill_manage": "skills"}
+
+
+def _key(path: str) -> str:
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def agent_touched(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until: Optional[datetime] = None,
+                  tools=()) -> Tuple[set, List[str]]:
+    """(paths, prefixes) touched by the agent's tool calls: every path recorded in events.jsonl with
+    t <= *until* (all events when None), plus `HERMES_HOME/<dir>/` prefixes of SELF_WRITE_TOOLS that appear
+    in those events or in *tools* (tool names from the Hermes log). Paths are realpath-normalised."""
+    paths, names = set(), {str(t) for t in (tools or ())}
+    for ev in events(snapdir):
+        if until is not None:
+            try:
+                if q.parse_utc(str(ev.get("t") or "")) > until:
+                    continue
+            except ValueError:
+                continue
+        for p in ev.get("paths") or []:
+            if isinstance(p, str) and p.strip():
+                paths.add(_key(p))
+        names.add(str(ev.get("tool") or ""))
+    hh = (cfg or {}).get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    prefixes = [_key(os.path.join(hh, d)).rstrip("/") + "/" for n, d in SELF_WRITE_TOOLS.items() if n in names]
+    return paths, prefixes
+
+
+def attribute(changed, paths, prefixes=()) -> Tuple[List[str], List[str]]:
+    """Split *changed* paths into (agent, others): a path is the agent's when its realpath is in *paths*
+    (compared realpath-normalised) or starts with one of *prefixes*."""
+    keys = {_key(p) for p in paths}
+    agent: List[str] = []
+    others: List[str] = []
+    for p in changed:
+        k = _key(p)
+        (agent if k in keys or any(k.startswith(x) for x in prefixes) else others).append(p)
+    return agent, others
 
 
 def _load_index(snapdir: Path) -> Dict[str, Dict]:
@@ -270,22 +332,49 @@ def _stat(a: Optional[List[str]], b: Optional[List[str]]) -> str:
     return f"+{plus} -{minus}"
 
 
-def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive: bool = True) -> str:
+def _late_note(path: str, until: Optional[datetime]) -> str:
+    if until is None:
+        return ""
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc)
+    except OSError:
+        return ""
+    if mtime <= until:
+        return ""
+    return (f"# NOTE: {path} was modified after the review window ended (mtime {q.utc_now_iso(mtime)}, window "
+            f"end {q.utc_now_iso(until)}); what follows shows it as observed at collection time\n")
+
+
+def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive: bool = True,
+              include=None, until: Optional[datetime] = None) -> str:
     """Watched files vs snapshot + repo changes since the session-start HEAD.
 
-    sensitive=True: `git diff --stat`-style lines only (path | +N -M), never file contents."""
+    sensitive=True: `git diff --stat`-style lines only (path | +N -M), never file contents.
+    include: only these paths (realpath-compared); None = every changed path.
+    until: end of the review window; files modified after it get a NOTE line (their content is as observed
+    at collection time)."""
     snapdir = Path(snapdir)
     meta = load_meta(snapdir)
     if not meta:
         return "# no snapshot for this session (on_session_start hook not installed or did not run)\n"
+    keys = None if include is None else {_key(p) for p in include}
+
+    def want(p: str) -> bool:
+        return keys is None or _key(p) in keys
+
     idx = _load_index(snapdir)
     hdr = [f"# local diff vs snapshot taken {meta.get('started')} (session {meta.get('session')})"]
     if meta.get("late"):
         hdr.append("# NOTE: late snapshot (taken mid-session); earlier changes are not visible")
     hdr.append("# mode: " + ("stat only (data_class=sensitive)" if sensitive else "unified diff"))
+    if keys is not None:
+        hdr.append(f"# restricted to paths attributed to the agent ({len(keys)} candidate path(s))")
     out = ["\n".join(hdr) + "\n"]
     for status, p in _file_changes(snapdir, meta):
+        if not want(p):
+            continue
         snap = snapdir / "files" / p.lstrip("/")
+        out.append(_late_note(p, until))
         if idx.get(p, {}).get("skipped"):
             out.append(f"{status} {p} | snapshot skipped ({idx[p]['skipped']}); content diff unavailable\n")
             continue
@@ -304,15 +393,25 @@ def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive:
         root, head = repo.get("root"), repo.get("head")
         if not root or not head or not os.path.isdir(root):
             continue
+        changes = _repo_changes(repo)
+        rels: List[str] = []
+        if keys is not None:
+            mine = [p for _, p in changes if want(p)]
+            if not mine:
+                continue
+            rels = [os.path.relpath(p, root) for p in mine]
         pre = [ln for ln in (repo.get("status") or "").splitlines() if ln.strip()]
         out.append(f"\n# repo {root}: changes since session-start HEAD {head[:12]}\n")
         if pre:
             out.append(f"# {len(pre)} path(s) were already modified/untracked at session start:\n")
             out.extend(f"#   {ln}\n" for ln in pre[:50])
+        out.extend(_late_note(p, until) for _, p in changes if want(p))
         args = ["diff", "--stat", head] if sensitive else ["diff", "--no-color", "--no-ext-diff", head]
+        if rels:
+            args += ["--", *rels]
         rc, txt = _git(root, *args)
         out.append(txt if rc == 0 else f"# git diff failed (rc={rc})\n")
-        new = [p for s, p in _repo_changes(repo) if s == "A" and not _tracked(root, p)]
+        new = [p for s, p in changes if s == "A" and want(p) and not _tracked(root, p)]
         for p in new:
             lines = _read_lines(Path(p))
             if sensitive or lines is None:
@@ -322,6 +421,44 @@ def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive:
                 if out and not out[-1].endswith("\n"):
                     out.append("\n")
     return "".join(out)
+
+
+def stat_lines(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, paths=()) -> List[str]:
+    """`<status> <path> | +N -M` for each of *paths* (as returned by changed_files). Never file contents."""
+    snapdir = Path(snapdir)
+    meta = load_meta(snapdir)
+    if not meta:
+        return []
+    idx = _load_index(snapdir)
+    files = {p: s for s, p in _file_changes(snapdir, meta)}
+    in_repo: Dict[str, Tuple[str, Dict]] = {}
+    for repo in meta.get("repos") or []:
+        for s, p in _repo_changes(repo):
+            in_repo.setdefault(p, (s, repo))
+    out = []
+    for p in paths:
+        if p in files:
+            s = files[p]
+            if idx.get(p, {}).get("skipped"):
+                stat = f"snapshot skipped ({idx[p]['skipped']})"
+            else:
+                stat = _stat(_read_lines(snapdir / "files" / p.lstrip("/")) if s != "A" else [],
+                             _read_lines(Path(p)) if s != "D" else [])
+        elif p in in_repo:
+            s, repo = in_repo[p]
+            root, head = repo.get("root") or "", repo.get("head") or ""
+            stat = "?"
+            rc, txt = _git(root, "diff", "--numstat", head, "--", os.path.relpath(p, root)) if head else (1, "")
+            parts = txt.split("\t") if rc == 0 and txt.strip() else []
+            if len(parts) >= 2:
+                stat = "binary" if parts[0] == "-" else f"+{parts[0]} -{parts[1]}"
+            elif s == "A":
+                lines = _read_lines(Path(p))
+                stat = "binary" if lines is None else f"+{len(lines)} (untracked)"
+        else:
+            s, stat = "?", "?"
+        out.append(f"{s} {p} | {stat}")
+    return out
 
 
 def _tracked(root: str, path: str) -> bool:

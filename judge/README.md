@@ -29,8 +29,10 @@ Gates are synchronous and dumb; judging is asynchronous and smart. No model call
                              polls llama-server slots) --> watch.log, alert, queue --+
                                                                                      |
                      runner (systemd path unit on queue/) <--------------------------+
-                       1. collector/collect.py  -> evidence/<id>/  (logs, diffs vs. snapshot,
-                                                   host find -newermt in UTC, slots, probes)
+                       1. collector/collect.py  -> evidence/<id>/  (logs, gate decisions + outcome,
+                                                   agent diff / others' changes vs. snapshot,
+                                                   host find in UTC, slots, probes; window ends
+                                                   at request.created + grace)
                        2. run_judge.py          -> frontier `claude -p` (infra data only)
                                                    or local `big` (sensitive data, or over the cap)
                        3. validate.py           -> findings/<id>.json + .md   (items without
@@ -161,13 +163,14 @@ Values come from `site.env` at the repo root (defaults < `site.env` < environmen
 | `JUDGE_SSH_ALIASES` | empty | SSH aliases that should reach the edge; C3 and the probes test them. |
 | `EDGE_SSH_USER`, `EDGE_SSH_KEY` | `ubuntu`, `~/.ssh/edge.pem` | How read-only probes reach Covenant. |
 | `JUDGE_RUNAWAY_TOKENS`, `JUDGE_RUNAWAY_MINUTES` | `20000`, `10` | C6 thresholds. |
+| `JUDGE_WINDOW_GRACE_SECONDS` | `10` | Evidence window end = request `created` + this (logs, host diffs, gate decisions). |
 | `HERMES_HOME`, `JUDGE_REVIEW_DIR` | `~/.hermes`, `$HERMES_HOME/review` | Runtime locations. |
 
 The judge also reads the existing `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`, `SPARK_DOMAIN` and `SPARK_*_HOST`. Less common tuning knobs (timeouts, bundle size, inject window) are documented at the top of each script.
 
 ## Data boundary
 
-Every request carries a `data_class`. It is `infra` only when **every** changed path matches an infrastructure rule: the Hermes config, skills, memories and plans, `~/.ssh/config`, this repo, `/etc` or `/srv`. Anything else, or anything unclear, is `sensitive`.
+Every request carries a `data_class`. It is `infra` only when **every** path the agent changed matches an infrastructure rule: the Hermes config, skills, memories and plans, `~/.ssh/config`, this repo, `/etc` or `/srv`. Changes made by someone else (`others-changed.txt`) never count. Anything else, or anything unclear, is `sensitive`.
 
 - `infra`: the frontier judge may see it.
 - `sensitive`: **local judge only**, whatever `JUDGE_MODE` says, and the bundle carries diff stats and metadata rather than file contents.

@@ -10,6 +10,7 @@ are continuations of the previous line.
     log_tz(cfg) -> tzinfo
     session_lines(path, session, since_utc, until_utc, tz, include_untagged=True, max_bytes=...) -> list[str]
     tool_activity(path, session, since_utc, until_utc, tz) -> int        tool_executor lines for the session
+    tools_used(path, session, since_utc, until_utc, tz) -> set[str]     tool names in those lines
     last_assistant_message(hermes_home, session) -> str | None            from state.db (opened read-only)
     session_started_at(hermes_home, session) -> datetime | None
 """
@@ -93,6 +94,22 @@ def tool_activity(path, session: str, since: datetime, until: datetime, tz: tzin
         if m and m.group("logger") == "agent.tool_executor":
             n += 1
     return n
+
+
+_TOOL_NAME_RE = re.compile(r"\b[Tt]ool (?P<name>[A-Za-z0-9_.-]+) (?:completed|returned|failed)")
+
+
+def tools_used(path, session: str, since: datetime, until: datetime, tz: tzinfo) -> set:
+    """Names of the tools the session ran in [since, until] (agent.tool_executor lines, e.g.
+    `tool memory completed (...)` / `Tool patch returned error ...`)."""
+    out = set()
+    for line in session_lines(path, session, since, until, tz, include_untagged=False):
+        m = LINE_RE.match(line)
+        if m and m.group("logger") == "agent.tool_executor":
+            t = _TOOL_NAME_RE.search(m.group("msg"))
+            if t:
+                out.add(t.group("name"))
+    return out
 
 
 def _db(hermes_home) -> Optional[sqlite3.Connection]:

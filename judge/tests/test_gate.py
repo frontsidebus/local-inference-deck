@@ -485,8 +485,19 @@ def test_timing_subprocess(env):
 
 # --- data_class of gate review requests (what may reach a frontier judge) ---
 
+def _real_host_rules():
+    sys.path.insert(0, str(JUDGE))
+    try:
+        from lib import config as jconfig
+    finally:
+        sys.path.remove(str(JUDGE))
+    return jconfig.HOST_RULES
+
+
 class _Cfg:
-    """Stand-in for lib.config: classify() says infra only for /srv paths."""
+    """Stand-in for lib.config: classify() says infra only for /srv paths; HOST_RULES is the real one."""
+    HOST_RULES = _real_host_rules()
+
     @staticmethod
     def classify(paths, cwd=None):
         return "infra" if all(str(p).startswith("/srv/") for p in paths) else "sensitive"
@@ -516,6 +527,11 @@ def test_gate_data_class(rules, paths, expected):
 
 def test_gate_data_class_fails_safe():
     assert gate.gate_data_class(_Boom, ["remote-copy"], ["/srv/x"], None) == "sensitive"
+
+
+def test_host_rules_shared_with_lib_config():
+    assert _Cfg.HOST_RULES == frozenset({"remote-mutation", "remote-opaque", "remote-copy"})
+    assert not hasattr(gate, "HOST_RULES")   # single definition: lib/config.py
 
 
 def test_cli_host_mutation_request_is_infra(env):
