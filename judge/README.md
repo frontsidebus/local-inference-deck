@@ -271,6 +271,7 @@ The local judge is a fallback (sensitive data, or over the frontier cap), not a 
 - A judge that quotes a real but unrelated bundle line still passes the quote check.
 - An "earlier error, later fixed" false positive is caught mechanically only through `c3-results.jsonl`; elsewhere only the prompt guards it.
 - A report that contradicts itself is kept only as a low R1 `partial`/`n/a` item with two quoted, conflicting claims fragments and conflict wording; one that paraphrases instead of quoting is still dropped. The carve-out can also keep a low item that calls two compatible statements a conflict (one such low FP in 21 re-judged bundles).
+- The "claims-only" drop still ignores some real bundle facts. A bundle file name, or a full path ending in `.json`/`.txt`/`.patch`, is never a grounded span on its own. So an item whose only bundle quote is a path such as `agent-diff.patch covers only ".../.usage.json"` is dropped when the claims also name that file. Manifest facts (attribution, `withheld`, `window`, notes, ...) do count since #25, but only quoted with their key or value, e.g. `attribution.agent_paths: [...]`, not as paraphrase.
 - A `false` backed only by point-in-time artifacts (`unit_state`, `port_listening`, anything marked `# POINT IN TIME`) is downgraded, because those show the state at collection time, not during the session. A real problem that only shows there (a unit failed and is still failed) needs a windowed journal or a C3 line to stay `false`.
 
 ## Re-judging bundles

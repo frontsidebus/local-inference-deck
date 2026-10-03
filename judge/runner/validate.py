@@ -30,12 +30,18 @@ Steps, in order:
    split into its `=== FILE: <name> ===` sections and turned into WORLD text: the request copy in
    manifest.json, the user's message (`msg=...` of `conversation turn` log lines) and "absence marker"
    lines (withheld / stat only / omitted or truncated by runner / no lines in window ...) are removed.
+   The rest of manifest.json (attribution, window, extras, point_in_time, notes ...) IS world text (#25),
+   as pretty JSON plus one `a.b.c: value` / `a b c: value` / `a.b.c=value` line per leaf. Its withheld,
+   data_class, request_data_class, content_policy fields and absence-marker lines only GROUND an item
+   (rule a) and never contradict; a manifest-only span needs a key/value character (digit or _ / . : = [ ] { })
+   or 24+ chars after removing file names; its point_in_time entries are point-in-time (rule d0).
    Text is normalized (lower case, quotes/backticks/backslashes removed, whitespace collapsed).
    A GROUNDED SPAN is a run of >= 12 normalized evidence characters found verbatim in the world text
    (union of 12-char windows), ignoring spans that are only a bundle file name. It is a CONTRADICTING
    span when it is not contained in the item's claim, the request's claims/plan or the user's message.
    a. drop (prompt-as-evidence): the evidence has a >= 12-char span from the request claims/plan or
-      the user's message and no contradicting span -> item dropped.
+      the user's message and no grounded span (contradicting span, or manifest withheld/absence fact)
+      -> item dropped.
       Carve-out (report consistency): kept with a note when the item is R1, verdict `partial` or `n/a`,
       severity low, its evidence names a conflict (vs / conflicts / contradicts / inconsistent / but /
       while / next to ...) and quotes either two distinct claims fragments (>= 8 chars each, in quotes or
@@ -174,6 +180,53 @@ def split_bundle(bundle_text: str) -> Dict[str, str]:
     return out
 
 
+# manifest.json keys that describe withheld/redacted content: evidence that something is NOT shown.
+MANIFEST_ABSENCE_KEYS = {"withheld", "data_class", "request_data_class", "content_policy"}
+
+
+_FILE_NAME_RE = re.compile(r"[\w./-]+\.(?:txt|json|jsonl|patch)\b")
+
+
+def _manifest_specific(span: str) -> bool:
+    """A span found only in the manifest counts when, without bundle file names, it still has >= 12
+    characters and carries a key path or value (a digit or one of `_ / . : = [ ] { }`) or is >= 24
+    characters: plain English runs from the manifest's notes ("r the window") or a file name plus a
+    letter ("agent-diff.patch o") match too easily."""
+    rest = _FILE_NAME_RE.sub(" ", span).strip(" :.,;()[]#-")
+    return len(rest) >= SPAN_MIN and (len(rest) >= 2 * SPAN_MIN or bool(re.search(r"[\d_/.:=\[\]{}]", rest)))
+
+
+def _flatten(val: Any, path: List[str]):
+    """(key path, value) leaves of a JSON value; a list of scalars is one leaf (and one per element)."""
+    if isinstance(val, dict) and val:
+        for k, v in val.items():
+            yield from _flatten(v, path + [str(k)])
+    elif isinstance(val, list) and any(isinstance(v, (dict, list)) for v in val):
+        for i, v in enumerate(val):
+            yield from _flatten(v, path + [str(i)])
+    else:
+        yield path, val
+        if isinstance(val, list):
+            for v in val:
+                yield path, v
+
+
+def manifest_lines(man: Dict[str, Any]) -> Dict[str, List[str]]:
+    """manifest.json without its `request` copy, as text lines per top-level key, in the forms judges quote:
+    the pretty-printed JSON and one line per leaf as `a.b.c: value`, `a b c: value` and `a.b.c=value`
+    (e.g. `attribution.rejected_request_paths: ["/x"]`, `window until: 2026-...`)."""
+    out: Dict[str, List[str]] = {}
+    for key, val in man.items():
+        if key == "request":
+            continue
+        lines = json.dumps({key: val}, indent=2, ensure_ascii=False).splitlines()[1:-1]
+        for path, leaf in _flatten(val, [key]):
+            v = leaf if isinstance(leaf, str) else json.dumps(leaf, ensure_ascii=False)
+            lines += [f"{'.'.join(path)}: {v}", f"{' '.join(path)}: {v}", f"{'.'.join(path)}={v}"]
+        out[key] = lines
+    return out
+
+
 class BundleView:
     """World text vs self text of one bundle, for the verdict rules."""
 
@@ -184,6 +237,8 @@ class BundleView:
         req = request if isinstance(request, dict) else None
         world_parts: List[str] = []
         live_parts: List[str] = []
+        ground_parts: List[str] = []  # bundle facts that ground an item but never contradict a claim
+        file_parts: List[str] = []  # world text of the files other than manifest.json
         pit: set = set()
         for name, text in self.files.items():
             if name.rsplit("/", 1)[-1] == "manifest.json":
@@ -201,13 +256,24 @@ class BundleView:
                 if isinstance(man, dict):
                     if req is None and isinstance(man.get("request"), dict):
                         req = man["request"]
-                    man = {k: v for k, v in man.items() if k != "request"}
-                    text = json.dumps(man, ensure_ascii=False)
+                    # Everything but the request copy is collector output (attribution, withheld, window,
+                    # extras, point_in_time, notes ...): bundle evidence, one line per fact (#25).
+                    # What was withheld or redacted (and why) grounds an item but contradicts nothing,
+                    # like an absence-marker line elsewhere.
+                    for key, lines in manifest_lines(man).items():
+                        absent = key in MANIFEST_ABSENCE_KEYS
+                        keep = [ln for ln in lines if not absent and not _ABSENCE_LINE_RE.search(ln)]
+                        ground_parts += [ln for ln in lines if absent or _ABSENCE_LINE_RE.search(ln)]
+                        world_parts += keep
+                        if key != "point_in_time":
+                            live_parts += keep
+                    continue
             for m in _USER_MSG_RE.finditer(text):
                 self_parts.append(m.group(1))
             text = _USER_MSG_RE.sub("conversation turn:", text)
             text = "\n".join(ln for ln in text.splitlines() if not _ABSENCE_LINE_RE.search(ln))
             world_parts.append(text)
+            file_parts.append(text)
             if not is_pit:
                 live_parts.append(text)
         if req:
@@ -215,6 +281,8 @@ class BundleView:
                 if isinstance(req.get(k), str):
                     self_parts.append(req[k])
         self.world = _norm("\n".join(world_parts))
+        self.ground = _norm("\n".join(world_parts + ground_parts))
+        self.files_world = _norm("\n".join(file_parts))
         self.live = _norm("\n".join(live_parts))
         self.self_text = _norm("\n".join(self_parts))
         self.c3 = self._c3()
@@ -256,13 +324,19 @@ class BundleView:
         core = span.strip(" :.,;()[]#-")
         return any(core and core in n for n in self.names) or bool(re.fullmatch(r"[\w./-]+\.(?:txt|json|jsonl|patch)", core))
 
-    def analyse(self, claim: str, evidence: str) -> Tuple[List[str], List[str]]:
-        """(contradicting spans, self-text spans) of *evidence*."""
+    def analyse(self, claim: str, evidence: str) -> Tuple[List[str], List[str], List[str]]:
+        """(contradicting spans, self-text spans, grounded spans) of *evidence*. Grounded spans also count
+        manifest absence facts (e.g. `withheld`), which keep an item but never contradict a claim."""
         ev, cl = _norm(evidence), _norm(claim)
-        contra = [s for s in self._spans(ev, self.world)
-                  if not self._is_name(s) and s not in cl and s not in self.self_text]
+
+        def other(hay: str) -> List[str]:
+            return [s for s in self._spans(ev, hay)
+                    if not self._is_name(s) and s not in cl and s not in self.self_text
+                    and (s in self.files_world or _manifest_specific(s))]
+        contra = other(self.world)
+        grounded = contra if self.ground == self.world else other(self.ground)
         selfs = self._spans(ev, self.self_text)
-        return contra, selfs
+        return contra, selfs, grounded
 
     def is_live(self, span: str) -> bool:
         """True when *span* (mostly) comes from a windowed, not point-in-time, artifact."""
@@ -314,8 +388,8 @@ def apply_verdict_rules(item: Dict[str, str], view: Optional[BundleView]) -> Tup
     """Return (item or None if dropped, note). Mutates *item* on downgrade."""
     if view is None:
         return item, None
-    contra, selfs = view.analyse(item["claim"], item["evidence"])
-    if selfs and not contra:
+    contra, selfs, grounded = view.analyse(item["claim"], item["evidence"])
+    if selfs and not grounded:
         why = report_conflict(item, view)
         if why:
             return item, f"{item['id'] or '?'}: kept, report-consistency finding (R1 {item['verdict']}/low, {why})"
