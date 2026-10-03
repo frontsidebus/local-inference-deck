@@ -427,3 +427,28 @@ def test_host_rule_gate_request_is_still_infra(env):
     assert req["data_class"] == "infra" and req["detail"]["rules"] == ["remote-mutation"]
     ev = collect.collect(req["id"], runner=runner())
     assert json.loads((ev / "manifest.json").read_text())["data_class"] == "infra"
+
+
+# --- calls that never ran (Hermes emits post_tool_call with status="blocked" for a denied/timed-out
+# approval, "cancelled"/"aborted" for interrupted calls) must not count as the agent touching a file ---
+
+@pytest.mark.parametrize("status", ["blocked", "cancelled", "aborted"])
+def test_not_run_calls_do_not_attribute(tmp_path, status):
+    from lib import snapshot
+    d = tmp_path / "snap"
+    ran_path, blocked_path = str(tmp_path / "ran.txt"), str(tmp_path / "ssh_config")
+    snapshot.record_event(d, "write_file", [ran_path], "completed")
+    snapshot.record_event(d, "write_file", [blocked_path], status)
+    paths, _ = snapshot.agent_touched(d)
+    keys = {os.path.realpath(p) for p in paths}
+    assert os.path.realpath(ran_path) in keys
+    assert os.path.realpath(blocked_path) not in keys
+    agent, others = snapshot.attribute([ran_path, blocked_path], paths)
+    assert agent == [ran_path] and others == [blocked_path]
+
+
+def test_not_run_statuses_shared():
+    from lib import snapshot
+    assert collect.NOT_RUN_STATUSES is snapshot.NOT_RUN_STATUSES
+    assert {"blocked", "cancelled", "aborted"} <= snapshot.NOT_RUN_STATUSES
+    assert snapshot.ran({"status": "completed"}) and snapshot.ran({}) and not snapshot.ran({"status": "Blocked"})
