@@ -147,3 +147,49 @@ def test_slots_probe_cli_shape(env):
     assert rc == 0 and body["_note"].startswith("no llama-swap")
     rc, text = probe.run_probe("slots", [], runner=FakeRunner(default=(255, "", "unreachable")))
     assert rc == 255 and "_error" in text
+
+
+# ---------------------------------------------------------------- unit_journal + strict unit names
+@pytest.mark.parametrize("args", [
+    ["covenant", "nginx; rm -rf /", "2026-10-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "nginx$(id)", "2026-10-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "-nginx", "2026-10-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "a\\x2db.mount", "2026-10-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "x" * 129, "2026-10-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["local", "nginx", "2026-10-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "nginx", "2026-10-03 13:34:00", "2026-10-03T13:34:30Z"],
+    ["covenant", "nginx", "2026-10-03T13:34:00+02:00", "2026-10-03T13:34:30Z"],
+    ["covenant", "nginx", "2026-13-03T13:34:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "nginx", "2026-10-03T13:34:30Z", "2026-10-03T13:34:00Z"],
+    ["covenant", "nginx", "2026-09-01T00:00:00Z", "2026-10-03T13:34:30Z"],
+    ["covenant", "nginx", "2026-10-03T13:34:00Z"],
+])
+def test_unit_journal_bad_args_exit_64(env, args):
+    r = FakeRunner()
+    rc, text = probe.run_probe("unit_journal", args, runner=r)
+    assert rc == 64 and r.calls == []
+
+
+@pytest.mark.parametrize("unit", ["nginx;id", "nginx service", "../nginx", "-p"])
+def test_unit_state_strict_unit_names(env, unit):
+    r = FakeRunner()
+    assert probe.run_probe("unit_state", ["walter", unit], runner=r)[0] == 64 and r.calls == []
+
+
+@pytest.mark.parametrize("unit", ["nginx", "nginx.service", "wg-quick@wg0.service", "spark-backup.timer"])
+def test_unit_names_accepted(env, unit):
+    r = FakeRunner()
+    assert probe.run_probe("unit_state", ["walter", unit], runner=r)[0] == 0 and len(r.calls) == 1
+
+
+def test_unit_journal_command_and_redaction(env):
+    r = FakeRunner([(r"journalctl", (0, "13:34:13 systemd[1]: Reloaded nginx.service\n"
+                                        "13:34:13 app: password=hunter2hunter2\n", ""))])
+    rc, text = probe.run_probe("unit_journal", ["covenant", "nginx.service", "2026-10-03T13:34:00Z",
+                                                "2026-10-03T13:34:30Z"], runner=r)
+    assert rc == 0
+    remote = r.calls[0]["argv"][-1]
+    assert remote.startswith("sudo -n journalctl --no-pager -q --utc -o short-iso -n 300 -u nginx.service ")
+    assert "--since '2026-10-03 13:34:00 UTC' --until '2026-10-03 13:34:30 UTC' || journalctl" in remote
+    assert "Reloaded nginx.service" in text and "hunter2" not in text
+    assert "1 secret-shaped line(s) withheld" in text and "RESULT: 2 journal line(s)" in text
