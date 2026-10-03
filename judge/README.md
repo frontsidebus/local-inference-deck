@@ -97,7 +97,7 @@ hooks:
     fail_closed: true
     managed_by: agent-judge
   post_tool_call:
-  - matcher: write_file|patch|terminal
+  - matcher: write_file|patch|terminal|memory|skill_manage
     command: /usr/bin/python3 /path/to/repo/judge/hooks/enqueue.py
     managed_by: agent-judge
   on_session_start:

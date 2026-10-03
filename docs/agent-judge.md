@@ -32,7 +32,7 @@ Hermes shell hooks are configured in `$HERMES_HOME/config.yaml` under `hooks:` a
 
 | # | When | Hermes mechanism | Sync? | What happens |
 |---|---|---|---|---|
-| C1 | A plan is written | `post_tool_call`, matcher `write_file\|patch`, on `.hermes/plans/**` | async | Queue a **plan review**: the judge checks the plan against the project context file, the repo conventions and live facts. |
+| C1 | A plan is written | `post_tool_call` (matcher `write_file\|patch\|terminal\|memory\|skill_manage`; plan reviews for writes to `.hermes/plans/**`) | async | Queue a **plan review**: the judge checks the plan against the project context file, the repo conventions and live facts. |
 | C2 | Before a risky action | `pre_tool_call`, matcher `terminal\|write_file\|patch`, `fail_closed: true` | **sync** | Deterministic policy (below). It returns `{"action":"approve","message":…}` to **escalate to the human**, or `block` for hard violations, and queues a review. |
 | C3 | The agent says "done" after editing code | `pre_verify` (one-shot via `extra.attempt`) | sync, fast | Run deterministic verifiers on the changed paths: `check-sanitized.sh`, `bash -n`, JSON and YAML parsing, `ssh -G` plus an alias test when `~/.ssh/config` changed. On failure, return `{"action":"continue","message":…}` so the agent fixes it before stopping (bounded by `max_verify_nudges`). |
 | C4 | After a turn or session | `on_session_end`, plus the completion request queued by C3 | async | Queue a **completion audit**: claims against reality across everything touched. `on_session_start` takes the snapshot the diffs are measured against. |

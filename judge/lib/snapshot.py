@@ -221,6 +221,17 @@ def _key(path: str) -> str:
     return os.path.realpath(os.path.expanduser(path))
 
 
+# post_tool_call fires for every tool call, including ones that never ran: Hermes emits
+# status="blocked" for a denied/timed-out approval or a block, "cancelled"/"aborted" for interrupted
+# calls. Those must not count as the agent touching a file, nor as an executed call.
+NOT_RUN_STATUSES = frozenset({"blocked", "denied", "rejected", "cancelled", "canceled", "aborted", "not_approved"})
+
+
+def ran(ev) -> bool:
+    """True unless the event's recorded status says the tool call did not run."""
+    return str((ev or {}).get("status") or "").lower() not in NOT_RUN_STATUSES
+
+
 def agent_touched(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until: Optional[datetime] = None,
                   tools=()) -> Tuple[set, List[str]]:
     """(paths, prefixes) touched by the agent's tool calls: every path recorded in events.jsonl with
@@ -228,6 +239,8 @@ def agent_touched(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until:
     in those events or in *tools* (tool names from the Hermes log). Paths are realpath-normalised."""
     paths, names = set(), {str(t) for t in (tools or ())}
     for ev in events(snapdir):
+        if not ran(ev):
+            continue
         if until is not None:
             try:
                 if q.parse_utc(str(ev.get("t") or "")) > until:

@@ -181,10 +181,17 @@ def run_gate(env, command, call_id=None):
 
 
 def ran(env, command, call_id=None):
-    """post_tool_call: Hermes executed the call (it fires only for calls that ran)."""
+    """post_tool_call for a call that executed (Hermes status "ok"/"completed")."""
     hook(hev(env, "post_tool_call", tool_name="terminal", tool_input={"command": command},
              extra={"status": "ok", **({"tool_call_id": call_id} if call_id else {})}))
 
+
+
+def declined(env, command, call_id=None, status="blocked"):
+    """What Hermes really emits for a denied/timed-out approval: post_tool_call with status="blocked"."""
+    hook(hev(env, "post_tool_call", tool_name="terminal", tool_input={"command": command},
+             extra={"status": status, "error_type": "plugin_block",
+                    **({"tool_call_id": call_id} if call_id else {})}))
 
 CHECK = "ssh edge-alias 'systemctl is-active nginx'"
 RELOAD = "ssh edge-alias 'sudo systemctl reload nginx'"
@@ -427,3 +434,66 @@ def test_host_rule_gate_request_is_still_infra(env):
     assert req["data_class"] == "infra" and req["detail"]["rules"] == ["remote-mutation"]
     ev = collect.collect(req["id"], runner=runner())
     assert json.loads((ev / "manifest.json").read_text())["data_class"] == "infra"
+
+
+# --- calls that never ran (Hermes emits post_tool_call with status="blocked" for a denied/timed-out
+# approval, "cancelled"/"aborted" for interrupted calls) must not count as the agent touching a file ---
+
+@pytest.mark.parametrize("status", ["blocked", "cancelled", "aborted"])
+def test_not_run_calls_do_not_attribute(tmp_path, status):
+    from lib import snapshot
+    d = tmp_path / "snap"
+    ran_path, blocked_path = str(tmp_path / "ran.txt"), str(tmp_path / "ssh_config")
+    snapshot.record_event(d, "write_file", [ran_path], "completed")
+    snapshot.record_event(d, "write_file", [blocked_path], status)
+    paths, _ = snapshot.agent_touched(d)
+    keys = {os.path.realpath(p) for p in paths}
+    assert os.path.realpath(ran_path) in keys
+    assert os.path.realpath(blocked_path) not in keys
+    agent, others = snapshot.attribute([ran_path, blocked_path], paths)
+    assert agent == [ran_path] and others == [blocked_path]
+
+
+def test_not_run_statuses_shared():
+    from lib import snapshot
+    assert collect.NOT_RUN_STATUSES is snapshot.NOT_RUN_STATUSES
+    assert {"blocked", "cancelled", "aborted"} <= snapshot.NOT_RUN_STATUSES
+    assert snapshot.ran({"status": "completed"}) and snapshot.ran({}) and not snapshot.ran({"status": "Blocked"})
+
+
+
+def test_gate_escalation_declined_with_real_hermes_blocked_event(env):
+    """Hermes fires post_tool_call even for the declined call (status="blocked"): still not_executed."""
+    hook(hev(env, "on_session_start"))
+    assert run_gate(env, RELOAD, "call-2")["action"] == "approve"
+    declined(env, RELOAD, "call-2")
+    _, lines = completion_gates(env)
+    assert [x["outcome"] for x in lines] == ["not_executed"]
+
+
+def test_hash_fallback_with_real_blocked_events(env):
+    """No ids: first attempt declined (blocked event), retry approved and run."""
+    hook(hev(env, "on_session_start"))
+    assert run_gate(env, RELOAD)["action"] == "approve"
+    declined(env, RELOAD)
+    assert run_gate(env, RELOAD)["action"] == "approve"
+    ran(env, RELOAD)
+    _, lines = completion_gates(env)
+    assert [x["outcome"] for x in lines] == ["not_executed", "executed"]
+
+
+@pytest.mark.parametrize("tool,sub,status,expect_agent", [
+    ("memory", "memories/MEMORY.md", "completed", True),
+    ("skill_manage", "skills/demo/SKILL.md", "completed", True),
+    ("memory", "memories/MEMORY.md", "blocked", False),      # never ran: not the agent's change
+])
+def test_memory_and_skill_hook_events_attribute(tmp_path, tool, sub, status, expect_agent):
+    """post_tool_call for memory/skill_manage (installer matcher) attributes HERMES_HOME/<dir>/ changes."""
+    from lib import snapshot
+    hh = tmp_path / "hermes"
+    d = tmp_path / "snap"
+    snapshot.record_event(d, tool, [], status)
+    paths, prefixes = snapshot.agent_touched(d, {"HERMES_HOME": str(hh)})
+    target = str(hh / sub)
+    agent, others = snapshot.attribute([target], paths, prefixes)
+    assert (agent == [target]) is expect_agent and (others == [target]) is (not expect_agent)

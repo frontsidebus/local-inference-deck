@@ -90,7 +90,7 @@ def hermes_log(req: Dict, cfg: Mapping[str, str], since: datetime, until: dateti
 
 
 GATE_MATCH_SECONDS = 600       # an escalated call that has not run this long after its decision never ran
-NOT_RUN_STATUSES = {"blocked", "denied", "rejected", "cancelled", "canceled", "not_approved"}
+NOT_RUN_STATUSES = snapshot.NOT_RUN_STATUSES  # shared with attribution (lib/snapshot.py)
 
 
 def _read_gate_log(root: Path) -> List[Dict]:

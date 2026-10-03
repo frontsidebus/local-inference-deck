@@ -144,7 +144,7 @@ def post_tool_call(payload, cfg, root):
     snapshot.record_event(d, tool, paths, _status(extra),
                           call_id=str(cid) if isinstance(cid, (str, int)) and str(cid).strip() else None,
                           call_hash=redact.call_hash(tool, tinput))
-    if tool not in WRITE_TOOLS or _status(extra) == "error":
+    if tool not in WRITE_TOOLS or _status(extra) == "error" or not snapshot.ran({"status": _status(extra)}):
         return None
     for plan in (p for p in paths if is_plan(p)):
         meta = snapshot.load_meta(d)
@@ -191,7 +191,7 @@ def on_session_end(payload, cfg, root):
     touched = []  # this turn's write_file/patch targets (terminal tokens are only used for attribution)
     for ev in snapshot.events(d):
         try:
-            if (ev.get("tool") in WRITE_TOOLS
+            if (ev.get("tool") in WRITE_TOOLS and snapshot.ran(ev)
                     and q.parse_utc(ev.get("t", "")) >= since - timedelta(seconds=1)):
                 touched += ev.get("paths") or []
         except ValueError:
