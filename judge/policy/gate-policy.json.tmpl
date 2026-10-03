@@ -35,7 +35,16 @@
       "path": "$HERMES_HOME/config.yaml",
       "keys": ["command_allowlist", "hooks", "hooks_auto_accept", "security", "approvals", "agent.max_verify_nudges"],
       "hermes_cli_block_flags": ["--yolo", "--accept-hooks"],
-      "hermes_cli_block_env": ["HERMES_ACCEPT_HOOKS", "HERMES_YOLO_MODE"]
+      "hermes_cli_block_env": ["HERMES_ACCEPT_HOOKS", "HERMES_YOLO_MODE"],
+      "hermes_cli": {
+        "_doc": "`hermes` on the terminal. -h/--help anywhere before `--` passes (argparse exits first). config set/unset of an oversight key and the *_block entries block; read-only forms pass; any other config/hooks action and approve_subcommands escalate as hermes-config. config get --raw is secret-output. approvals suggest --apply blocks (writes command_allowlist). Read-only lists verified against `hermes <sub> --help` and hermes_cli/config.py (_CONFIG_SUBCOMMANDS) / hermes_cli/hooks.py (_ACTIONS).",
+        "config_readonly": ["", "show", "get", "path", "env-path", "check"],
+        "config_block": ["edit"],
+        "hooks_readonly": ["", "list", "ls", "doctor"],
+        "hooks_block": ["revoke", "remove", "rm", "approve", "accept", "allow"],
+        "block_subcommands": ["import"],
+        "approve_subcommands": ["setup", "migrate"]
+      }
     },
     {
       "id": "oversight-path",
@@ -55,7 +64,7 @@
       "id": "hermes-config",
       "kind": "hermes_config",
       "action": "approve",
-      "description": "Edit to the Hermes config that does not touch oversight keys (still a human decision)",
+      "description": "Edit to the Hermes config that does not touch oversight keys, or a hermes CLI action not known to be read-only (still a human decision)",
       "path": "$HERMES_HOME/config.yaml"
     },
     {
@@ -140,7 +149,12 @@
       "id": "secret-output",
       "kind": "secret_output",
       "action": "approve",
-      "description": "Command that would print a secret into the transcript (reading it into a variable or a pipe to a hash/count is fine)",
+      "description": "Command or read_file that would put a secret into the transcript (reading it into a variable or a pipe to a hash/count is fine)",
+      "_doc_read_file": "read_file escalates when the path is secret-shaped by secret_names (basename) or secret_paths (full path), minus not_secret_names; every other read passes. $HERMES_HOME/config.yaml deliberately passes: it holds settings, not credentials (those live in $HERMES_HOME/.env, which escalates), the agent needs it to reason about its own setup, and Hermes's output redactor still masks key-shaped values.",
+      "secret_paths": [
+        "~/.config/spark/**", "$HERMES_HOME/.env", "~/.ssh/id_*", "/etc/llama-swap/api-key", "/etc/wireguard/**",
+        "/etc/ssh/ssh_host_*_key", "~/.git-credentials", "~/.docker/config.json", "~/.config/gh/hosts.yml"
+      ],
       "secret_names": [
         "*.key", "*.pem", ".env", "*.env", "api-key", "api_key", "apikey", "*-api-key", "*_api_key",
         "*secret*", "admin-password", "*password*", "shadow", "gshadow", "id_rsa", "id_ecdsa", "id_ed25519",

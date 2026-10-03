@@ -30,8 +30,11 @@ judge/
     inject.py            C5 pre_llm_call   (runner agent)
   policy/gate-policy.json.tmpl   C2 rules (JSON: stdlib has no YAML), host patterns as ${VARS} (gate agent)
   collector/collect.py   build evidence bundle for a request (collector agent)
+  collector/extras.py    C3 results + host-state probes for the bundle (`c3_results`, `host_state_probes`)
   probes/                read-only probe executables + probe.py dispatcher/allowlist (collector agent)
   runner/                judge prompt, run-judge (frontier|local), findings validator, systemd user units (runner agent)
+  runner/rejudge.py      re-judge stored bundles with the current prompt/validator, without touching findings/
+  bin/judge-ack|judge-findings   operator CLIs (acks, listing)
   watch/runaway.py       C6 llama-server slot watcher (verify agent)
   tests/                 pytest; one test module per part; fixtures under tests/fixtures/
 ```
@@ -44,11 +47,14 @@ queue/<request-id>.json          pending review requests
 evidence/<request-id>/           collector output (see bundle below)
 findings/<request-id>.json       judge output (validated)
 findings/<request-id>.md         human-readable rendering of the same
-acks/<request-id>.<item-id>      empty or one-line reason; presence = acknowledged
+acks/<request-id>.<item-id>      ack JSON (see "Acks" below); legacy: empty or one-line reason
 done/<request-id>.json           request moved here after findings are written
-snapshots/<session-id>/          watched-path snapshots taken at session start (collector)
+snapshots/<session-id>/          watched-path snapshots taken at session start (collector), plus
+                                 c3-results.jsonl (verify.py, one line per verifier run)
 gate.log                         JSONL, one line per C2 decision (incl. `tool_call_id` when sent, `call_hash`)
 watch.log                        JSONL, one line per C6 alert
+inject.log                       C5: one line when the count of skipped local-mode items changes for a session
+.inject-local-skips.json         C5 state for inject.log ({session: last logged count}, at most 200 sessions)
 ```
 Writes are atomic (write tmp + rename). Files are mode 600, dirs 700.
 
@@ -61,6 +67,21 @@ Completion dedupe (`lib/queue.is_duplicate`, used by verify.py and enqueue.py): 
 when a completion request of the same session exists with `created` within `JUDGE_COMPLETION_DEDUPE_SECONDS`
 (default 900) and a superset of its `changed_paths` (empty is a subset).
 
+**One completion request per turn** (`lib/queue.merge_into_pending_completion(req, since=None, root=None) -> id | None`,
+called by `hooks/enqueue.py` on `on_session_end` before `is_duplicate`). Target: the newest completion request in
+queue/ of the same session written by pre_verify (`source_event == "pre_verify"` or `detail.hook == "pre_verify"`),
+not already merged, `created` at or after `since` (the session's previous `on_session_end`). Merge:
+`changed_paths` = union; `since` = the earlier; `claims` (pre_verify's when session_end's are empty), `plan`,
+`created` (the turn's end, so the window covers the whole turn) and `detail` fields (`turn_id`, `completed`,
+`changed_by_others`, ...) from the session end layered over pre_verify's; `data_class` = `sensitive` if either is;
+`id`, `kind`, `session`, `source_event` stay pre_verify's; `detail.merged = {"from": ["pre_verify",
+"on_session_end"], "pre_verify_created", "session_end_created"}`. Schema-validated, atomic.
+**Not merged** (returns None; enqueue writes a new request subject to `is_duplicate`) when the pre_verify request
+is already in done/ or `evidence/<id>/` exists (judging has started). A runner pick-up between check and write is
+undone; a sub-second race remains in which the merged extra paths land in done/ unreviewed. Because the runner's
+path unit fires on every queue/ change, the merge often finds the pre_verify request already being judged; it
+removes the duplicate whenever the session end arrives first.
+
 ## Request (schema/request.schema.json)
 ```json
 {"id": "...", "kind": "plan|gate|completion|runaway",
@@ -71,6 +92,8 @@ when a completion request of the same session exists with `created` within `JUDG
  "source_event": "post_tool_call|pre_tool_call|pre_verify|on_session_end|watch", "detail": {}}
 ```
 `changed_paths` lists only paths **the agent touched** (see "Attribution" below), never every snapshot change.
+The collector does **not** trust a request's `changed_paths` (see "Attribution"): a path without a backing tool
+event is rejected and never reaches `agent-diff.patch`, but still counts for `data_class`.
 A `completion` request from `hooks/enqueue.py` also carries `detail.changed_by_others`: the session's other
 snapshot changes (paths only, at most 200; `detail.changed_by_others_total` when more), which never count for
 `data_class`.
@@ -88,6 +111,23 @@ URLs excluded) or when it lies under `$HERMES_HOME/memories/` or `$HERMES_HOME/s
 `changed_paths` of a completion = snapshot changes attributed this way + this turn's write_file/patch targets.
 Everything else is "changed by others" (`lib/snapshot.agent_touched` / `attribute`).
 
+**Request paths need a backing event** (`collect.attribution`). In the collector, a request's `changed_paths`
+entry is the agent's only if a session tool event in `events.jsonl` names it (up to the window end, status not in
+`NOT_RUN_STATUSES`), or it lies under a `$HERMES_HOME` self-write prefix (memory/skill_manage ran). Otherwise it
+is **rejected**: never in `agent-diff.patch` (which gets a `# N path(s) listed by the request are NOT attributed
+to the agent ...` line), in `others-changed.txt` if the snapshot shows it changed, and still counted for
+`data_class` (it can only make the bundle stricter). A request without a session snapshot gets all its paths
+rejected. Manifest: `attribution.rejected_request_paths` (in an `infra` bundle only the infra ones are listed),
+`attribution.rejected_request_paths_total`, `notes.attribution`.
+
+**Noise paths.** Hermes bookkeeping files change on their own and are never anyone's edit. `lib/snapshot.noise_globs(cfg, meta)`
+= `NOISE_GLOBS` (`*/skills/.usage.json`, `*/skills/.locks/*`, `*/skills/.curator_ledger.jsonl`,
+`*/skills/.curator_backups/*`) + `$HERMES_HOME/*.lock` + `JUDGE_NOISE_GLOBS` (default empty; space- or
+comma-separated; it only adds). All are `fnmatch` globs over absolute paths (`*` crosses `/`). Noise is excluded
+from snapshot indexing, `changed_files`/diffs (repo changes too), `agent_touched`, request-path attribution and
+`data_class`, so it is in neither `changed_paths` nor `changed_by_others`. Recorded as `meta.json` `noise_globs`
+and manifest `attribution.ignored_noise_paths` (count) + `notes.noise`.
+
 ## Finding (schema/finding.schema.json)
 ```json
 {"request": "<request-id>", "judge": "<model id>", "created": "...Z", "mode": "frontier|local",
@@ -98,56 +138,243 @@ Everything else is "changed by others" (`lib/snapshot.agent_touched` / `attribut
 Optional top-level `"notes": ["..."]` (runner bookkeeping, e.g. "sensitive -> local enforced",
 "frontier cap reached", "validator dropped N items"). Validator drops items with empty `evidence`. Rubric codes as in docs/agent-judge.md.
 
+**Verdicts.** `false` = the bundle contradicts the claim, and the evidence quotes the contradicting bundle text;
+`n/a` = unverifiable from the bundle (missing output, withheld or stat-only content); `partial` = mild doubt.
+Missing evidence is never `false`. The request `claims`, the user's message (`msg=` in log lines), withheld or
+stat-only diffs and `tool ... completed` lines are not evidence about the world. The final state of a turn wins
+(`"final": true` in `c3-results.jsonl`, `# WINDOWED` journals). `high` only for a false claim with quoted
+contradicting evidence, an unapproved host or oversight change, or secret exposure.
+
+**Validator rules** (`runner/validate.py`, docstring step 4; applied when bundle text is supplied, which
+`run_judge.py` always does and the CLI does with `--bundle`). *World text* = the bundle's `=== FILE:` sections
+minus the manifest's `request` copy, the user's `msg=` text and absence-marker lines (withheld, stat only, no
+lines in window, ...), normalized (lower case, quotes/backticks/backslashes stripped, whitespace collapsed). A
+*grounded span* is 12+ normalized evidence chars found verbatim in the world text (a bare bundle file name does
+not count); it is *contradicting* when it is not contained in the item's claim, the request claims or plan, or
+the user message.
+- **Drop** an item whose evidence quotes only the claims, plan or user message (no contradicting span).
+- **`false` → `n/a` + `low`** when (b) there is no contradicting span; (c) the evidence admits absence ("no
+  evidence", "cannot verify", "withheld", ...) and no contradicting span carries a failure word (error, fail,
+  denied, inactive, non-zero exit, 4xx/5xx, blocked, ...); (d0) every contradicting span comes only from
+  point-in-time artifacts (text starting `# POINT IN TIME`, e.g. `unit_state`, `port_listening`, or listed under
+  the manifest's `point_in_time`), which show the state at collection time, not during the session; or (d)
+  `c3-results.jsonl` has a `final: true, ok: true` line for a file the item names and no final failing line for
+  it. Only `# WINDOWED` artifacts (e.g. `unit_journal`) and C3 `final: true` lines count as final-state evidence.
+- **`high` → `medium`** unless the verdict is `false` or the rubric is R3, R4 or R5.
+- **Local-judge cap.** Items of a `mode=local` finding are capped at `JUDGE_LOCAL_MAX_SEVERITY` (`low|medium|high`,
+  default and fallback `medium`). Applies to every local finding: `JUDGE_MODE=local`, sensitive bundles and
+  frontier-cap fallbacks.
+- Every change is a `notes` line, e.g. `"F1: verdict false->n/a, severity high->low (...)"`,
+  `"F1: severity high->medium (local judge cap JUDGE_LOCAL_MAX_SEVERITY=medium; ...)"`, `"validator dropped F2: ..."`.
+- `validate_finding(..., request=, max_severity=, notes_out=)`; return shape unchanged. CLI:
+  `validate.py ... [--bundle FILE] [--local-max-severity LEVEL]`.
+
 ## Evidence bundle (`evidence/<request-id>/`)
-**Window.** Every time-windowed artifact covers `[request.since, request.created + JUDGE_WINDOW_GRACE_SECONDS]`
-(default 10 s), in UTC, whenever the bundle is collected: a later turn's evidence never reaches an earlier
-request's bundle. Point-in-time artifacts (read at collection time) are labelled as such in the manifest.
+**Window.** Every time-windowed artifact covers `[request.since, until]` in UTC, with
+`until = min(request.created + JUDGE_WINDOW_GRACE_SECONDS, next_turn_start - 1 s)`, never before `created`
+(`collect.window_info`), whenever the bundle is collected: a later turn's evidence never reaches an earlier
+request's bundle, even inside the grace period. `next_turn_start` is the first
+`agent.turn_context: conversation turn:` line of the session in the Hermes log at or after `created` (Hermes'
+background review turns count); only when the log has none in `[since, created + grace]` (no log, older
+Hermes), the earliest `since >= created` among the session's other requests in queue/ and done/. Log times have
+1 s resolution, so a next turn in the same second gives `until = created`. Manifest: `window.until_basis`
+(`grace` | `next_turn_log` | `next_request`) and `window.next_turn_start` (when cut). The host `find` bound moves
+with the cut. Exception: `c3-results.jsonl` is windowed to the **turn end** (next turn start − 1 s, searched up to
+collection time; else collection time; never before `until`) so C3 re-runs after a nudge are kept
+(`extras.c3_window`). Point-in-time artifacts (read at collection time) are labelled as such in the manifest.
+
+**Withheld content.** A withheld diff is never silent, so the judge can't read absence of content as absence of
+change. A `sensitive` `agent-diff.patch` starts `# mode: CONTENT WITHHELD (data_class=sensitive): ... the file DID
+change` and has one line per changed agent path (snapshot files, repo files via `git diff --numstat`, untracked
+files): `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b) [added|modified|deleted]`,
+or `— binary file changed` / `— snapshot skipped (...)` (`snapshot.withheld_line`). Manifest
+`withheld: {artifact: reason}` covers `agent-diff.patch` (sensitive) and `others-changed.txt` (non-infra others
+in an `infra` bundle); `{}` when nothing is withheld.
 
 | File | Content | Time |
 |---|---|---|
-| `manifest.json` | request copy, `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, changed_by_others, omitted_after_window}`, `notes: {<artifact>: "..."}` | — |
+| `manifest.json` | request copy, `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, changed_by_others, omitted_after_window, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`) | — |
 | `hermes-log.txt` | agent.log/errors.log lines of this session (plus untagged lines) in the window, secrets redacted | window |
 | `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires for every call; Hermes reports a denied or timed-out approval as `status="blocked"`, interrupted calls as `cancelled`/`aborted`) matches the decision by `tool_call_id`, else by tool + `call_hash`, and its status is not in `NOT_RUN_STATUSES` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
-| `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (request `changed_paths` + session tool events up to the window end). Content only when `data_class=infra`; otherwise stat lines. A file modified after the window gets a `# NOTE:` line | point in time (current content) |
+| `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (session tool events up to the window end; request `changed_paths` only with a backing event, see Attribution). Content only when `data_class=infra`; otherwise `# content withheld` lines (see above). A file modified after the window gets a `# NOTE:` line; a truncated or missing opted-in dir gets a `# NOTE: opted-in dir ...` header line | point in time (current content) |
 | `others-changed.txt` | snapshot changes **not** made by the agent: `<status> <path> \| +N -M` lines, never content. In an `infra` bundle, non-infra paths are withheld (count only). Changes made after the window (by anyone) are omitted (count only) | point in time |
 | `host-<name>.txt` | UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local, then `systemctl --failed` and the host clock (both at collection time) | find: window |
+| `c3-results.jsonl` | the C3 verifier runs of this session from `since` to the turn end, from `snapshots/<session>/c3-results.jsonl` (format below), re-redacted; every line has `final`, `true` on the latest per `(path, check)` | window (to turn end) |
+| `probes/host-<name>.txt` | read-only host-state probes chosen from the request's claims and the window's gate excerpts by `extras.host_state_probes` (`<name>` = `unit_state-<host>-<unit>`, `unit_journal-<host>-<unit>`, `port_listening-<host>-<port>`, sanitized to `[A-Za-z0-9_.-]`; at most 4 per request), re-redacted; text starting `# WINDOWED` is listed in `windowed`, the rest in `point_in_time` | unit_state, port_listening: point in time; unit_journal: window |
 | `slots.json` | llama-server slots summary (`{"<model>": [slot, ...], "_collected": "...Z", "_error": "..."}`; `_`-prefixed keys are string metadata) | point in time |
 | `probes/<probe>-<n>.txt` | stdout+stderr+exit code; written by `collect.py <id> --probe <name> [args]` (adds a `point_in_time` entry) | point in time |
 | `probes/judge-<probe>-<n>.txt` | probes the judge requested, saved by the runner | point in time |
 
 `data_class` of the bundle: the stricter of the request's class and the collector's own classification of the
-agent-attributed paths. With no such paths, only a host-rule `gate` request keeps the hook's class; any other
+agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request keeps the hook's class; any other
 request is classified with `classify([], cfg, cwd)`, so an `infra` label on a path-less request (forged or
 buggy) comes out `sensitive` unless the cwd is infra. For `data_class=sensitive`: diffs replaced by
-`git diff --stat`-style summaries; no file contents.
+`# content withheld` stat lines; no file contents.
+**Extras** (`collector/extras.py`, imported lazily): when absent, no `c3-results.jsonl` or host probes,
+`notes` say "not installed" and `extras: {available: false}`; any exception from it becomes a note
+(`not collected: ... failed (<ExcClass>)`) and the bundle is still written.
 
 CLI: `judge/collector/collect.py <request-id>` reads the request from queue/ (or done/), writes the bundle and
 `manifest.json` last, prints the evidence dir, exits 0. Exit 2 = bad id / request not found. Unreachable hosts are
 recorded in `host-<name>.txt` (`UNREACHABLE: ...`), never fatal.
-Snapshots (`snapshots/<session>/`, written by `hooks/enqueue.py` on `on_session_start`): `meta.json`,
+Snapshots (`snapshots/<session>/`, written by `hooks/enqueue.py` on `on_session_start`) cover the watched paths
+**and the opted-in dirs**: `JUDGE_INFRA_REPOS` entries that are git repos join meta `repos` (HEAD + status, diffed
+via git); plain dirs are copied (`snapshot.dir_roots`), skipping `.git`, `node_modules`, `__pycache__`, `.venv`,
+`venv`, `.cache`, capped at `JUDGE_SNAPSHOT_MAX_FILES` (default 2000) files per root — beyond it the root is
+`truncated` and **additions in it are not detected** (only M/D) — and `JUDGE_SNAPSHOT_MAX_BYTES` (default
+1048576) per file (larger files are hashed, not copied: `skipped: too large`). `meta.json` gains
+`dir_roots: [{root, files, truncated, too_large}]`, `skipped_roots: [{root, reason}]` (missing or not a
+directory), `snapshot_caps: {max_files, max_bytes}` and `noise_globs`. `meta.json`,
 `index.json` (`{abs_path: {"sha256", "size"}}`, plus `"skipped"` when a file was not copied), `files/<abs path>`
 copies, `events.jsonl` (tool calls seen by post_tool_call: `{"t","tool","paths","status"}`; `paths` are the
 write_file/patch targets, or the path-like tokens of a terminal command, used only for attribution; plus
 `call_id` = Hermes `extra.tool_call_id` when sent and `call_hash` = `lib/redact.call_hash(tool, tool_input)`;
 never the command text).
 
+## C3 results (`snapshots/<session>/c3-results.jsonl`)
+`hooks/verify.py` appends one JSON line per verifier run, passing or failing (file 600, append-only):
+```json
+{"t": "2026-10-03T08:31:02Z", "attempt": 0, "path": "/abs/path", "check": "bash-n", "ok": false,
+ "detail": "<one line, redacted, then cut to 300 chars>"}
+```
+- `check`: `bash-n`, `shellcheck`, `py-compile`, `json`, `yaml`, `check-sanitized` (`path` = repo root),
+  `ssh-config`, `ssh-alias:<alias>` (`path` = `~/.ssh/config`), `claim` (`path` = the claimed path; `ok: false` is
+  a claim mismatch, `ok: true` means changed_paths, the snapshot hash or a recent mtime confirms the change).
+- Checks that did not run (budget spent, no PyYAML, probe refused or missing) are not recorded. A shellcheck
+  timeout is recorded `ok: true`, detail "timed out (not counted as a failure)".
+- `detail` is redacted before it is cut, so a cut can't defeat a pattern; if `lib/redact` can't load it is `""`.
+- **Retries are recorded.** When Hermes re-fires `pre_verify` after the nudge (`extra.attempt > 0`), the verifiers
+  run again in record-only mode: lines are appended with that attempt, the hook prints `{}` and enqueues nothing.
+  So the final state is on record and there is still at most one nudge.
+- A failure to write the file goes to `hook-errors.log`; the hook's output is unchanged.
+
+The collector copies the lines from `since` to the turn end (see Window) into the bundle and marks the latest line per `(path, check)`
+with `"final": true`, so the judge can tell a failure the agent later fixed from one it left.
+
+## Collector extras (`judge/collector/extras.py`)
+Read-only, stdlib-only helpers the collector calls; if the module is missing the collector skips them and notes it.
+- `c3_results(session, since, until, root) -> list[dict]`: the `c3-results.jsonl` lines with `t` in
+  `[since, until]` (inclusive), oldest first, malformed lines skipped. Each line gains `final`; `true` on the
+  latest per `(path, check)` (ties on `t` go to the later line in the file).
+- `host_state_probes(req, cfg, runner=None, root=None, gate_lines=None) -> dict[str, str]`: never raises; on a
+  malformed request returns `{"host_state_probes-error": "..."}`. Disabled by `JUDGE_HOST_PROBES=0` (default `1`).
+  - Text scanned: the request's `claims`, `plan` and `detail.excerpt`, plus the `excerpt` of this session's
+    gate.log lines in the window (and a gate request's own line). Window as for the bundle.
+  - Units: `systemctl <verb> <unit>` / `service <unit> <verb>` (`--user` skipped), and in claim sentences with a
+    state word (active, running, reloaded, restarted, up, failed, completed, ...) `<name>.service|timer|socket` or
+    a well-known unit. Gate-excerpt units come first.
+  - Host of a unit: the one host named in the same line or sentence (walter/covenant, `edge`, the site.env IPs,
+    `JUDGE_SSH_ALIASES`); else a known-unit map (edge: nginx, oauth2-proxy, fail2ban; backend: llama-swap, docker,
+    docker-user-rules, spark-backup, spark-update-check, nvidia-persistenced); else the only host named in the
+    whole text; else the unit is skipped.
+  - Each unit gets `unit_state <host> <unit>` + `unit_journal <host> <unit> <since> <until>`; each loopback port
+    (`127.0.0.1:<p>`, `localhost:<p>`, `[::1]:<p>`) gets `port_listening <host> <p>` (same host rule, default walter).
+  - **At most 4 probe runs per request**, all through `probes/probe.py` (allowlist, validation, redaction); a
+    refused probe (exit 64) is dropped.
+  - Keys: `unit_state-<host>-<unit>`, `unit_journal-<host>-<unit>`, `port_listening-<host>-<port>`. Each text
+    starts with `# POINT IN TIME: ...` (unit_state, port_listening) or `# WINDOWED: ...` (unit_journal), then
+    `# selected because: ...`.
+
 ## Probes (`judge/probes/probe.py <name> [args...]`)
 Allowlisted names with per-arg regex validation; each runs read-only with a timeout (default 20s):
 `ssh_alias_test <alias>`, `port_listening <host:walter|covenant> <port>`, `http_status <https-url-on-SPARK_DOMAIN>`,
 `unit_state <host> <unit>`, `file_hash <host> <abs-path>`, `render_and_diff <repo-template-path>`,
-`check_sanitized <repo-path>`, `slots`. Unknown name or bad arg → exit 64, no execution.
+`check_sanitized <repo-path>`, `slots`, `unit_journal <host> <unit> <since> <until>`. Unknown name or bad arg →
+exit 64, no execution.
+- `unit_journal`: remote `sudo -n journalctl --no-pager -q --utc -o short-iso -n 300 -u <unit> --since ... --until ...`,
+  falling back to plain `journalctl` when sudo needs a password. `since`/`until` must be strict
+  `YYYY-MM-DDTHH:MM:SSZ`, `since <= until`, span at most 7 days. Lines the redactor would change are withheld
+  whole (the count is printed); the output is redacted again as for every probe.
+- Unit names (`unit_state`, `unit_journal`): `^[A-Za-z0-9@._-]+\.?(service|timer|socket)?$`, starting with a letter
+  or digit, at most 128 chars. systemd-escaped names (with `:` or `\`) are refused.
 
-## Hermes shell-hook wire format (from Hermes docs; verify against ~/.hermes/hermes-agent source)
-stdin: `{"hook_event_name", "tool_name", "tool_input", "session_id", "cwd", "profile", "extra"}`.
-stdout: `pre_tool_call` → `{"action":"block","message":...}` | `{"action":"approve","message":...,"rule_key":...}` | `{}`;
-`pre_verify` → `{"action":"continue","message":...}` | `{}` (gate on `extra.attempt`);
-`pre_llm_call` → `{"context": "..."}` | `{}`. Exit code 2 = block (pre_tool_call). Hooks must never crash: wrap,
-log to `$JUDGE_REVIEW_DIR/hook-errors.log`, and emit `{}` — EXCEPT gate.py which is installed `fail_closed: true`.
+## Gate (C2) coverage
+- **Matcher** (`install.sh`): `terminal|write_file|patch|read_file`.
+- **`read_file`** (`tool_input = {"path", "offset"?, "limit"?}`; only `path` is used). A missing, empty or
+  non-string path fails closed (block, exit 2), like write_file/patch. A secret-shaped path escalates
+  (`approve`, rule `secret-output`; the request is a `gate` request with `detail.tool = "read_file"`, always
+  `sensitive`). Every other read passes with `{}`: no log line, no request.
+- **Secret-shaped** (`Gate.is_secret_file`, shared with the terminal `secret-output` rule): basename in
+  `secret_output.secret_names`, OR full path in the policy key `secret_output.secret_paths` (default
+  `~/.config/spark/**`, `$HERMES_HOME/.env`, `~/.ssh/id_*`, `/etc/llama-swap/api-key`, `/etc/wireguard/**`,
+  `/etc/ssh/ssh_host_*_key`, `~/.git-credentials`, `~/.docker/config.json`, `~/.config/gh/hosts.yml`), minus
+  `not_secret_names` (`*.pub`, `*.example`, `*.md`, `*.sh`, `*.py`, ...). A symlink's target counts too.
+  `$HERMES_HOME/config.yaml` passes on purpose (settings, not credentials; see the policy's `_doc_read_file`).
+- **`rule_key`** for a secret read = `judge-gate:secret-output:<sha256(tool \0 resolved-abs-path)[:12]>`: one key
+  per file whatever the spelling or page, so a human's "always" covers that one file, never the whole rule.
+- **hermes CLI** (policy key `oversight_config.hermes_cli`; gate.py carries the same values as a fallback for
+  older rendered policies):
+  - pass: `-h`/`--help` anywhere before `--` (block flags `--yolo`/`--accept-hooks` are still checked);
+    `--version`, `status`; `config` (bare) `show|get|path|env-path|check`; `hooks` (bare) `list|ls|doctor`;
+    `approvals suggest` without `--apply`, `approvals test`.
+  - block: `config edit`; `config set|unset` of an oversight key; `hooks revoke|remove|rm` (and legacy
+    `approve|accept|allow`); `approvals suggest --apply`; `import`.
+  - escalate as `secret-output`: `config get --raw` (prints credentials unmasked; passes when captured).
+  - escalate as `hermes-config`: any other `config` action (`migrate`, `set|unset` of a non-oversight key,
+    unknown), any other `hooks` action (e.g. `test`), `setup`, `migrate`.
+- Hermes keys consent on `(event, command)` (`agent/shell_hooks.py` `_entry_matches`), not the matcher, so the
+  matcher change needs `install.sh --apply` (re-renders `gate-policy.json`, rewrites the hooks block) and a
+  restart of Hermes and the gateway, but no new consent.
+
+## Acks (`acks/<request-id>.<item-id>`)
+One JSON object, mode 600, atomic:
+`{"actor": "human"|"agent", "reason": "<first line, at most 500 chars>", "ts": "<UTC Z>", "via": {...}?}`.
+- `via` (written by `bin/judge-ack`; informational, forgeable, never trusted): `{"tool": "judge-ack", "uid",
+  "ppid", "parent", "flag_agent", "agent_context": [...], "hermes_session"?}`.
+- A legacy ack (empty or a plain-text reason) reads as `actor: "human"`, `ts` = file mtime. A JSON ack with a
+  missing or invalid `actor` reads as `"agent"`.
+- If any agent tool call in `snapshots/*/events.jsonl` named the ack file (write_file/patch target or terminal
+  path token), the ack reads as `agent` whatever it claims (`queue.agent_wrote_ack`; `claimed_actor` is kept).
+- **Status** per item: `open` (no ack) | `agent-acked` (agent ack of a `high` item: no longer injected, waits for
+  a human) | `closed` (human ack, or agent ack of a non-high item). *Needs human* = a `high` item without a
+  human ack. **Any** ack stops C5 re-injection.
+- A human ack replaces an agent ack; an agent ack never replaces a human one (judge-ack refuses, exit 0).
+- `lib/queue`: `ack(..., *, actor="human", via=None, now=None)` (alias `write_ack`), `read_ack`, `is_acked`,
+  `agent_event_paths`, `agent_wrote_ack`, `ack_actor`, `closure(actor, severity)`, `item_status`, `is_closed`,
+  `needs_human(status, item)`, `items_by_status`; constants `ACK_ACTORS`, `ACK_STATUSES`.
+- The gate still lets the agent write under `acks/` (it has to, to ack). So a same-user agent can still forge
+  a human ack (see README "Ack trust").
+
+**`bin/judge-ack [--agent] <request-id> <item-id> "<reason>"`** (flag anywhere). Default actor `human`;
+`--agent` → `agent`. It records `agent` regardless of the flag when it detects an agent context: a non-empty env
+marker (`HERMES_AGENT`, `HERMES_SESSION_ID`, `HERMES_SESSION_KEY`, `AI_AGENT`, plus the comma-separated names in
+the environment variable `JUDGE_ACK_AGENT_ENV`) or a `hermes`, `hermes-agent`, `run_agent.py` or `hermes_cli`
+process among its /proc ancestors (a note goes to stderr). Detection can only add `agent`. Exit 0 ok, 2 unknown
+finding/item, 64 usage.
+
+**`bin/judge-findings`**: `--items` and `<request-id>` views print `== open (n) ==`,
+`== agent-acked: awaiting a human (n) ==`, `== closed (n) ==`, each item with `ack: <actor> <ts>: <reason>`.
+`--needs-human` = only `high` items no human has closed (implies `--items`); `--unacked` = no ack at all. The
+summary line ends `open:N agent-acked:N closed:N`. `--json` items gain `status` and `ack`
+(`{"actor","reason","ts"[,"claimed_actor","legacy"]}` or null); `acked` (any ack) is kept.
+
+## C5 injection (`hooks/inject.py`)
+Injects unacknowledged items at or above `JUDGE_INJECT_MIN_SEVERITY` from the last `JUDGE_INJECT_WINDOW_HOURS`.
+Items of `mode=local` findings are skipped unless `JUDGE_INJECT_LOCAL=1` (env or site.env; default `0`); the skip
+count goes to `inject.log` only when it changes for the session. The footer names
+`judge-ack --agent <request-id> <item-id> "<reason>"` and says a HIGH item stays open until the human reviews it.
+
+## Re-judging (`runner/rejudge.py`)
+`rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget]` judges existing bundles
+again with the current prompt and validator, via `run_judge.judge_bundle(request_id, request, evidence_dir, mode,
+notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, input, mode, model, notes}`, raises
+`JudgeError`).
+- Reads the request from queue/ or done/ and `evidence/<id>/`; never collects (a missing bundle is an error) and
+  never runs probes (`PROBES ALLOWED: no`).
+- Never writes to queue/, done/, findings/, acks/ or evidence/; an `--out` inside any of them is refused (64).
+- Writes `DIR/<id>.json` (with notes), `<id>.md`, `<id>.raw.txt`, `<id>.input.txt` and `DIR/summary.json`, and
+  prints old (`findings/<id>.json`) vs new: mode, items, high+false count.
+- A `sensitive` bundle is always judged locally; `--mode frontier` on one is refused and noted.
+- `--model` sets `JUDGE_LOCAL_MODEL` or `JUDGE_FRONTIER_MODEL` by `--mode` (both without `--mode`).
+- Frontier calls count in `usage.json` against `JUDGE_FRONTIER_DAILY_MAX` unless `--no-budget`.
+- Exit 0 ok, 1 when any request failed, 64 usage.
 
 ## site.env variables (add to site.env.example under `# --- judge`)
 `JUDGE_MODE=frontier` (frontier|local), `JUDGE_LOCAL_MODEL=big`, `JUDGE_FRONTIER_CMD=claude`,
 `JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
 `EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=20000`, `JUDGE_RUNAWAY_MINUTES=10`,
-`JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this).
+`JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
+`JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`.
+Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

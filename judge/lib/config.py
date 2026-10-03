@@ -64,6 +64,13 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_LOG_TZ": "",                    # tz of Hermes log timestamps: "" = system local, "UTC", "+02:00", IANA
     "JUDGE_COMPLETION_DEDUPE_SECONDS": "900",  # completion requests of a session within this window dedupe
     "JUDGE_WINDOW_GRACE_SECONDS": "10",    # evidence window = [request.since, request.created + this]
+    # run-1 fixes (one place for every default; site.env and the environment override)
+    "JUDGE_HOST_PROBES": "1",              # collector runs read-only host-state probes for host claims
+    "JUDGE_NOISE_GLOBS": "",               # extra globs added to snapshot.NOISE_GLOBS
+    "JUDGE_SNAPSHOT_MAX_FILES": "2000",    # per opted-in dir root
+    "JUDGE_SNAPSHOT_MAX_BYTES": "1048576", # larger files are hashed, not copied
+    "JUDGE_LOCAL_MAX_SEVERITY": "medium",  # cap for findings from the local judge
+    "JUDGE_INJECT_LOCAL": "0",             # 1 = C5 also injects local-judge findings
     "BACKEND_SSH_USER": "operator",
     "LLAMA_SWAP_PORT": "8080",
 }

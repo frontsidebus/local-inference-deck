@@ -40,7 +40,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("JUDGE_LOCAL_MODEL", "big")
     monkeypatch.setenv("JUDGE_PROBES", "0")
     for k in ("JUDGE_MODE", "JUDGE_FRONTIER_CMD", "JUDGE_FRONTIER_DAILY_MAX", "JUDGE_LOCAL_URL",
-              "JUDGE_FRONTIER_MODEL", "SPARK_API_HOST"):
+              "JUDGE_FRONTIER_MODEL", "SPARK_API_HOST", "JUDGE_LOCAL_MAX_SEVERITY"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(RJ, "COLLECTOR", tmp_path / "no-collector.py")
     return review

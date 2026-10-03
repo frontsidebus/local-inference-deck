@@ -12,8 +12,8 @@ Wire format (verified against hermes-agent agent/shell_hooks.py + agent/turn_sto
   stdout {"action": "continue", "message": "..."}  |  {}
 
 Rules:
-- One-shot: ``extra.attempt > 0`` -> ``{}`` immediately (Hermes re-fires after every nudge; the
-  ``agent.max_verify_nudges`` bound is only a backstop).
+- One-shot: ``extra.attempt > 0`` -> ``{}`` (Hermes re-fires after every nudge; the
+  ``agent.max_verify_nudges`` bound is only a backstop). The verifiers re-run record-only (see "C3 results").
 - Total budget ~45 s (``JUDGE_VERIFY_BUDGET``); configure the hook with ``timeout: 60``.
 - Always (on attempt 0) enqueue a ``completion`` review request, deduplicated (see ``is_duplicate``).
 - Never crashes: any internal error is logged to ``$JUDGE_REVIEW_DIR/hook-errors.log`` and ``{}`` is printed.
@@ -30,6 +30,16 @@ Verifiers (chosen by path):
   ~/.ssh/config                        ``ssh -G`` parse check, then probes/probe.py ssh_alias_test for each
                                        Host alias whose block changed (baseline: collector snapshot)
   final_response claims                light heuristic, see ``check_claims``
+
+C3 results (evidence for the judge, interface "C3 results" in the run-1 integration notes):
+  Every verifier run, passing or failing, appends one JSON line to
+  ``$JUDGE_REVIEW_DIR/snapshots/<session>/c3-results.jsonl``:
+      {"t": "<UTC Z>", "attempt": int, "path": "<abs>", "check": "<name>", "ok": bool,
+       "detail": "<= 300 chars, redacted>"}
+  Checks: bash-n, shellcheck, py-compile, json, yaml, check-sanitized (path = repo root), ssh-config,
+  ssh-alias:<alias>, claim (path = the claimed path). On ``attempt > 0`` (Hermes re-fires after our nudge)
+  the verifiers run again in record-only mode: the results are appended, the hook still prints ``{}`` and
+  enqueues nothing, so the judge sees the post-fix state. collector/extras.py ``c3_results`` reads the file.
 """
 from __future__ import annotations
 
@@ -273,6 +283,11 @@ class Result:
         self.ran: List[str] = []
         self.claim_flags: List[Dict[str, str]] = []
         self.soft_claims: List[Dict[str, str]] = []
+        self.records: List[Dict[str, Any]] = []  # one per verifier run -> c3-results.jsonl
+
+    def record(self, path: str, check: str, ok: bool, detail: str = "") -> None:
+        self.records.append({"t": _utc_iso(), "path": str(path), "check": check, "ok": bool(ok),
+                             "detail": str(detail or "")})
 
     def fail(self, tag: str, msg: str) -> None:
         self.fail_tags.append(tag)
@@ -332,12 +347,17 @@ def check_shell(paths: List[str], res: Result, budget: Budget) -> None:
         if r is None:
             res.notes.append(f"budget exhausted before bash -n {p}")
             return
+        res.record(p, "bash-n", r[0] == 0, r[1] if r[0] != 0 else "syntax OK")
         if r[0] != 0:
             res.fail("bash-syntax", f"bash -n {p} failed:\n    {_excerpt(r[1])}")
             continue
         if sc and not p.endswith(".tmpl"):
             r = run([sc, "-S", "error", "-f", "gcc", p], budget, timeout=15)
             res.ran.append(f"shellcheck {p}")
+            if r and r[0] == 124:
+                res.record(p, "shellcheck", True, "timed out (not counted as a failure)")
+            elif r:
+                res.record(p, "shellcheck", r[0] == 0, r[1] if r[0] != 0 else "no errors")
             if r and r[0] not in (0, 124):
                 res.fail("shellcheck", f"shellcheck -S error {p}:\n    {_excerpt(r[1])}")
     if paths and not sc:
@@ -350,9 +370,12 @@ def check_python(paths: List[str], res: Result) -> None:
         try:
             with open(p, "rb") as fh:
                 compile(fh.read(), p, "exec", dont_inherit=True)
+            res.record(p, "py-compile", True, "compiles")
         except SyntaxError as e:
+            res.record(p, "py-compile", False, f"line {e.lineno}: {e.msg}")
             res.fail("python-syntax", f"Python syntax error in {p} line {e.lineno}: {e.msg}")
         except (OSError, ValueError) as e:
+            res.record(p, "py-compile", False, f"cannot compile: {e}")
             res.fail("python-syntax", f"cannot compile {p}: {e}")
 
 
@@ -362,9 +385,12 @@ def check_json(paths: List[str], res: Result) -> None:
         try:
             with open(p, encoding="utf-8") as fh:
                 json.load(fh)
+            res.record(p, "json", True, "parses")
         except json.JSONDecodeError as e:
+            res.record(p, "json", False, f"line {e.lineno} col {e.colno}: {e.msg}")
             res.fail("json", f"invalid JSON in {p} line {e.lineno} col {e.colno}: {e.msg}")
         except (OSError, UnicodeDecodeError) as e:
+            res.record(p, "json", False, f"cannot read: {e}")
             res.fail("json", f"cannot read {p}: {e}")
 
 
@@ -408,6 +434,11 @@ def check_yaml(paths: List[str], res: Result, budget: Budget) -> None:
     except Exception:
         res.notes.append("YAML parse check gave unreadable output")
         return
+    for p in paths:
+        if p in errs:
+            res.record(p, "yaml", False, str(errs[p]))
+        else:
+            res.record(p, "yaml", True, "parses")
     for p, msg in errs.items():
         res.fail("yaml", f"invalid YAML in {p}: {msg}")
 
@@ -418,7 +449,9 @@ def check_sanitized(roots: List[str], res: Result, budget: Budget) -> None:
         res.ran.append(f"check-sanitized.sh in {root}")
         if r is None:
             res.notes.append(f"budget exhausted before check-sanitized.sh in {root}")
-        elif r[0] != 0:
+        else:
+            res.record(root, "check-sanitized", r[0] == 0, r[1] if r[0] != 0 else "clean")
+        if r is not None and r[0] != 0:
             res.fail("check-sanitized",
                      f"{root}/scripts/check-sanitized.sh failed (public repo: no real hosts/IPs/names/"
                      f"secrets; use site.env variables and example values):\n    {_excerpt(r[1], 600)}")
@@ -463,6 +496,79 @@ def snapshot_dir(session: str) -> Optional[Path]:
     except Exception:
         base = review_dir() / "snapshots" / session
     return base if base.is_dir() else None
+
+
+# ------------------------------------------------------------------ C3 results (evidence for the judge)
+C3_RESULTS = "c3-results.jsonl"
+C3_DETAIL_MAX = 300
+C3_MAX_RECORDS = 200  # per hook run
+_SESSION_SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")  # same rule as lib/queue.safe_session
+_redact_fn: Optional[Any] = None
+
+
+def _redactor() -> Any:
+    """lib/redact.redact; when it cannot be loaded, a redactor that drops the text (never leak a detail)."""
+    global _redact_fn
+    if _redact_fn is None:
+        fn = getattr(_import("redact"), "redact", None)
+        if not callable(fn):
+            try:
+                import importlib.util
+
+                spec = importlib.util.spec_from_file_location("judge_c3_redact", JUDGE_DIR / "lib" / "redact.py")
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                fn = mod.redact
+            except Exception:
+                fn = None
+        _redact_fn = fn if callable(fn) else (lambda _t: "")
+    return _redact_fn
+
+
+def c3_results_path(session: str) -> Optional[Path]:
+    """$JUDGE_REVIEW_DIR/snapshots/<session>/c3-results.jsonl (None without a session id)."""
+    if not session:
+        return None
+    q = _import("queue")
+    fn = getattr(q, "snapshot_dir", None) if q else None
+    try:
+        base = Path(fn(session)) if callable(fn) else None
+    except Exception:
+        base = None
+    if base is None:
+        safe = _SESSION_SAFE_RE.sub("_", session).strip(".")[:120] or "nosession"
+        base = review_dir() / "snapshots" / safe
+    return base / C3_RESULTS
+
+
+def c3_line(rec: Dict[str, Any], attempt: int) -> str:
+    detail = " ".join(str(rec.get("detail") or "").split())  # one line; whitespace collapsed
+    try:
+        detail = str(_redactor()(detail))
+    except Exception:
+        detail = ""
+    if len(detail) > C3_DETAIL_MAX:  # truncate AFTER redaction so a cut cannot defeat a pattern
+        detail = detail[:C3_DETAIL_MAX - 3] + "..."
+    return json.dumps({"t": str(rec.get("t") or _utc_iso()), "attempt": int(attempt),
+                       "path": str(rec.get("path") or ""), "check": str(rec.get("check") or ""),
+                       "ok": bool(rec.get("ok")), "detail": detail}, ensure_ascii=False)
+
+
+def write_c3_results(session: str, attempt: int, records: Sequence[Dict[str, Any]]) -> Optional[Path]:
+    """Append one line per verifier run. Never raises (errors go to hook-errors.log)."""
+    try:
+        path = c3_results_path(session)
+        if path is None or not records:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        text = "".join(c3_line(r, attempt) + "\n" for r in list(records)[:C3_MAX_RECORDS])
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+    except Exception as e:
+        log_error("verify.py c3-results", e)
+        return None
 
 
 def snapshot_index(session: str) -> Dict[str, Dict[str, Any]]:
@@ -528,8 +634,11 @@ def check_ssh_config(path: str, session: str, final_response: str, res: Result, 
         r = run(["ssh", "-G", "-F", path, probe_alias], budget, timeout=5)
         res.ran.append("ssh -G parse")
         if r and r[0] not in (0, 124):
+            res.record(path, "ssh-config", False, r[1])
             res.fail("ssh-config", f"ssh cannot parse {path}:\n    {_excerpt(r[1])}")
             return
+        if r and r[0] == 0:
+            res.record(path, "ssh-config", True, "ssh -G parses")
     baseline = find_ssh_baseline(session)
     if baseline is not None:
         old = parse_ssh_hosts(baseline)
@@ -550,7 +659,10 @@ def check_ssh_config(path: str, session: str, final_response: str, res: Result, 
             res.notes.append(f"ssh_alias_test {a} not run: {r[1][:120]}")
         elif r[0] == 64:
             res.notes.append(f"probe refused alias {a!r} (exit 64)")
+        elif r[0] == 0:
+            res.record(path, f"ssh-alias:{a}", True, "connects")
         elif r[0] != 0:
+            res.record(path, f"ssh-alias:{a}", False, f"probe ssh_alias_test exit {r[0]}")
             res.fail("ssh-alias", f"ssh alias {a!r} from {path} does not connect "
                                   f"(probe ssh_alias_test exit {r[0]}):\n    {_excerpt(r[1], 300)}")
     if len(aliases) > 8:
@@ -619,8 +731,12 @@ def check_claims(final_response: str, changed: List[str], cwd: str, res: Result,
                 continue
             seen.add(rp)
             if rp in changed_real or any(c.startswith(rp.rstrip("/") + "/") for c in changed_real):
+                if hard:
+                    res.record(p, "claim", True, "claimed changed; in changed_paths")
                 continue
             if "/" not in tok and tok in changed_base:
+                if hard:
+                    res.record(p, "claim", True, "claimed changed; a changed path has this name")
                 continue
             if os.path.isdir(p):
                 continue
@@ -634,12 +750,14 @@ def check_claims(final_response: str, changed: List[str], cwd: str, res: Result,
             snap = (snap_index or {}).get(p) or (snap_index or {}).get(rp) or {}
             if exists and snap.get("sha256"):
                 if _sha256(p) != snap["sha256"]:
+                    res.record(p, "claim", True, "claimed changed; differs from the session-start snapshot")
                     res.notes.append(f"{tok} claimed changed, not in changed_paths, but differs from the "
                                      f"session-start snapshot (edited outside file tools?)")
                     continue
             elif exists:
                 try:
                     if now - os.path.getmtime(p) <= window_s:
+                        res.record(p, "claim", True, "claimed changed; modified recently (no snapshot entry)")
                         res.notes.append(f"{tok} claimed changed, not in changed_paths, but modified "
                                          f"recently (edited outside file tools?)")
                         continue
@@ -652,6 +770,7 @@ def check_claims(final_response: str, changed: List[str], cwd: str, res: Result,
                 state = "it is identical to its session-start snapshot"
             else:
                 state = "it is unchanged (not in this turn's edited files, not modified recently)"
+            res.record(p, "claim", False, f"claimed changed, but {state}")
             res.fail("claim-mismatch", f"your answer claims {tok} was changed, but {state}. "
                                        f"Make the change, or correct the claim in your answer.")
 
@@ -771,10 +890,20 @@ def main(stdin: Any = None, stdout: Any = None) -> int:
             attempt = int(extra.get("attempt") or 0)
         except (TypeError, ValueError):
             attempt = 0
-        if attempt > 0 or not extra.get("changed_paths"):
+        if not extra.get("changed_paths"):
+            stdout.write("{}\n")
+            return 0
+        if attempt > 0:
+            # re-fire after our nudge: record-only (post-fix state for the judge), never nudge again
+            try:
+                _, res, ctx = verify(payload)
+                write_c3_results(ctx["session"], attempt, res.records)
+            except Exception as e:
+                log_error("verify.py record-only", e)
             stdout.write("{}\n")
             return 0
         out, res, ctx = verify(payload)
+        write_c3_results(ctx["session"], attempt, res.records)
         try:
             enqueue(res, ctx)
         except Exception as e:

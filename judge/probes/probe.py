@@ -7,6 +7,10 @@ Usage: probe.py <name> [args...]
     port_listening <walter|covenant> <port> `ss -ltnH` on the host
     http_status <https-url-on-SPARK_DOMAIN> status code + redirect target, no cookies, no body
     unit_state <walter|covenant> <unit>     `systemctl show` state properties
+    unit_journal <walter|covenant> <unit> <since> <until>
+                                            `journalctl -u <unit>` lines in [since, until] (UTC
+                                            YYYY-MM-DDTHH:MM:SSZ, span <= 7 days, last 300 lines), via
+                                            `sudo -n` with a plain fallback; secret-shaped lines withheld
     file_hash <walter|covenant|local> <abs-path>   sha256 + owner/mode/size/mtime
     render_and_diff <repo-template-path> [<walter|covenant>:<abs-live-path>]
                                             render a repo *.tmpl with site.env; diff against the live file
@@ -14,6 +18,8 @@ Usage: probe.py <name> [args...]
     check_sanitized <repo-path>             the judge repo's scripts/check-sanitized.sh run in <repo-path>
     slots                                   llama-server /slots summary from Walter's per-model localhost ports
 
+Unit names (unit_state, unit_journal) must match ^[A-Za-z0-9@._-]+\\.?(service|timer|socket)?$, start with a
+letter or digit and be at most 128 characters.
 Every probe validates each argument against a regex before anything runs; an unknown name or a bad
 argument exits 64 with no execution. Commands are fixed and read-only; each step has a timeout
 (JUDGE_PROBE_TIMEOUT, default 20 s). Output: the commands, their stdout+stderr (redacted) and exit codes.
@@ -68,7 +74,10 @@ HOST_RE = re.compile(r"^(walter|covenant)$")
 HOST_OR_LOCAL_RE = re.compile(r"^(walter|covenant|local)$")
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 PORT_RE = re.compile(r"^[0-9]{1,5}$")
-UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:\\-]{0,127}$")
+UNIT_RE = re.compile(r"^[A-Za-z0-9@._-]+\.?(service|timer|socket)?$")
+UTC_TS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+JOURNAL_MAX_SPAN_S = 7 * 24 * 3600
+JOURNAL_MAX_LINES = 300
 ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9._@+/-]{0,1023}$")
 TEMPLATE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]{0,255}\.tmpl$")
 LIVE_RE = re.compile(r"^(walter|covenant):(/[A-Za-z0-9._@+/-]{1,1023})$")
@@ -167,6 +176,33 @@ def p_http_status(ctx: Ctx, url: str) -> None:
 def p_unit_state(ctx: Ctx, host: str, unit: str) -> None:
     ctx.ssh(host, "systemctl show --no-pager -p Id,LoadState,ActiveState,SubState,UnitFileState,"
                   f"ActiveEnterTimestamp,NRestarts,Result -- {shlex.quote(unit)}")
+
+
+def _journal_ts(ts: str) -> str:
+    return ts.replace("T", " ").replace("Z", " UTC")  # systemd.time accepts "YYYY-MM-DD HH:MM:SS UTC"
+
+
+def p_unit_journal(ctx: Ctx, host: str, unit: str, since: str, until: str) -> None:
+    q = shlex.quote
+    jc = (f"journalctl --no-pager -q --utc -o short-iso -n {JOURNAL_MAX_LINES} -u {q(unit)} "
+          f"--since {q(_journal_ts(since))} --until {q(_journal_ts(until))}")
+    rc, out, err = ctx.ssh(host, f"sudo -n {jc} || {jc}", show=False)
+    ctx.note(f"$ ssh {host} 'sudo -n {jc} || {jc}'")
+    kept, withheld = [], 0
+    for line in out.splitlines():
+        if redact(line) != line:  # secret-shaped: withhold the whole line, not just the value
+            withheld += 1
+            continue
+        kept.append(line)
+    if kept:
+        ctx.note("\n".join(kept))
+    if err.strip():
+        ctx.note("[stderr] " + err.strip())
+    if withheld:
+        ctx.note(f"# {withheld} secret-shaped line(s) withheld")
+    ctx.note(f"# exit {rc}")
+    if rc == 0:
+        ctx.note(f"RESULT: {len(kept) + withheld} journal line(s) for {unit} on {host} in [{since}, {until}]")
 
 
 def p_file_hash(ctx: Ctx, host: str, path: str) -> None:
@@ -330,7 +366,18 @@ def _registry(cfg: Mapping[str, str]):
         return v
 
     def unit_ok(v):
-        return _check(UNIT_RE, v, "unit")
+        _check(UNIT_RE, v, "unit")
+        if len(v) > 128 or not v[0].isalnum():
+            raise UsageError(f"bad unit: {v!r}")
+        return v
+
+    def ts_ok(v):
+        _check(UTC_TS_RE, v, "UTC timestamp")
+        try:
+            datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            raise UsageError(f"bad UTC timestamp: {v!r}")
+        return v
 
     def template_ok(v):
         _check(TEMPLATE_RE, v, "template path")
@@ -350,6 +397,7 @@ def _registry(cfg: Mapping[str, str]):
         "port_listening": ([lambda v: _check(HOST_RE, v, "host"), port_ok], [], p_port_listening),
         "http_status": ([lambda v: _https_url(v, cfg)], [], p_http_status),
         "unit_state": ([lambda v: _check(HOST_RE, v, "host"), unit_ok], [], p_unit_state),
+        "unit_journal": ([lambda v: _check(HOST_RE, v, "host"), unit_ok, ts_ok, ts_ok], [], p_unit_journal),
         "file_hash": ([lambda v: _check(HOST_OR_LOCAL_RE, v, "host"), _abs_path], [], p_file_hash),
         "render_and_diff": ([template_ok], [live_ok], p_render_and_diff),
         "check_sanitized": ([_abs_path], [], p_check_sanitized),
@@ -357,8 +405,8 @@ def _registry(cfg: Mapping[str, str]):
     }
 
 
-PROBE_NAMES = ("ssh_alias_test", "port_listening", "http_status", "unit_state", "file_hash", "render_and_diff",
-               "check_sanitized", "slots")
+PROBE_NAMES = ("ssh_alias_test", "port_listening", "http_status", "unit_state", "unit_journal", "file_hash",
+               "render_and_diff", "check_sanitized", "slots")
 
 
 def validate_args(name: str, args: Sequence[str], cfg: Mapping[str, str]):
@@ -370,6 +418,10 @@ def validate_args(name: str, args: Sequence[str], cfg: Mapping[str, str]):
         raise UsageError(f"{name}: expected {len(req)}..{len(req) + len(opt)} args, got {len(args)}")
     for v, val in zip(req + opt, args):
         v(val)
+    if name == "unit_journal":
+        a, b = (datetime.strptime(x, "%Y-%m-%dT%H:%M:%SZ") for x in args[2:4])
+        if not 0 <= (b - a).total_seconds() <= JOURNAL_MAX_SPAN_S:
+            raise UsageError(f"unit_journal: need since <= until and a span <= {JOURNAL_MAX_SPAN_S // 86400} days")
     return impl
 
 

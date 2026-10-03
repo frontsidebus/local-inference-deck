@@ -74,7 +74,8 @@ def test_framing_and_fields(review):
     for s in ("[HIGH]", "R1", RID, "F1", "Claim: alias updated", "Evidence: ssh -o BatchMode=yes",
               "Recommendation: Check the alias", "verdict: false"):
         assert s in ctx
-    assert ctx.rstrip().endswith('judge-ack <request-id> <item-id> "<reason>"')
+    assert 'judge-ack --agent <request-id> <item-id> "<reason>"' in ctx
+    assert ctx.rstrip().endswith("A HIGH item stays open until the human reviews it.")
     assert str(JUDGE / "bin" / "judge-ack") in ctx
 
 
@@ -131,7 +132,7 @@ def test_cap_and_overflow_note(review):
                       for i in range(1, 15)])
     ctx = run_hook(review)["context"]
     assert len(ctx) <= 2000
-    assert "more not shown" in ctx and ctx.rstrip().endswith('"<reason>"')
+    assert "more not shown" in ctx and ctx.rstrip().endswith("until the human reviews it.")
     assert len(run_hook(review, JUDGE_INJECT_MAX_CHARS="4000")["context"]) > 2000
 
 
@@ -226,11 +227,12 @@ def test_builtin_scanner_fallback(review):
 
 def test_judge_ack_cli_then_not_injected(review):
     add(review, RID, [it("F1"), it("F2", claim="still open")])
-    env = {**os.environ, "HERMES_HOME": str(review.parent), "JUDGE_REVIEW_DIR": str(review),
-           "SITE_ENV": str(review / "no-site.env")}
+    env = {**{k: v for k, v in os.environ.items() if k not in ("AI_AGENT", "HERMES_AGENT", "HERMES_SESSION_ID",
+                                                                "HERMES_SESSION_KEY")},
+           "HERMES_HOME": str(review.parent), "JUDGE_REVIEW_DIR": str(review), "SITE_ENV": str(review / "no-site.env")}
     ack = [sys.executable, str(JUDGE / "bin" / "judge-ack")]
     assert subprocess.run(ack + [RID, "F1", "fixed the alias"], env=env, capture_output=True).returncode == 0
-    assert (review / "acks" / f"{RID}.F1").read_text().strip() == "fixed the alias"
+    assert json.loads((review / "acks" / f"{RID}.F1").read_text())["reason"] == "fixed the alias"
     assert subprocess.run(ack + [RID, "F9", "x"], env=env, capture_output=True).returncode == 2
     assert subprocess.run(ack + ["../../x", "F1", "x"], env=env, capture_output=True).returncode == 64
     ctx = run_hook(review)["context"]
@@ -238,3 +240,41 @@ def test_judge_ack_cli_then_not_injected(review):
     out = subprocess.run([sys.executable, str(JUDGE / "bin" / "judge-findings"), "--unacked", "--json"], env=env,
                          capture_output=True, text=True)
     assert [i["id"] for i in json.loads(out.stdout)[0]["items"]] == ["F2"]
+
+
+def add_mode(review, rid, items, mode):
+    add(review, rid, items)
+    f = json.loads((review / "findings" / f"{rid}.json").read_text())
+    f["mode"] = mode
+    (review / "findings" / f"{rid}.json").write_text(json.dumps(f))
+
+
+RID_LOCAL = "20261003T040000Z-fdc8ec-completion"
+
+
+def test_local_mode_findings_skipped_by_default_and_logged(review):
+    add_mode(review, RID_LOCAL, [it("F1", claim="local judge says false"), it("F2", "medium", claim="local two")],
+             "local")
+    add(review, RID, [it("F1", claim="frontier finding")])
+    ctx = run_hook(review)["context"]
+    assert "frontier finding" in ctx and "local judge says" not in ctx and RID_LOCAL not in ctx
+    log = (review / "inject.log").read_text()
+    assert "skipped 2 item(s) from local-mode findings" in log and SESSION in log
+    run_hook(review)  # unchanged count: not logged again
+    assert (review / "inject.log").read_text() == log
+    # only local findings: nothing injected at all
+    (review / "findings" / f"{RID}.json").unlink()
+    assert run_hook(review) == {}
+
+
+def test_local_mode_findings_injected_when_enabled(review):
+    add_mode(review, RID_LOCAL, [it("F1", claim="local judge says false")], "local")
+    ctx = run_hook(review, JUDGE_INJECT_LOCAL="1")["context"]
+    assert "local judge says false" in ctx
+    assert not (review / "inject.log").exists()
+
+
+def test_agent_ack_stops_injection_even_for_high(review):
+    add(review, RID, [it("F1", "high", claim="high one")])
+    (review / "acks" / f"{RID}.F1").write_text(json.dumps({"actor": "agent", "reason": "fp", "ts": ts()}))
+    assert run_hook(review) == {}

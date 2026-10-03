@@ -1,22 +1,92 @@
 #!/usr/bin/env python3
-"""judge-ack <request-id> <item-id> "<reason>"
+"""judge-ack [--agent] <request-id> <item-id> "<reason>"
 
-Acknowledge one judge finding item: writes $JUDGE_REVIEW_DIR/acks/<request-id>.<item-id> with the
-one-line reason. Acknowledged items are no longer injected into the agent's context (C5).
+Acknowledge one judge finding item: writes $JUDGE_REVIEW_DIR/acks/<request-id>.<item-id> as
+{"actor": "human"|"agent", "reason": "<one line>", "ts": "<UTC>", "via": {...}}.
+
+  --agent   record the ack as the agent's (the C5 injection tells the agent to pass this)
+
+Without --agent the ack is recorded as the human's, UNLESS judge-ack detects that it runs inside an agent
+session: an agent marker in the environment (HERMES_AGENT, HERMES_SESSION_ID, HERMES_SESSION_KEY,
+AI_AGENT, plus any listed in JUDGE_ACK_AGENT_ENV) or a Hermes process among its ancestors. Then it is
+recorded as the agent's and a note goes to stderr. Detection can only add "agent", never remove it.
+
+Any ack stops C5 from re-injecting the item. The item counts as CLOSED only when a human acked it, or the
+agent acked it and its severity is not high; an agent-acked HIGH item waits for a human
+(judge-findings --needs-human). An agent ack never replaces an existing human ack.
+
 Exit: 0 ok, 2 unknown finding/item, 64 usage.
 """
+import os
+import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runner"))
+JUDGE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(JUDGE_DIR / "runner"))
+sys.path.insert(0, str(JUDGE_DIR))
 import common as C  # noqa: E402
+from lib import queue as Q  # noqa: E402
+
+AGENT_ENV_MARKERS = ("HERMES_AGENT", "HERMES_SESSION_ID", "HERMES_SESSION_KEY", "AI_AGENT")
+# argv[0..2] basenames of a Hermes process (CLI `hermes ...`, gateway, run_agent.py, hermes_cli module)
+AGENT_PROC_RE = re.compile(r"(?:^|/)(?:hermes|hermes-agent|run_agent\.py|hermes_cli)$")
+MAX_DEPTH = 64
+
+
+def _proc_info(pid, proc_root):
+    """(ppid, argv) of *pid* from <proc_root>/<pid>/{stat,cmdline}; None when unreadable."""
+    base = Path(proc_root) / str(pid)
+    try:
+        stat = (base / "stat").read_text(errors="replace")
+        ppid = int(stat[stat.rindex(")") + 2:].split()[1])
+        argv = [a.decode("utf-8", "replace") for a in (base / "cmdline").read_bytes().split(b"\0") if a]
+    except (OSError, ValueError, IndexError):
+        return None
+    return ppid, argv
+
+
+def agent_context(environ=None, proc_root="/proc", start_pid=None):
+    """Reasons to believe this process runs inside an agent session (empty list = none found)."""
+    environ = os.environ if environ is None else environ
+    names = list(AGENT_ENV_MARKERS) + [n.strip() for n in str(environ.get("JUDGE_ACK_AGENT_ENV") or "").split(",")
+                                       if n.strip()]
+    reasons = [f"env:{n}" for n in dict.fromkeys(names) if environ.get(n)]
+    pid = os.getppid() if start_pid is None else start_pid
+    seen = set()
+    for _ in range(MAX_DEPTH):
+        if pid in seen or pid <= 1:
+            break
+        seen.add(pid)
+        info = _proc_info(pid, proc_root)
+        if info is None:
+            break
+        ppid, argv = info
+        hit = next((a for a in argv[:3] if AGENT_PROC_RE.search(a)), None)
+        if hit:
+            reasons.append(f"proc:{pid}:{os.path.basename(hit)}")
+            break
+        pid = ppid
+    return reasons
+
+
+def _parent_name():
+    try:
+        return (Path("/proc") / str(os.getppid()) / "comm").read_text().strip()[:64]
+    except OSError:
+        return ""
 
 
 def main(argv):
-    if len(argv) != 3 or argv[0] in ("-h", "--help"):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    want_agent = "--agent" in argv
+    args = [a for a in argv if a != "--agent"]
+    if len(args) != 3 or any(a.startswith("--") for a in args):
         print(__doc__.strip(), file=sys.stderr)
-        return 0 if argv[:1] in (["-h"], ["--help"]) else 64
-    rid, iid, reason = argv
+        return 64
+    rid, iid, reason = args
     reason = " ".join(reason.split())
     if not reason:
         print("judge-ack: a reason is required", file=sys.stderr)
@@ -32,11 +102,29 @@ def main(argv):
     except (OSError, ValueError):
         print(f"judge-ack: no finding {rid}", file=sys.stderr)
         return 2
-    if not any(isinstance(it, dict) and str(it.get("id")) == iid for it in finding.get("items") or []):
+    item = next((it for it in finding.get("items") or [] if isinstance(it, dict) and str(it.get("id")) == iid), None)
+    if item is None:
         print(f"judge-ack: finding {rid} has no item {iid}", file=sys.stderr)
         return 2
-    C.write_ack(rid, iid, reason)
-    print(f"acknowledged {rid} {iid}: {reason[:200]}")
+
+    root = C.review_dir()
+    reasons = agent_context()
+    actor = "agent" if (want_agent or reasons) else "human"
+    if actor == "agent" and not want_agent:
+        print(f"judge-ack: running inside an agent session ({', '.join(reasons)}); recorded as actor=agent",
+              file=sys.stderr)
+    if actor == "agent" and Q.ack_actor(rid, iid, root) == "human":
+        print(f"{rid} {iid} is already closed by a human; agent ack not recorded")
+        return 0
+    via = {"tool": "judge-ack", "uid": os.getuid(), "ppid": os.getppid(), "parent": _parent_name(),
+           "flag_agent": want_agent, "agent_context": reasons}
+    sess = os.environ.get("HERMES_SESSION_ID")
+    if sess:
+        via["hermes_session"] = sess[:200]
+    Q.ack(rid, iid, reason, root, actor=actor, via=via)
+    status = Q.closure(actor, item.get("severity"))
+    note = " (HIGH: stays open until a human acks it)" if status == "agent-acked" else ""
+    print(f"acknowledged {rid} {iid} as {actor}: {reason[:200]}{note}")
     return 0
 
 
