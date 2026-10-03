@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""judge-findings [options] [request-id]
+
+List or summarize judge findings in $JUDGE_REVIEW_DIR/findings/.
+
+  (no args)              one line per finding from the last 7 days: counts by severity, unacked count
+  <request-id>           every item of that finding, with ack status
+  --items                every item (not one line per finding), filtered by the options below
+  --unacked              only unacknowledged items (implies --items)
+  --min-severity LEVEL   low|medium|high (default low)
+  --since HOURS          only findings created in the last HOURS (default 168; 0 = all)
+  --json                 machine-readable output
+Colors are used only when stdout is a TTY and NO_COLOR is unset.
+"""
+import json
+import os
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runner"))
+import common as C  # noqa: E402
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+SEV_COLOR = {"high": "31;1", "medium": "33", "low": "36"}
+
+
+def paint(text, code):
+    return f"\033[{code}m{text}\033[0m" if COLOR and code else text
+
+
+def sev(s):
+    return paint(f"{str(s).upper():<6}", SEV_COLOR.get(str(s), ""))
+
+
+def parse(argv):
+    opts = {"items": False, "unacked": False, "min": "low", "since": 168.0, "json": False, "rid": None}
+    it = iter(argv)
+    for a in it:
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        elif a == "--items":
+            opts["items"] = True
+        elif a == "--unacked":
+            opts["unacked"] = opts["items"] = True
+        elif a == "--json":
+            opts["json"] = True
+        elif a == "--min-severity":
+            opts["min"] = next(it, "low").lower()
+        elif a == "--since":
+            opts["since"] = float(next(it, "168"))
+        elif not a.startswith("-") and opts["rid"] is None:
+            opts["rid"] = a
+        else:
+            print(f"judge-findings: unknown argument {a}", file=sys.stderr)
+            sys.exit(64)
+    if opts["min"] not in C.SEVERITY_RANK:
+        print("judge-findings: --min-severity must be low, medium or high", file=sys.stderr)
+        sys.exit(64)
+    return opts
+
+
+def main(argv):
+    o = parse(argv)
+    floor = C.SEVERITY_RANK[o["min"]]
+    rows = []
+    for path, f in C.iter_findings():
+        rid = str(f.get("request") or path.stem)
+        if o["rid"] and rid != o["rid"]:
+            continue
+        if not o["rid"] and o["since"] > 0 and not C.finding_age_ok(f, path, timedelta(hours=o["since"])):
+            continue
+        items = []
+        for it in f.get("items") or []:
+            if not isinstance(it, dict) or C.SEVERITY_RANK.get(str(it.get("severity")), 0) < floor:
+                continue
+            acked = C.is_acked(rid, str(it.get("id")))
+            if o["unacked"] and acked:
+                continue
+            items.append({**it, "acked": acked})
+        rows.append((rid, f, items))
+    if o["rid"] and not rows:
+        print(f"judge-findings: no finding {o['rid']}", file=sys.stderr)
+        return 2
+
+    if o["json"]:
+        print(json.dumps([{**{k: v for k, v in f.items() if k != "items"}, "items": items}
+                          for _, f, items in rows], indent=2, ensure_ascii=False))
+        return 0
+    if o["rid"] or o["items"]:
+        for rid, f, items in rows:
+            if not items and not o["rid"]:
+                continue
+            print(paint(f"{rid}", "1") + f"  {f.get('mode')} {f.get('judge')}  {f.get('created')}")
+            for n in f.get("notes") or []:
+                print(f"  note: {n}")
+            if not items:
+                print("  (no items)")
+            for it in C.items_sorted(items):
+                ack = paint("acked", "32") if it["acked"] else paint("open", "1")
+                print(f"  {it.get('id')} {sev(it.get('severity'))} {it.get('rubric')} verdict={it.get('verdict')} [{ack}]")
+                print(f"     claim: {it.get('claim')}")
+                print(f"     evidence: {it.get('evidence')}")
+                print(f"     recommendation: {it.get('recommendation')}")
+            print()
+        return 0
+    if not rows:
+        print("no findings")
+        return 0
+    for rid, f, items in rows:
+        counts = {s: sum(1 for i in items if i.get("severity") == s) for s in ("high", "medium", "low")}
+        open_n = sum(1 for i in items if not i["acked"])
+        parts = " ".join(paint(f"{s[0].upper()}:{counts[s]}", SEV_COLOR[s] if counts[s] else "") for s in counts)
+        print(f"{rid:<44} {f.get('mode', '?'):<8} {parts}  open:{open_n}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

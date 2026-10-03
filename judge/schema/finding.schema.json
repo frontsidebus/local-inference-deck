@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "judge/schema/finding.schema.json",
+  "title": "judge finding",
+  "description": "Written to $JUDGE_REVIEW_DIR/findings/<request>.json by the judge runner. Items with empty evidence are dropped before writing. See judge/CONTRACT.md.",
+  "type": "object",
+  "required": ["request", "judge", "created", "mode", "items"],
+  "properties": {
+    "request": {"type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{1,6}-(plan|gate|completion|runaway)$"},
+    "judge": {"type": "string", "minLength": 1},
+    "created": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"},
+    "mode": {"type": "string", "enum": ["frontier", "local"]},
+    "notes": {"type": "array", "items": {"type": "string"}},
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "rubric", "severity", "claim", "evidence", "verdict", "recommendation"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$"},
+          "rubric": {"type": "string", "enum": ["R1", "R2", "R3", "R4", "R5", "R6", "R7"]},
+          "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+          "claim": {"type": "string"},
+          "evidence": {"type": "string"},
+          "verdict": {"type": "string", "enum": ["true", "false", "partial", "n/a"]},
+          "recommendation": {"type": "string"}
+        }
+      }
+    }
+  }
+}

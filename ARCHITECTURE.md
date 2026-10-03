@@ -155,6 +155,15 @@ Why here:
 - The client-side workaround was an undocumented Claude Code variable (`CLAUDE_CODE_MODEL_CAPABILITIES="-mid_conv_system,-mid_conv_tool_change"`) found in the binary, which can break on any upgrade. It is no longer needed.
 - It also fixed `coder-fast` silently dropping Claude Code's environment information.
 
+## The agent judge
+
+Hermes, running on the local models, is reviewed by a judge that works from evidence rather than from the agent's own account ([judge/](judge/README.md), rationale in [docs/agent-judge.md](docs/agent-judge.md)). It runs entirely on the workstation, as Hermes shell hooks in `~/.hermes/config.yaml` plus systemd user units for the runner and the runaway watcher:
+
+- **Gates are synchronous and deterministic.** `pre_tool_call` escalates host-mutating commands for Walter or Covenant and writes to sensitive paths to the human, and blocks edits to allowlists, hooks and approval settings. `pre_verify` runs fast checks (`bash -n`, parsers, `check-sanitized.sh`) before the agent may stop.
+- **Judging is asynchronous.** Hooks drop requests in `~/.hermes/review/queue/`; a path unit runs the collector (logs, diffs against a session-start snapshot, host `find -newermt` in UTC, llama-server slots, read-only probes) and then the judge. Findings with evidence come back to the agent at the next turn through `pre_llm_call`, as data.
+- **Data boundary.** Only infra-class requests go to the frontier judge (the normal Anthropic API, not this gateway); anything else goes to a local alias through the gateway, with diff stats instead of contents.
+- **Read-only toward hosts.** The judge reaches Walter and Covenant only through an allowlist of read-only probes over SSH. A runaway watcher polls llama-server slots and alerts; it never cancels a generation.
+
 ## Backups and restore
 
 - `spark-backup.timer` runs `spark-backup.sh` daily at 03:30 UTC (up to 10 min random delay) with `Persistent=true`, so a run missed while Walter was off happens at the next boot.

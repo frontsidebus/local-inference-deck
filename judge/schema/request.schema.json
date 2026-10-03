@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "judge/schema/request.schema.json",
+  "title": "judge review request",
+  "description": "Written to $JUDGE_REVIEW_DIR/queue/<id>.json by hooks (C1 plan, C2 gate, C4 completion) and the watcher (C6 runaway). See judge/CONTRACT.md.",
+  "type": "object",
+  "required": ["id", "kind", "session", "created", "since", "changed_paths", "claims", "plan", "data_class", "source_event"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{1,6}-(plan|gate|completion|runaway)$"},
+    "kind": {"type": "string", "enum": ["plan", "gate", "completion", "runaway"]},
+    "session": {"type": "string", "maxLength": 200},
+    "created": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "since": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "changed_paths": {"type": "array", "items": {"type": "string"}},
+    "claims": {"type": "string", "maxLength": 4000},
+    "plan": {"type": ["string", "null"]},
+    "data_class": {"type": "string", "enum": ["infra", "sensitive"]},
+    "source_event": {"type": "string", "enum": ["post_tool_call", "pre_tool_call", "pre_verify", "on_session_end", "watch"]},
+    "detail": {"type": "object"}
+  }
+}

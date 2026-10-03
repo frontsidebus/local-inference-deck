@@ -60,6 +60,7 @@ Every Walter port binds to `BACKEND_WG_IP` (or loopback) and only accepts traffi
 | [walter/](walter/README.md) | Backend VM: llama-swap config, gateway (LiteLLM + Postgres + hooks), webui (Open WebUI + Pocket-ID + theme), monitoring, telemetry app, backups, update-check, systemd units and drop-ins, firewall. |
 | [covenant/](covenant/README.md) | Edge: nginx sites and snippets, oauth2-proxy, fail2ban, ufw, WireGuard, certbot hooks. |
 | [clients/](clients/README.md) | Workstation wrappers and configs for Claude Code, Codex, Hermes and OpenCode, plus the hermes-gateway service. |
+| [judge/](judge/README.md) | A reviewer for the local agent: Hermes shell hooks gate risky tool calls and queue reviews; a frontier (or local) judge checks the agent's claims against collected evidence. See [docs/agent-judge.md](docs/agent-judge.md). |
 | `hypervisor/` | Pointer only. The host layer (VFIO, libvirt domain, disk passthrough) lives in a private infrastructure repo. |
 | [docs/](docs/) | [Decisions](docs/decisions.md), [runbooks](docs/runbooks/) and [history](docs/history/gen2/INDEX.md). |
 | `scripts/` | `render.sh` (templates), `gen-secrets.sh` (secrets on the target host), `check-sanitized.sh` (pre-commit guard). |
@@ -126,4 +127,5 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): request paths, ports, trust boundaries, the llama-swap matrix, the gateway hook, backups, monitoring, quirks.
 - [docs/decisions.md](docs/decisions.md): why llama.cpp and not vLLM, why nginx, why LiteLLM, and more.
+- [docs/agent-judge.md](docs/agent-judge.md): why and how a judge reviews the local agent, and the [pilot runbook](docs/runbooks/agent-judge-pilot.md).
 - [docs/runbooks/](docs/runbooks/): [power loss](docs/runbooks/power-loss-recovery.md), [rotate secrets](docs/runbooks/rotate-secrets.md), [add a user](docs/runbooks/add-user.md), [add a model](docs/runbooks/add-model.md), [upgrade](docs/runbooks/upgrade.md).

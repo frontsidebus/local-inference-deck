@@ -1,0 +1,4 @@
+2026-10-02 22:10:02,500 ERROR [20261003_031000_a1b2c3] root: API call failed after 3 retries. HTTP 502 - 502 Bad Gateway | provider=custom model=coder msgs=2 tokens=~3,545
+2026-10-02 22:26:41,002 ERROR [20261003_031000_a1b2c3] root: Non-retryable client error: <html>
+<head><title>401 Authorization Required</title></head>
+</html>

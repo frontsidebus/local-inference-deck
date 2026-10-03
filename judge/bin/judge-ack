@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""judge-ack <request-id> <item-id> "<reason>"
+
+Acknowledge one judge finding item: writes $JUDGE_REVIEW_DIR/acks/<request-id>.<item-id> with the
+one-line reason. Acknowledged items are no longer injected into the agent's context (C5).
+Exit: 0 ok, 2 unknown finding/item, 64 usage.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runner"))
+import common as C  # noqa: E402
+
+
+def main(argv):
+    if len(argv) != 3 or argv[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 0 if argv[:1] in (["-h"], ["--help"]) else 64
+    rid, iid, reason = argv
+    reason = " ".join(reason.split())
+    if not reason:
+        print("judge-ack: a reason is required", file=sys.stderr)
+        return 64
+    try:
+        C.check_ids(rid, iid)
+    except ValueError as exc:
+        print(f"judge-ack: {exc}", file=sys.stderr)
+        return 64
+    path = C.sub("findings") / f"{rid}.json"
+    try:
+        finding = C.read_json(path)
+    except (OSError, ValueError):
+        print(f"judge-ack: no finding {rid}", file=sys.stderr)
+        return 2
+    if not any(isinstance(it, dict) and str(it.get("id")) == iid for it in finding.get("items") or []):
+        print(f"judge-ack: finding {rid} has no item {iid}", file=sys.stderr)
+        return 2
+    C.write_ack(rid, iid, reason)
+    print(f"acknowledged {rid} {iid}: {reason[:200]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
