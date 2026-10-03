@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#07070d">
+<title>Walter Telemetry</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M4 22h6l3-12 5 16 3-8h7' fill='none' stroke='%2300f0ff' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="preload" href="/static/fonts/orbitron-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="bg-grid" aria-hidden="true"></div>
+<div class="bg-scan" aria-hidden="true"></div>
+
+<header class="top">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>WALTER<span class="slash">//</span>TELEMETRY</h1>
+      <div class="brand-sub mono">${SPARK_SITE_NAME} · inference stack</div>
+    </div>
+  </div>
+  <div class="top-right">
+    <div id="status-pill" class="pill pill-wait" role="status" aria-live="polite">
+      <span class="pill-dot" aria-hidden="true"></span><span class="pill-text">CONNECTING</span>
+    </div>
+    <div class="fresh mono" id="fresh" aria-live="off">
+      <span class="fresh-dot" aria-hidden="true"></span><span id="fresh-text">waiting for data</span>
+    </div>
+    <div class="viewer mono" id="viewer" hidden></div>
+  </div>
+</header>
+
+<div class="banner" id="banner" hidden role="alert"></div>
+
+<main class="grid">
+  <!-- GPU cards -->
+  <section class="panel gpu" id="gpu0" data-gpu="0" aria-labelledby="gpu0-h"></section>
+  <section class="panel gpu" id="gpu1" data-gpu="1" aria-labelledby="gpu1-h"></section>
+
+  <!-- Models -->
+  <section class="panel models" aria-labelledby="models-h">
+    <div class="panel-h">
+      <h2 id="models-h">Models</h2>
+      <span class="tag mono" id="models-tag">—</span>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi">
+        <div class="kpi-l mono">tokens out</div>
+        <div class="kpi-v num" data-k="tps">—</div><div class="kpi-u mono">tok/s</div>
+      </div>
+      <div class="spark-wrap" data-spark="tps" data-unit="tok/s" data-color="magenta"></div>
+    </div>
+    <div class="table-wrap">
+      <table class="tbl" id="models-tbl">
+        <thead><tr><th>model</th><th>state</th><th class="c-gpu">gpu</th><th class="r">decode</th><th class="r">prompt</th><th class="r">active</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="note"><b>decode / prompt</b>: tok/s averaged over requests completed in the last 10 min (llama-server updates its token counters when a request finishes). <b>active</b>: requests in flight · <b>st/s</b>: live decode steps per second. <b>tokens out</b>: generated tok/s, 1 min rate.</p>
+  </section>
+
+  <!-- Gateway -->
+  <section class="panel gateway" aria-labelledby="gw-h">
+    <div class="panel-h">
+      <h2 id="gw-h">Gateway</h2>
+      <span class="tag mono">litellm · :4000</span>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi">
+        <div class="kpi-l mono">requests</div>
+        <div class="kpi-v num" data-k="rpm">—</div><div class="kpi-u mono">/min</div>
+      </div>
+      <div class="spark-wrap" data-spark="rpm" data-unit="req/min" data-color="cyan"></div>
+    </div>
+    <dl class="stats">
+      <div><dt>in flight</dt><dd class="num-s" data-k="inflight">—</dd></div>
+      <div><dt>p50 · 1h</dt><dd class="num-s" data-k="p50">—</dd></div>
+      <div><dt>p95 · 1h</dt><dd class="num-s" data-k="p95">—</dd></div>
+      <div><dt>ttft p50</dt><dd class="num-s" data-k="ttft">—</dd></div>
+      <div><dt>reqs · 1h</dt><dd class="num-s" data-k="req1h">—</dd></div>
+      <div><dt>errors · 1h</dt><dd class="num-s" data-k="err1h">—</dd></div>
+      <div><dt>tok in · 1h</dt><dd class="num-s" data-k="tin">—</dd></div>
+      <div><dt>tok out · 1h</dt><dd class="num-s" data-k="tout">—</dd></div>
+    </dl>
+    <h3 class="sub-h mono">today by key <span class="muted" id="today-since"></span></h3>
+    <div class="table-wrap">
+      <table class="tbl" id="keys-tbl">
+        <thead><tr><th>key alias</th><th class="r">reqs</th><th class="r">err</th><th class="r">in</th><th class="r">out</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Host -->
+  <section class="panel host" aria-labelledby="host-h">
+    <div class="panel-h">
+      <h2 id="host-h">Host</h2>
+      <span class="tag mono">walter · 16 vCPU</span>
+    </div>
+    <div class="kpi-row">
+      <div class="kpi">
+        <div class="kpi-l mono">cpu</div>
+        <div class="kpi-v num" data-k="cpu">—</div><div class="kpi-u mono">%</div>
+      </div>
+      <div class="spark-wrap" data-spark="cpu" data-unit="%" data-color="purple"></div>
+    </div>
+    <div class="bars" id="host-bars"></div>
+    <dl class="stats" id="host-net"></dl>
+  </section>
+
+  <!-- Services + alerts -->
+  <section class="panel services" aria-labelledby="svc-h">
+    <div class="panel-h">
+      <h2 id="svc-h">Services</h2>
+      <span class="tag mono" id="targets-tag">—</span>
+    </div>
+    <ul class="svc-list" id="svc-list"></ul>
+    <h3 class="sub-h mono">alerts</h3>
+    <ul class="alert-list" id="alert-list"></ul>
+  </section>
+
+  <!-- Backup -->
+  <section class="panel backup" aria-labelledby="bk-h">
+    <div class="panel-h">
+      <h2 id="bk-h">Backup</h2>
+      <span class="tag mono" id="bk-tag">—</span>
+    </div>
+    <div class="bk-body">
+      <div class="kpi-l mono">last ok snapshot</div>
+      <div class="bk-name mono" id="bk-name">—</div>
+      <div class="kpi-l mono">age</div>
+      <div class="kpi-v num" id="bk-age">—</div>
+    </div>
+    <div class="sources" id="sources"></div>
+  </section>
+</main>
+
+<footer class="foot mono">
+  <span>walter · ${BACKEND_WG_IP}</span><span>snapshot every 2s · 30 min history</span><span id="foot-seq"></span>
+</footer>
+</body>
+</html>

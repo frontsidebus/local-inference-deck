@@ -1,0 +1,32 @@
+# Spark-gateway fragment for ~${BACKEND_SSH_USER}/.hermes/config.yaml ON WALTER
+# (Hermes Agent tag v2026.9.24). Same as clients/hermes/config.spark.yaml.tmpl except that
+# Walter talks to LiteLLM directly over wg0 instead of through the edge, and has no vision
+# entry (as live). walter/deploy.sh --with-hermes merges these keys into the existing
+# config (backup first); every other key in config.yaml is left alone.
+model:
+  # Spark gateway via internal LiteLLM. Key from env SPARK_HERMES_API_KEY,
+  # exported by ~/.local/bin/hermes-spark from ~/.config/spark/hermes.key.
+  # Switch: hermes-spark -m coder-fast | -m hermes | -m big ; in-session /model custom:spark:<name>
+  default: coder
+  provider: custom:spark
+  base_url: http://${BACKEND_WG_IP}:4000/v1
+  max_tokens: 32768
+
+custom_providers:
+  - name: spark
+    base_url: http://${BACKEND_WG_IP}:4000/v1
+    key_env: SPARK_HERMES_API_KEY
+    api_mode: chat_completions
+    model: coder
+    models:
+      coder:
+        context_length: 131072
+      coder-fast:
+        context_length: 131072
+      hermes:
+        context_length: 65536
+      big:
+        context_length: 131072
+
+security:
+  redact_secrets: true

@@ -1,0 +1,415 @@
+/* ==========================================================================
+   NEON GRID - cyberpunk skin for Open WebUI (dark mode only)
+   Host file: /srv/webui/theme/custom.css  (bind-mounted read-only to
+   /app/build/static/custom.css; copied to /static at container start)
+   Target: Open WebUI v0.11.4. Recheck selectors after upgrades.
+
+   Rules of the road:
+   - Everything visual is scoped to html.dark. Light mode is untouched.
+   - Open WebUI branding (name, logo, favicon, splash) is NOT hidden or
+     replaced; only colors/typography/effects are restyled.
+   - Prefer ids / aria / data-* / CSS variables over Tailwind class chains.
+   - No glow on body text. Animations are disabled under
+     prefers-reduced-motion.
+   Fonts (SIL OFL 1.1, self-hosted, licenses in fonts/OFL-*.txt):
+   Inter, JetBrains Mono, Orbitron. Latin + Latin-ext subsets.
+   ========================================================================== */
+
+/* -- 0. Fonts ------------------------------------------------------------- */
+@font-face{font-family:'CP Inter';font-style:italic;font-weight:400 700;font-display:swap;src:url(fonts/inter-italic-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'CP Inter';font-style:italic;font-weight:400 700;font-display:swap;src:url(fonts/inter-italic-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+@font-face{font-family:'CP Inter';font-style:normal;font-weight:400 700;font-display:swap;src:url(fonts/inter-normal-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'CP Inter';font-style:normal;font-weight:400 700;font-display:swap;src:url(fonts/inter-normal-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+@font-face{font-family:'CP JetBrains Mono';font-style:italic;font-weight:400 700;font-display:swap;src:url(fonts/jetbrains-mono-italic-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'CP JetBrains Mono';font-style:italic;font-weight:400 700;font-display:swap;src:url(fonts/jetbrains-mono-italic-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+@font-face{font-family:'CP JetBrains Mono';font-style:normal;font-weight:400 700;font-display:swap;src:url(fonts/jetbrains-mono-normal-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF}
+@font-face{font-family:'CP JetBrains Mono';font-style:normal;font-weight:400 700;font-display:swap;src:url(fonts/jetbrains-mono-normal-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+@font-face{font-family:'CP Orbitron';font-style:normal;font-weight:500 800;font-display:swap;src:url(fonts/orbitron-normal-latin.woff2) format('woff2');unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD}
+
+/* -- 1. Shared palette (same tokens as the telemetry dashboard) ----------- */
+:root {
+	--cp-bg: #07070d;
+	--cp-panel: #0f0f1a;
+	--cp-panel-2: #161627;
+	--cp-border: #2a2a45;
+	--cp-text: #e6e6f0;
+	--cp-muted: #8a8aa8;
+	--cp-cyan: #00f0ff;
+	--cp-magenta: #ff2a6d;
+	--cp-yellow: #fcee0a;
+	--cp-green: #39ff14;
+	--cp-red: #ff3b3b;
+	--cp-purple: #b026ff;
+
+	--cp-font-display: 'CP Orbitron', 'Orbitron', ui-sans-serif, system-ui, sans-serif;
+	--cp-font-body: 'CP Inter', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+	--cp-font-mono: 'CP JetBrains Mono', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+	--cp-cyan-a08: rgb(0 240 255 / 0.08);
+	--cp-cyan-a15: rgb(0 240 255 / 0.15);
+	--cp-cyan-a35: rgb(0 240 255 / 0.35);
+	--cp-magenta-a12: rgb(255 42 109 / 0.12);
+	--cp-magenta-a45: rgb(255 42 109 / 0.45);
+	--cp-glow: 0 0 0 1px var(--cp-cyan-a35), 0 0 14px rgb(0 240 255 / 0.18);
+	--cp-glow-strong: 0 0 0 1px var(--cp-cyan), 0 0 22px rgb(0 240 255 / 0.28);
+	--cp-grid: linear-gradient(rgb(0 240 255 / 0.035) 1px, transparent 1px),
+		linear-gradient(90deg, rgb(0 240 255 / 0.035) 1px, transparent 1px);
+}
+
+/* -- 2. Dark-mode foundation ----------------------------------------------
+   Open WebUI (Tailwind v4) paints almost everything from --color-gray-*.
+   Re-mapping that ramp re-skins the whole app with a blue-violet tint.
+   (The built-in "OLED dark" theme sets these inline and will win.)        */
+html.dark {
+	color-scheme: dark;
+	--color-gray-50: #f2f2fa;
+	--color-gray-100: #e6e6f0; /* = --cp-text */
+	--color-gray-200: #d2d2e2;
+	--color-gray-300: #b8b8cf;
+	--color-gray-400: #9d9dba;
+	--color-gray-500: #8a8aa8; /* = --cp-muted */
+	--color-gray-600: #7c7ca0; /* >= 4.5:1 on panels */
+	--color-gray-700: #3a3a5c;
+	--color-gray-800: #2a2a45; /* = --cp-border */
+	--color-gray-850: #161627; /* = --cp-panel-2 */
+	--color-gray-900: #0a0a13; /* main surface */
+	--color-gray-950: #07070d; /* = --cp-bg, sidebar */
+	--font-sans: var(--cp-font-body);
+	--font-mono: var(--cp-font-mono);
+	--default-mono-font-family: var(--cp-font-mono);
+	background: var(--cp-bg);
+}
+html.dark body {
+	background: var(--cp-bg);
+	color: var(--cp-text);
+	font-family: var(--cp-font-body);
+}
+/* Splash shown while the app boots: match the theme (logo untouched). */
+html.dark body #splash-screen { background: var(--cp-bg); }
+
+/* -- 3. Selection, focus, scrollbars --------------------------------------- */
+html.dark ::selection { background: rgb(0 240 255 / 0.28); color: #fff; }
+
+html.dark :is(a, button, [role='tab'], [role='option'], [role='menuitem'], [role='switch'], summary):focus-visible {
+	outline: 1px solid var(--cp-cyan);
+	outline-offset: 1px;
+	box-shadow: 0 0 10px rgb(0 240 255 / 0.35);
+}
+
+/* WebKit/Blink scrollbars (keep the app's hover-to-reveal behaviour). */
+html.dark ::-webkit-scrollbar-thumb {
+	background-color: rgb(0 240 255 / 0.22);
+	border-color: var(--cp-bg);
+}
+html.dark ::-webkit-scrollbar-thumb:hover { background-color: rgb(0 240 255 / 0.45); }
+/* Firefox only (Blink ignores ::-webkit-scrollbar when scrollbar-color is set). */
+@supports not selector(::-webkit-scrollbar) {
+	html.dark * { scrollbar-color: rgb(0 240 255 / 0.3) transparent; }
+}
+
+/* -- 4. Sidebar ------------------------------------------------------------ */
+html.dark #sidebar {
+	background-color: var(--cp-bg);
+	background-image: var(--cp-grid);
+	background-size: 22px 22px;
+	border-right: 1px solid rgb(0 240 255 / 0.12);
+}
+/* Workspace name: Orbitron + RGB-split glitch on hover (text stays readable). */
+html.dark #sidebar-webui-name {
+	font-family: var(--cp-font-display);
+	font-weight: 600;
+	font-size: 0.82rem;
+	letter-spacing: 0.08em;
+	color: var(--cp-text);
+}
+html.dark #sidebar a:hover > #sidebar-webui-name,
+html.dark #sidebar-webui-name:hover {
+	color: #fff;
+	animation: cp-glitch 0.9s steps(2, end) infinite;
+}
+@keyframes cp-glitch {
+	0%, 100% { text-shadow: -1px 0 var(--cp-magenta), 1px 0 var(--cp-cyan); transform: none; }
+	20% { text-shadow: -2px 0 var(--cp-magenta), 2px 0 var(--cp-cyan); transform: translateX(0.5px); }
+	40% { text-shadow: 1px 0 var(--cp-magenta), -1px 0 var(--cp-cyan); transform: translateX(-0.5px) skewX(-4deg); }
+	60% { text-shadow: -1px 1px var(--cp-magenta), 1px -1px var(--cp-cyan); transform: none; }
+	80% { text-shadow: 2px 0 var(--cp-magenta), -2px 0 var(--cp-cyan); transform: translateX(0.5px); }
+}
+/* Section labels (Folders / Chats / Today ...) */
+html.dark #sidebar :is(button[aria-controls='sidebar-chats-content'], #sidebar-chats-content .text-xs) {
+	letter-spacing: 0.06em;
+}
+/* Nav rows + chat items */
+html.dark #sidebar :is(a, button):hover { background-color: var(--cp-cyan-a08); }
+html.dark #sidebar #sidebar-chat-item {
+	border: 1px solid transparent;
+	transition: background-color 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+html.dark #sidebar #sidebar-chat-item[aria-current='page'] {
+	background: linear-gradient(90deg, rgb(0 240 255 / 0.12), rgb(0 240 255 / 0.02));
+	border-color: var(--cp-cyan-a35);
+	box-shadow: inset 2px 0 0 var(--cp-cyan), 0 0 12px rgb(0 240 255 / 0.1);
+	color: #fff;
+}
+/* Collapsed icon rail (v0.11 mini sidebar). */
+html.dark #sidebar[role='navigation'] svg { transition: color 0.15s, filter 0.15s; }
+html.dark #sidebar :is(a, button):hover svg { color: var(--cp-cyan); filter: drop-shadow(0 0 4px rgb(0 240 255 / 0.5)); }
+
+/* -- 5. Top bar + main surface --------------------------------------------- */
+html.dark #chat-container { background-color: var(--cp-bg); }
+/* Fade under the sticky top bar: a bit denser than stock so scrolled text
+   never collides with the chat title. */
+html.dark #navbar-bg-gradient-to-b {
+	background-image: linear-gradient(to bottom, rgb(7 7 13 / 0.98), rgb(7 7 13 / 0.94) 55%, transparent 97%);
+}
+/* Empty state (new chat): faint grid + horizon glow. */
+html.dark #chat-container:not(:has([role='log'])) {
+	background-image: radial-gradient(ellipse 70% 45% at 50% 105%, rgb(176 38 255 / 0.12), transparent 70%),
+		radial-gradient(ellipse 60% 40% at 50% 40%, rgb(0 240 255 / 0.05), transparent 70%), var(--cp-grid);
+	background-size: auto, auto, 32px 32px, 32px 32px;
+}
+/* Empty-state model name heading. */
+html.dark #chat-container:not(:has([role='log'])) .text-3xl .text-2xl {
+	font-family: var(--cp-font-display);
+	letter-spacing: 0.04em;
+}
+
+/* -- 6. Messages ----------------------------------------------------------- */
+/* User bubble: magenta tint + thin neon edge. */
+html.dark .chat-user .rounded-3xl {
+	background: var(--cp-magenta-a12);
+	border: 1px solid var(--cp-magenta-a45);
+	box-shadow: 0 0 14px rgb(255 42 109 / 0.08);
+	color: var(--cp-text);
+}
+/* Assistant name */
+html.dark #response-message-model-name {
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	color: var(--cp-cyan);
+}
+html.dark .assistant-message-profile-image { box-shadow: 0 0 0 1px var(--cp-cyan-a35); }
+/* Message action icons */
+html.dark .message-listitem button[aria-label]:hover { color: var(--cp-cyan); }
+
+/* -- 7. Markdown ------------------------------------------------------------ */
+html.dark .markdown-prose {
+	--tw-prose-body: var(--cp-text);
+	--tw-prose-headings: #fff;
+	--tw-prose-links: var(--cp-cyan);
+	--tw-prose-bold: #fff;
+	--tw-prose-counters: var(--cp-muted);
+	--tw-prose-bullets: var(--cp-cyan-a35);
+	--tw-prose-quotes: var(--color-gray-300);
+	--tw-prose-quote-borders: var(--cp-purple);
+	--tw-prose-hr: var(--cp-border);
+	--tw-prose-code: var(--cp-yellow);
+	--color-black: #0b0b16; /* code-block header + gutter strips */
+}
+html.dark .markdown-prose :is(h1, h2) { font-family: var(--cp-font-display); letter-spacing: 0.03em; }
+html.dark .markdown-prose h1 { color: #fff; }
+html.dark .markdown-prose h2 { color: var(--cp-text); border-bottom: 1px solid var(--cp-border); padding-bottom: 0.25em; }
+html.dark .markdown-prose h3 { color: var(--cp-cyan); }
+html.dark .markdown-prose a { color: var(--cp-cyan); text-decoration-color: var(--cp-cyan-a35); text-underline-offset: 3px; }
+html.dark .markdown-prose a:hover { text-decoration-color: var(--cp-cyan); }
+html.dark .markdown-prose blockquote { border-left-color: var(--cp-purple); background: rgb(176 38 255 / 0.06); }
+/* Inline code: mono, faint yellow (used sparingly) on panel. */
+html.dark .markdown-prose :not(pre) > code,
+html.dark .markdown-prose code.codespan {
+	font-family: var(--cp-font-mono);
+	color: #fff4a3;
+	background: var(--cp-panel-2);
+	border: 1px solid var(--cp-border);
+}
+
+/* -- 8. Code blocks (CodeMirror) ------------------------------------------- */
+html.dark .markdown-prose [dir='ltr']:has(> [class*='language-'] [id^='code-textarea-']) {
+	border: 1px solid var(--cp-border);
+	border-left: 2px solid var(--cp-cyan);
+	box-shadow: 0 0 18px rgb(0 240 255 / 0.05);
+	background: #0b0b16;
+}
+html.dark :is(.copy-code-button, .run-code-button, .save-code-button) { color: var(--cp-muted); }
+html.dark :is(.copy-code-button, .run-code-button, .save-code-button):hover { color: var(--cp-cyan); }
+html.dark [id^='code-textarea-'] .cm-editor { background: #0b0b16; }
+html.dark .cm-editor :is(.cm-scroller, .cm-content) { font-family: var(--cp-font-mono); font-size: 0.85rem; line-height: 1.6; }
+html.dark .cm-editor .cm-gutters { background: #0b0b16; border-right: 1px solid var(--cp-border); color: #55557a; }
+html.dark .cm-editor .cm-activeLine { background: rgb(0 240 255 / 0.04); }
+html.dark .cm-editor .cm-activeLineGutter { background: rgb(0 240 255 / 0.08); color: var(--cp-cyan); }
+html.dark .cm-editor .cm-cursor { border-left-color: var(--cp-cyan); }
+html.dark .cm-editor .cm-selectionBackground,
+html.dark .cm-editor.cm-focused .cm-selectionBackground { background: rgb(0 240 255 / 0.22) !important; }
+html.dark pre, html.dark code, html.dark kbd { font-family: var(--cp-font-mono); }
+
+/* -- 9. Tables ------------------------------------------------------------- */
+html.dark .markdown-prose table {
+	color: var(--color-gray-200);
+	border: 1px solid var(--cp-border);
+	border-collapse: separate;
+	border-spacing: 0;
+	overflow: hidden;
+}
+html.dark .markdown-prose thead { background: var(--cp-panel-2); color: var(--cp-cyan); letter-spacing: 0.08em; }
+html.dark .markdown-prose th { border-bottom: 1px solid var(--cp-cyan-a35) !important; }
+html.dark .markdown-prose td { border-color: var(--cp-border) !important; }
+html.dark .markdown-prose tbody tr:nth-child(even) { background: rgb(255 255 255 / 0.015); }
+html.dark .markdown-prose tbody tr:hover { background: var(--cp-cyan-a08); }
+
+/* -- 10. Composer ---------------------------------------------------------- */
+html.dark #message-input-container {
+	background: rgb(15 15 26 / 0.85);
+	border: 1px solid var(--cp-cyan-a35);
+	box-shadow: 0 0 0 1px transparent, 0 0 18px rgb(0 240 255 / 0.06), 0 10px 30px rgb(0 0 0 / 0.5);
+	transition: border-color 0.2s, box-shadow 0.2s;
+}
+html.dark #message-input-container:hover { border-color: rgb(0 240 255 / 0.55); }
+html.dark #message-input-container:focus-within { border-color: var(--cp-cyan); box-shadow: var(--cp-glow-strong), 0 10px 30px rgb(0 0 0 / 0.5); }
+html.dark #chat-input { caret-color: var(--cp-cyan); }
+html.dark #chat-input p.is-editor-empty::before, html.dark #chat-input [data-placeholder]::before { color: var(--color-gray-600); }
+/* Send + voice-mode buttons (white pill by default) -> cyan. */
+html.dark :is(#send-message-button, button[aria-label='Voice mode']):not(:disabled) {
+	background: var(--cp-cyan);
+	color: #001418;
+	box-shadow: 0 0 12px rgb(0 240 255 / 0.45);
+}
+html.dark :is(#send-message-button, button[aria-label='Voice mode']):not(:disabled):hover { background: #6ff7ff; }
+html.dark #send-message-button:disabled { background: var(--cp-panel-2); color: var(--cp-muted); }
+html.dark #message-input-container :is(#input-menu-button, #integration-menu-button, #voice-input-button):hover { color: var(--cp-cyan); background: var(--cp-cyan-a08); }
+
+/* -- 11. Model selector ---------------------------------------------------- */
+html.dark #model-selector-model-button > div { border: 1px solid transparent; }
+html.dark #model-selector-model-button:hover > div,
+html.dark #model-selector-model-button[aria-expanded='true'] > div {
+	color: var(--cp-cyan);
+	border-color: var(--cp-cyan-a35);
+	background: var(--cp-cyan-a08);
+}
+html.dark div:has(> div > #model-search-input) {
+	background: var(--cp-panel);
+	border-color: var(--cp-cyan-a35);
+	box-shadow: var(--cp-glow), 0 18px 40px rgb(0 0 0 / 0.6);
+}
+html.dark #model-search-input { caret-color: var(--cp-cyan); }
+html.dark [role='listbox'] [role='option']:is(:hover, [data-arrow-selected='true']) { background: var(--cp-cyan-a08); }
+html.dark [role='listbox'] [role='option'][aria-selected='true'] { background: var(--cp-cyan-a15); box-shadow: inset 2px 0 0 var(--cp-cyan); color: #fff; }
+
+/* -- 12. Menus, popovers, toasts ------------------------------------------- */
+html.dark [role='menu'] {
+	background: var(--cp-panel);
+	border: 1px solid var(--cp-border);
+	box-shadow: 0 0 0 1px rgb(0 240 255 / 0.12), 0 18px 40px rgb(0 0 0 / 0.6);
+}
+html.dark [role='menu'] :is([role='menuitem'], button, a):hover { background: var(--cp-cyan-a08); color: #fff; }
+html.dark [data-sonner-toast] { background: var(--cp-panel) !important; border-color: var(--cp-cyan-a35) !important; color: var(--cp-text) !important; }
+
+/* -- 13. Modals + settings ------------------------------------------------- */
+html.dark .modal[role='dialog'] { background: rgb(3 3 8 / 0.72); backdrop-filter: blur(3px); }
+html.dark .modal[role='dialog'] > div {
+	background: var(--cp-panel);
+	border: 1px solid var(--cp-cyan-a35);
+	box-shadow: 0 0 0 1px rgb(0 0 0 / 0.6), 0 0 32px rgb(0 240 255 / 0.1), 0 30px 80px rgb(0 0 0 / 0.7);
+}
+html.dark #settings-tabs-container { background: rgb(7 7 13 / 0.6); border-color: var(--cp-border); }
+html.dark #settings-tabs-container span.hidden { font-family: var(--cp-font-display); letter-spacing: 0.12em; text-transform: uppercase; color: var(--color-gray-600); }
+html.dark [role='tab'][aria-selected='true'] {
+	color: #fff;
+	background: var(--cp-cyan-a08);
+	box-shadow: inset 2px 0 0 var(--cp-cyan);
+}
+html.dark [role='tab'][aria-selected='true'] svg { color: var(--cp-cyan); }
+html.dark .modal[role='dialog'] h2 { font-family: var(--cp-font-display); letter-spacing: 0.06em; font-weight: 600; }
+html.dark .modal[role='dialog'] :is(input:not([type='checkbox'], [type='radio'], [type='range']), textarea, select) { caret-color: var(--cp-cyan); }
+html.dark .modal[role='dialog'] :is(input, textarea, select):focus { border-color: var(--cp-cyan-a35); }
+/* Primary pill buttons (Save, Confirm...) are white in dark mode -> cyan. */
+html.dark button.dark\:bg-white:not(:disabled) { background: var(--cp-cyan); color: #001418; box-shadow: 0 0 12px rgb(0 240 255 / 0.3); }
+html.dark button.dark\:bg-white:not(:disabled):hover { background: #6ff7ff; }
+/* Toggles */
+html.dark button[role='switch'][data-state='checked'] { background: var(--cp-cyan); box-shadow: 0 0 10px rgb(0 240 255 / 0.4); }
+html.dark button[role='switch'][data-state='checked'] > span { background: #001418; }
+html.dark input[type='checkbox'], html.dark input[type='radio'], html.dark input[type='range'] { accent-color: var(--cp-cyan); }
+
+/* -- 14. Login page -------------------------------------------------------- */
+html.dark #auth-page { --color-black: var(--cp-bg); }
+html.dark #auth-page > div:first-child {
+	background-color: var(--cp-bg);
+	background-image: radial-gradient(ellipse 60% 50% at 50% 50%, rgb(0 240 255 / 0.07), transparent 70%),
+		radial-gradient(ellipse 80% 40% at 50% 110%, rgb(255 42 109 / 0.1), transparent 70%), var(--cp-grid);
+	background-size: auto, auto, 28px 28px, 28px 28px;
+}
+html.dark #auth-login-card {
+	background: rgb(15 15 26 / 0.88);
+	border: 1px solid var(--cp-cyan-a35);
+	border-radius: 1.25rem;
+	padding: 2rem 1.75rem 1.75rem;
+	box-shadow: 0 0 40px rgb(0 240 255 / 0.08), 0 30px 80px rgb(0 0 0 / 0.6);
+	backdrop-filter: blur(4px);
+}
+html.dark #auth-login-card form > div:first-child > div:first-child {
+	font-family: var(--cp-font-display);
+	font-weight: 600;
+	font-size: 1.3rem;
+	letter-spacing: 0.06em;
+	color: #fff;
+}
+html.dark #auth-login-card label { color: var(--cp-muted); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; }
+html.dark #auth-login-card label.sr-only { text-transform: none; }
+/* Password row: the wrapper (input + eye toggle) becomes the field box. */
+html.dark #auth-login-card div.flex:has(> #password) {
+	background: var(--cp-bg);
+	border: 1px solid var(--cp-border);
+	border-radius: 0.6rem;
+	padding-right: 0.6rem;
+	transition: border-color 0.15s, box-shadow 0.15s;
+}
+html.dark #auth-login-card div.flex:has(> #password:focus) { border-color: var(--cp-cyan); box-shadow: var(--cp-glow); }
+html.dark #auth-login-card div.flex:has(> #password) #password { border: 0 !important; box-shadow: none !important; background: transparent; }
+html.dark #auth-login-card :is(#email, #password, input[type='text'], input[name]) {
+	background: var(--cp-bg);
+	border: 1px solid var(--cp-border);
+	border-radius: 0.6rem;
+	padding: 0.55rem 0.75rem;
+	color: var(--cp-text);
+	caret-color: var(--cp-cyan);
+	transition: border-color 0.15s, box-shadow 0.15s;
+}
+html.dark #auth-login-card :is(#email, #password, input[name]):focus { border-color: var(--cp-cyan); box-shadow: var(--cp-glow); }
+html.dark #auth-login-card :is(#email, #password, input[name])::placeholder { color: var(--color-gray-600); }
+html.dark #auth-login-card button[aria-label*='password' i] { margin-left: 0.25rem; color: var(--cp-muted); }
+/* Local sign-in = primary (cyan); SSO / OIDC buttons = secondary (magenta). */
+html.dark #auth-login-card button[type='submit'] {
+	background: var(--cp-cyan);
+	color: #001418;
+	font-family: var(--cp-font-display);
+	font-weight: 600;
+	letter-spacing: 0.12em;
+	text-transform: uppercase;
+	box-shadow: 0 0 16px rgb(0 240 255 / 0.35);
+}
+html.dark #auth-login-card button[type='submit']:hover { background: #6ff7ff; color: #001418; }
+html.dark #auth-login-card > div:last-of-type button,
+html.dark #auth-login-card form ~ div button {
+	background: var(--cp-magenta-a12);
+	border: 1px solid var(--cp-magenta-a45);
+	color: var(--cp-text);
+	transition: background-color 0.15s, box-shadow 0.15s;
+}
+html.dark #auth-login-card form ~ div button:hover { background: rgb(255 42 109 / 0.2); box-shadow: 0 0 16px rgb(255 42 109 / 0.3); color: #fff; }
+html.dark #auth-login-card hr { background: var(--cp-border); width: auto; flex: 1 1 0; min-width: 2rem; }
+html.dark #auth-login-card hr + span { white-space: nowrap; color: var(--cp-muted); }
+
+/* -- 15. Misc bits --------------------------------------------------------- */
+html.dark .bg-green-500 { background-color: var(--cp-green); }
+html.dark :is(.text-red-500, .text-red-400) { color: var(--cp-red); }
+
+/* -- 16. Mobile ------------------------------------------------------------ */
+@media (max-width: 640px) {
+	html.dark #auth-login-card { padding: 1.5rem 1.1rem 1.25rem; }
+	html.dark #auth-login-card form > div:first-child > div:first-child { font-size: 1.1rem; }
+	html.dark .modal[role='dialog'] > div { border-radius: 1.25rem; }
+}
+
+/* -- 17. Reduced motion ---------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+	html.dark #sidebar-webui-name,
+	html.dark #sidebar a:hover > #sidebar-webui-name { animation: none !important; }
+	html.dark :is(#sidebar *, #message-input-container, #auth-login-card *) { transition: none !important; }
+}

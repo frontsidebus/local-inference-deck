@@ -1,0 +1,166 @@
+# Walter backup restore guide
+
+Backups are made nightly at about 03:30 UTC (plus up to 10 minutes of random delay) by
+`spark-backup.timer` running `/usr/local/sbin/spark-backup.sh`. Snapshots go to
+`${MODELS_DIR}/backups/<YYYY-mm-dd_HHMM>/`. `${MODELS_DIR}` is a separate XFS disk from the root disk.
+Retention keeps the newest snapshot of each of the last 14 days plus the newest of each of the
+last 8 Sundays. `${MODELS_DIR}/backups/LAST_OK` names the last successful snapshot. Everything is
+root-only (dirs 700, files 600) and is **not encrypted**. Snapshots contain all secrets: .env
+files, keys and DB dumps.
+
+Logs: `journalctl -u spark-backup`. Run a backup now: `sudo systemctl start spark-backup`.
+Run the non-destructive restore test (uses throwaway containers only):
+`sudo /usr/local/sbin/spark-backup-restore-test.sh [${MODELS_DIR}/backups/<snapshot>]`
+
+## Snapshot contents
+
+| File | What it is |
+|---|---|
+| `pg-litellm.dump` | `pg_dump -Fc` of LiteLLM DB `litellm` (online, consistent) |
+| `pg-globals.sql` | `pg_dumpall --globals-only` (roles; the compose env recreates `litellm` anyway) |
+| `webui.db` | Online `sqlite3 .backup` of Open WebUI's `webui.db` (integrity-checked) |
+| `pocket-id.db` | Online `sqlite3 .backup` of Pocket-ID's `pocket-id.db` (integrity-checked) |
+| `pocket-id-export.zip` | `pocket-id export` (official full export; usable with `pocket-id import`) |
+| `vol-open-webui-data.tar.zst` | Volume `webui_open-webui-data` **minus** `./cache` (re-downloadable models) and the live `webui.db*` files |
+| `vol-pocket-id-data.tar.zst` | Volume `webui_pocket-id-data` **minus** the live `pocket-id.db*` files |
+| `config.tar.zst` | `/srv/*/` (compose, .env, keys, litellm.yaml, ...), `/etc/llama-swap`, llama-swap/docker-user-rules units, nvidia-persistenced drop-in, spark-backup units, `/usr/local/sbin/*.sh`, `/etc/ufw/user*.rules`, `/etc/fstab`, `/home/${BACKEND_SSH_USER}/.hermes/config.yaml` (paths relative to `/`) |
+| `manifest.txt` | Host, Docker/compose/Postgres versions, llama-swap version+sha256, every container's image ref and digest, volumes, file sizes |
+| `SHA256SUMS` | Checksums. Verify with `cd <snap> && sha256sum -c SHA256SUMS` |
+
+The volume tarballs leave out the live SQLite files on purpose, because a copy taken while
+the app is writing can be torn. **After untarring a volume, always copy the matching `.db`
+file from the snapshot into it** (steps below).
+
+The helper image `spark-backup-helper:alpine-5291449c` is alpine (pinned by digest) plus
+sqlite and GNU tar. `spark-backup.sh` rebuilds it automatically if it is missing. You can
+also use any alpine with `apk add sqlite tar`.
+
+```bash
+S=${MODELS_DIR}/backups/$(sudo awk '{print $2}' ${MODELS_DIR}/backups/LAST_OK)   # or pick a snapshot dir
+cd "$S" && sudo sha256sum -c SHA256SUMS
+```
+
+---
+
+## 1. Restore single config files
+
+```bash
+sudo zstd -dc "$S/config.tar.zst" | sudo tar -tvf -                          # list
+sudo zstd -dc "$S/config.tar.zst" | sudo tar -C /tmp/cfg-restore -xf - srv/gateway/litellm.yaml   # extract one file elsewhere
+# or restore everything in place (ownership/modes preserved):
+sudo zstd -dc "$S/config.tar.zst" | sudo tar -C / --numeric-owner -xpf -
+```
+
+## 2. LiteLLM Postgres (`gateway` project)
+
+To restore into the existing DB, replacing its contents:
+
+```bash
+cd /srv/gateway
+sudo docker compose stop litellm
+sudo docker compose exec -T db pg_restore -U litellm -d litellm --clean --if-exists --no-owner --exit-on-error < "$S/pg-litellm.dump"
+sudo docker compose start litellm
+sudo docker compose exec -T db psql -U litellm -d litellm -c 'select count(*) from "LiteLLM_VerificationToken";'
+```
+
+To restore into a fresh, empty volume (rebuild):
+
+```bash
+cd /srv/gateway
+sudo docker compose up -d db                # creates gateway_pgdata + litellm role/db from .env
+until sudo docker compose exec -T db pg_isready -U litellm; do sleep 1; done
+sudo docker compose exec -T db pg_restore -U litellm -d litellm --no-owner --exit-on-error < "$S/pg-litellm.dump"
+sudo docker compose up -d
+```
+
+## 3. Open WebUI (`webui_open-webui-data`)
+
+```bash
+cd /srv/webui
+sudo docker compose stop open-webui
+# (optional) keep the current state: sudo docker run --rm -v webui_open-webui-data:/v:ro -v /root:/o alpine tar -C /v -czf /o/owui-before-restore.tgz .
+sudo docker volume create webui_open-webui-data          # no-op if it exists
+sudo zstd -dc "$S/vol-open-webui-data.tar.zst" | sudo docker run --rm -i -v webui_open-webui-data:/v spark-backup-helper:alpine-5291449c tar -C /v --numeric-owner -xpf -
+sudo docker run --rm -v webui_open-webui-data:/v -v "$S":/s:ro spark-backup-helper:alpine-5291449c \
+  sh -c 'rm -f /v/webui.db-wal /v/webui.db-shm && cp /s/webui.db /v/webui.db && sqlite3 /v/webui.db "PRAGMA integrity_check;"'
+sudo docker compose up -d open-webui      # ./cache (embedding models etc.) is re-downloaded on first use
+```
+
+## 4. Pocket-ID (`webui_pocket-id-data`)
+
+Pocket-ID files are owned by uid 1000. Its signing keys live in the DB, encrypted with
+`ENCRYPTION_KEY` from `/srv/webui/pocket-id.env`, so **restore that env file from the same
+snapshot**.
+
+```bash
+cd /srv/webui
+sudo docker compose stop pocket-id
+sudo docker volume create webui_pocket-id-data
+sudo zstd -dc "$S/vol-pocket-id-data.tar.zst" | sudo docker run --rm -i -v webui_pocket-id-data:/v spark-backup-helper:alpine-5291449c tar -C /v --numeric-owner -xpf -
+sudo docker run --rm -v webui_pocket-id-data:/v -v "$S":/s:ro spark-backup-helper:alpine-5291449c sh -euc '
+  rm -f /v/pocket-id.db-wal /v/pocket-id.db-shm
+  cp /s/pocket-id.db /v/pocket-id.db
+  chown 1000 /v/pocket-id.db
+  sqlite3 /v/pocket-id.db "PRAGMA integrity_check;"
+  # The backup contains the old instance cluster heartbeat; with only one replica allowed a
+  # fresh heartbeat blocks startup ("already one instance of Pocket ID running").
+  # Clear it ONLY when no other Pocket-ID is running against this data:
+  sqlite3 /v/pocket-id.db "DELETE FROM francis_hosts;"'
+sudo docker compose up -d pocket-id
+sudo docker exec pocket-id /app/pocket-id healthcheck
+```
+
+Alternative: run `pocket-id import` from `$S/pocket-id-export.zip` into an empty data volume
+(see `docker exec pocket-id /app/pocket-id import --help`).
+
+## 5. Host config: llama-swap, firewall, units
+
+```bash
+sudo zstd -dc "$S/config.tar.zst" | sudo tar -C / --numeric-owner -xpf - \
+  etc/llama-swap etc/systemd/system/llama-swap.service etc/systemd/system/docker-user-rules.service \
+  etc/systemd/system/nvidia-persistenced.service.d usr/local/sbin etc/ufw/user.rules etc/ufw/user6.rules
+sudo systemctl daemon-reload
+sudo systemctl restart docker-user-rules llama-swap
+sudo ufw reload
+```
+
+`/etc/llama-swap` is `root:llamaswap 750/640`. tar `-p --numeric-owner` keeps that only if
+the `llamaswap` user/group IDs are the same (uid 995, gid 987). On a rebuilt host, check
+with `chown -R root:llamaswap /etc/llama-swap`.
+
+---
+
+## 6. Whole-VM rebuild
+
+1. **Base OS.** Install Ubuntu 24.04. Attach the `${MODELS_DIR}` disk (XFS) and add its fstab line
+   from `config.tar.zst:etc/fstab`. Use `blkid` to confirm the UUID. Mount it: `sudo mount ${MODELS_DIR}`.
+   Set up WireGuard `wg0` (${BACKEND_WG_IP}), which the units bind to. Its config is **not** in
+   this backup; take it from the infra repo or a peer.
+2. **NVIDIA.** Install the NVIDIA driver plus `nvidia-container-toolkit` (the manifest records
+   the version), then run `sudo nvidia-ctk runtime configure --runtime=docker`.
+3. **Docker.** Run `sudo apt install docker.io docker-compose-v2` (the manifest records the
+   versions). Add `${BACKEND_SSH_USER}` to the `docker` group.
+4. **Users.** Run
+   `sudo groupadd -r -g 987 llamaswap && sudo useradd -r -u 995 -g 987 -G docker -d /var/lib/llama-swap -s /usr/sbin/nologin llamaswap`.
+5. **Config files.** Pick `S`, run `sha256sum -c`, then restore all config in place:
+   `sudo zstd -dc "$S/config.tar.zst" | sudo tar -C / --numeric-owner -xpf -`.
+   This restores `/srv/gateway`, `/srv/webui` (and any other `/srv/*` stacks), `/etc/llama-swap`,
+   units, scripts, ufw rules, fstab and the Hermes config.
+6. **llama-swap binary.** It is not in the backup. Reinstall the version shown in the manifest
+   (`llama-swap:` line, with sha256) to `/usr/local/bin/llama-swap`. GGUF models live on `${MODELS_DIR}`.
+7. **Firewall.** Run `sudo ufw enable && sudo ufw reload` and
+   `sudo systemctl daemon-reload && sudo systemctl enable --now docker-user-rules`.
+8. **Gateway.** Follow section 2, "fresh volume": `docker compose up -d db`, then `pg_restore`,
+   then `docker compose up -d`. Images are pinned by digest in compose.yaml and are pulled
+   automatically.
+9. **WebUI stack.** Run `cd /srv/webui && sudo docker compose create`. This creates the
+   `webui_*` volumes and containers without starting them. Then do the volume steps in
+   sections 3 and 4, including the `francis_hosts` cleanup, and run `sudo docker compose up -d`.
+10. **Other `/srv/*` stacks** (for example monitoring): run `cd /srv/<x> && sudo docker compose up -d`.
+    Only their config is backed up, not their data volumes.
+11. **Host services.** Run
+    `sudo systemctl enable --now nvidia-persistenced llama-swap spark-backup.timer`.
+12. **Verify.** Check that the containers are healthy (`docker ps`), that LiteLLM accepts a key,
+    that Open WebUI login through Pocket-ID works, and that `systemctl list-timers spark-backup*`
+    shows the timer. Then run `sudo systemctl start spark-backup` and
+    `sudo /usr/local/sbin/spark-backup-restore-test.sh`.

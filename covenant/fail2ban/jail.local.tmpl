@@ -1,0 +1,25 @@
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 ${WG_SUBNET} ${ADMIN_SOURCE_IPS}
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+banaction = ufw
+backend = auto
+
+[sshd]
+enabled = true
+backend = systemd
+
+[nginx-limit-req]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/error.log
+maxretry = 10
+findtime = 10m
+
+[recidive]
+enabled  = true
+logpath  = /var/log/fail2ban.log
+bantime  = 1w
+findtime = 1d
+maxretry = 5

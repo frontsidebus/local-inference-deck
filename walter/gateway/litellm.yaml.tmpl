@@ -1,0 +1,148 @@
+# LiteLLM gateway -> llama-swap (Walter). Secrets come from /srv/gateway/.env
+model_list:
+  - model_name: coder
+    litellm_params:
+      model: openai/coder
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      mode: chat
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+      supports_function_calling: true
+      supports_tool_choice: true
+      supports_vision: false
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+  - model_name: coder-fast
+    litellm_params:
+      model: openai/coder-fast
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      mode: chat
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+      supports_function_calling: true
+      supports_tool_choice: true
+      supports_vision: false
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+  - model_name: big
+    litellm_params:
+      model: openai/big
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      mode: chat
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+      supports_function_calling: true
+      supports_tool_choice: true
+      supports_vision: false
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+  - model_name: vision
+    litellm_params:
+      model: openai/vision
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      mode: chat
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+      max_input_tokens: 131072
+      max_output_tokens: 16384
+      max_tokens: 16384
+      supports_function_calling: true
+      supports_tool_choice: true
+      supports_vision: true
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+  - model_name: hermes
+    litellm_params:
+      model: openai/hermes
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      mode: chat
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+      max_input_tokens: 65536
+      max_output_tokens: 16384
+      max_tokens: 16384
+      supports_function_calling: true
+      supports_tool_choice: true
+      supports_vision: false
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+  # any llama-swap model ID: local/<id> -> <id>
+  - model_name: local/*
+    litellm_params:
+      model: openai/*
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+  # safety net: real Claude model names (Claude Code background tasks) -> coder
+  - model_name: claude-*
+    litellm_params:
+      model: openai/coder
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+
+litellm_settings:
+  # /srv/gateway/hooks/spark_hooks.py (mounted at /app): mid-conversation system/developer
+  # messages -> user <system-reminder> text (Qwen templates reject/drop them otherwise)
+  callbacks: ["spark_hooks.proxy_handler_instance", "prometheus"]
+  # /metrics unauthenticated (owner-approved 2026-10-01): reachable only from Walter + Covenant (WALTER-PUBLISHED); nginx on api. does not expose it
+  require_auth_for_metrics_endpoint: false
+  drop_params: true
+  request_timeout: 900
+  num_retries: 0            # retries would trigger extra cold model loads in llama-swap
+  telemetry: false
+  check_provider_endpoint: true   # /v1/models lists real llama-swap IDs for local/* instead of OpenAI catalog names
+
+router_settings:
+  num_retries: 0
+  timeout: 900
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
+  trusted_proxy_ranges: ["${EDGE_WG_IP}/32"]   # Covenant edge proxy over wg0; XFF honoured only from this peer. use_x_forwarded_for stays off (it trusts XFF from any peer)

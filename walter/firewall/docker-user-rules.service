@@ -1,0 +1,18 @@
+[Unit]
+Description=Restrict Docker-published ports on wg0 to Covenant (DOCKER-USER)
+Documentation=file:/usr/local/sbin/docker-user-rules.sh
+# Run before dockerd so the filter is in place before any container port is
+# published (Docker preserves an existing DOCKER-USER chain). After ufw so a
+# ufw (re)start at boot doesn't race us. PartOf: re-applied whenever
+# docker.service is restarted.
+After=ufw.service
+Before=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/docker-user-rules.sh
+
+[Install]
+WantedBy=docker.service

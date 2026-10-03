@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# spark-backup.sh -- nightly local backup of Walter's service state to ${MODELS_DIR}/backups
+#
+# Produces ${MODELS_DIR}/backups/<YYYY-mm-dd_HHMM>/ containing:
+#   pg-litellm.dump            pg_dump -Fc of the LiteLLM Postgres DB (online, MVCC-consistent)
+#   pg-globals.sql             roles (pg_dumpall --globals-only)
+#   webui.db                   online sqlite3 .backup of Open WebUI's DB
+#   pocket-id.db               online sqlite3 .backup of Pocket-ID's DB
+#   pocket-id-export.zip       `pocket-id export` (official full export: DB json + uploads)
+#   vol-open-webui-data.tar.zst   volume contents minus ./cache and live SQLite files
+#   vol-pocket-id-data.tar.zst    volume contents minus live SQLite files
+#   config.tar.zst             /srv/*/, /etc/llama-swap, systemd units, scripts, ufw, fstab, hermes config
+#   manifest.txt, SHA256SUMS
+# Retention: 14 daily + 8 weekly (Sunday) snapshots. Writes LAST_OK only on full success.
+# Contains no secrets; it reads secrets from disk and writes them to root-only files.
+set -euo pipefail
+umask 077
+
+BACKUP_ROOT=${MODELS_DIR}/backups
+GATEWAY_COMPOSE=/srv/gateway/compose.yaml
+KEEP_DAILY=14
+KEEP_WEEKLY=8
+# Helper image: built locally FROM alpine pinned by digest, adds sqlite + GNU tar.
+BASE_IMAGE='alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8'
+HELPER_IMAGE='spark-backup-helper:alpine-5291449c'
+LOCK=/run/spark-backup.lock
+
+log() {
+  # Under systemd stdout/stderr already go to the journal; otherwise also send to journal.
+  echo "spark-backup: $*" >&2
+  if [[ -z "${INVOCATION_ID:-}" ]]; then logger -t spark-backup -- "$*" || true; fi
+}
+die() { log "ERROR: $*"; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+exec 9>"$LOCK"
+flock -n 9 || die "another backup is running"
+
+START_EPOCH=$(date +%s)
+STAMP=$(date +%Y-%m-%d_%H%M)
+FINAL="$BACKUP_ROOT/$STAMP"
+WORK="$BACKUP_ROOT/.inprogress-$STAMP"
+
+install -d -m 700 -o root -g root "$BACKUP_ROOT"
+[[ ! -e "$FINAL" ]] || die "$FINAL already exists"
+rm -rf "$WORK"
+install -d -m 700 "$WORK"
+
+cleanup() {
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log "FAILED (rc=$rc); removing partial $WORK"
+    rm -rf "$WORK"
+  fi
+}
+trap cleanup EXIT
+
+ensure_helper() {
+  if ! docker image inspect "$HELPER_IMAGE" >/dev/null 2>&1; then
+    log "building helper image $HELPER_IMAGE"
+    printf 'FROM %s\nRUN apk add --no-cache sqlite tar\n' "$BASE_IMAGE" \
+      | docker build -q -t "$HELPER_IMAGE" - >/dev/null
+  fi
+}
+
+vol_path() { docker volume inspect -f '{{.Mountpoint}}' "$1"; }
+
+# Online SQLite backup via the sqlite3 backup API, run as the DB file's owner so that
+# any -wal/-shm it might create keep the owner the app expects. Verifies integrity.
+sqlite_backup() { # <volume> <db filename in volume> <output file>
+  local vol=$1 db=$2 out=$3 mp owner res
+  mp=$(vol_path "$vol")
+  [[ -f "$mp/$db" ]] || die "$vol: $db not found"
+  owner=$(stat -c '%u:%g' "$mp/$db")
+  docker run --rm --network none --user "$owner" -v "$vol:/data" "$HELPER_IMAGE" \
+    sh -euc 'sqlite3 -bail "/data/$1" ".timeout 30000" ".backup /tmp/b.db"
+             r=$(sqlite3 /tmp/b.db "PRAGMA integrity_check;")
+             [ "$r" = ok ] || { echo "integrity_check: $r" >&2; exit 3; }
+             cat /tmp/b.db' _ "$db" > "$out"
+  res=$(stat -c %s "$out")
+  [[ $res -gt 0 ]] || die "$vol: empty sqlite backup"
+  log "sqlite $vol/$db -> $(basename "$out") ($res bytes, integrity ok)"
+}
+
+vol_tar() { # <volume> <output> [tar exclude args...]
+  local vol=$1 out=$2; shift 2
+  docker run --rm --network none -v "$vol:/v:ro" "$HELPER_IMAGE" \
+    tar -C /v --numeric-owner --xattrs -cf - "$@" . | zstd -q -T0 -3 -o "$out"
+  log "volume $vol -> $(basename "$out") ($(stat -c %s "$out") bytes)"
+}
+
+ensure_helper
+
+# ---------------------------------------------------------------- Postgres
+log "pg_dump litellm"
+docker compose -f "$GATEWAY_COMPOSE" exec -T db pg_dump -U litellm -Fc litellm > "$WORK/pg-litellm.dump"
+docker compose -f "$GATEWAY_COMPOSE" exec -T db pg_restore -l < "$WORK/pg-litellm.dump" > /dev/null \
+  || die "pg_restore -l could not read the dump"
+docker compose -f "$GATEWAY_COMPOSE" exec -T db pg_dumpall -U litellm --globals-only > "$WORK/pg-globals.sql"
+log "pg dump ok ($(stat -c %s "$WORK/pg-litellm.dump") bytes)"
+
+# ---------------------------------------------------------------- SQLite (online)
+sqlite_backup webui_open-webui-data webui.db "$WORK/webui.db"
+sqlite_backup webui_pocket-id-data pocket-id.db "$WORK/pocket-id.db"
+
+log "pocket-id export"
+docker exec pocket-id /app/pocket-id export -p - > "$WORK/pocket-id-export.zip" 2>/dev/null
+python3 -c 'import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; assert "database.json" in z.namelist()' \
+  "$WORK/pocket-id-export.zip" || die "pocket-id export zip invalid"
+
+# ---------------------------------------------------------------- Volume tarballs
+# Live SQLite files are excluded (torn copies); the consistent .backup copies above replace them.
+vol_tar webui_open-webui-data "$WORK/vol-open-webui-data.tar.zst" \
+  --exclude=./cache --exclude='./webui.db' --exclude='./webui.db-wal' --exclude='./webui.db-shm'
+vol_tar webui_pocket-id-data "$WORK/vol-pocket-id-data.tar.zst" \
+  --exclude='./pocket-id.db' --exclude='./pocket-id.db-wal' --exclude='./pocket-id.db-shm'
+
+# ---------------------------------------------------------------- Config tarball
+cfg=()
+shopt -s nullglob
+for p in /srv/*/ /etc/llama-swap \
+         /etc/systemd/system/llama-swap.service \
+         /etc/systemd/system/docker-user-rules.service \
+         /etc/systemd/system/nvidia-persistenced.service.d \
+         /etc/systemd/system/spark-backup.service /etc/systemd/system/spark-backup.timer \
+         /usr/local/sbin/*.sh /etc/ufw/user*.rules /etc/fstab \
+         /home/${BACKEND_SSH_USER}/.hermes/config.yaml; do
+  if [[ -e "$p" ]]; then cfg+=("${p#/}"); else log "WARN: config path missing: $p"; fi
+done
+shopt -u nullglob
+[[ ${#cfg[@]} -gt 0 ]] || die "no config paths found"
+set +e
+tar -C / --numeric-owner --xattrs --acls -cf - "${cfg[@]}" | zstd -q -T0 -3 -o "$WORK/config.tar.zst"
+st=("${PIPESTATUS[@]}")
+set -e
+# tar rc 1 = "file changed as we read it" (other agents edit /srv concurrently): warn only.
+if [[ ${st[0]} -gt 1 || ${st[1]} -ne 0 ]]; then die "config tar failed (tar=${st[0]} zstd=${st[1]})"; fi
+[[ ${st[0]} -eq 1 ]] && log "WARN: some config files changed while being archived"
+log "config tarball ok (${#cfg[@]} top-level paths, $(stat -c %s "$WORK/config.tar.zst") bytes)"
+
+# ---------------------------------------------------------------- Manifest + checksums
+{
+  echo "snapshot:   $STAMP"
+  echo "host:       $(hostname)"
+  echo "created:    $(date -Is)"
+  echo "kernel:     $(uname -r)"
+  echo "docker:     $(docker version -f '{{.Server.Version}}') / compose $(docker compose version --short)"
+  echo "postgres:   $(docker compose -f "$GATEWAY_COMPOSE" exec -T db postgres --version)"
+  echo "llama-swap: $( (/usr/local/bin/llama-swap --version 2>&1 || true) | head -1) sha256=$(sha256sum /usr/local/bin/llama-swap 2>/dev/null | cut -c1-64)"
+  echo "nvidia-ctk: $(dpkg-query -W -f '${Version}' nvidia-container-toolkit 2>/dev/null || echo '?')"
+  echo "helper:     $HELPER_IMAGE $(docker image inspect -f '{{.Id}}' "$HELPER_IMAGE") (base $BASE_IMAGE)"
+  echo
+  echo "## containers (name | image ref | image id | repo digests)"
+  for c in $(docker ps -a --format '{{.Names}}' | sort); do
+    img_id=$(docker inspect -f '{{.Image}}' "$c")
+    printf '%s | %s | %s | %s\n' "$c" "$(docker inspect -f '{{.Config.Image}}' "$c")" "$img_id" \
+      "$(docker image inspect -f '{{join .RepoDigests ","}}' "$img_id" 2>/dev/null || echo '?')"
+  done
+  echo
+  echo "## volumes"
+  docker volume ls --format '{{.Name}}' | sort
+  echo
+  echo "## config paths"
+  printf '/%s\n' "${cfg[@]}"
+  echo
+  echo "## files (bytes)"
+  (cd "$WORK" && stat -c '%s %n' -- * | sort -k2)
+} > "$WORK/manifest.txt"
+
+chmod 600 "$WORK"/*
+(cd "$WORK" && sha256sum -- $(ls | grep -v '^SHA256SUMS$') > SHA256SUMS && chmod 600 SHA256SUMS \
+  && sha256sum --quiet -c SHA256SUMS) || die "checksum verification failed"
+
+mv "$WORK" "$FINAL"
+chmod 700 "$FINAL"
+
+# ---------------------------------------------------------------- Retention
+# Keep the newest snapshot of each of the last $KEEP_DAILY days that have snapshots,
+# plus the newest snapshot of each of the last $KEEP_WEEKLY Sundays.
+declare -A keep=() seen_day=() seen_sun=()
+ndaily=0; nweekly=0
+for d in $(cd "$BACKUP_ROOT" && ls -1d 20[0-9][0-9]-[01][0-9]-[0-3][0-9]_[0-2][0-9][0-5][0-9] 2>/dev/null | sort -r); do
+  day=${d%_*}
+  if [[ -z "${seen_day[$day]:-}" ]]; then
+    seen_day[$day]=1
+    if (( ndaily < KEEP_DAILY )); then keep[$d]=1; ndaily=$((ndaily+1)); fi
+    if [[ $(date -d "$day" +%u) -eq 7 ]] && [[ -z "${seen_sun[$day]:-}" ]]; then
+      seen_sun[$day]=1
+      if (( nweekly < KEEP_WEEKLY )); then keep[$d]=1; nweekly=$((nweekly+1)); fi
+    fi
+  fi
+  if [[ -z "${keep[$d]:-}" ]]; then
+    log "prune $d"
+    rm -rf -- "${BACKUP_ROOT:?}/$d"
+  fi
+done
+# Leftover partials from crashed runs (older than a day).
+find "$BACKUP_ROOT" -maxdepth 1 -name '.inprogress-*' -mmin +1440 -exec rm -rf {} + || true
+
+DUR=$(( $(date +%s) - START_EPOCH ))
+SIZE=$(du -sh "$FINAL" | cut -f1)
+echo "$(date -Is) $STAMP size=$SIZE duration=${DUR}s" > "$BACKUP_ROOT/LAST_OK"
+chmod 600 "$BACKUP_ROOT/LAST_OK"
+log "OK $FINAL size=$SIZE duration=${DUR}s"

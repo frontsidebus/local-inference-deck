@@ -1,960 +1,215 @@
-# 343-guilty-spark.io — Architecture & Handoff
+# Architecture
 
-**Last updated:** 2026-09-22
-**Repo:** `local-inference-deck` (private); see also `installation-343` (§9)
-**Domain:** `343-guilty-spark.io`
-**Status:** Live and serving — public edge verified, backend running but
-**not autostarting** (§5)
+How a request travels through 343 Guilty Spark, where each service listens, who may talk to whom, and the operational pieces around it. Deploy steps are in the component READMEs: [walter/](walter/README.md), [covenant/](covenant/README.md), [clients/](clients/README.md). Values in `${...}` come from `site.env` (see [site.env.example](site.env.example)).
 
-> **Verification pass 2026-09-22.** Every host- and edge-level claim below
-> was checked against the running system; drift was corrected in place and
-> the corrections are called out inline. Two classes of claim remain
-> unverified and are marked as such where they appear: anything **inside
-> the guest** (guest driver/CUDA versions, Ollama override, model tags) and
-> anything **on EC2** (site file, UI, WireGuard server config). Both need
-> access this pass did not use.
+## Hosts
 
-Self-hosted LLM inference platform. Web UI on EC2 (public-facing), inference
-backend on a homelab workstation reached over WireGuard. Currently serves
-Llama 3.3 70B via Ollama across dual RTX 3090s in a GPU-passthrough VM.
+| Codename | Role | Where | Key facts |
+|---|---|---|---|
+| (hypervisor) | KVM/libvirt host | home | Binds both GPUs to `vfio-pci`, passes the models NVMe to Walter as a raw disk, autostarts Walter. CUDA does not work on the host by design. |
+| **Walter** | Backend VM | home, behind NAT | 2x RTX 3090, 16 vCPU, ~80 GiB RAM, `${MODELS_DIR}` on its own XFS disk. LAN address `${BACKEND_LAN_IP}`, tunnel address `${BACKEND_WG_IP}`. Runs everything stateful. |
+| **Covenant** | Edge | cloud, t3.small class | Public address `${EDGE_PUBLIC_IP}`, tunnel address `${EDGE_WG_IP}`. nginx, oauth2-proxy, fail2ban, certbot. Stateless apart from certificates. |
+| workstation | Operator's desktop (on the hypervisor) | home | Runs the harness wrappers and the `hermes-gateway` on `${HYPERVISOR_BRIDGE_IP}:8642`. |
 
----
+Walter dials Covenant over WireGuard (`udp/${WG_PORT}`); Covenant is the listener and has no route into the home LAN beyond Walter's tunnel address.
 
-## 1. High-Level Architecture
+## Request paths
+
+### Chat
 
 ```
-   Browser
-      │  HTTPS
-      ▼
-   ┌──────────────────────────────────────┐
-   │  EC2 (ip-172-31-85-93)               │
-   │  ─────────────────────────           │
-   │  nginx 1.24.0 :80/:443 (HTTP/2)      │
-   │    ├─ TLS (Let's Encrypt, certbot)   │
-   │    ├─ :80 → 301 → :443               │
-   │    ├─ auth_basic (server-level, so   │
-   │    │   ALL routes inherit it)        │
-   │    ├─ / → /var/www/spark/index.html  │
-   │    ├─ /v1/llama/* → proxy_pass       │
-   │    │               10.100.0.2:11434  │
-   │    └─ /v1/* → :8000 [PARKED, vLLM]   │
-   │  WireGuard wg0 (server, :51820)      │
-   └──────────────────────────────────────┘
-                    │
-                    │  WireGuard tunnel
-                    │  (encrypted, keyed)
-                    │
-   ┌──────────────────────────────────────┐
-   │  VM: agent-sandbox-3090              │
-   │  ─────────────────────────           │
-   │  WireGuard wg0 (peer, 10.100.0.2)    │
-   │  Ollama :11434                       │
-   │    └─ llama3.3-70b-fullgpu:latest    │
-   │       (Q4_K_M, ~42 GB VRAM)          │
-   │  Both RTX 3090s via vfio-pci         │
-   └──────────────────────────────────────┘
-                    │
-                    │  KVM/QEMU
-                    ▼
-   ┌──────────────────────────────────────┐
-   │  Host: bishop-X870-GAMING-WIFI6      │
-   │  ─────────────────────────           │
-   │  Ubuntu 24.04 LTS                    │
-   │  Kernel 6.14.0-37-generic            │
-   │  AMD 9950X3D, 128 GB DDR5 (4×32)     │
-   │  Gigabyte X870 GAMING WIFI6          │
-   │  be quiet! 1200W 80+ Gold ATX 3.1    │
-   │  Dual RTX 3090 (ZOTAC, 19da:1613)    │
-   │  Open-air workbench, horizontal      │
-   │  vfio-pci owns both GPUs             │
-   │  libvirt/QEMU hosts the VM           │
-   └──────────────────────────────────────┘
+browser --HTTPS--> Covenant nginx (${SPARK_CHAT_HOST})
+        --wg0--> Open WebUI ${BACKEND_WG_IP}:3000
+        --docker network--> LiteLLM :4000  (key: open-webui)
+        --> llama-swap ${BACKEND_WG_IP}:8080
+        --> llama-server container 127.0.0.1:100xx (GPU0 / GPU1 / both)
 ```
 
----
+- Login: Open WebUI redirects to Pocket-ID at `https://${SPARK_ID_HOST}` (OIDC, confidential client with PKCE). Pocket-ID only lets members of `${CHAT_GROUP}` through. Users authenticate with a passkey. New users get the Open WebUI role `user`; signup is off.
+- Open WebUI reaches Pocket-ID through the public hostname (the hairpin path out through Covenant and back), so both browser and server agree on the issuer URL.
+- Model visibility uses Open WebUI access grants. The five aliases have public-read grants; a model with no grant (for example `hermes-agent`) is visible to admins only.
+- A local break-glass admin (`${ADMIN_EMAIL}`) exists alongside the OIDC admins.
 
-## 2. Component Details
-
-### 2.1 EC2 Frontend
-
-- **Instance:** `ip-172-31-85-93` (public IP `13.217.253.94`)
-- **OS:** Ubuntu (version unconfirmed but recent)
-- **nginx:** 1.24.0 (Ubuntu), serving HTTP/2
-- **Web root:** `/var/www/spark/index.html`
-- **nginx config:** `/etc/nginx/sites-available/343-guilty-spark`
-  (symlinked from `sites-enabled/`)
-- **WireGuard:** server-side, listening `51820/udp`, peer public key
-  `SKGnl0A+fGx7t5iiltKRrqX8NGos2mzjhApyKc7Sugw=`
-
-**Public edge — TLS and access control:**
-
-Verified live 2026-09-22 against `https://343-guilty-spark.io/`:
-
-- **TLS:** valid Let's Encrypt certificate, `CN = 343-guilty-spark.io`,
-  issuer `Let's Encrypt YE2`, valid `2026-08-27` → `2026-11-25`. Issued by
-  certbot; renewal is presumably on the standard `certbot.timer`, though
-  the timer state has not been confirmed on the instance.
-- **HTTP/2** negotiated on `:443`. Port `:80` redirects to HTTPS.
-- **Access control:** HTTP Basic auth gates the entire site — the `401`
-  comes back before any content is served, including the static UI.
-  Realm is exactly `343 Guilty Spark`.
-
-  ```
-  HTTP/2 401
-  www-authenticate: Basic realm="343 Guilty Spark"
-  ```
-
-  This is nginx's `auth_basic` + `auth_basic_user_file /etc/nginx/.htpasswd`,
-  declared at the `server` level so every `location` inherits it.
-
-  > **Note:** nginx has no `.htaccess` support — that is an Apache
-  > mechanism. Per-directory override files are not read. The only
-  > mechanism in play here is `auth_basic` plus an htpasswd file, and the
-  > `.htpasswd` file is already in `.gitignore`.
-
-Because basic auth is inherited by the `/v1/llama/` block, the inference
-endpoint is not reachable from the public internet without credentials.
-The browser's basic-auth header travels on to Ollama, which ignores it
-(Ollama does no auth of its own — see §7).
-
-**The UI (`index.html`) is:**
-- Single-page, no framework, ~9 KB
-- Vanilla JS + fetch API with SSE streaming
-- Theme: 343 Guilty Spark (Halo lore, terminal aesthetic, `#f0a020` accent)
-- Model dropdown supports multiple endpoints (only `/v1/llama` currently
-  active)
-- OpenAI-compatible client — sends `POST /v1/llama/chat/completions` with
-  `{model, messages, stream: true}`
-- Streams tokens with a blinking cursor, supports `/clear` command and
-  ESC-to-abort
-- System prompt is a Guilty Spark persona (humor: 85%, honesty: 95%)
-
-**Active endpoint config:**
-
-```javascript
-const MODELS = {
-  "/v1/llama": "llama3.3-70b-fullgpu:latest",
-};
-```
-
-Commented-out dropdown entries (`/v1/fast` for Hermes-4 14B, `/v1/big` for
-Hermes-4 70B) are placeholders from an earlier architecture; not currently
-wired up.
-
-**Active nginx location block:**
-
-```nginx
-location /v1/llama/ {
-    rewrite ^/v1/llama/(.*) /v1/$1 break;
-    proxy_pass         http://10.100.0.2:11434;
-    proxy_http_version 1.1;
-    proxy_set_header   Host       $host;
-    proxy_set_header   Connection "";
-    proxy_buffering    off;
-    proxy_cache        off;
-    proxy_read_timeout 600s;
-    proxy_send_timeout 600s;
-}
-```
-
-**Parked `/v1/` catch-all:** a second block points at `10.100.0.2:8000`
-with a bearer token for vLLM. The backend is not running, so the block is
-inert — but it is **parked, not dead** (see §3.1: tensor-parallel vLLM is
-blocked on the PCIe ×1 slot until the ProArt upgrade). Leave it in place.
-
-It does not shadow the active route: nginx matches prefix `location`s
-longest-first, so `/v1/llama/` always wins over `/v1/` regardless of
-declaration order. The UI only ever calls `/v1/llama/*`.
-
-### 2.2 WireGuard Mesh
-
-- **Subnet:** `10.100.0.0/24`
-- **EC2:** WG server, listens on `51820/udp`, public endpoint
-  `13.217.253.94:51820`
-- **VM:** WG peer at `10.100.0.2/24`, wg-quick@wg0.service enabled and
-  active
-- **Host (`bishop-X870-GAMING-WIFI6`):** WireGuard is **not installed at
-  all** — no `wg` binary, no `/etc/wireguard/`, no `wg-quick@` unit, no
-  packages. (Verified 2026-09-22; an earlier revision of this doc said
-  "installed but inactive", which overstated what is on disk.) This is
-  fine: the host is not on the mesh and does not need to be, because the
-  VM holds its own tunnel. Host interfaces are `enp7s0` (192.168.1.83/24)
-  and `virbr127-nat` (10.127.10.1/24).
-
-  **Consequence for debugging:** from the host you cannot reach
-  `10.100.0.2` at all — there is no route to `10.100.0.0/24`. Pinging it
-  or curling `10.100.0.2:11434` from the host times out, and that is
-  expected, not a fault. Reach Ollama either from the EC2 side of the
-  tunnel or via the guest's libvirt NAT address.
-
-### 2.3 VM: agent-sandbox-3090
-
-- **libvirt name:** `agent-sandbox-3090`
-- **User:** `operator`
-- **OS:** Ubuntu (Linux guest, matching kernel driver 580.173.02)
-- **Resources:** 32 GB RAM, 16 vCPUs, host-passthrough CPU
-- **Networks:**
-  - libvirt network **`iac127-nat`** (bridge `virbr127-nat`, gateway
-    `10.127.10.1/24`); the VM leases `10.127.10.160`. This is a
-    purpose-built network, **not** a customized `default` — the stock
-    `default` network still exists, still holds `192.168.122.1/24`, and
-    its `virbr0` is DOWN. Sibling network `iac127-isolated` also exists.
-    All three autostart.
-  - WireGuard `wg0` at `10.100.0.2`
-- **GPUs:** Both RTX 3090s attached via four `<hostdev>` blocks (2 GPU
-  functions + 2 audio functions, PCI IDs 10de:2204 and 10de:1aef)
-- **Guest PCI addresses:** GPU 0 at `05:00.0` (host card at `01:00.0`,
-  the ×16 slot), GPU 1 at `09:00.0` (host card at `05:00.0`, the ×1 slot)
-- **NVIDIA driver in guest:** 580.173.02, CUDA 13.0
-
-**Ollama configuration** (`/etc/systemd/system/ollama.service.d/override.conf`):
-
-```ini
-[Service]
-Environment="OLLAMA_HOST=0.0.0.0:11434"
-Environment="OLLAMA_KEEP_ALIVE=-1"
-Environment="OLLAMA_NUM_PARALLEL=2"
-```
-
-- `OLLAMA_KEEP_ALIVE=-1` keeps the model loaded forever (no eviction)
-- `OLLAMA_NUM_PARALLEL=2` lets 2 concurrent requests share the loaded model
-
-> ### ⚠ Correction: Ollama binds `0.0.0.0`, not the tunnel address
->
-> Earlier revisions of this document stated `OLLAMA_HOST=10.100.0.2:11434`
-> and described the bind as *"only to WireGuard interface (surgical, not
-> `0.0.0.0`)"*. **That was wrong.** Verified in the guest 2026-09-22:
->
-> ```
-> $ cat /etc/systemd/system/ollama.service.d/override.conf
-> Environment="OLLAMA_HOST=0.0.0.0:11434"
-> $ sudo ss -tlnp | grep 11434
-> LISTEN 0 4096 *:11434 *:*  users:(("ollama",pid=1029,fd=4))
-> $ curl -o /dev/null -w '%{http_code}' http://10.127.10.160:11434/v1/models
-> 200          # answers on the libvirt NAT address too
-> ```
->
-> Ollama listens on **every interface the VM has**. What actually prevents
-> that from being reachable is **ufw** (§2.3.1) — its default incoming
-> policy is deny, and the allow rule for 11434 is scoped to the `wg0`
-> interface. From the host, `curl 10.127.10.160:11434` times out for
-> precisely this reason.
->
-> **This inverts the security story.** The protection is not the bind
-> address; it is one firewall rule. `ufw disable`, a flushed ruleset, or
-> losing the interface scope would immediately publish an unauthenticated
-> 70B endpoint onto the libvirt network. Tightening the bind address would
-> add a second, independent control — see the hardening note in
-> `unit-files/ollama-override.conf`, including the wg0 startup-ordering
-> caveat that is the likely reason it is `0.0.0.0` today. Not yet applied;
-> tracked in §7.2.
-
-**Model store:** service runs as `User=ollama`, so weights live under
-`/usr/share/ollama/.ollama/`. (Resolves an item §9 previously flagged
-unverified.)
-
-**Loaded models:**
-- `llama3.3-70b-fullgpu:latest` — custom Modelfile derived from
-  `llama3.3:70b-instruct-q4_K_M` with `num_gpu 999` and `num_ctx 4096`.
-  This is the model the UI targets.
-- `llama3.3:70b-instruct-q4_K_M` — base model, kept as a reference. Ollama
-  dedupes blob storage so actual disk cost is ~42 GB not 84.
-
-#### 2.3.1 ufw on the VM — the actual access control
-
-Previously undocumented, and load-bearing. Verified in the guest
-2026-09-22:
+### Hermes Agent (chat, admins only)
 
 ```
-$ sudo ufw status verbose
-Status: active
-Default: deny (incoming), allow (outgoing), deny (routed)
-
-To                         Action      From
---                         ------      ----
-8000/tcp                   ALLOW IN    10.100.0.0/24
-22/tcp                     ALLOW IN    Anywhere
-11434/tcp on wg0           ALLOW IN    Anywhere
-8080/tcp on wg0            ALLOW IN    Anywhere
+Open WebUI --libvirt bridge--> hermes-gateway ${HYPERVISOR_BRIDGE_IP}:8642/v1 (API_SERVER_KEY)
+           --> Hermes Agent on the workstation --> api. --> LiteLLM --> llama-swap
 ```
 
-`ufw` is **active and enabled**, `iptables -S` confirms `-P INPUT DROP`.
+Open WebUI has two OpenAI-compatible connections: LiteLLM and the hermes-gateway. Hermes runs its tools on the workstation with the workstation user's permissions. Commands that need interactive approval are blocked in API mode, and secret redaction is on. This model is deliberately admin-only.
 
-| Rule | Purpose | Verdict |
+### API (harnesses)
+
+```
+harness --HTTPS + key--> Covenant nginx (${SPARK_API_HOST}, path allowlist, 401 without credentials)
+        --wg0--> LiteLLM ${BACKEND_WG_IP}:4000 (virtual key, pre-call hook)
+        --> llama-swap ${BACKEND_WG_IP}:8080 --> llama-server
+```
+
+| Harness | API it speaks | Entry point |
 |---|---|---|
-| `11434/tcp on wg0` | Ollama, tunnel only | **required — do not remove** |
-| `22/tcp Anywhere` | SSH | works; consider scoping (below) |
-| `8000/tcp from 10.100.0.0/24` | parked vLLM (§3.1) | keep while vLLM is parked |
-| `8080/tcp on wg0` | dead llama.cpp Docker port | **stale — removable** (§7.2) |
+| Claude Code | Anthropic `/v1/messages` (+ `count_tokens`) | `claude-spark` (isolated config dir) |
+| Codex | `/v1/responses` | `codex-spark [--profile spark-fast]` |
+| Hermes Agent | `/v1/chat/completions` | `hermes-spark` |
+| OpenCode, Cline | `/v1/chat/completions` | `opencode`, Cline's OpenAI-compatible provider |
 
-**Does the WireGuard tunnel itself need a rule? No.** The VM *dials out* to
-EC2 (`13.217.253.94:51820`); EC2 is the listener. Outbound plus
-established/related return traffic is permitted by the default
-`allow (outgoing)` policy, so no inbound rule for `51820` is needed or
-present.
+nginx forwards only `/v1/chat/completions`, `/v1/responses...`, `/v1/models...`, `/v1/messages` and `/v1/messages/count_tokens`. Everything else on `api.` (LiteLLM's UI, `/metrics`, key management) returns 404 at the edge. Add `/v1/embeddings` to the regex if it is ever needed.
 
-**But traffic arriving over the tunnel does.** nginx on EC2 opens a *new*
-inbound connection to `10.100.0.2:11434`. Under `deny (incoming)` that is
-dropped unless explicitly allowed — which is what
-`11434/tcp on wg0` does. **This rule is why inference works at all.** It is
-also, given the `0.0.0.0` bind (§2.3), the only thing confining Ollama to
-the tunnel.
+LiteLLM sends `/v1/messages` straight through to llama-server's own Anthropic endpoint, so thinking blocks survive (see [quirks](#known-quirks-and-gotchas)). Chat and Responses are translated by LiteLLM.
 
-The `on wg0` interface scope is the important part: it permits 11434 *only*
-on the tunnel interface, not on the libvirt NAT or any future interface.
-Were the rule written as a bare `ufw allow 11434/tcp`, Ollama would be
-reachable from the libvirt network immediately. Preserve the scope.
-
-**SSH note:** `22/tcp` is allowed from `Anywhere`, which is how this
-verification pass reached the guest over the libvirt NAT
-(`operator@10.127.10.160`). The VM has no public route, so this is not an
-internet exposure, but scoping it to `wg0` and/or the libvirt subnet would
-be consistent with how 11434 is handled. Operator's call — note that
-tightening it removes the NAT path that currently serves as the
-out-of-band way in if the tunnel breaks.
-
-**Verified guest internals** (closing §10's previously-unverifiable items):
-
-| Item | Verified |
-|---|---|
-| NVIDIA driver / CUDA | `580.173.02` / CUDA `13.0` — matches §2.3 |
-| PCIe width per card | card 0 ×16, card 1 ×1 — **confirms §3.1** |
-| VRAM in use | 21960 MiB + 21798 MiB — matches §4's "~21 GB per card" |
-| Model tags | both `llama3.3-70b-fullgpu:latest` and the base tag present, 42 GB each |
-| Residency | `ollama ps` → `100% GPU`, context `4096`, `UNTIL: Forever` — `KEEP_ALIVE=-1` working |
-| `wg-quick@wg0` | active + enabled; handshake fresh, keepalive 25s, `allowed ips 10.100.0.0/24` |
-| Preload unit | **not installed** — confirms §7.3 |
-
-> **Caveat on `pcie.link.gen.current`:** at idle both cards report gen 1
-> (ASPM power saving) even though card 0 negotiates ×16. Link *width* is the
-> stable signal; *gen* only reads true under load. Sample it during
-> generation when comparing before/after the ProArt upgrade.
-
----
-
-### 2.4 Host: bishop-X870-GAMING-WIFI6
-
-- **CPU:** AMD Ryzen 9950X3D
-- **RAM:** 128 GB DDR5 (4×32 GB)
-- **Motherboard:** Gigabyte X870 GAMING WIFI6
-- **PSU:** be quiet! 1200W 80+ Gold ATX 3.1 (2000W transient headroom)
-- **GPUs:** Dual ZOTAC RTX 3090 (subsystem `19da:1613`)
-- **Cooling:** Open-air workbench, cards mounted horizontally with spacing
-- **Storage:** single 931.5 GB `nvme1n1`, **all data partitions XFS**
-  (an earlier revision of this doc called root ext4 — it is XFS):
-
-  | Partition | FS | Size | Mount |
-  |---|---|---|---|
-  | `nvme1n1p1` | vfat | 1 G | `/boot/efi` |
-  | `nvme1n1p2` | XFS | 93.1 G | `/` |
-  | `nvme1n1p3` | XFS | 186.3 G | `/home` |
-  | `nvme1n1p4` | XFS | 465.7 G | `/data` — also mounted at `/var/lib/docker/volumes/ollama/_data/models` (see §2.5) |
-- **OS:** Ubuntu 24.04 LTS
-- **Kernel:** 6.14.0-37-generic (default), 6.14.0-35-generic as fallback
-- **HWE track:** version-locked at `linux-generic-6.14`
-- **Secure Boot:** enabled with MOK enrolled at
-  `/var/lib/shim-signed/mok/MOK.der`
-- **Host NVIDIA stack:** 580.178.04 installed and DKMS-built for both
-  kernels, signed with MOK. Present for future toggle-back capability;
-  `nvidia-smi` on the host fails by design because vfio-pci owns the GPUs.
-
-**vfio-pci configuration** (`/etc/modprobe.d/vfio.conf`):
+### Telemetry
 
 ```
-options vfio-pci ids=10de:2204,10de:1aef
-softdep amdgpu pre: vfio-pci
-softdep nouveau pre: vfio-pci
-softdep nvidia pre: vfio-pci
-softdep nvidiafb pre: vfio-pci
-softdep snd_hda_intel pre: vfio-pci
-softdep i915 pre: vfio-pci
+browser --HTTPS--> Covenant nginx (${SPARK_TELEMETRY_HOST})
+        --> oauth2-proxy 127.0.0.1:4180 (Pocket-ID OIDC, group ${TELEMETRY_GROUP})
+        --wg0--> telemetry app ${BACKEND_WG_IP}:3200 --> Prometheus 127.0.0.1:9090
 ```
 
-ID-based binding means both 3090s (same vendor:device ID) auto-bind on
-boot without needing per-slot configuration.
+- `/api/*` returns a JSON 401 instead of a login redirect. `/api/v1/stream` (server-sent events every 2 s) is unbuffered in nginx.
+- The app runs Prometheus queries fixed on the server side and shares one cached snapshot between all viewers, so viewer count does not drive query load. It uses about 28 MiB of RAM.
+- Endpoints: `/api/v1/telemetry`, `/api/v1/stream`, `/healthz`.
 
----
+## Ports and bind addresses
 
-### 2.5 Undocumented: a second Ollama on the host
+### Walter
 
-Found during verification 2026-09-22. Not part of the serving path, but it
-exists and was previously undocumented:
-
-```
-$ systemctl is-active ollama && systemctl is-enabled ollama
-active
-enabled
-$ ss -tlnp | grep 11434
-LISTEN 0 4096 127.0.0.1:11434 0.0.0.0:*
-$ curl -s http://127.0.0.1:11434/api/tags
-{"models":[{"name":"qwen3-coder:30b", ... "parameter_size":"30.5B",
-            "quantization_level":"Q4_K_M"}]}   # 18.5 GB
-```
-
-- Binds `127.0.0.1:11434` — loopback only, so it is not reachable from the
-  mesh or the LAN, and it does **not** conflict with the VM's Ollama (that
-  one binds `10.100.0.2:11434`, a different address, same port).
-- Holds one model, `qwen3-coder:30b`, last modified 2025-09-12. This is the
-  lineage of the `qwen3-coder-30b` tag that §6 Session 8 describes as the
-  *old dead-architecture* target.
-- **It is CPU-only.** vfio-pci owns both GPUs, so this Ollama has no CUDA
-  device — a 30B model here would run on the 9950X3D at a small fraction
-  of the VM's throughput.
-- Its model store is on the `nvme1n1p4` mount at
-  `/var/lib/docker/volumes/ollama/_data/models` (see §2.4), a Docker
-  volume path — consistent with the retired llama.cpp/Docker era.
-
-**Almost certainly a leftover.** It is enabled, so it starts on every boot
-and holds a service on loopback :11434 forever. Note the tension with §10
-("Don't try to run inference on the host") — that guidance is still
-correct about *why* (no GPU access), but a host Ollama does exist and will
-answer on loopback, which could mislead someone debugging. Decide whether
-to remove it (see §7).
-
----
-
-## 3. Known Hardware Limitations
-
-### 3.1 PCIe Bandwidth Asymmetry
-
-- **Card 1** (host bus `01:00.0`, slot 1): PCIe 4.0 ×16 — full bandwidth
-- **Card 2** (host bus `05:00.0`, slot 2): PCIe 4.0 ×1 — bandwidth-limited
-
-Slot 2 is chipset-attached with only 1 lane wired on this consumer board.
-16× reduction in inter-GPU communication bandwidth.
-
-**Impact:**
-- Model loading to Card 2 is ~10-20× slower (but happens once at
-  container/service start; not user-visible thereafter)
-- Tensor-parallel inference (vLLM-style) would bottleneck on ×1 link
-- **Pipeline-parallel inference (Ollama/llama.cpp default) is largely
-  unaffected** — inter-GPU traffic per token is small enough that ×1
-  handles it fine
-- Measured throughput: 19 tok/s on 70B Q4_K_M, consistent across runs
-- No thermal throttling issues in practice (validated by 30-min burn-in)
-
-**This is why vLLM is parked.** The choice of serving engine is dictated by
-this one wire:
-
-| | inter-GPU traffic | ×1 link | status |
+| Service | Bind | Reachable from | Gate |
 |---|---|---|---|
-| Pipeline-parallel (Ollama/llama.cpp) | small per token — activations at layer boundaries | fine | **active** |
-| Tensor-parallel (vLLM) | large per token — all-reduce every layer | bottleneck | **parked** |
+| Open WebUI | `${BACKEND_WG_IP}:3000` | `${EDGE_WG_IP}` | `WALTER-PUBLISHED` |
+| Pocket-ID | `${BACKEND_WG_IP}:1411` | `${EDGE_WG_IP}` | `WALTER-PUBLISHED` |
+| LiteLLM | `${BACKEND_WG_IP}:4000` | `${EDGE_WG_IP}`, Walter | `WALTER-PUBLISHED` |
+| Postgres 17 | gateway docker network only | LiteLLM | not published |
+| telemetry app | `${BACKEND_WG_IP}:3200` (host network) | `${EDGE_WG_IP}` | ufw on `wg0` |
+| llama-swap | `${BACKEND_WG_IP}:8080` | `${GATEWAY_DOCKER_SUBNET}`, Walter | ufw + API key |
+| llama-server instances | `127.0.0.1:10001+` | llama-swap | loopback |
+| Prometheus / Grafana | `127.0.0.1:9090` / `127.0.0.1:3001` | SSH tunnel | loopback |
+| node-exporter, cAdvisor, dcgm-exporter, blackbox | `127.0.0.1` | Prometheus | loopback |
+| SSH | `${BACKEND_LAN_IP}:22` | home LAN | |
 
-vLLM is not a worse engine; it is the wrong engine *for this slot wiring*.
-The repo deliberately retains the vLLM-generation artifacts
-(`scripts/vllm-serve.bash`, `unit-files/vllm.service`,
-`nginx-configs/nginx.conf`, and the `/v1/` nginx block) so the path can be
-revived rather than rebuilt.
+### Covenant
 
-**Planned upgrade:** ASUS ProArt X870E-Creator WiFi board (~$550). Supports
-×8/×8 bifurcation with both primary slots populated. PCIe 5.0 ×8 to each
-card is bandwidth-equivalent to PCIe 4.0 ×16, saturating the 3090s'
-capability. Would eliminate the asymmetry — and is therefore the gate on
-un-parking vLLM.
+| Service | Bind | Reachable from |
+|---|---|---|
+| nginx | `:80`, `:443` | internet |
+| WireGuard | `udp/${WG_PORT}` | internet (Walter dials in) |
+| SSH | `:22` | internet, fail2ban-protected |
+| oauth2-proxy | `127.0.0.1:4180` | nginx |
 
-**Longer-term consideration:** HEDT platform (Threadripper 7960X + TRX50
-board) for true dual-×16 and expansion room for 3-4 GPUs. Deferred until
-workload demands it.
+### Workstation
 
-### 3.2 Ollama Model Swap Limitation
+| Service | Bind | Reachable from |
+|---|---|---|
+| hermes-gateway | `${HYPERVISOR_BRIDGE_IP}:8642` | the libvirt bridge (Walter) |
 
-VRAM budget is 48 GB total (24 GB per card). The 70B Q4_K_M model uses ~42
-GB with KV cache. This leaves ~6 GB free — not enough to hot-load a second
-large model. Small models (7B and under) can coexist.
+## Trust boundaries and firewall model
 
-For a second large model, either:
-- Reduce 70B context (`num_ctx`) to free VRAM
-- Accept swap latency (~30 seconds to unload 70B and load another)
-- Wait for the ProArt upgrade + more VRAM or additional cards
-
----
-
-## 4. Performance Baseline
-
-Measured on the current setup (Sep 2026):
-
-| Metric | Value |
-|---|---|
-| Model | Llama 3.3 70B Instruct, Q4_K_M |
-| VRAM allocation | ~21 GB per card, near-symmetric |
-| Cold start (Ollama load) | ~15-20 seconds |
-| Warm start (already loaded) | 0 seconds |
-| Token generation rate | ~19 tokens/second |
-| Prompt processing | Fast, not measured |
-| Idle power per card | ~20-25 W |
-| Sustained inference power per card | ~280 W |
-| Sustained gpu-burn power per card | ~340-350 W (validated) |
-| Peak thermal per card under burn | 72-82°C (validated) |
-| Thermal throttle during 30-min burn | Card 1: 0s / Card 2: 57s of 1800s |
-
-Save this as the baseline. When the ProArt upgrade happens, rerun the
-same test to quantify the improvement from proper PCIe wiring.
-
-**Reproduce it with `scripts/inference-baseline.sh`** (run inside the VM —
-the host cannot, since vfio-pci owns the GPUs). It derives tok/s from
-Ollama's own `eval_count`/`eval_duration` counters rather than wall-clock,
-and reports `pcie.link.gen.current` / `pcie.link.width.current` per card —
-which is the single clearest before/after signal for the upgrade, since the
-whole point is turning ×16 + ×1 into ×8 + ×8. Cold-start measurement is
-opt-in because it must evict the resident model, making the next real query
-pay a 15-20s reload.
-
----
-
-## 5. Boot & Recovery Behavior
-
-**On host boot:**
-- Kernel 6.14.0-37 boots (GRUB_DEFAULT pins it)
-- vfio-pci claims both GPUs automatically
-- libvirt starts
-- **VM autostart is ON** as of 2026-09-22. It was found off during
-  verification and enabled at operator request; the boot path below now
-  completes unattended. Original finding, for the record:
-  ```
-  $ virsh -c qemu:///system dominfo agent-sandbox-3090
-  State:          running
-  Persistent:     yes
-  Autostart:      disable      <-- confirmed
-  ```
-  `virsh list --autostart` returns an empty list and
-  `/etc/libvirt/qemu/autostart/` does not exist, both corroborating.
-
-  At that point an unattended reboot would **not** have brought inference
-  back up. The then-running VM had been started by hand — the journal shows
-  `virsh start agent-sandbox-3090` run via sudo 68 seconds after boot, not
-  by autostart. (`libvirt-guests.service` is enabled but has nothing to
-  resume: `Managed save: no`.)
-
-  **Enabled 2026-09-22** (no sudo needed — `bishop` is in group `libvirt`):
-  ```bash
-  virsh -c qemu:///system autostart agent-sandbox-3090            # done
-  virsh -c qemu:///system autostart --disable agent-sandbox-3090  # revert
-  ```
-  Confirmed by `dominfo` (`Autostart: enable`), `list --autostart`, and the
-  symlink `/etc/libvirt/qemu/autostart/agent-sandbox-3090.xml`.
-
-  Accepted consequence: the VM now claims both GPUs and ~42 GB of VRAM on
-  every boot, at ~20-25 W/card idle. **Still to prove: an actual reboot.**
-  The setting is verified; the end-to-end unattended recovery is not.
-
-  > **Command correction:** earlier revisions of this doc said to check
-  > with `virsh domautostart <domain>`. **That subcommand does not
-  > exist** — on libvirt 10.0.0 it returns
-  > `error: unknown command: 'domautostart'`. There is no `dom`-prefixed
-  > form. Read the state with `virsh dominfo <domain>` or
-  > `virsh list --autostart`; set it with `virsh autostart <domain>`.
-
-**On VM boot:**
-- Ubuntu boots, NVIDIA driver loads for both cards
-- `wg-quick@wg0.service` starts WireGuard, connects to EC2
-- `ollama.service` starts, binds `0.0.0.0:11434` (§2.3 — reachable only
-  on `wg0` because of the ufw scope, §2.3.1)
-- Model is NOT preloaded — first user query triggers ~15-20s load
-- Once loaded, `OLLAMA_KEEP_ALIVE=-1` keeps it resident indefinitely
-
-**Preload unit now exists in the repo, not yet installed.**
-`unit-files/ollama-preload.service` eliminates the 15-20s first-query
-penalty. Install instructions are in its header comment. Design notes:
-
-- Polls `/v1/models` on a bounded 1s/60-attempt loop rather than
-  `sleep`-ing, because `After=ollama.service` only means systemd started
-  the process — the listening socket appears later, and here it is also
-  gated on `wg0` having configured `10.100.0.2` (Ollama binds that address,
-  not `0.0.0.0`).
-- Both `Exec` lines are `-`-prefixed and dependencies are `Wants=` rather
-  than `Requires=`, so a failed warm-up degrades to today's behaviour
-  (first real query pays the cold start) and can never fail the boot.
-
-Note it is `WantedBy=multi-user.target` **inside the VM**, so it only helps
-once the VM is actually running — which currently requires a manual
-`virsh start`. Enabling VM autostart above is the prerequisite for
-unattended warm recovery.
-
-**On EC2 boot:**
-- nginx starts (`nginx.service` enabled)
-- WireGuard server starts
-- UI is served immediately
-
----
-
-## 6. Recent Work Log (Sep 2026)
-
-**Session 1 — Ubuntu recovery:**
-- Broken `apt upgrade` on the host cascaded into NVIDIA driver, kernel,
-  Secure Boot MOK, and HWE track issues
-- Enrolled MOK, switched HWE to version-locked `linux-generic-6.14`,
-  restored 580.126.20 driver stack
-- Deliverable: `ubuntu-kernel-nvidia-troubleshooting.md` runbook
-
-**Session 2 — Patching script:**
-- Built `inference-host-patch.sh` — staged base/Docker/NVIDIA/cleanup
-  passes with autoremove blocklist, dry-run default, vfio-pci awareness
-- Companion `README.md`
-- ~~To be added to `installation-343` repo~~ — **done.** Committed there
-  as `scripts/patch-virt-host.sh` + `scripts/PATCH-VIRT-HOST-README.md`
-  (commit `9d36bdd`, PR #23). The name `inference-host-patch.sh` above is
-  historical and matches no file on disk; see §9.
-
-**Session 3 — Real patch cycle:**
-- Applied ~500 package backlog via the 3-pass model
-- NVIDIA 580.126.20 → 580.178.04, Docker CE 29.4 → 29.8.1, kernel
-  6.14.0-35 → 6.14.0-37
-- Autoremove purged 401 orphans (Steam ecosystem, Debian Node.js)
-- Reclaimed ~2 GB
-
-**Session 4 — Dual GPU installation:**
-- Added second RTX 3090, new PSU (be quiet! 1200W), open-air workbench
-- Discovered PCIe ×1 limitation on slot 2 (accepted for now)
-- IOMMU groups verified clean, both cards in separate groups
-- vfio-pci already claimed both via ID-based binding (no config change
-  needed)
-
-**Session 5 — VM XML update:**
-- Added 3 more `<hostdev>` blocks to `agent-sandbox-3090` for card 1
-  audio, card 2 GPU, card 2 audio
-- Bumped VM specs: 32 GB RAM, 16 vCPUs
-- Both cards visible in guest, driver loaded correctly
-
-**Session 6 — Burn-in validation:**
-- Individual card FP32 burn: both cards pass, ~340W sustained
-- Dual-card 30-minute burn: 0 errors, minor thermal throttle on card 2
-  (~3% of run), no PSU trips, no crashes
-- Hardware validated
-
-**Session 7 — Ollama setup:**
-- Installed Ollama in VM
-- Pulled `llama3.3:70b-instruct-q4_K_M` (~40 GB)
-- Created custom `llama3.3-70b-fullgpu:latest` via Modelfile with
-  `num_gpu 999`
-- Verified full GPU offload (no CPU spillover), 19 tok/s baseline
-
-**Session 8 — UI cutover:**
-- Diagnosed dead architecture: old llama.cpp Docker container had been
-  stopped 4 months prior, `/v1/llama/` endpoint pointing at dead port
-  8080
-- Resolved zombie `ollama serve` process holding port 11434 (had been
-  crash-looping systemd for hours)
-- Updated nginx `/v1/llama/` block: port 8080 → 11434
-- Updated `index.html` MODELS dict: `qwen3-coder-30b` →
-  `llama3.3-70b-fullgpu:latest`
-- End-to-end streaming confirmed working through browser
-
----
-
-## 7. Known Gaps / Open Items
-
-Re-verified against reality 2026-09-22. Items are grouped by whether they
-need a decision or just work.
-
-### 7.1 Resolved / narrowed since last revision
-
-- **~~VM autostart~~ → ENABLED 2026-09-22. DONE.** Was confirmed off, then
-  turned on at operator request:
-  ```
-  $ virsh -c qemu:///system autostart agent-sandbox-3090
-  Domain 'agent-sandbox-3090' marked as autostarted
-  $ virsh -c qemu:///system dominfo agent-sandbox-3090 | grep Autostart
-  Autostart:      enable
-  ```
-  Corroborated by the new symlink
-  `/etc/libvirt/qemu/autostart/agent-sandbox-3090.xml`. No sudo was needed
-  (`bishop` is in group `libvirt`). **Not yet proven by an actual reboot** —
-  that is the real test, and worth doing deliberately rather than
-  discovering at the next power cut.
-- **~~Patching script not committed~~ → already committed, under a
-  different name.** It lives in the *other* repo,
-  `~/source/installation-343`, as `scripts/patch-virt-host.sh` plus
-  `scripts/PATCH-VIRT-HOST-README.md` (commit `9d36bdd`, PR #23). §6
-  Session 2 calls it `inference-host-patch.sh`; no file by that name
-  exists anywhere on the host. The remaining repo TODO is therefore
-  narrower than previously stated: **VM XML, nginx config, UI HTML, and
-  the runbook.**
-- **Public edge auth → present and verified.** TLS + basic auth gate the
-  whole site (§2.1). This does **not** close the Ollama item below — see
-  the layering note there.
-
-### 7.2 Needs a decision from the operator
-
-- **Host-side Ollama (§2.5): remove or keep?** `active` and `enabled` on
-  loopback :11434 with a stale `qwen3-coder:30b`. CPU-only, so of little
-  use, and a plausible source of confusion for a future debugger who
-  curls `localhost:11434` and gets a *different* Ollama than the one
-  serving traffic. Removal is `sudo systemctl disable --now ollama` on the
-  **host** (never in the VM).
-- **Ollama binds `0.0.0.0`; ufw is the only control (§2.3, §2.3.1).**
-  The highest-value item on this list. Tightening `OLLAMA_HOST` to
-  `10.100.0.2:11434` adds an independent second control, but introduces a
-  startup-ordering dependency on `wg-quick@wg0.service` (bind fails with
-  `EADDRNOTAVAIL` if wg0 is not up yet). Trade-off and the exact
-  directives are documented in `unit-files/ollama-override.conf`. Must be
-  tested with a **reboot**, not a restart — a restart passes while wg0 is
-  already up and hides the race. Deliberately not applied.
-- **~~ufw rule for 11434~~ → already present and required. NOTHING TO DO.**
-  Resolved 2026-09-22. The tunnel itself needs no inbound rule (the VM
-  dials out), but traffic *arriving* over it does, and
-  `11434/tcp on wg0 ALLOW IN` is what makes inference work. It was never
-  missing — only undocumented. Now §2.3.1.
-- **Stale ufw rule: `8080/tcp on wg0`.** Port 8080 was the llama.cpp Docker
-  container stopped ~4 months ago (§6 Session 8). Nothing listens there.
-  Safe to remove: `sudo ufw delete allow in on wg0 to any port 8080`.
-  Left in place pending operator confirmation.
-- **Runbook is stale and uncommitted.** Two identical copies sit in
-  `~/Downloads/` (`ubuntu-kernel-nvidia-troubleshooting.md` and
-  `...(1).md`, 19426 bytes each). Dated 2026-04-19 and written when the
-  box had a **single** 3090 with the AMD iGPU driving display — so it
-  predates the dual-GPU and vfio-pci-both-cards reality. Needs updating
-  before it is trusted, then committing.
-
-### 7.3 Straightforward work
-
-- **Preload service not installed.** Unit now exists at
-  `unit-files/ollama-preload.service`; needs installing in the VM. Note
-  it only helps after the VM is up, so it pairs with the autostart
-  decision.
-- **No auth on the Ollama endpoint itself.** Still true and still worth
-  noting, despite the nginx basic auth. The two live at different layers:
-  nginx protects the **public** path (`443 → /v1/llama/`), but a peer
-  already on the WireGuard mesh reaching `10.100.0.2:11434` **directly**
-  bypasses nginx entirely and meets no authentication, because Ollama has
-  no API-key mechanism. Low risk while the mesh is just EC2 ⇄ VM;
-  revisit before adding peers.
-- **The parked `/v1/` catch-all.** Keep it — reclassified from "dead
-  weight" to parked (§2.1, §3.1). It cannot shadow `/v1/llama/` because
-  nginx matches prefixes longest-first.
-- **Commented-out dropdown options in UI.** `/v1/fast` (Hermes-4 14B) and
-  `/v1/big` (Hermes-4 70B) placeholders. Either wire up or delete. Note
-  the VRAM budget (§3.2) only permits a small second model.
-- **`llama3.3:70b-instruct-q4_K_M` base tag** can be removed once
-  confident in the `-fullgpu` variant; disk cost is ~zero due to blob
-  dedup, so this is cosmetic.
-- **Baseline is now reproducible.** `scripts/inference-baseline.sh` exists
-  to re-run §4's measurements; previously the numbers were recorded with
-  no way to reproduce them.
-
----
-
-## 8. Common Operations
-
-### Restart the inference stack
-
-```bash
-# On host, restart the VM
-sudo virsh shutdown agent-sandbox-3090
-# Wait for shutoff
-sudo virsh start agent-sandbox-3090
-# VM boots, WireGuard reconnects, Ollama starts
-# First query after this triggers model load (~15-20s)
+```
+internet | Covenant (ufw, fail2ban, nginx allowlist + limits) | wg0 | Walter (DOCKER-USER + ufw) | loopback (models, monitoring)
 ```
 
-### Restart just Ollama (VM stays up)
+1. **Internet to Covenant.** ufw allows 22, 80, 443 and `udp/${WG_PORT}`; the cloud security group matches. fail2ban runs `sshd` (with `journalmatch` for Ubuntu 24.04's `ssh.service`), `nginx-limit-req` and `recidive`. An unknown `Host` gets nginx's 444. The apex redirects to `chat.`.
+2. **Covenant to Walter.** The only path is the tunnel. On Walter, Docker-published ports bypass ufw, so `docker-user-rules.service` installs a chain `WALTER-PUBLISHED` hooked from `DOCKER-USER` that admits ports 3000, 1411 and 4000 only from `${EDGE_WG_IP}` and drops the rest. The telemetry app uses host networking, which bypasses that chain, so it is gated by ufw instead: `allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200`. (Port 3200 is also listed in the chain script for consistency.)
+3. **Gateway to models.** ufw allows `${BACKEND_WG_IP}:8080` only from `${GATEWAY_DOCKER_SUBNET}`; the gateway compose network is pinned to that subnet so the rule stays valid. llama-swap also requires its own API key. llama-server containers bind loopback.
+4. **Forwarded headers.** Every app behind the edge trusts `X-Forwarded-*` from `${EDGE_WG_IP}` only:
+   - Open WebUI: `FORWARDED_ALLOW_IPS=${EDGE_WG_IP}`
+   - Pocket-ID: `TRUST_PROXY=true`, reachable only from the edge
+   - LiteLLM: `trusted_proxy_ranges` = `${EDGE_WG_IP}/32`
 
-```bash
-# SSH into VM as operator
-sudo systemctl restart ollama
+   This keeps client IPs correct for rate limiting and logs without letting anything else spoof them.
+5. **Identity.** Pocket-ID is the only IdP. `/setup` is locked to `${ADMIN_SOURCE_IPS}` in nginx until the admin is claimed; after that the lock snippet is removed and the setup API returns 404.
 
-# Model reloads on first query
-```
+## llama-swap matrix and GPU placement
 
-### Check current state
+GPU0 sits on the CPU's x16 slot; GPU1 sits on a chipset x1 slot. Single-GPU models are pinned with `--gpus device=N -sm none`; split models use `-sm layer -ts 1,1`. Every model runs `--fit off -ngl all -np 1 -fa on -ctk q8_0 -ctv q8_0 --jinja --metrics`, so a model that does not fit fails at load instead of shrinking.
 
-```bash
-# ---- On host (no sudo needed: user `bishop` is in group `libvirt`) ----
-virsh -c qemu:///system list --all           # VM state
-virsh -c qemu:///system dominfo agent-sandbox-3090   # incl. Autostart
-virsh -c qemu:///system domblklist agent-sandbox-3090  # disk paths
-lspci -nnk -s 01:00.0   # vfio-pci owns card 1 (x16 slot)
-lspci -nnk -s 05:00.0   # vfio-pci owns card 2 (x1 slot)
-ping -c2 10.127.10.160  # VM alive on libvirt NAT (iac127-nat)
+| Model ID | Alias | GPU | Context | Extra |
+|---|---|---|---|---|
+| `qwen3.8-27b` | `coder` | 0 | 131072 | MTP: `--spec-type draft-mtp --spec-draft-n-max 2` (22.6 GB) |
+| `qwen3.6-35b-a3b` | `coder-fast` | 1 | 131072 | |
+| `qwen3-coder-next` | `big` | 0+1 | 131072 | `ttl` 1800 s, evict cost 5 |
+| `gemma-4-31b` | `vision` | 0+1 | 131072 | `--mmproj`, `--ctx-checkpoints 8`, `ttl` 1800 s |
+| `hermes-4.3-36b` | `hermes` | 0+1 | 65536 | `ttl` 1800 s |
 
-# ---- On VM (via SSH or `virsh console`) ----
-nvidia-smi                           # confirm both cards visible
-ollama list                          # loaded models
-sudo ss -tlnp | grep 11434           # Ollama binding
-sudo systemctl status ollama         # service state
-sudo wg show wg0                     # WireGuard status
+Matrix sets (which models may be resident together):
 
-# ---- On EC2 ----
-sudo systemctl status nginx          # nginx state
-sudo wg show wg0                     # WireGuard status
-curl -s http://10.100.0.2:11434/v1/models | jq .  # Ollama over the tunnel
+| Set | Members | When |
+|---|---|---|
+| `coding` | `coder` + `coder-fast` | Default. Preloaded at startup. |
+| `big` | `big` | Evicts the pair; unloads after 30 min idle. |
+| `vision` | `vision` | Evicts the pair. |
+| `hermes` | `hermes` | Evicts the pair. |
 
-# ---- From anywhere: is the public edge alive? ----
-curl -sS -o /dev/null -w '%{http_code}\n' https://343-guilty-spark.io/
-# 401 is CORRECT and healthy -- basic auth is working (see 2.1).
-```
+The `big` model has an eviction cost of 5 because loading it moves about 40 GB, half of it over the x1 link. After a split model unloads, the next `coder` or `coder-fast` request reloads the pair (about 9 s and 16 s).
 
-> **Do not run the `10.100.0.2` curl on the host.** The host has no
-> WireGuard (§2.2) and therefore no route to `10.100.0.0/24`; it will hang
-> until timeout. That is expected, not a fault. Use the EC2 side, or reach
-> the guest on `10.127.10.160`.
->
-> Also note `curl localhost:11434` **on the host** answers — but that is
-> the unrelated leftover host Ollama (§2.5), not the serving instance.
+Each model runs as a llama.cpp `server-cuda` container pinned by digest. Containers start through `spark-docker-run.sh`, which waits until the previous container of the same name is gone. Without it, a config reload raced the old container's removal and left both models down until the next request. `cmdStop` uses `docker rm -f` because it is synchronous.
 
-### Update the model
+## The gateway hook: mid-conversation system messages
 
-```bash
-# On VM
-ollama pull <new-model-tag>
+Claude Code inserts `system` or `developer` messages in the middle of a conversation, for example environment updates and tool changes. Qwen's chat template rejects them with "System message must be at the beginning". llama-server turns that into HTTP 500, and Claude Code then retries for about three minutes.
 
-# If replacing the served model, create a new Modelfile-derived variant
-cat > /tmp/Modelfile <<'EOF'
-FROM <new-model-tag>
-PARAMETER num_gpu 999
-PARAMETER num_ctx 4096
-EOF
-ollama create <new-alias> -f /tmp/Modelfile
+The fix lives in the gateway, not the client. `spark_hooks.py` is a LiteLLM pre-call hook (shipped under [walter/](walter/README.md)) that rewrites every system or developer message after the first into a user message wrapped in `<system-reminder>` tags. It covers `/v1/messages`, `/v1/chat/completions` and `/v1/responses`.
 
-# Then on EC2, update /var/www/spark/index.html MODELS dict to point at
-# the new alias. No nginx changes needed.
-```
+Why here:
+- It protects every harness and every model behind the alias, not only one client config.
+- The client-side workaround was an undocumented Claude Code variable (`CLAUDE_CODE_MODEL_CAPABILITIES="-mid_conv_system,-mid_conv_tool_change"`) found in the binary, which can break on any upgrade. It is no longer needed.
+- It also fixed `coder-fast` silently dropping Claude Code's environment information.
 
-### Add a second model to serve concurrently
+## Backups and restore
 
-VRAM budget is tight (~6 GB free after 70B loads). Small models only.
+- `spark-backup.timer` runs `spark-backup.sh` daily at 03:30 UTC (up to 10 min random delay) with `Persistent=true`, so a run missed while Walter was off happens at the next boot.
+- Snapshots go to `${MODELS_DIR}/backups/<YYYY-mm-dd_HHMM>/`, on a different disk from the root filesystem. Retention: the newest of each of the last 14 days plus the newest of each of the last 8 Sundays. `LAST_OK` names the last full success.
+- Contents: `pg_dump -Fc` of LiteLLM plus roles; online SQLite `.backup` of Open WebUI and Pocket-ID (integrity-checked); `pocket-id export`; volume tarballs without the live DB files; a config tarball of `/srv/*/`, `/etc/llama-swap`, units, scripts, ufw rules, fstab and the Hermes config; a manifest of versions and digests; `SHA256SUMS`.
+- Snapshots are root-only (700/600) and **not encrypted**; they contain every secret. Offsite (restic to object storage with a bucket-scoped credential) is planned, not built.
+- `spark-backup-restore-test.sh` restores the latest snapshot into throwaway containers and checks it. It is non-destructive.
+- Restore steps per component, and a whole-VM rebuild, ship with the backup units in [walter/](walter/README.md) and are installed as `${MODELS_DIR}/backups/RESTORE.md`. Two traps: a restored Pocket-ID needs `DELETE FROM francis_hosts;` (a stale cluster heartbeat) before it starts, and Pocket-ID's signing keys are encrypted with `ENCRYPTION_KEY`, so the env file must come from the same snapshot.
 
-```bash
-# On VM
-ollama pull qwen2.5:1.5b   # or similar small model
+## Monitoring and telemetry
 
-# On EC2, add to MODELS in index.html:
-#   "/v1/fast": "qwen2.5:1.5b"
-# And uncomment the <option value="/v1/fast"> line in the header select.
-# Reload page — nginx routes /v1/fast/ to same Ollama backend, model tag
-# in the request body picks which model responds.
-```
+- `/srv/monitoring` on Walter: Prometheus, Grafana, node-exporter, cAdvisor, dcgm-exporter, blackbox and a small llama-swap target discovery that adds each running llama-server's `/metrics`. All bind 127.0.0.1. 16 targets, 12 alert rules, 3 dashboards.
+- Access: `ssh -N -L 3001:127.0.0.1:3001 -L 9090:127.0.0.1:9090 ${BACKEND_SSH_USER}@${BACKEND_LAN_IP}`.
+- LiteLLM `/metrics` is unauthenticated (an accepted trade-off). Only Walter and Covenant can reach it, and nginx on `api.` returns 404 for it.
+- The telemetry dashboard (above) is the read-only, browser-friendly view of the same Prometheus data.
+- Telemetry gaps: llama-server updates its token counters only when a request finishes, so live speed is shown as decode steps per second; there is no KV-cache usage metric; per-key spend is not shown (costs are 0).
 
-### Rebuild the VM (if it gets wedged)
+## Update check
 
-The VM's disk image is at
-**`/data/iac127/disks/agent-sandbox-3090.qcow2`** (on the host's XFS
-`/data` partition), with a cloud-init seed at
-`/data/iac127/seeds/agent-sandbox-3090-seed.iso`. Confirm with:
+`spark-update-check.timer` runs Mondays at 09:00 UTC (`Persistent=true`). It is **report-only**: it never pulls, upgrades or restarts.
 
-```bash
-virsh -c qemu:///system domblklist agent-sandbox-3090
-```
+- It checks every image in `/srv/*/compose.yaml` and in the llama-swap config for digest drift against the registry, compares GitHub releases (llama.cpp `bNNNN`, LiteLLM, Open WebUI, Pocket-ID, llama-swap, hermes-agent), and evaluates GitHub security advisories against the running version. For a digest-only image reference it reads the tag from the comment next to it, so keep those comments accurate.
+- It also reports pending apt and `-security` updates, reboot-required, held packages, the NVIDIA driver against the apt candidate, and Docker and container-toolkit versions.
+- Output: `/var/lib/spark-update-check/latest.md`, plus a one-line summary in the login banner. Exit codes: 0 OK, 10 updates available, 20 advisories affect current versions, 1 checker error.
+- Covenant has no inbound key from Walter, so its check (`spark-edge-check`: apt security count, cert expiry, ufw, fail2ban, `nginx -t`) runs manually from the workstation.
 
-> **Path correction:** earlier revisions said
-> `/data/libvirt/images/agent-sandbox-3090.qcow2`. **That directory does
-> not exist.** Storage is namespaced under `/data/iac127/` with libvirt
-> pools `disks`, `isos`, `seeds`, `tmp`. Do not follow the old path — a
-> rebuild guided by it would not find the disk.
+How to act on the report: [docs/runbooks/upgrade.md](docs/runbooks/upgrade.md).
 
-Back up the XML with `virsh dumpxml agent-sandbox-3090 > backup.xml`
-before any risky operations. Note `/etc/libvirt/qemu/agent-sandbox-3090.xml`
-is `0600 root:root`, so read it via `virsh dumpxml` rather than `cat`.
+## Known quirks and gotchas
 
-Full rebuild would require:
-1. `virsh undefine agent-sandbox-3090` and delete qcow2
-2. Install fresh Ubuntu VM (or restore from a backup image if available)
-3. Re-attach GPUs via 4 `<hostdev>` blocks (see Session 5 notes)
-4. Reinstall NVIDIA driver in guest, then Ollama
-5. Reconfigure WireGuard peer
-6. Recreate Modelfile and pull models
+**Models and llama.cpp**
+- Qwen and Gemma think by default. A small `max_tokens` returns empty content; clients need a bigger budget or `enable_thinking: false`.
+- The startup preload logs `status 404` for each model, yet both models load and stay warm. Harmless; cause unknown.
+- Loads over the x1 link are slow: `coder-fast` ~16 s, `big` ~20 s.
 
----
+**LiteLLM**
+- In LiteLLM 1.103.x, `openai/` deployments route `/v1/messages` through the Responses adapter, which drops llama-server's reasoning. Every alias therefore sets `model_info.supported_endpoints: ["/v1/chat/completions","/v1/responses","/v1/messages"]`, so Messages pass straight through to llama-server. Keep this on new aliases.
+- Reasoning is not returned as Anthropic `thinking` blocks on the translated paths, and the `/v1/responses` reasoning summary is empty.
+- `count_tokens` is estimated by LiteLLM and undercounts; it also logs a harmless 404 ERROR.
+- Settings: `drop_params: true`, 900 s timeouts, `num_retries: 0`.
 
-## 9. Repos & Files of Interest
+**Harnesses**
+- Claude Code sends about 15K tokens of system prompt and tools per request. Context is set to 131072 with auto-compact at 85% and max output 16384. Its default `auto` permission mode runs the safety classifier on the local model; use `--permission-mode default` or `acceptEdits` for anything sensitive.
+- Codex 0.159 only supports `wire_api="responses"` and needs the custom model catalog, otherwise it assumes a 272K window. Its sandbox needs an AppArmor profile for `bwrap` on Ubuntu 24.04.
+- Plain `hermes` gets a 401; use `hermes-spark`. Never run `hermes update`: it jumps to `main`, not the next release.
 
-### Repos
+**Open WebUI and Pocket-ID**
+- `ENABLE_PERSISTENT_CONFIG=false`: `.env` is the source of truth and admin-panel changes to those settings do not survive a restart.
+- A model with no access grant is visible to admins only. Add a public-read grant for each new alias.
+- The `local/*` models also appear in the model list; hide them in Admin → Models if wanted.
+- The cyberpunk theme (`custom.css` and self-hosted OFL fonts, mounted read-only into `/app/build/static/`) applies in dark mode only. There is no server-side default theme, so users pick Dark in Settings → General. Open WebUI's branding is left intact as its license requires.
 
-- **`local-inference-deck`** (this repo) — holds this document plus the
-  serving artifacts:
-
-  | Path | Generation | Status |
-  |---|---|---|
-  | `ARCHITECTURE.md` | — | this document |
-  | `nginx-configs/spark-ollama.conf` | current | template matching live EC2 |
-  | `unit-files/ollama-override.conf` | current | matches live VM drop-in |
-  | `unit-files/ollama-preload.service` | current | **not yet installed** (§7.3) |
-  | `models/Modelfile.llama3.3-70b-fullgpu` | current | matches served model |
-  | `scripts/inference-baseline.sh` | current | re-runs §4 measurements |
-  | `nginx-configs/nginx.conf` | vLLM | **parked** (§3.1) |
-  | `unit-files/vllm.service` | vLLM | **parked** |
-  | `scripts/vllm-serve.bash` | vLLM | **parked** |
-  | `server/index.html` | stale | **drifted from live** — see below |
-  | `wireguard-configs/` | — | empty; real confs live on the hosts, uncommitted |
-
-  > **`server/index.html` is not the live UI.** The committed copy has a
-  > hardcoded `ENDPOINT = "/v1/chat/completions"` and no model selector.
-  > The live `/var/www/spark/index.html` uses a `MODELS` dict targeting
-  > `/v1/llama` and a different persona (humor 85 / honesty 95 vs 75 / 90).
-  > Treat the live file as source of truth and re-export it.
-
-- **`installation-343`** — the other private repo, at
-  `~/source/installation-343`. Already holds
-  `scripts/patch-virt-host.sh` and `scripts/PATCH-VIRT-HOST-README.md`
-  (§7.1). §6 Session 2 refers to this script as
-  `inference-host-patch.sh`; that name does not exist on disk.
-
-### Uncommitted, on disk
-
-- `~/Downloads/ubuntu-kernel-nvidia-troubleshooting.md` (and a duplicate
-  `...(1).md`) — the Session 1 runbook. Stale: single-GPU era (§7.2).
-
-### On EC2
-
-- `/etc/nginx/sites-available/343-guilty-spark` (symlinked from `sites-enabled/`)
-- `/etc/nginx/.htpasswd` — basic auth credentials (gitignored; **never commit**)
-- `/etc/letsencrypt/live/343-guilty-spark.io/` — certbot material
-- `/var/www/spark/index.html` — the real UI
-- `/etc/wireguard/wg0.conf`
-
-### On host (`bishop-X870-GAMING-WIFI6`)
-
-- `/etc/modprobe.d/vfio.conf` — verified byte-for-byte against §2.4
-- `/etc/default/grub` — kernel pinning; also carries
-  `amd_iommu=on iommu=pt`
-- `/etc/libvirt/qemu/agent-sandbox-3090.xml` — `0600 root:root`; read via
-  `virsh dumpxml`
-- `/data/iac127/disks/agent-sandbox-3090.qcow2` — VM disk
-- `/data/iac127/seeds/agent-sandbox-3090-seed.iso` — cloud-init seed
-- `/var/lib/shim-signed/mok/MOK.der` — enrolled MOK
-- *(no `/etc/wireguard/` — WireGuard is not installed here, §2.2)*
-
-### On VM (`agent-sandbox-3090`, user `operator`)
-
-- `/etc/systemd/system/ollama.service.d/override.conf`
-- `/etc/wireguard/wg0.conf`
-- Model store: `~/.ollama/` or `/usr/share/ollama/.ollama/` — depends on
-  the service user; **still unverified** (needs guest access)
-
-## 10. Handoff Notes
-
-If you're picking this up cold, the fastest way to grok the state:
-
-1. Read Section 1 (architecture diagram)
-2. Verify current state with commands in Section 8 — confirms nothing
-   drifted between this document and reality
-3. Look at Section 7 (open items) to see what could be worth doing next
-4. Reference sections 2-4 as needed for component details
-
-The single most important thing to know: **the VM does all the work.** The
-host is just a passthrough platform. The EC2 is just a frontend. Debugging
-inference issues means SSHing into the VM (`operator@agent-sandbox-3090`,
-reachable via libvirt console from the host or over WireGuard as
-`10.100.0.2`).
-
-Don't try to run inference on the host — vfio-pci owns the GPUs, so
-`nvidia-smi` on the host will fail and CUDA workloads won't work. This is
-by design, not a bug.
-
-If Ollama seems to be misbehaving, first check for zombie `ollama serve`
-processes with `sudo ss -tlnp | grep 11434`. The systemd service and a
-stray foreground process can conflict, and the resulting crash-loop is
-silent unless you check `journalctl -u ollama`.
-
-**There are two Ollamas on this hardware — do not confuse them.**
-
-| | binds | GPUs | role |
-|---|---|---|---|
-| **VM** `agent-sandbox-3090` | `10.100.0.2:11434` | both 3090s | **serves production traffic** |
-| **Host** (leftover, §2.5) | `127.0.0.1:11434` | none (CPU-only) | stale `qwen3-coder:30b` |
-
-Same port, different addresses, so they coexist without conflict — but
-`curl localhost:11434` **on the host** answers from the wrong one. When
-debugging inference, confirm you are talking to the VM's instance. Running
-`systemctl restart ollama` on the host restarts the leftover and will
-appear to do nothing, because production Ollama is inside the guest.
+**Hosts**
+- Walter: Ollama is retired but installed. A drop-in (`ConditionPathExists=/etc/ollama-enabled`) stops other units' `Wants=` from starting it at boot.
+- Walter: nvidia-persistenced must start before anything GPU-bound; services that raced the driver at boot came up CPU-only.
+- Hypervisor: `nvidia-cdi-refresh.{path,service}` is masked because both GPUs belong to `vfio-pci` and `nvidia-smi` cannot run there. Unmask it if a GPU ever returns to the host.
+- Hypervisor: refer to the models NVMe by `/dev/disk/by-id/...`, never `/dev/nvmeXn1`; the kernel names have swapped between boots.
+- Covenant: Ubuntu 24.04 names the SSH unit `ssh.service`, so the stock fail2ban `sshd` jail matches nothing without a `journalmatch` override.

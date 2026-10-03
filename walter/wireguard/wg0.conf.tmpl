@@ -1,0 +1,9 @@
+[Interface]
+Address    = ${BACKEND_WG_IP}/24
+PrivateKey = @WG_PRIVATE_KEY@
+
+[Peer]
+PublicKey           = ${WG_EDGE_PUBLIC_KEY}
+Endpoint            = ${EDGE_PUBLIC_IP}:${WG_PORT}
+AllowedIPs          = ${WG_SUBNET}
+PersistentKeepalive = 25     # punches/keeps NAT mapping

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# fetch-models.sh -- download the GGUF files that llama-swap's config.yaml expects.
+# Installed to ${MODELS_DIR}/fetch-models.sh. Run as ${BACKEND_SSH_USER} (owner of ${MODELS_DIR}), not root:
+#   ${MODELS_DIR}/fetch-models.sh            # all models
+#   ${MODELS_DIR}/fetch-models.sh coder big  # only these aliases
+#   ${MODELS_DIR}/fetch-models.sh --list
+# Resumable (curl -C -), retried, and each file's size is checked against the size of
+# the copy that is live on Walter. Uses $HF_TOKEN or ~/.cache/huggingface/token if
+# present (none of these repos is gated, so a token is optional). See ../models.md.
+set -u
+DEST=${MODELS_DIR}/gguf
+LOGDIR=${MODELS_DIR}/logs
+
+# alias | HF repo | file | dest subdir | expected bytes
+MODELS='
+coder|unsloth/Qwen3.8-27B-GGUF|Qwen3.8-27B-UD-Q4_K_XL.gguf|qwen3.8-27b|17559178144
+coder-fast|unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf|qwen3.6-35b-a3b|19500506080
+big|unsloth/Qwen3-Coder-Next-GGUF|Qwen3-Coder-Next-UD-IQ4_NL.gguf|qwen3-coder-next|39234725888
+vision|unsloth/gemma-4-31B-it-qat-GGUF|gemma-4-31B-it-qat-UD-Q4_K_XL.gguf|gemma-4-31b-qat|17287670048
+vision|unsloth/gemma-4-31B-it-qat-GGUF|mmproj-BF16.gguf|gemma-4-31b-qat|1200726496
+hermes|NousResearch/Hermes-4.3-36B-GGUF|hermes-4_3_36b-Q4_K_M.gguf|hermes-4.3-36b|21762145216
+'
+# NOTE: the hermes repo is UNVERIFIED. The live file was copied from an earlier manual
+# download whose source was not recorded; check the repo's file list before relying on it.
+
+TOK=${HF_TOKEN:-}
+[[ -z $TOK && -r ~/.cache/huggingface/token ]] && TOK=$(cat ~/.cache/huggingface/token)
+AUTH=()
+[[ -n $TOK ]] && AUTH=(-H "Authorization: Bearer $TOK")
+
+fetch() { # repo file dir size
+  local repo=$1 file=$2 dir=$DEST/$3 size=$4 out
+  mkdir -p "$dir"; out=$dir/$file
+  if [[ -f $out && $(stat -c %s "$out") == "$size" ]]; then echo "OK (present) $out"; return 0; fi
+  for try in 1 2 3 4 5; do
+    curl -fL --retry 5 -C - "${AUTH[@]}" -o "$out" -s -S "https://huggingface.co/$repo/resolve/main/$file" \
+      && { local got; got=$(stat -c %s "$out")
+           if [[ $got == "$size" ]]; then echo "OK $out $got"; return 0; fi
+           echo "WARN $out is $got bytes, expected $size (upstream file changed?)"; return 0; }
+    echo "RETRY $try $out"; sleep 10
+  done
+  echo "FAIL $out"; return 1
+}
+
+if [[ ${1:-} == --list ]]; then
+  printf '%s\n' "$MODELS" | sed '/^$/d' | column -t -s'|'; exit 0
+fi
+[[ $EUID -ne 0 ]] || { echo "run as the models owner, not root" >&2; exit 1; }
+mkdir -p "$LOGDIR"
+want=" $* "
+rc=0
+while IFS='|' read -r alias repo file dir size; do
+  [[ -n $alias ]] || continue
+  [[ $# -eq 0 || $want == *" $alias "* ]] || continue
+  fetch "$repo" "$file" "$dir" "$size" 2>&1 | tee -a "$LOGDIR/$alias.log" | grep -q '^FAIL' && rc=1
+done <<<"$MODELS"
+exit $rc

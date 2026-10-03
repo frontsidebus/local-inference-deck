@@ -1,0 +1,119 @@
+# llama-swap v260 config for Walter -> /etc/llama-swap/config.yaml
+# Each model is a llama-server container (image pinned by digest), bound to 127.0.0.1 only.
+# Model IDs are the concrete model; aliases (coder, coder-fast, big, vision) are the stable names harnesses use.
+# GPU0 = x16 on CPU, GPU1 = x1 on chipset: single-GPU models are pinned, splits use -sm layer.
+
+healthCheckTimeout: 600        # big splits over the x1 link can take a while to load
+logLevel: info
+logToStdout: "proxy,http"
+startPort: 10001
+globalTTL: 0
+sendLoadingState: true
+includeAliasesInList: true
+
+apiKeys:
+  - "${env.LLAMA_SWAP_API_KEY}"
+
+macros:
+  "image": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:7149a45c80596644320de1d565db1b3b8e70b22c66fed612e69b73f6b1e0d746"
+  # spark-docker-run.sh waits for a same-named container (from a reload) to be gone, then execs docker run --name <id>
+  "run": "/usr/local/sbin/spark-docker-run.sh ${MODEL_ID} --rm --init --label llama-swap=1 --runtime nvidia -p 127.0.0.1:${PORT}:8080 -v ${MODELS_DIR}:/models:ro"
+  # common llama-server args: everything on GPU, fail loudly instead of auto-shrinking, one slot, q8_0 KV
+  "common": "-a ${MODEL_ID} --fit off -ngl all -np 1 -fa on -ctk q8_0 -ctv q8_0 --jinja --metrics --no-webui"
+  # rm -f is synchronous (stop + --rm removes asynchronously, so a reload's docker run could hit a name conflict)
+  "stop": "docker rm -f ${MODEL_ID}"
+
+models:
+  "qwen3.8-27b":
+    name: "Qwen3.8 27B (GPU0)"
+    aliases: ["coder"]
+    cmd: |
+      ${run} --gpus "\"device=0\"" ${image}
+      -m /models/gguf/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+      ${common} -c 131072 -sm none --spec-type draft-mtp --spec-draft-n-max 2
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    capabilities: { in: [text], out: [text], tools: true, context: 131072 }
+
+  "qwen3.6-35b-a3b":
+    name: "Qwen3.6 35B-A3B (GPU1)"
+    aliases: ["coder-fast"]
+    cmd: |
+      ${run} --gpus "\"device=1\"" ${image}
+      -m /models/gguf/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf
+      ${common} -c 131072 -sm none
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    capabilities: { in: [text], out: [text], tools: true, context: 131072 }
+
+  "qwen3-coder-next":
+    name: "Qwen3-Coder-Next 80B-A3B (GPU0+GPU1)"
+    aliases: ["big"]
+    cmd: |
+      ${run} --gpus "\"device=0,1\"" ${image}
+      -m /models/gguf/qwen3-coder-next/Qwen3-Coder-Next-UD-IQ4_NL.gguf
+      ${common} -c 131072 -sm layer -ts 1,1
+      --temp 1.0 --top-p 0.95 --top-k 40 --min-p 0.01
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    ttl: 1800
+    capabilities: { in: [text], out: [text], tools: true, context: 131072 }
+
+  "gemma-4-31b":
+    name: "Gemma 4 31B QAT + vision (GPU0+GPU1)"
+    aliases: ["vision"]
+    cmd: |
+      ${run} --gpus "\"device=0,1\"" ${image}
+      -m /models/gguf/gemma-4-31b-qat/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf
+      --mmproj /models/gguf/gemma-4-31b-qat/mmproj-BF16.gguf
+      ${common} -c 131072 -sm layer -ts 1,1 --ctx-checkpoints 8
+      --temp 1.0 --top-p 0.95 --top-k 64
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    ttl: 1800
+    capabilities: { in: [text, image], out: [text], tools: true, context: 131072 }
+
+  "hermes-4.3-36b":
+    name: "Hermes 4.3 36B (GPU0+GPU1)"
+    aliases: ["hermes"]
+    cmd: |
+      ${run} --gpus "\"device=0,1\"" ${image}
+      -m /models/gguf/hermes-4.3-36b/hermes-4_3_36b-Q4_K_M.gguf
+      ${common} -c 65536 -sm layer -ts 1,1
+      --temp 0.6 --top-p 0.95 --top-k 20
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    ttl: 1800
+    capabilities: { in: [text], out: [text], tools: true, context: 65536 }
+
+routing:
+  router:
+    use: matrix
+    settings:
+      matrix:
+        vars:
+          c: qwen3.8-27b
+          f: qwen3.6-35b-a3b
+          b: qwen3-coder-next
+          v: gemma-4-31b
+          h: hermes-4.3-36b
+        evict_costs:
+          b: 5     # ~40 GB load, half of it over the x1 link
+        sets:
+          coding: "c & f"   # one per GPU, the default working pair
+          big: "b"
+          vision: "v"
+          hermes: "h"
+
+hooks:
+  on_startup:
+    preload: ["qwen3.8-27b", "qwen3.6-35b-a3b"]
+
+# Reloads are safe: tested 2026-10-01, both models come back via the startup preload (spark-docker-run.sh).

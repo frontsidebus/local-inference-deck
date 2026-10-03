@@ -1,0 +1,61 @@
+name: gateway
+
+services:
+  db:
+    # postgres:17 (pinned 2026-09-30)
+    image: postgres@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [gw]
+    # no ports: Postgres is reachable only on the internal compose network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  litellm:
+    # ghcr.io/berriai/litellm:v1.103.1 == main-stable (pinned 2026-09-30, cosign-verified)
+    image: ghcr.io/berriai/litellm@sha256:df15400b5b80925c45d3fd53f8f7a6c0eaa8a25a86833e1b358002e129018943
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?}
+      LLAMA_SWAP_KEY: ${LLAMA_SWAP_KEY:?}
+      DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@db:5432/litellm
+      STORE_MODEL_IN_DB: "False"
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"   # don't fetch pricing JSON from GitHub at startup
+      LITELLM_DONT_SHOW_FEEDBACK_BOX: "True"
+      LITELLM_LOG: "INFO"
+    volumes:
+      - ./litellm.yaml:/app/config.yaml:ro
+      # pre-call hook: rewrites mid-conversation system messages (Claude Code) for the Qwen templates
+      - ./hooks/spark_hooks.py:/app/spark_hooks.py:ro
+    ports:
+      - "${BACKEND_WG_IP}:4000:4000"
+    networks: [gw]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+volumes:
+  pgdata:
+
+networks:
+  gw:
+    ipam:
+      config:
+        - subnet: ${GATEWAY_DOCKER_SUBNET}   # UFW allows this subnet -> ${BACKEND_WG_IP}:8080 (llama-swap)

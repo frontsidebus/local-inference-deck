@@ -1,0 +1,215 @@
+# spark-update-check: weekly update and security report for Walter
+
+This checker **only reports**. It never pulls images, upgrades packages or restarts
+anything. All updates are manual and use the procedures below.
+
+## What runs where
+
+| Item | Location |
+|---|---|
+| Checker (python3 stdlib, root 0750) | `/usr/local/sbin/spark-update-check.py` |
+| Schedule | `spark-update-check.timer`: Mon 09:00 UTC, `Persistent=true` (catches up after downtime) |
+| Reports | `/var/lib/spark-update-check/report-YYYY-mm-dd.md`, with `latest.md` as a symlink to the newest |
+| HTTP cache (ETag) | `/var/cache/spark-update-check/http/` |
+| Login banner | `/etc/update-motd.d/90-spark-updates` (reads `latest.md`, no network) |
+| Optional GitHub token | `/etc/spark-update-check/github-token` (root 0600, read-only PAT with no scopes). Not created by default. |
+| Edge host (Covenant) | `~/.local/bin/spark-edge-check` on the **workstation**, run manually (see the end of this file) |
+
+Commands:
+
+```sh
+sudo systemctl start spark-update-check.service     # run now
+journalctl -u spark-update-check -n 20              # one-line summary per run
+less /var/lib/spark-update-check/latest.md
+sudo /usr/local/sbin/spark-update-check.py --stdout # print the report without writing files
+# self-test of the advisory logic: pretend an older version is deployed
+sudo /usr/local/sbin/spark-update-check.py --stdout --assume BerriAI/litellm=1.103.0 >/dev/null
+```
+
+Exit codes: `0` OK, `10` updates available, `20` security advisories affect current
+versions, `1` checker error. The unit treats 10 and 20 as success, so only real errors
+show the unit as failed.
+
+### What is checked
+
+* Every `image:` in `/srv/*/compose.yaml` (and `compose.yml` / `docker-compose.y*ml`),
+  plus every digest-pinned image in `/etc/llama-swap/config.yaml`. New stacks are picked
+  up automatically. For a digest-only ref (`repo@sha256:…`), the tag comes from a nearby
+  comment such as `# postgres:17`. Keep those comments accurate.
+* **Digest drift:** the registry (ghcr.io, Docker Hub, quay, nvcr; anonymous token flow)
+  is asked what the pinned tag points to now. A difference means a newer build is
+  available, for example a rebuilt `postgres:17` or `server-cuda`.
+* **GitHub releases:** compares the latest stable release with the current version.
+  llama.cpp uses `bNNNN` build tags, read from the image label
+  `org.opencontainers.image.version`. The LiteLLM version is read from inside the pinned
+  image (`docker run --network none`), which cross-checks the compose comment.
+* **GitHub security advisories:** each one is evaluated against the current version
+  using `vulnerable_version_range` and `patched_versions`. Backport lists are understood.
+  An advisory whose range data cannot be compared (commit hashes, free text) is judged by
+  its publication date against the current release date and marked "check manually".
+  Some old advisories have incomplete data: an open-ended range with no patched version
+  that predates the current release is marked "likely not affected (manual)".
+* **hermes-agent:** the number of commits the local checkout is behind upstream
+  `main`, and the latest release.
+* **llama-swap:** `llama-swap --version` against the latest GitHub release.
+* **OS:** `apt list --upgradable`, including how many updates come from `-security`.
+  The package lists are refreshed by `apt-daily`; this checker does not run
+  `apt update`. Also checked: unattended-upgrades status, reboot-required, held
+  packages, the loaded NVIDIA driver against the apt candidate, and
+  nvidia-container-toolkit and Docker versions.
+
+Rate limits: anonymous GitHub API access allows 60 requests per hour. One run uses about
+30–45. If the limit is hit, the checker retries with backoff, then falls back to the last
+cached response (reported as such) or marks the check "unknown". Putting a token in
+`/etc/spark-update-check/github-token` raises the limit to 5000 per hour.
+
+---
+
+## How to update each component safely
+
+General rules:
+
+* Change one component at a time and verify it before moving on.
+* Always pin by digest. Record the human-readable tag in the comment next to the digest,
+  because the checker reads it.
+* Back up the file first: `cp compose.yaml compose.yaml.bak-$(date +%Y%m%d-%H%M%S)`.
+* **Rollback** = put the old digest back and run `docker compose up -d` again. Old
+  images stay on disk until `docker image prune`, so do not prune until the new version
+  has run for a while.
+* Read the release notes for migrations, especially for LiteLLM and Open WebUI, which
+  change their DB schemas. Downgrading after a schema migration may not work, so take a
+  DB or volume backup first.
+
+### Resolving a digest for a tag
+
+```sh
+docker pull ghcr.io/berriai/litellm:v1.104.0          # or postgres:17, etc.
+docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/berriai/litellm:v1.104.0
+# -> ghcr.io/berriai/litellm@sha256:<digest>   (use this in compose)
+```
+
+LiteLLM publishes cosign signatures. Verify them as you did for the current pin before
+switching.
+
+### LiteLLM and Postgres (`/srv/gateway`)
+
+```sh
+cd /srv/gateway
+sudo cp compose.yaml compose.yaml.bak-$(date +%Y%m%d-%H%M%S)
+# optional DB backup before LiteLLM upgrades (schema migrations run on start):
+sudo docker compose exec db pg_dump -U litellm litellm | gzip > ~/litellm-$(date +%F).sql.gz
+sudoedit compose.yaml        # update image digest + the "# ...:vX.Y.Z" comment
+sudo docker compose pull litellm && sudo docker compose up -d litellm
+sudo docker compose ps; sudo docker compose logs --tail 50 litellm
+curl -s http://${BACKEND_WG_IP}:4000/health/liveliness
+# then one real request through a harness (e.g. claude-spark / hermes-spark)
+```
+
+For Postgres, a new digest of the same `17` tag is a minor or patch rebuild:
+`docker compose up -d db`, then wait for the healthcheck to report healthy. Never change
+the major version (17 → 18) by editing the tag. That needs a dump and restore.
+
+Rollback: restore `compose.yaml.bak-…` (or put the old digest back), then
+`sudo docker compose up -d`.
+
+### Open WebUI and Pocket-ID (`/srv/webui`)
+
+```sh
+cd /srv/webui
+sudo cp compose.yaml compose.yaml.bak-$(date +%Y%m%d-%H%M%S)
+sudoedit compose.yaml        # image: ghcr.io/open-webui/open-webui:vX.Y.Z@sha256:<digest>
+sudo docker compose pull open-webui && sudo docker compose up -d open-webui
+sudo docker compose logs --tail 50 open-webui
+```
+
+Verify: log in through `https://${SPARK_CHAT_HOST}` (Pocket-ID OIDC), list models,
+and send one chat. For Pocket-ID, update `pocket-id` the same way and verify that login
+at `https://${SPARK_ID_HOST}` works and that Open WebUI SSO still works. Back up the
+named volumes before major versions:
+`docker run --rm -v <vol>:/v -v $PWD:/b alpine tar czf /b/<vol>.tgz -C /v .`.
+
+### llama.cpp server image (`/etc/llama-swap/config.yaml`, macro `image`)
+
+```sh
+docker pull ghcr.io/ggml-org/llama.cpp:server-cuda
+docker image inspect --format '{{index .RepoDigests 0}} {{index .Config.Labels "org.opencontainers.image.version"}}' ghcr.io/ggml-org/llama.cpp:server-cuda
+sudo cp /etc/llama-swap/config.yaml /etc/llama-swap/config.yaml.bak-$(date +%Y%m%d-%H%M%S)
+sudoedit /etc/llama-swap/config.yaml   # macros.image: ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:<new>
+sudo systemctl restart llama-swap       # stops running model containers; next request reloads
+journalctl -u llama-swap -n 50
+```
+
+Verify that each alias (coder, coder-fast, big, vision) loads and answers. Watch for
+changed CLI flags in the release notes; `--fit` and `-fa` have changed before. Rollback
+means putting the old digest back and restarting llama-swap.
+
+The report shows "newer source builds" for llama.cpp when GitHub has newer `bNNNN`
+releases than the image. This is informational: only a changed `server-cuda` digest
+means a new image exists.
+
+### llama-swap binary (`/usr/local/bin/llama-swap`)
+
+Download the release tarball for linux_amd64 from GitHub `mostlygeek/llama-swap` and check
+its checksum. Then:
+
+```sh
+sudo cp /usr/local/bin/llama-swap /usr/local/bin/llama-swap.v260   # keep the old one
+sudo install -m 755 llama-swap /usr/local/bin/llama-swap
+/usr/local/bin/llama-swap --version
+sudo systemctl restart llama-swap && journalctl -u llama-swap -n 30
+```
+
+Rollback means copying `llama-swap.v260` back and restarting.
+
+### hermes-agent (`~${BACKEND_SSH_USER}/.hermes/hermes-agent`, git checkout)
+
+```sh
+cd ~/.hermes/hermes-agent
+git status                        # keep local changes safe (git stash) first
+git fetch --tags origin
+git log --oneline HEAD..origin/main | wc -l
+git tag before-update-$(date +%F) # rollback point
+git checkout v2026.9.24           # prefer a release tag over main
+venv/bin/pip install -e .         # or the project's documented update step (hermes update / setup-hermes.sh)
+hermes --version; hermes-spark    # quick smoke test
+```
+
+Rollback: `git checkout before-update-<date>` and reinstall.
+
+### Monitoring stack (`/srv/monitoring`)
+
+This works like the other compose stacks: update the digest and tag, run
+`docker compose up -d <svc>`, then check that the Prometheus targets are up and that the
+Grafana dashboards load. Rollback by putting the old digest back.
+
+### Ubuntu packages and the NVIDIA driver
+
+* Security updates are applied by **unattended-upgrades** (allowed origins: noble and
+  noble-security). Any `-security` packages still pending are listed in the report. To
+  apply them by hand: `sudo apt update && sudo apt upgrade`, then check
+  `/var/run/reboot-required`.
+* **NVIDIA driver** (`nvidia-driver-580`): upgrade it deliberately, in a maintenance
+  window, because it needs a DKMS rebuild and a reboot, and all GPU containers stop.
+  Steps: `sudo apt install nvidia-driver-580 nvidia-utils-580`, then reboot, then run
+  `nvidia-smi` and `docker run --rm --gpus all --runtime nvidia ghcr.io/ggml-org/llama.cpp:server-cuda --version`,
+  then load one model through llama-swap. Keep the driver and `nvidia-container-toolkit`
+  versions compatible. To roll back, install the previous version from the apt version
+  table (`apt-cache policy nvidia-driver-580`, then
+  `sudo apt install nvidia-driver-580=<old>`) and reboot. To pin a version:
+  `sudo apt-mark hold nvidia-driver-580`.
+
+---
+
+## Edge host (Covenant): workstation-side, manual
+
+Covenant (${EDGE_PUBLIC_IP}) can only be reached by SSH from the workstation, and no new keys
+are added there. Its check therefore lives on the workstation and is **not** part of this
+timer:
+
+```sh
+~/.local/bin/spark-edge-check          # read-only: apt security count, certbot expiry,
+                                       # ufw, fail2ban jails, nginx -t
+```
+
+Run it after reading the weekly Walter report, or add a workstation cron or systemd
+user timer if needed.

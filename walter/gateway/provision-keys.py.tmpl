@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""provision-keys -- create the LiteLLM virtual keys for harnesses and users.
+
+Installed to /srv/gateway/provision-keys.py (root 0700) and run by walter/deploy.sh after the
+gateway stack is healthy. Idempotent; safe to re-run after adding names to site.env.
+
+For every name in HARNESS_KEYS and SPARK_USERS:
+  - /srv/gateway/keys/<name>.key exists        -> kept, nothing sent to LiteLLM
+  - alias <name> already exists in LiteLLM     -> NOT regenerated (would orphan the old key);
+                                                  reported so the operator can decide
+  - otherwise POST /key/generate with key_alias=<name>, rpm_limit=60, max_parallel_requests=4
+    (the limits every live key has) and write the key to keys/<name>.key (root 0600)
+Then fills OPENAI_API_KEYS in /srv/webui/.env (if still CHANGEME / PENDING) with
+"<open-webui key>;<hermes-gateway key>", the order of OPENAI_API_BASE_URLS. The second key is
+the workstation hermes-gateway's API_SERVER_KEY, read from /srv/webui/hermes-gateway.key
+(root 0600, copied there by hand from the workstation; see walter/README.md). Until that
+file exists the slot holds the literal PENDING and the Hermes connection simply fails.
+
+Never prints a key. The master key is read from /srv/gateway/.env.
+
+Usage: provision-keys.py [--dry-run] [--root DESTDIR]
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+LITELLM = "http://${BACKEND_WG_IP}:4000"
+HARNESS_KEYS = "${HARNESS_KEYS}".split()
+SPARK_USERS = "${SPARK_USERS}".split()
+LIMITS = {"rpm_limit": 60, "max_parallel_requests": 4}
+
+args = sys.argv[1:]
+DRY = "--dry-run" in args
+ROOT = args[args.index("--root") + 1].rstrip("/") if "--root" in args else ""
+GW_ENV = ROOT + "/srv/gateway/.env"
+KEY_DIR = ROOT + "/srv/gateway/keys"
+WEBUI_ENV = ROOT + "/srv/webui/.env"
+HERMES_GW_KEY = ROOT + "/srv/webui/hermes-gateway.key"
+
+
+def log(msg):
+    print("provision-keys: " + msg, file=sys.stderr)
+
+
+def env_get(path, var):
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith(var + "="):
+                    return line.rstrip("\n").split("=", 1)[1].strip().strip('"')
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def env_set(path, var, value):
+    st = os.stat(path)
+    with open(path) as f:
+        lines = f.read().split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith(var + "="):
+            lines[i] = var + "=" + value
+            break
+    tmp = path + ".pk-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o7777)
+    with os.fdopen(fd, "w") as o:
+        o.write("\n".join(lines))
+    try:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    except PermissionError:
+        pass
+    os.replace(tmp, path)
+
+
+def read_secret(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def api(method, path, master, body=None):
+    req = urllib.request.Request(LITELLM + path, method=method,
+                                 headers={"Authorization": "Bearer " + master,
+                                          "Content-Type": "application/json"},
+                                 data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def wait_healthy(timeout=300):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(LITELLM + "/health/liveliness", timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(5)
+    return False
+
+
+def alias_exists(master, alias):
+    q = urllib.parse.urlencode({"key_alias": alias, "page": 1, "size": 10})
+    try:
+        res = api("GET", "/key/list?" + q, master)
+    except urllib.error.HTTPError as e:
+        log("WARN key/list failed (%s); assuming alias %s is new" % (e.code, alias))
+        return False
+    return bool(res.get("keys"))
+
+
+def main():
+    names = [(n, "harness") for n in HARNESS_KEYS] + [(n, "user") for n in SPARK_USERS]
+    if not names:
+        log("HARNESS_KEYS and SPARK_USERS are empty; nothing to do")
+    todo = [(n, k) for n, k in names if not read_secret(os.path.join(KEY_DIR, n + ".key"))]
+    for entry in names:
+        if entry not in todo:
+            log("keep    keys/%s.key (exists)" % entry[0])
+
+    if todo:
+        if DRY:
+            for n, k in todo:
+                log("would create %s key %s (rpm 60, 4 parallel)" % (k, n))
+        else:
+            master = env_get(GW_ENV, "LITELLM_MASTER_KEY")
+            if not master or master == "CHANGEME":
+                sys.exit("provision-keys: LITELLM_MASTER_KEY not set in " + GW_ENV)
+            if not wait_healthy():
+                sys.exit("provision-keys: LiteLLM not healthy at " + LITELLM)
+            os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+            for n, kind in todo:
+                if alias_exists(master, n):
+                    log("SKIP    %s: alias exists in LiteLLM but keys/%s.key is missing. "
+                        "Restore the file from backup, or delete/regenerate the key in the "
+                        "LiteLLM UI and write it to keys/%s.key" % (n, n, n))
+                    continue
+                res = api("POST", "/key/generate", master, dict(
+                    LIMITS, key_alias=n,
+                    metadata={"kind": kind, "created_by": "provision-keys"}))
+                key = res.get("key", "")
+                if not key:
+                    sys.exit("provision-keys: no key returned for " + n)
+                path = os.path.join(KEY_DIR, n + ".key")
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(key + "\n")
+                log("created %s key %s -> keys/%s.key" % (kind, n, n))
+
+    # Open WebUI connection keys
+    cur = env_get(WEBUI_ENV, "OPENAI_API_KEYS")
+    if cur is None:
+        log("skip    OPENAI_API_KEYS (%s not installed)" % WEBUI_ENV)
+        return
+    owui = read_secret(os.path.join(KEY_DIR, "open-webui.key"))
+    hermes = read_secret(HERMES_GW_KEY)
+    if cur == "CHANGEME":
+        if not owui:
+            log("WARN    open-webui key missing; OPENAI_API_KEYS left as CHANGEME"
+                + (" (dry run)" if DRY else ""))
+            return
+        new = owui + ";" + (hermes or "PENDING")
+    elif cur.endswith(";PENDING") and hermes:
+        new = cur[: -len("PENDING")] + hermes
+    else:
+        log("keep    OPENAI_API_KEYS in /srv/webui/.env (set%s)"
+            % ("; hermes-gateway slot PENDING" if cur.endswith(";PENDING") else ""))
+        return
+    if DRY:
+        log("would set OPENAI_API_KEYS in /srv/webui/.env")
+        return
+    env_set(WEBUI_ENV, "OPENAI_API_KEYS", new)
+    log("set     OPENAI_API_KEYS in /srv/webui/.env%s (restart open-webui to apply)"
+        % ("" if hermes else "; hermes-gateway slot PENDING"))
+
+
+if __name__ == "__main__":
+    main()

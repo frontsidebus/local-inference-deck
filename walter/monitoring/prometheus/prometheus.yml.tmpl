@@ -1,0 +1,98 @@
+# /srv/monitoring/prometheus/prometheus.yml
+# Prometheus runs with network_mode: host and listens on 127.0.0.1:9090.
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    host: walter
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["127.0.0.1:9100"]
+        labels: { instance: walter }
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["127.0.0.1:8081"]
+        labels: { instance: walter }
+
+  - job_name: dcgm
+    static_configs:
+      - targets: ["127.0.0.1:9400"]
+        labels: { instance: walter }
+
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ["127.0.0.1:9115"]
+
+  # llama-swap's own /metrics (v260): host CPU/mem/net/load + per-GPU util/VRAM/temp/power/fan.
+  # Requires the API key (apiKeys in llama-swap config).
+  - job_name: llama-swap
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/llama-swap-api-key
+    static_configs:
+      - targets: ["${BACKEND_WG_IP}:8080"]
+        labels: { instance: walter }
+
+  # llama-server /metrics of each *loaded* model, scraped directly on its 127.0.0.1:<port>.
+  # Targets come from the llamaswap-sd sidecar (llama-swap /running, every 15 s).
+  # Deliberately NOT /upstream/<model>/metrics: that path makes llama-swap load (swap in) the model.
+  - job_name: llama-server
+    file_sd_configs:
+      - files: ["/etc/prometheus/llamaswap/sd/llama-server.json"]
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [model]
+        target_label: instance
+
+  # LiteLLM Prometheus callback (`callbacks: [..., "prometheus"]` in /srv/gateway/litellm.yaml).
+  - job_name: litellm
+    metrics_path: /metrics/
+    # LiteLLM /metrics is unauthenticated (require_auth_for_metrics_endpoint: false)
+    static_configs:
+      - targets: ["${BACKEND_WG_IP}:4000"]
+        labels: { instance: walter }
+
+  # Blackbox HTTP probes. External ones go Walter -> internet -> Covenant nginx -> wg0 -> Walter,
+  # so they test the whole public path, TLS included.
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets:
+          - https://${SPARK_CHAT_HOST}/health
+          - https://${SPARK_ID_HOST}/.well-known/openid-configuration
+        labels: { scope: public }
+      - targets:
+          - http://${BACKEND_WG_IP}:4000/health/liveliness   # LiteLLM
+          - http://${BACKEND_WG_IP}:3000/health              # Open WebUI
+          - http://${BACKEND_WG_IP}:1411/healthz             # Pocket-ID
+          - http://${BACKEND_WG_IP}:8080/health              # llama-swap
+        labels: { scope: internal }
+    relabel_configs: &bb_relabel
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+
+  - job_name: blackbox-http-401
+    metrics_path: /probe
+    params: { module: [http_401] }
+    static_configs:
+      - targets:
+          - https://${SPARK_API_HOST}/v1/models   # must refuse without a key
+        labels: { scope: public }
+    relabel_configs: *bb_relabel

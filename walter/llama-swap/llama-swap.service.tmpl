@@ -1,0 +1,34 @@
+# DRAFT - not enabled. Review, write /etc/llama-swap/config.yaml, then:
+#   systemctl daemon-reload && systemctl enable --now llama-swap
+[Unit]
+Description=llama-swap model swapping proxy (llama.cpp in Docker)
+Documentation=https://github.com/mostlygeek/llama-swap
+Requires=docker.service
+Wants=network-online.target wg-quick@wg0.service
+# listen address ${BACKEND_WG_IP} lives on wg0 (wg-quick@wg0); bind fails if it is not up yet
+After=docker.service network-online.target nvidia-persistenced.service wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=llamaswap
+Group=llamaswap
+SupplementaryGroups=docker
+Environment=HOME=/var/lib/llama-swap
+StateDirectory=llama-swap
+WorkingDirectory=/var/lib/llama-swap
+# Key is exported as an env var so config.yaml can use:  apiKeys: ["${env.LLAMA_SWAP_API_KEY}"]
+# ($$ escapes $ from systemd so the shell receives $(...))
+ExecStart=/bin/sh -c 'LLAMA_SWAP_API_KEY="$$(cat /etc/llama-swap/api-key)" exec /usr/local/bin/llama-swap --config /etc/llama-swap/config.yaml --listen ${BACKEND_WG_IP}:8080 --watch-config'
+# Remove containers left behind by a crash (each model cmd must pass: --label llama-swap=1)
+ExecStartPre=/bin/sh -c 'docker ps -aq --filter label=llama-swap=1 | xargs -r docker rm -f'
+ExecStopPost=/bin/sh -c 'docker ps -q --filter label=llama-swap=1 | xargs -r docker stop -t 20'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

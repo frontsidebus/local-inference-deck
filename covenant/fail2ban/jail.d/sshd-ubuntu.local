@@ -1,0 +1,3 @@
+# Ubuntu 24.04 names the unit ssh.service, not sshd.service (fixed 2026-10-02)
+[sshd]
+journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd

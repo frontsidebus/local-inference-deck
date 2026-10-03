@@ -1,0 +1,15 @@
+[Unit]
+Description=Spark/Walter local backup to ${MODELS_DIR}/backups
+Documentation=file:${MODELS_DIR}/backups/RESTORE.md
+Wants=docker.service
+After=docker.service network-online.target
+RequiresMountsFor=${MODELS_DIR}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/spark-backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=2h
+SyslogIdentifier=spark-backup

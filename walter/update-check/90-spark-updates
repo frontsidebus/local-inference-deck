@@ -1,0 +1,10 @@
+#!/bin/sh
+# Show the last spark-update-check summary (no network, file read only).
+f=/var/lib/spark-update-check/latest.md
+[ -r "$f" ] || exit 0
+s=$(grep -m1 '^\*\*Summary:\*\*' "$f" | sed 's/^\*\*Summary:\*\* *//')
+[ -n "$s" ] || exit 0
+age=$(( ( $(date +%s) - $(stat -L -c %Y "$f") ) / 86400 ))
+stale=""
+[ "$age" -gt 8 ] && stale=" (STALE: ${age}d old - check spark-update-check.timer)"
+printf '\n Spark update check (%sd ago)%s:\n   %.400s\n   details: %s\n' "$age" "$stale" "$s" "$f"

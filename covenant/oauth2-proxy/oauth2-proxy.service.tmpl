@@ -1,0 +1,59 @@
+[Unit]
+Description=oauth2-proxy (Pocket-ID OIDC gate for ${SPARK_TELEMETRY_HOST})
+Documentation=https://oauth2-proxy.github.io/oauth2-proxy/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oauth2-proxy
+Group=oauth2-proxy
+# Secrets stay root:root 0600; systemd hands the service a private copy.
+LoadCredential=client-secret:/etc/oauth2-proxy/client-secret
+LoadCredential=cookie-secret:/etc/oauth2-proxy/cookie-secret
+ExecStart=/usr/local/bin/oauth2-proxy --config=/etc/oauth2-proxy/oauth2-proxy.cfg --client-secret-file=%d/client-secret --cookie-secret-file=%d/cookie-secret
+Restart=on-failure
+RestartSec=5s
+
+# Keep memory small on the t3.small
+Environment=GOMEMLIMIT=40MiB
+Environment=GOMAXPROCS=2
+MemoryHigh=64M
+MemoryMax=96M
+MemorySwapMax=0
+TasksMax=64
+LimitNOFILE=4096
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

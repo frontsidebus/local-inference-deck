@@ -1,0 +1,39 @@
+# Spark-gateway fragment for ~/.hermes/config.yaml (Hermes Agent v0.21.5 / tag v2026.9.24).
+# Only the gateway-relevant keys. Everything else in config.yaml is personal and is
+# left alone. clients/install.sh merges this in with --force (backup first); otherwise it
+# writes ~/.hermes/config.yaml.spark for you to merge by hand.
+
+model:
+  # Spark gateway (nginx -> LiteLLM). Key comes from env SPARK_HERMES_API_KEY,
+  # exported by ~/.local/bin/hermes-spark from ~/.config/spark/hermes.key.
+  # Switch models: hermes-spark -m coder-fast | -m hermes | -m big
+  #   or in-session: /model custom:spark:coder-fast
+  # Per-model context_length lives under custom_providers[spark].models (a
+  # model.context_length here would override it for every model, incl. hermes=64K).
+  default: coder
+  provider: custom:spark
+  base_url: https://${SPARK_API_HOST}/v1
+  max_tokens: 32768
+
+custom_providers:
+  - name: spark
+    base_url: https://${SPARK_API_HOST}/v1
+    key_env: SPARK_HERMES_API_KEY
+    api_mode: chat_completions
+    model: coder
+    models:
+      coder:
+        context_length: 131072
+      coder-fast:
+        context_length: 131072
+      hermes:
+        context_length: 65536
+      big:
+        context_length: 131072
+      vision:
+        context_length: 131072
+
+security:
+  # Redact secrets from tool output/logs before they reach the model or session
+  # store. Not retroactive. Equivalent: hermes config set security.redact_secrets true
+  redact_secrets: true

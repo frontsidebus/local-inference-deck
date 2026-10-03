@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""pocketid-bootstrap -- create Pocket-ID groups, OIDC clients and (optionally) users via the API.
+
+Installed to /srv/webui/pocketid-bootstrap.py (root 0700). Run as root on Walter AFTER the
+Pocket-ID admin has been claimed in a browser at https://${SPARK_ID_HOST}/setup (a passkey
+ceremony; it cannot be scripted). See walter/README.md "Pocket-ID / OIDC bootstrap".
+
+What it does (idempotent; everything that exists is left alone):
+  1. Temporary API key: adds STATIC_API_KEY=<random> to /srv/webui/pocket-id.env, recreates the
+     pocket-id container, and ALWAYS removes the key and recreates it again on exit.
+  2. Groups ${CHAT_GROUP} and ${TELEMETRY_GROUP}.
+  3. OIDC client "open-webui": confidential + PKCE, callback
+     https://${SPARK_CHAT_HOST}/oauth/oidc/callback, restricted to ${CHAT_GROUP}.
+     If OAUTH_CLIENT_SECRET in /srv/webui/.env is CHANGEME, a client secret is generated and
+     written there (then: docker compose up -d open-webui).
+  4. OIDC client "${OAUTH2_PROXY_CLIENT_ID}" (telemetry, oauth2-proxy on the edge): PKCE, callback
+     https://${SPARK_TELEMETRY_HOST}/oauth2/callback, restricted to ${TELEMETRY_GROUP}.
+     If /srv/webui/oidc/${OAUTH2_PROXY_CLIENT_ID}.client-secret does not exist, a secret is
+     generated and written there (root 0600). Copy it to the edge's
+     /etc/oauth2-proxy/client-secret (covenant/deploy.sh --set-client-secret).
+  5. With --users FILE: lines "username email [group,group...]" (default group ${CHAT_GROUP}).
+     Missing users are created and added to their groups, and a one-time login link (valid
+     24 h) is written to /srv/webui/oidc/login-links.txt (root 0600) for the operator to send.
+     Each user then registers a passkey from that link.
+
+Secrets are never printed. Usage:
+  pocketid-bootstrap.py [--users FILE] [--dry-run]
+--dry-run makes no Pocket-ID or .env changes, but it still needs (and then removes) the
+temporary API key, which recreates the pocket-id container twice.
+
+API: Pocket-ID v2 REST API with the X-API-KEY header (STATIC_API_KEY). Endpoint shapes were
+written against Pocket-ID v2.16.0; if a call fails after an upgrade, compare with the
+instance's API reference before retrying.
+"""
+import datetime
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+POCKET_ID = "http://${BACKEND_WG_IP}:1411"
+WEBUI_DIR = "/srv/webui"
+PID_ENV = WEBUI_DIR + "/pocket-id.env"
+OWUI_ENV = WEBUI_DIR + "/.env"
+OIDC_DIR = WEBUI_DIR + "/oidc"
+CHAT_GROUP = "${CHAT_GROUP}"
+TELEMETRY_GROUP = "${TELEMETRY_GROUP}"
+CLIENTS = [
+    {"id": "open-webui", "name": "Open WebUI",
+     "callbackURLs": ["https://${SPARK_CHAT_HOST}/oauth/oidc/callback"],
+     "group": CHAT_GROUP, "secret_sink": ("env", OWUI_ENV, "OAUTH_CLIENT_SECRET")},
+    {"id": "${OAUTH2_PROXY_CLIENT_ID}", "name": "Telemetry",
+     "callbackURLs": ["https://${SPARK_TELEMETRY_HOST}/oauth2/callback"],
+     "group": TELEMETRY_GROUP,
+     "secret_sink": ("file", OIDC_DIR + "/${OAUTH2_PROXY_CLIENT_ID}.client-secret", None)},
+]
+
+args = sys.argv[1:]
+DRY = "--dry-run" in args
+USERS_FILE = args[args.index("--users") + 1] if "--users" in args else None
+API_KEY = None
+
+
+def log(msg):
+    print("pocketid-bootstrap: " + msg, file=sys.stderr)
+
+
+def compose(*a):
+    subprocess.run(["docker", "compose", "-f", WEBUI_DIR + "/compose.yaml", *a], check=True,
+                   stdout=subprocess.DEVNULL)
+
+
+def env_lines(path):
+    with open(path) as f:
+        return f.read().split("\n")
+
+
+def write_lines(path, lines):
+    st = os.stat(path)
+    tmp = path + ".pb-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o7777)
+    with os.fdopen(fd, "w") as o:
+        o.write("\n".join(lines))
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, path)
+
+
+def env_get(path, var):
+    for line in env_lines(path):
+        if line.startswith(var + "="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def env_set(path, var, value):
+    lines = env_lines(path)
+    for i, line in enumerate(lines):
+        if line.startswith(var + "="):
+            lines[i] = var + "=" + value
+            break
+    else:
+        lines.insert(len(lines) - 1 if lines and lines[-1] == "" else len(lines), var + "=" + value)
+    write_lines(path, lines)
+
+
+def env_del(path, var):
+    write_lines(path, [l for l in env_lines(path) if not l.startswith(var + "=")])
+
+
+def api(method, path, body=None, ok404=False):
+    req = urllib.request.Request(POCKET_ID + path, method=method,
+                                 headers={"X-API-KEY": API_KEY, "Content-Type": "application/json"},
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        if ok404 and e.code == 404:
+            return None
+        detail = e.read()[:300].decode(errors="replace")
+        raise SystemExit("pocketid-bootstrap: %s %s -> HTTP %s %s" % (method, path, e.code, detail))
+
+
+def wait_healthy(timeout=120):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(POCKET_ID + "/healthz", timeout=5) as r:
+                if r.status in (200, 204):
+                    return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(2)
+    raise SystemExit("pocketid-bootstrap: pocket-id not healthy at " + POCKET_ID)
+
+
+def listing(path, search):
+    q = urllib.parse.urlencode({"search": search, "pagination[limit]": 100})
+    res = api("GET", path + "?" + q) or {}
+    return res.get("data", res if isinstance(res, list) else [])
+
+
+def ensure_group(name):
+    for g in listing("/api/user-groups", name):
+        if g.get("name") == name:
+            log("keep    group %s" % name)
+            return g["id"]
+    if DRY:
+        log("would create group %s" % name)
+        return None
+    g = api("POST", "/api/user-groups", {"name": name, "friendlyName": name})
+    log("created group %s" % name)
+    return g["id"]
+
+
+def write_secret_file(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(value)          # no trailing newline (oauth2-proxy client-secret-file)
+
+
+def ensure_client(c, group_id):
+    cid = c["id"]
+    existing = api("GET", "/api/oidc/clients/" + urllib.parse.quote(cid), ok404=True)
+    if existing:
+        log("keep    OIDC client %s" % cid)
+    elif DRY:
+        log("would create OIDC client %s (PKCE, callback %s)" % (cid, c["callbackURLs"][0]))
+    else:
+        api("POST", "/api/oidc/clients", {
+            "id": cid, "name": c["name"], "callbackURLs": c["callbackURLs"],
+            "logoutCallbackURLs": [], "isPublic": False, "pkceEnabled": True})
+        log("created OIDC client %s" % cid)
+    if group_id and not DRY:
+        api("PUT", "/api/oidc/clients/%s/allowed-user-groups" % urllib.parse.quote(cid),
+            {"userGroupIds": [group_id]})
+        log("set     %s allowed groups -> %s" % (cid, c["group"]))
+
+    kind, path, var = c["secret_sink"]
+    need = (env_get(path, var) in (None, "", "CHANGEME")) if kind == "env" else not os.path.exists(path)
+    if not need:
+        log("keep    client secret for %s (already stored)" % cid)
+        return False
+    if DRY:
+        log("would generate client secret for %s -> %s" % (cid, path))
+        return False
+    secret = api("POST", "/api/oidc/clients/%s/secret" % urllib.parse.quote(cid))["secret"]
+    if kind == "env":
+        env_set(path, var, secret)
+    else:
+        write_secret_file(path, secret)
+    log("stored  client secret for %s -> %s" % (cid, path))
+    return kind == "env"
+
+
+def ensure_users(group_ids):
+    links = []
+    with open(USERS_FILE) as f:
+        rows = [l.split() for l in f if l.strip() and not l.lstrip().startswith("#")]
+    for row in rows:
+        username, email = row[0], row[1]
+        groups = row[2].split(",") if len(row) > 2 else [CHAT_GROUP]
+        found = [u for u in listing("/api/users", username) if u.get("username") == username]
+        if found:
+            uid = found[0]["id"]
+            log("keep    user %s" % username)
+        elif DRY:
+            log("would create user %s (%s)" % (username, ",".join(groups)))
+            continue
+        else:
+            u = api("POST", "/api/users", {"username": username, "email": email,
+                                           "firstName": username, "lastName": "",
+                                           "isAdmin": False})
+            uid = u["id"]
+            log("created user %s" % username)
+            exp = (datetime.datetime.now(datetime.timezone.utc)
+                   + datetime.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tok = api("POST", "/api/users/%s/one-time-access-token" % uid, {"expiresAt": exp})["token"]
+            links.append("%s https://${SPARK_ID_HOST}/lc/%s" % (username, tok))
+        for g in groups:
+            gid = group_ids.get(g)
+            if not gid:
+                log("WARN    unknown group %s for %s" % (g, username))
+                continue
+            members = api("GET", "/api/user-groups/%s" % gid).get("users", [])
+            ids = [m["id"] for m in members]
+            if uid not in ids:
+                api("PUT", "/api/user-groups/%s/users" % gid, {"userIds": ids + [uid]})
+                log("added   %s to %s" % (username, g))
+    if links:
+        os.makedirs(OIDC_DIR, mode=0o700, exist_ok=True)
+        path = OIDC_DIR + "/login-links.txt"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write("\n".join(links) + "\n")
+        log("wrote %d one-time login link(s) to %s (valid 24 h; send each to its user, then delete)"
+            % (len(links), path))
+
+
+def main():
+    global API_KEY
+    if os.geteuid() != 0:
+        raise SystemExit("pocketid-bootstrap: run as root")
+    if env_get(PID_ENV, "STATIC_API_KEY") is not None:
+        raise SystemExit("pocketid-bootstrap: STATIC_API_KEY already in %s; remove it first" % PID_ENV)
+    API_KEY = secrets.token_hex(32)
+    env_set(PID_ENV, "STATIC_API_KEY", API_KEY)
+    owui_changed = False
+    try:
+        compose("up", "-d", "pocket-id")
+        wait_healthy()
+        group_ids = {g: ensure_group(g) for g in (CHAT_GROUP, TELEMETRY_GROUP)}
+        for c in CLIENTS:
+            owui_changed |= ensure_client(c, group_ids.get(c["group"]))
+        if USERS_FILE:
+            ensure_users(group_ids)
+    finally:
+        env_del(PID_ENV, "STATIC_API_KEY")
+        compose("up", "-d", "pocket-id")
+        log("removed temporary STATIC_API_KEY and recreated pocket-id")
+    if owui_changed:
+        compose("up", "-d", "open-webui")
+        log("recreated open-webui with the new OAUTH_CLIENT_SECRET")
+
+
+if __name__ == "__main__":
+    main()

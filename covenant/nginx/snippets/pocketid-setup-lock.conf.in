@@ -1,0 +1,27 @@
+# =====================================================================
+# Pocket-ID INITIAL ADMIN SETUP LOCK  (temporary)
+# Until the owner claims the initial admin account, the setup paths are
+# reachable only from the admin IP(s). REMOVE this include (and the
+# "include snippets/pocketid-setup-lock.conf;" line in
+# sites-available/30-id) once the admin account has been claimed, then:
+#   nginx -t && systemctl reload nginx
+# (covenant/scripts/setup-lock.sh enable|disable does both.)
+# Paths (verified against pocket-id v2.16.0 source + live probe):
+#   /setup                -> frontend alias, 307 to /signup/setup
+#   /signup/setup         -> frontend page (+ /signup/setup/__data.json)
+#   /api/signup/setup     -> GET (availability check) / POST (create admin)
+# Rendered by setup-lock.sh: @ALLOW@ becomes one "allow <ip>;" line per
+# entry in ADMIN_SOURCE_IPS; the proxy_pass upstream becomes BACKEND_WG_IP:POCKETID_PORT.
+# =====================================================================
+location ~ ^/(api/)?signup/setup(/|$) {
+@ALLOW@
+    deny  all;
+    include snippets/proxy-common.conf;
+    proxy_pass http://@POCKETID_UPSTREAM@;
+}
+location ~ ^/setup(/|$) {
+@ALLOW@
+    deny  all;
+    include snippets/proxy-common.conf;
+    proxy_pass http://@POCKETID_UPSTREAM@;
+}
