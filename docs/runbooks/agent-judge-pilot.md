@@ -147,7 +147,7 @@ For each item:
 3. Acknowledge it: `judge/bin/judge-ack <request-id> <item-id> "<confirmed: fixed in abc123 | rejected: reason>"`. Your ack is recorded as `actor: human` and closes the item. The agent acks with `--agent`. That stops the item being injected again, but it does not close a `high` item: `judge-findings` lists those as agent-acked, waiting for you. Review every agent ack: in run 1 the agent rebutted and acknowledged findings about itself. <!-- TODO(area D) -->
 4. Check for judge errors: an estimate presented as fact, a time window in the wrong zone, a probe misread. Log each one; they count against the judge separately from false positives.
 5. Log your own errors too: a decline you remember that the journal does not confirm, a score you changed after checking. Run 1 had two.
-6. Remember the local-judge policy: findings with `mode: local` are capped at `JUDGE_LOCAL_MAX_SEVERITY` and are not shown to the agent unless `JUDGE_INJECT_LOCAL=1`. Score them like any other finding. <!-- TODO(area A, D) -->
+6. Remember the local-judge policy: findings with `mode: local` are capped at `JUDGE_LOCAL_MAX_SEVERITY` and are not shown to the agent unless `JUDGE_INJECT_LOCAL=1`. Read `finding.notes` too: it lists every item the validator dropped, downgraded or capped. Score the items as delivered, and note any dropped item that was true. <!-- TODO(area D): JUDGE_INJECT_LOCAL -->
 
 ## Metrics to record
 

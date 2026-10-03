@@ -6,22 +6,42 @@ Why bundles and not live runs: a live re-run changes the agent's behaviour, the 
 
 ## What you need
 
-- **Saved bundles** from a run: `$JUDGE_REVIEW_DIR/evidence/<request-id>/` plus the request (`done/<request-id>.json`). Copy them out of the review directory before you start, so a later collector run cannot rebuild them.
+- **Saved bundles** from a run: `$JUDGE_REVIEW_DIR/evidence/<request-id>/` and the request in `queue/` or `done/`. `rejudge.py` never collects, so a missing bundle is an error, not a fresh collection.
 - **Ground truth per request**, written down before you read any finding: what the agent actually did and whether each of its claims was true, checked independently (host journal, file diffs, the gate `outcome`, live read-only commands). See [Verifying ground truth](agent-judge-pilot.md#verifying-ground-truth). Run 1's table in the design doc is an example.
-- `judge/runner/rejudge.py`. <!-- TODO(area A): exact path, arguments and output layout -->
+
+## The tool
+
+```bash
+judge/runner/rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model ALIAS] [--no-budget]
+```
+
+- It reads requests and bundles from `$JUDGE_REVIEW_DIR` and **writes only to `DIR`**: `<id>.json` (with the validator's notes), `<id>.md`, `<id>.raw.txt` (the model's raw reply), `<id>.input.txt` (exactly what was sent), and `summary.json`. It never writes to `queue/`, `done/`, `findings/`, `acks/` or `evidence/`, and refuses an `--out` inside them. So it can point at the live review directory without changing what the agent sees.
+- It prints a table comparing each new finding with the existing `findings/<id>.json`: mode, items, and the count of high `false` items.
+- It sends `PROBES ALLOWED: no`, so every run sees the bundle exactly as saved.
+- **The data boundary holds.** A `sensitive` bundle is always judged locally; `--mode frontier` on one is refused and noted.
+- `--model` sets the local or frontier model according to `--mode` (both when `--mode` is absent).
+- Frontier calls count against `JUDGE_FRONTIER_DAILY_MAX` unless you pass `--no-budget`. Each still costs up to `JUDGE_FRONTIER_MAX_USD`.
+- Exit codes: 0 ok, 1 when any request failed, 64 for usage errors.
 
 ## Rules
 
-- **Never re-judge in the live review directory.** Work on a copy, with `JUDGE_REVIEW_DIR` pointing at it. Re-judging there would overwrite the findings you are comparing against and could feed new findings to the agent through C5.
-- **Respect the data boundary.** A `sensitive` bundle may only go to a local model, also when re-judging. <!-- TODO(area A): confirm rejudge.py enforces this -->
 - **Fix the ground truth first.** Write the expected result for each request before you look at either judge's output. Otherwise you will grade the judge by its own answer.
 - **Change one thing at a time:** the prompt, or the model, or the policy. Not two at once.
+- **One output directory per run**, named after what you changed (for example `rj-<prompt commit>-<model>`). Keep them; they are the record.
 
 ## 1. Old prompt vs. new prompt
 
-<!-- TODO(area A): rejudge.py invocation for prompt A/B -->
+`rejudge.py` uses the prompt and validator of the checkout it runs from. To compare two versions, run it from two checkouts (for example a second `git worktree` at the old commit) on the same request ids and the same model:
 
-Run every saved bundle through the judge twice, once with the old prompt and once with the new one, with the same model. Keep each run's findings in its own directory, named after the prompt version (for example the git commit of `judge/runner/prompt.md`).
+```bash
+ids="<id1> <id2> ..."
+(cd <old-checkout> && judge/runner/rejudge.py $ids --mode local --model big --out ~/rj/old-big)
+(cd <new-checkout> && judge/runner/rejudge.py $ids --mode local --model big --out ~/rj/new-big)
+```
+
+Both read the same `$JUDGE_REVIEW_DIR`, so both see identical bundles. Use a real path for `--out`, outside the review directory.
+
+Some changes need no model call at all. Validator changes can be checked against the stored raw replies: `judge/runner/validate.py <finding.json> --bundle $JUDGE_REVIEW_DIR/evidence/<id> --local-max-severity medium`. That is how run 1's stored outputs were re-checked.
 
 ## 2. Local model choices
 
@@ -31,15 +51,20 @@ The local judge is any gateway alias. Run 1 used `coder-fast`, from the same fam
 |---|---|---|
 | `big` | the worker's family (Qwen3-Coder-Next) | the default `JUDGE_LOCAL_MODEL` |
 | `coder-fast` | the worker's family | run 1's local baseline; not a fair judge |
-| `vision` | Gemma 4, a different family | the cross-family option |
+| `vision` | Gemma 4, a different family | the recommended candidate; not yet measured as a judge |
 
-Select the model with `JUDGE_LOCAL_MODEL=<alias>` for the run. <!-- TODO(area A): confirm the rejudge.py flag or variable -->
+```bash
+judge/runner/rejudge.py $ids --mode local --model vision --out ~/rj/new-vision
+judge/runner/rejudge.py $ids --mode local --model big    --out ~/rj/new-big
+```
+
+For `infra` requests, add a frontier run with the same prompt as the reference (`--mode frontier`).
 
 **Loading a model on Walter can unload others.** llama-swap swaps models in and out of GPU memory. Loading `vision`, for example, unloads the coding pair (`coder`, `coder-fast`), and a working Hermes session then stalls or reloads on its next call. Re-judge with a different local model only when no agent is working.
 
 ## 3. Score against ground truth
 
-Label every item of every run, using the [scoring template](agent-judge-pilot.md#scoring-template): TP, FP, BG, Unverified, and FN for every ground-truth fault a run missed.
+Label every item of every run (read `<id>.json` and its `notes`; an item the validator dropped or downgraded counts as the validator's decision, and note it), using the [scoring template](agent-judge-pilot.md#scoring-template): TP, FP, BG, Unverified, and FN for every ground-truth fault a run missed.
 
 | Request | Ground truth | Run A items (id: label) | Run B items (id: label) | Notes |
 |---|---|---|---|---|
