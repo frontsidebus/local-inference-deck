@@ -166,7 +166,7 @@ The collector assigns the class by path rules, and defaults to `sensitive` when 
 What the data boundary means for the newer evidence:
 
 - **C3 results** carry the check name, the path and a short redacted detail, never file contents. The detail is redacted before it is cut to 300 characters, and left empty if the redactor cannot load.
-- **Host-state probes** run only from the read-only probe allowlist, and are redacted like every other probe. `unit_journal` withholds any journal line the redactor would change (it notes the count instead), and unit names must be plain `name[.service|.timer|.socket]`.
+- **Host-state probes** run only from the read-only probe allowlist, and are redacted like every other probe. `unit_journal` withholds any journal line the redactor would change (it notes the count instead), and the probe arguments are validated strictly: unit names must match `^[A-Za-z0-9@._-]+\.?(service|timer|socket)?$`, timestamps must be UTC `YYYY-MM-DDTHH:MM:SSZ`, a journal span is at most 7 days, and anything else is refused (exit 64).
 - **`read_file` gating** closes a gap in front of the boundary, not in it: a secret read through `read_file` used to reach the transcript, and so the logs, filtered only by Hermes's own redactor. Now it escalates like `cat` does, and the gate request is always `sensitive`.
 - **Local-mode findings** stay on the workstation and, by default, out of the agent's context (see [Local-judge policy](#local-judge-policy)).
 
@@ -264,6 +264,8 @@ The judge was not the only reviewer that got things wrong. So did the human and 
 - **Twice, an approved action was assumed to have been declined.** Once in the earlier S1 pilot, and again in run 1's S1, the reviewers believed the nginx reload had been declined. Both times the host journal showed `Reloading nginx.service` at the escalation's time: it had been approved and had run. In the pilot, a local finding that called the agent's "it was blocked" claim false had been scored as a false positive. It may have been true.
 - **Hermes logs "tool completed" even for calls the gate blocked or the human declined.** A log line that a tool completed is not evidence that the action ran. Use the gate decision's `outcome` (matched against `post_tool_call` events) and the host's own state.
 - **The evidence pipeline was right where the human's assumption was wrong.** The bundle's gate decision said `executed` for the S1 reload, and the journal agreed. The reviewer's memory of having declined it did not.
+
+The new host-state probes make this check part of the evidence. In a read-only smoke test against S1's claim "nginx reload completed", the collector selected `unit_state covenant nginx` (active, running) and `unit_journal covenant nginx` for the window, which returned `Reloading nginx.service` and `Reloaded nginx.service` at the reload's time. That is the evidence that would have stopped the local judge's S1 false positives.
 
 The rule that follows applies to the reviewers too: **verify against ground truth**, the host journal, the file diff, the gate outcome, before scoring a finding, and before trusting your own recollection of what happened.
 
