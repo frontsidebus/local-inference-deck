@@ -17,7 +17,7 @@ Steps, in order:
 3. Evidence gate. An item is dropped when its `evidence` is empty/whitespace, or does not look like
    it references the bundle. Heuristic: the evidence must contain at least one of
      a. a PATH: `/x/y`, `~/x`, `./x`, or a file name with an extension, optionally `:line`
-        (e.g. `local-diff.patch:12`, `hermes-log.txt`, `~/.ssh/config`);
+        (e.g. `agent-diff.patch:12`, `hermes-log.txt`, `~/.ssh/config`);
      b. a COMMAND: a known command word at a word boundary (ssh, curl, systemctl, git, grep, ...,
         or a probe name; words that are also English, like find/cat/head, only when followed by a
         flag or path), a shell prompt `$ `, or an arrow (`->`, `=>`, `→`) linking a command to

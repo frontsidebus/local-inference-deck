@@ -14,7 +14,9 @@ Public API (other judge parts depend on it; keep it stable):
     classify(paths, cfg=None, cwd=None) -> "infra" | "sensitive"
     is_infra_path(path, cfg=None, cwd=None) -> bool
     host_ssh(name, cfg=None) -> list[str]             argv prefix; append ONE remote command string
+    window_grace(cfg=None) -> int                     JUDGE_WINDOW_GRACE_SECONDS (evidence window end grace)
     HOSTS = ("walter", "covenant")
+    HOST_RULES                                        C2 gate rules about commands aimed at Walter/Covenant
     parse_env_file(path) -> dict[str, str]
     get(key, default="", cfg=None) -> str
 
@@ -40,6 +42,11 @@ REPO_ROOT = JUDGE_DIR.parent
 
 HOSTS = ("walter", "covenant")
 
+# C2 gate rules whose evidence is a command aimed at Walter/Covenant (no local paths): infra by definition.
+# Shared by hooks/gate.py (classifies its own requests) and collector/collect.py (decides when to trust that
+# classification for a request without changed paths).
+HOST_RULES = frozenset({"remote-mutation", "remote-opaque", "remote-copy"})
+
 # Judge defaults (contract: site.env variables under `# --- judge`), plus existing site vars the judge
 # needs a fallback for.  Values are strings, like everything else loaded from site.env.
 DEFAULTS: Dict[str, str] = {
@@ -56,6 +63,7 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_INFRA_REPOS": "",               # extra repo dirs whose files are infra (space-separated)
     "JUDGE_LOG_TZ": "",                    # tz of Hermes log timestamps: "" = system local, "UTC", "+02:00", IANA
     "JUDGE_COMPLETION_DEDUPE_SECONDS": "900",  # completion requests of a session within this window dedupe
+    "JUDGE_WINDOW_GRACE_SECONDS": "10",    # evidence window = [request.since, request.created + this]
     "BACKEND_SSH_USER": "operator",
     "LLAMA_SWAP_PORT": "8080",
 }
@@ -154,6 +162,14 @@ def review_dir(cfg: Optional[Mapping[str, str]] = None, create: bool = False) ->
         except OSError:
             pass
     return d
+
+
+def window_grace(cfg: Optional[Mapping[str, str]] = None) -> int:
+    """Seconds added to a request's `created` to close its evidence window (default 10, never negative)."""
+    try:
+        return max(0, int(float(_cfg(cfg).get("JUDGE_WINDOW_GRACE_SECONDS") or 10)))
+    except ValueError:
+        return 10
 
 
 # ---------------------------------------------------------------- data_class rules

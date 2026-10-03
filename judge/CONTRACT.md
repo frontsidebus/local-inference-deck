@@ -47,7 +47,7 @@ findings/<request-id>.md         human-readable rendering of the same
 acks/<request-id>.<item-id>      empty or one-line reason; presence = acknowledged
 done/<request-id>.json           request moved here after findings are written
 snapshots/<session-id>/          watched-path snapshots taken at session start (collector)
-gate.log                         JSONL, one line per C2 decision
+gate.log                         JSONL, one line per C2 decision (incl. `tool_call_id` when sent, `call_hash`)
 watch.log                        JSONL, one line per C6 alert
 ```
 Writes are atomic (write tmp + rename). Files are mode 600, dirs 700.
@@ -70,8 +70,23 @@ when a completion request of the same session exists with `created` within `JUDG
  "plan": "<path or null>", "data_class": "infra|sensitive",
  "source_event": "post_tool_call|pre_tool_call|pre_verify|on_session_end|watch", "detail": {}}
 ```
+`changed_paths` lists only paths **the agent touched** (see "Attribution" below), never every snapshot change.
+A `completion` request from `hooks/enqueue.py` also carries `detail.changed_by_others`: the session's other
+snapshot changes (paths only, at most 200; `detail.changed_by_others_total` when more), which never count for
+`data_class`.
 `data_class` defaults to **sensitive** unless every changed path matches an infra path rule
 (rules in `lib/config.py`: hermes config/skills/memories/plans, ~/.ssh/config, the deck repo, /etc, /srv).
+A request without paths is `infra` only when the session cwd is infra (`classify([], cfg, cwd)`), or when it is a
+`gate` request whose `detail.rules` are all host rules (`lib/config.HOST_RULES`: `remote-mutation`,
+`remote-opaque`, `remote-copy`; shared by `hooks/gate.py` and the collector).
+
+### Attribution (agent vs others)
+Snapshot diffs show every change to a watched path, whoever made it. A changed path is the agent's when
+`snapshots/<session>/events.jsonl` names it (write_file/patch targets; path-like tokens of terminal commands,
+URLs excluded) or when it lies under `$HERMES_HOME/memories/` or `$HERMES_HOME/skills/` and the session ran the
+`memory` / `skill_manage` tool (seen in `events.jsonl` or in the session's `agent.tool_executor` log lines).
+`changed_paths` of a completion = snapshot changes attributed this way + this turn's write_file/patch targets.
+Everything else is "changed by others" (`lib/snapshot.agent_touched` / `attribute`).
 
 ## Finding (schema/finding.schema.json)
 ```json
@@ -84,21 +99,37 @@ Optional top-level `"notes": ["..."]` (runner bookkeeping, e.g. "sensitive -> lo
 "frontier cap reached", "validator dropped N items"). Validator drops items with empty `evidence`. Rubric codes as in docs/agent-judge.md.
 
 ## Evidence bundle (`evidence/<request-id>/`)
-`manifest.json` (request copy + list of artifacts + collector version + data_class),
-`hermes-log.txt` (session-window lines from agent.log/errors.log, secrets redacted),
-`local-diff.patch` (watched paths vs snapshot), `host-<name>.txt` (UTC `find -newermt` + failed units per host),
-`slots.json` (llama-server slots summary: `{"<model>": [slot, ...], "_collected": "...Z", "_error": "..."}`;
-`_`-prefixed keys are string metadata), `probes/<probe>-<n>.txt` (stdout+stderr+exit code; written by
-`collect.py <id> --probe <name> [args]`), `probes/judge-<probe>-<n>.txt` (probes the judge requested, saved by the runner).
-For `data_class=sensitive` (request's class, or re-classification of `changed_paths`; the stricter wins): diffs
-replaced by `git diff --stat`-style summaries; no file contents.
+**Window.** Every time-windowed artifact covers `[request.since, request.created + JUDGE_WINDOW_GRACE_SECONDS]`
+(default 10 s), in UTC, whenever the bundle is collected: a later turn's evidence never reaches an earlier
+request's bundle. Point-in-time artifacts (read at collection time) are labelled as such in the manifest.
+
+| File | Content | Time |
+|---|---|---|
+| `manifest.json` | request copy, `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, changed_by_others, omitted_after_window}`, `notes: {<artifact>: "..."}` | — |
+| `hermes-log.txt` | agent.log/errors.log lines of this session (plus untagged lines) in the window, secrets redacted | window |
+| `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires only for calls that ran) matches the decision by `tool_call_id`, else by tool + `call_hash` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
+| `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (request `changed_paths` + session tool events up to the window end). Content only when `data_class=infra`; otherwise stat lines. A file modified after the window gets a `# NOTE:` line | point in time (current content) |
+| `others-changed.txt` | snapshot changes **not** made by the agent: `<status> <path> \| +N -M` lines, never content. In an `infra` bundle, non-infra paths are withheld (count only). Changes made after the window (by anyone) are omitted (count only) | point in time |
+| `host-<name>.txt` | UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local, then `systemctl --failed` and the host clock (both at collection time) | find: window |
+| `slots.json` | llama-server slots summary (`{"<model>": [slot, ...], "_collected": "...Z", "_error": "..."}`; `_`-prefixed keys are string metadata) | point in time |
+| `probes/<probe>-<n>.txt` | stdout+stderr+exit code; written by `collect.py <id> --probe <name> [args]` (adds a `point_in_time` entry) | point in time |
+| `probes/judge-<probe>-<n>.txt` | probes the judge requested, saved by the runner | point in time |
+
+`data_class` of the bundle: the stricter of the request's class and the collector's own classification of the
+agent-attributed paths. With no such paths, only a host-rule `gate` request keeps the hook's class; any other
+request is classified with `classify([], cfg, cwd)`, so an `infra` label on a path-less request (forged or
+buggy) comes out `sensitive` unless the cwd is infra. For `data_class=sensitive`: diffs replaced by
+`git diff --stat`-style summaries; no file contents.
 
 CLI: `judge/collector/collect.py <request-id>` reads the request from queue/ (or done/), writes the bundle and
 `manifest.json` last, prints the evidence dir, exits 0. Exit 2 = bad id / request not found. Unreachable hosts are
 recorded in `host-<name>.txt` (`UNREACHABLE: ...`), never fatal.
 Snapshots (`snapshots/<session>/`, written by `hooks/enqueue.py` on `on_session_start`): `meta.json`,
 `index.json` (`{abs_path: {"sha256", "size"}}`, plus `"skipped"` when a file was not copied), `files/<abs path>`
-copies, `events.jsonl` (tool calls seen by post_tool_call).
+copies, `events.jsonl` (tool calls seen by post_tool_call: `{"t","tool","paths","status"}`; `paths` are the
+write_file/patch targets, or the path-like tokens of a terminal command, used only for attribution; plus
+`call_id` = Hermes `extra.tool_call_id` when sent and `call_hash` = `lib/redact.call_hash(tool, tool_input)`;
+never the command text).
 
 ## Probes (`judge/probes/probe.py <name> [args...]`)
 Allowlisted names with per-arg regex validation; each runs read-only with a timeout (default 20s):
@@ -116,6 +147,7 @@ log to `$JUDGE_REVIEW_DIR/hook-errors.log`, and emit `{}` — EXCEPT gate.py whi
 ## site.env variables (add to site.env.example under `# --- judge`)
 `JUDGE_MODE=frontier` (frontier|local), `JUDGE_LOCAL_MODEL=big`, `JUDGE_FRONTIER_CMD=claude`,
 `JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
-`EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=20000`, `JUDGE_RUNAWAY_MINUTES=10`.
+`EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=20000`, `JUDGE_RUNAWAY_MINUTES=10`,
+`JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

@@ -1,6 +1,7 @@
 """judge/lib/redact.py: mask secret-looking values in text before it lands in evidence or requests.
 
     redact(text) -> str
+    call_hash(tool, tool_input) -> str      16-hex marker of one tool call (gate.log <-> events.jsonl)
 
 Conservative: masks values, keeps keys and structure so the judge can still see *that* something was set.
 Covers URL userinfo passwords, Bearer/Basic auth, well-known token shapes, PEM private keys, and
@@ -8,6 +9,7 @@ Covers URL userinfo passwords, Bearer/Basic auth, well-known token shapes, PEM p
 """
 from __future__ import annotations
 
+import hashlib
 import re
 
 MASK = "<redacted>"
@@ -57,3 +59,17 @@ def redact(text: str) -> str:
         t = rx.sub(MASK, t)
     t = _KV_RE.sub(_kv_sub, t)
     return t
+
+
+def call_hash(tool, tool_input) -> str:
+    """Stable, non-reversible marker of one tool call: sha256 over the tool name and the redacted subject
+    (terminal: the command; write_file/patch: the path, or the head of a V4A patch). hooks/gate.py writes it
+    to gate.log and hooks/enqueue.py to events.jsonl, so the collector can tell whether an escalated call
+    ran when Hermes gives no tool call id. Never stores the command itself."""
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    if tool == "terminal":
+        subject = str(ti.get("command") or "")
+    else:
+        subject = str(ti.get("path") or str(ti.get("patch") or "")[:400])
+    data = f"{tool or ''}\0{redact(subject.strip())}".encode("utf-8", "replace")
+    return hashlib.sha256(data).hexdigest()[:16]

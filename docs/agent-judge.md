@@ -90,9 +90,11 @@ Every item **must** carry `evidence`: a command and its output, or a file and li
 
 Deterministic, local, and run before the judge. `collect.py <request>` gathers a bundle so the judge can reason without broad shell access:
 
-- **Hermes logs:** tool calls, errors and API-call lines for the session window from `agent.log` and `errors.log` (latency, tokens, sanitization warnings), with secrets redacted.
-- **Local diffs:** content diffs of watched paths against the snapshot taken at session start: the Hermes config, skills and memories, `~/.ssh/config`, `.hermes/plans/`, and the repo worktree (`git diff`).
-- **Host diffs:** `find -newermt '<since in UTC>'` over `/etc /srv /usr/local` on Walter and Covenant, plus failed units. **Always UTC on the hosts.**
+- **Review window:** every time-windowed artifact covers `[request.since, request.created + JUDGE_WINDOW_GRACE_SECONDS]` (default 10 s), however late the bundle is collected. In the first live run, the bundle was collected about ten minutes after the request, and it included a *later* turn's log lines. The judge then cited them to call a true claim false. Artifacts that can only be read at collection time (`slots.json`, probes, failed units, current file contents) are listed in the manifest under `point_in_time` with their `observed_at` time. They are never evidence of the state during the session.
+- **Hermes logs:** tool calls, errors and API-call lines in the window from `agent.log` and `errors.log` (latency, tokens, sanitization warnings), with secrets redacted.
+- **Gate decisions:** the session's `gate.log` lines in the window (`gate-decisions.jsonl`), re-redacted. Each line gets an `outcome`: `executed`, `not_executed` or `unknown`. The collector works it out by matching the decision against the tool calls that `post_tool_call` saw run, by tool call id, or else by a hash of the call. An empty file is explained in the manifest, so "no escalations" is never confused with "not collected".
+- **Local diffs, split by who made them:** diffs of watched paths against the snapshot taken at session start. The watched paths are the Hermes config, skills and memories, `~/.ssh/config`, `.hermes/plans/` and the repo worktree (`git diff`). Only changes to paths the agent touched go into `agent-diff.patch`. A path counts as touched when it is a write or patch target, a path in one of the agent's terminal commands, or a memory or skill write. Every other change goes into `others-changed.txt`, with paths and diffstat but never content. It is context only, never attributed to the agent: in the first live run, the judge blamed the agent for the operator's `git pull`.
+- **Host diffs:** `find -newermt '<since>' ! -newermt '<until>'` (UTC) over `/etc /srv /usr/local` on Walter and Covenant, plus failed units at collection time. **Always UTC on the hosts.**
 - **Inference telemetry:** llama-server `/slots` and the slot release lines (`n_tokens`, `truncated`).
 - **Claim probes:** a fixed menu the judge can request by name, all read-only, for example `ssh_alias_test <alias>`, `port_listening <host> <port>`, `http_status <url>`, `render_and_diff <template>`.
 
@@ -131,10 +133,10 @@ How each request type is classified:
 
 | Request | Class |
 |---|---|
-| Plan, completion, or gate request **with** changed paths | `infra` only if every path matches an infra rule; the collector re-checks and the stricter answer wins |
-| Gate request about a command to the backend or edge with **no** local paths (rules `remote-mutation`, `remote-opaque`, `remote-copy`) | `infra`: the evidence is the redacted command itself |
+| Plan, completion, or gate request **with** changed paths | `infra` only if every path the **agent** touched matches an infra rule. Changes made by others never count. The collector re-checks and the stricter answer wins. |
+| Gate request about a command to the backend or edge with **no** local paths (every rule in `HOST_RULES`: `remote-mutation`, `remote-opaque`, `remote-copy`) | `infra`: the evidence is the redacted command itself. This is the only path-less request whose label the collector trusts. |
 | Gate request for any other rule (`secret-output`, `sensitive-path`, `public-push`, oversight) | `sensitive` |
-| Completion request with **no** changed paths | `sensitive`, unless the session's working directory is an infra path. The agent's final answer can quote anything it read, and reads are not tracked. Add a directory to `JUDGE_INFRA_REPOS` to opt it in deliberately. |
+| Any other request with **no** changed paths (completion, plan, runaway, or a forged or buggy `infra` label) | The collector classifies it independently: `sensitive`, unless the session's working directory is an infra path. The agent's final answer can quote anything it read, and reads are not tracked. Add a directory to `JUDGE_INFRA_REPOS` to opt it in deliberately. |
 
 ## Injection safety
 

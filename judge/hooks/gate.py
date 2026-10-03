@@ -1882,18 +1882,15 @@ def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# Rules whose evidence is a command aimed at Walter/Covenant: infrastructure by definition.
-HOST_RULES = frozenset({"remote-mutation", "remote-opaque", "remote-copy"})
-
-
 def gate_data_class(jconfig, rules, paths, cwd):
-    """'infra' only when every fired rule is a host rule and every involved local path (if any) is infra.
+    """'infra' only when every fired rule is a host rule (lib/config.HOST_RULES) and every involved local
+    path (if any) is infra.
 
     Anything else (secret-output, sensitive-path, public-push, oversight, unknown) stays 'sensitive',
     which keeps the request with the local judge.
     """
     try:
-        if not rules or not set(rules) <= HOST_RULES:
+        if not rules or not set(rules) <= jconfig.HOST_RULES:
             return "sensitive"
         if paths and jconfig.classify(paths, cwd=cwd) != "infra":
             return "sensitive"
@@ -1949,6 +1946,7 @@ def run(payload, rt=None, side_effects=True):
         record["elapsed_ms"] = round((time.monotonic() - t0) * 1000, 1)
         line = {k: record[k] for k in ("ts", "session", "tool", "rule", "rules", "decision", "excerpt",
                                        "rule_key", "elapsed_ms")}
+        line.update(_call_markers(payload, tool, ti))
         if record.get("request"):
             line["request"] = os.path.basename(record["request"])
         try:
@@ -1958,6 +1956,23 @@ def run(payload, rt=None, side_effects=True):
     if decision == "block":
         return {"action": "block", "message": msg}, 2, record
     return {"action": "approve", "message": msg, "rule_key": rule_key}, 0, record
+
+
+def _call_markers(payload, tool, ti):
+    """tool_call_id (when Hermes sends one) and lib/redact.call_hash, so the collector can match this
+    decision with the post_tool_call event of the call if it ran. Best effort: never fails the gate."""
+    out = {}
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    cid = extra.get("tool_call_id")
+    if isinstance(cid, (str, int)) and str(cid).strip():
+        out["tool_call_id"] = str(cid)[:200]
+    try:
+        _lib()
+        from lib import redact as jredact
+        out["call_hash"] = jredact.call_hash(tool, ti)
+    except Exception:
+        pass
+    return out
 
 
 def _fail_closed(reason):

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 
@@ -43,6 +44,15 @@ def _request(env, data_class="infra", paths=None):
     return r
 
 
+IN_WINDOW = datetime(2026, 10, 3, 3, 25, 0, tzinfo=timezone.utc).timestamp()
+
+
+def _in_window(*paths):
+    """Tests use fixed request times; give real files an mtime inside the request window."""
+    for p in paths:
+        os.utime(p, (IN_WINDOW, IN_WINDOW))
+
+
 def _snapshot_and_change(env):
     snapshot.take(SESSION, None, config.load_config())
     (env["hermes"] / "config.yaml").write_text("model: coder\napprovals:\n  mode: off\napi_key: s3cr3tvalue99\n")
@@ -54,8 +64,12 @@ def test_bundle_infra(env):
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
     man = json.loads((ev / "manifest.json").read_text())
     assert man["data_class"] == "infra" and man["request"]["id"] == r["id"] and man["collector_version"]
-    assert set(man["artifacts"]) == {"hermes-log.txt", "local-diff.patch", "host-walter.txt", "host-covenant.txt",
-                                     "slots.json"}
+    assert set(man["artifacts"]) == {"hermes-log.txt", "gate-decisions.jsonl", "agent-diff.patch",
+                                     "others-changed.txt", "host-walter.txt", "host-covenant.txt", "slots.json"}
+    assert man["window"] == {"since": "2026-10-03T03:20:00Z", "until": "2026-10-03T03:30:10Z", "grace_seconds": 10}
+    assert man["point_in_time"]["slots.json"]["observed_at"] == "2026-10-03T03:30:00Z"
+    assert man["notes"]["gate-decisions.jsonl"].startswith("no gate decisions in window")
+    assert (ev / "gate-decisions.jsonl").read_text() == ""
     log = (ev / "hermes-log.txt").read_text()
     assert "API call #2" in log and "tool terminal completed (0.21s" in log
     assert "Unrepairable tool_call arguments" in log            # untagged, in window
@@ -65,7 +79,7 @@ def test_bundle_infra(env):
     assert "23:59:00" not in log                                # after window
     assert "401 Authorization Required" in log                  # continuation line kept
     assert "Sup3rS3cretPw" not in log and "<redacted>" in log
-    diff = (ev / "local-diff.patch").read_text()
+    diff = (ev / "agent-diff.patch").read_text()
     assert "+  mode: off" in diff and "-  mode: manual" in diff
     assert "s3cr3tvalue99" not in diff
     assert "/etc/llama-swap/config.yaml" in (ev / "host-walter.txt").read_text()
@@ -82,7 +96,7 @@ def test_bundle_sensitive_has_no_content(env):
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
     man = json.loads((ev / "manifest.json").read_text())
     assert man["data_class"] == "sensitive" and man["request_data_class"] == "infra"
-    diff = (ev / "local-diff.patch").read_text()
+    diff = (ev / "agent-diff.patch").read_text()
     assert "mode: off" not in diff and "| +2 -1" in diff
 
 
@@ -96,10 +110,13 @@ def test_repo_diff_since_session_head(env, tmp_path):
     snapshot.take(SESSION, str(repo), config.load_config())
     (repo / "a.txt").write_text("one\ntwo\n")
     (repo / "new.txt").write_text("fresh\n")
+    _in_window(repo / "a.txt", repo / "new.txt")
     r = _request(env, paths=[str(repo / "a.txt")])
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
-    diff = (ev / "local-diff.patch").read_text()
-    assert "+two" in diff and "+fresh" in diff
+    diff = (ev / "agent-diff.patch").read_text()
+    assert "+two" in diff and "fresh" not in diff           # new.txt: nobody's tool call touched it
+    others = (ev / "others-changed.txt").read_text()
+    assert f"A {repo / 'new.txt'} | +1 (untracked)" in others and "fresh" not in others
     changed = [p for _, p in snapshot.changed_files(q.snapshot_dir(SESSION), config.load_config())]
     assert str(repo / "a.txt") in changed and str(repo / "new.txt") in changed
 
@@ -107,9 +124,11 @@ def test_repo_diff_since_session_head(env, tmp_path):
 def test_no_snapshot_and_bad_since_are_safe(env):
     r = _request(env)
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
-    assert "no snapshot" in (ev / "local-diff.patch").read_text()
+    assert "no snapshot" in (ev / "agent-diff.patch").read_text()
     with pytest.raises(ValueError):
-        collect.host_command("2026-10-03T03:20:00Z'; rm -rf /")
+        collect.host_command("2026-10-03T03:20:00Z'; rm -rf /", "2026-10-03T03:30:10Z")
+    with pytest.raises(ValueError):
+        collect.host_command("2026-10-03T03:20:00Z", "2026-10-03T03:30:10Z'; rm -rf /")
 
 
 def test_add_probe_and_cli_errors(env):
@@ -136,11 +155,12 @@ def test_redact_shapes():
     assert "max_tokens=4096" in s and "tokens=~3,545" in s
 
 
-# --- effective_class with no changed paths (gate requests about host commands) ---
+# --- effective_class with no changed paths: only host-rule gate requests keep the hook's label ---
 
 @pytest.mark.parametrize("req_class,expected", [("infra", "infra"), ("sensitive", "sensitive"), (None, "sensitive")])
-def test_effective_class_no_paths_keeps_hook_decision(env, req_class, expected):
-    req = {"changed_paths": [], "data_class": req_class, "detail": {}}
+def test_effective_class_host_gate_keeps_hook_decision(env, req_class, expected):
+    req = {"kind": "gate", "changed_paths": [], "data_class": req_class,
+           "detail": {"rules": ["remote-mutation", "remote-opaque"]}}
     if req_class is None:
         del req["data_class"]
     assert collect.effective_class(req, config.load_config()) == expected

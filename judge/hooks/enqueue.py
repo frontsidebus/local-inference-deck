@@ -7,12 +7,17 @@ stdout: always `{}`. Never raises, never exits non-zero; errors go to $JUDGE_REV
 Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
   on_session_start   snapshot watched paths into snapshots/<session>/ (idempotent)
   post_tool_call     matcher "write_file|patch|terminal": records touched paths in snapshots/<session>/
-                     events.jsonl; a successful write_file/patch of */.hermes/plans/*.md enqueues a `plan`
+                     events.jsonl (write_file/patch targets; for terminal, the path-like tokens of the
+                     command, used only to attribute snapshot changes to the agent); a successful write_file/patch of */.hermes/plans/*.md enqueues a `plan`
                      request (a still-pending plan request for the same session+plan is refreshed instead
                      of duplicated)
   on_session_end     fires once per turn: enqueues a `completion` request for the window since the previous
                      on_session_end of this session (or session start). Turns with no tool activity and no
                      changed watched paths are skipped (JUDGE_ENQUEUE_ALWAYS=1 to enqueue anyway).
+                     changed_paths = only what the agent touched: snapshot changes named by the session's
+                     tool events (lib/snapshot.agent_touched) plus this turn's write_file/patch targets.
+                     Every other snapshot change goes to detail.changed_by_others (paths only) and does not
+                     count for data_class.
 """
 from __future__ import annotations
 
@@ -20,6 +25,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import sys
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -52,6 +58,34 @@ def tool_paths(tool_name: str, tool_input, cwd: str):
     if tool_name == "patch" and isinstance(tool_input.get("patch"), str):
         paths += _V4A_FILE_RE.findall(tool_input["patch"]) + _V4A_MOVE_RE.findall(tool_input["patch"])
     return list(dict.fromkeys(_abs(p, cwd) for p in paths))
+
+
+_REDIR_RE = re.compile(r"^(?:\d*>>?|<|&>>?)")
+MAX_TERMINAL_PATHS = 64
+MAX_OTHERS = 200
+
+
+def terminal_paths(command, cwd: str):
+    """Path-like tokens of a terminal command, made absolute against *cwd* (best effort; used only to
+    attribute snapshot changes to the agent, never shown to the judge as such). A token counts when it
+    contains `/`, starts with `~`, or looks like a file name (`name.ext`); URLs are ignored."""
+    if not isinstance(command, str) or not command.strip():
+        return []
+    try:
+        toks = shlex.split(command, comments=False)
+    except ValueError:
+        toks = command.split()
+    out = []
+    for tok in toks:
+        for part in re.split(r"[;|&()]+", tok):
+            part = _REDIR_RE.sub("", part.strip())
+            if "=" in part and part.startswith("-"):
+                part = part.split("=", 1)[1]
+            if not part or "://" in part or len(part) > 1024 or part.startswith("-"):
+                continue
+            if "/" in part or part.startswith("~") or re.fullmatch(r"[\w.+-]+\.[A-Za-z0-9]{1,8}", part):
+                out.append(part)
+    return list(dict.fromkeys(_abs(p, cwd) for p in out))[:MAX_TERMINAL_PATHS]
 
 
 def is_plan(path: str) -> bool:
@@ -97,11 +131,19 @@ def post_tool_call(payload, cfg, root):
     cwd = payload.get("cwd") or ""
     extra = payload.get("extra") or {}
     tinput = payload.get("tool_input")
-    paths = tool_paths(tool, tinput, cwd) if tool in WRITE_TOOLS else []
+    if tool in WRITE_TOOLS:
+        paths = tool_paths(tool, tinput, cwd)
+    elif tool == "terminal" and isinstance(tinput, dict):
+        paths = terminal_paths(tinput.get("command"), str(tinput.get("workdir") or cwd or ""))
+    else:
+        paths = []
     if not session:
         return None
     d = _snapdir(cfg, session, cwd or None, root)
-    snapshot.record_event(d, tool, paths, _status(extra))
+    cid = extra.get("tool_call_id") if isinstance(extra, dict) else None
+    snapshot.record_event(d, tool, paths, _status(extra),
+                          call_id=str(cid) if isinstance(cid, (str, int)) and str(cid).strip() else None,
+                          call_hash=redact.call_hash(tool, tinput))
     if tool not in WRITE_TOOLS or _status(extra) == "error":
         return None
     for plan in (p for p in paths if is_plan(p)):
@@ -146,19 +188,29 @@ def on_session_end(payload, cfg, root):
             since_s = q.utc_now_iso(started)
     since = q.parse_utc(since_s) if since_s else now - timedelta(hours=1)
 
-    touched = []
+    touched = []  # this turn's write_file/patch targets (terminal tokens are only used for attribution)
     for ev in snapshot.events(d):
         try:
-            if q.parse_utc(ev.get("t", "")) >= since - timedelta(seconds=1):
+            if (ev.get("tool") in WRITE_TOOLS
+                    and q.parse_utc(ev.get("t", "")) >= since - timedelta(seconds=1)):
                 touched += ev.get("paths") or []
         except ValueError:
             continue
     changed = [p for _, p in snapshot.changed_files(d, cfg)]
-    changed_paths = sorted(set(touched) | set(changed))
 
     tz = hermeslog.log_tz(cfg)
     log = os.path.join(cfg["HERMES_HOME"], "logs", "agent.log")
     activity = hermeslog.tool_activity(log, session, since, now + timedelta(seconds=5), tz) if os.path.isfile(log) else -1
+    try:
+        started = q.parse_utc(meta.get("started") or "")
+    except ValueError:
+        started = since
+    log_tools = (hermeslog.tools_used(log, session, min(started, since), now + timedelta(seconds=5), tz)
+                 if os.path.isfile(log) else set())
+    agent_keys, prefixes = snapshot.agent_touched(d, cfg, tools=log_tools)
+    mine, others = snapshot.attribute(changed, agent_keys, prefixes)
+    changed_paths = sorted(set(touched) | set(mine))
+    others = sorted(set(others) - set(changed_paths))
     recent_events = [ev for ev in snapshot.events(d) if ev.get("t", "") >= q.utc_now_iso(since)]
     if (activity == 0 and not recent_events and not touched
             and os.environ.get("JUDGE_ENQUEUE_ALWAYS") != "1" and not _new_changes(meta, changed)):
@@ -169,7 +221,10 @@ def on_session_end(payload, cfg, root):
     claims = hermeslog.last_assistant_message(cfg["HERMES_HOME"], session) or ""
     detail = {k: extra.get(k) for k in ("task_id", "turn_id", "completed", "failed", "interrupted",
                                          "turn_exit_reason", "model", "platform", "reason") if k in extra}
-    detail.update({"cwd": cwd, "tool_activity": activity, "snapshot_late": bool(meta.get("late"))})
+    detail.update({"cwd": cwd, "tool_activity": activity, "snapshot_late": bool(meta.get("late")),
+                   "changed_by_others": others[:MAX_OTHERS]})
+    if len(others) > MAX_OTHERS:
+        detail["changed_by_others_total"] = len(others)
     plans = [p for p in changed_paths if is_plan(p)]
     req = q.make_request(
         "completion", session, q.utc_now_iso(since), source_event="on_session_end",

@@ -171,11 +171,11 @@ def _realistic(review):
         it("F1", "high", "R1", "The agent reported the edge-alias SSH alias as updated to the new user and key.",
            "ssh -o BatchMode=yes edge-alias true -> Permission denied (publickey); ~/.ssh/config unchanged"),
         it("F2", "high", "R4", "command_allowlist gained inline-script entries.",
-           "local-diff.patch:14 + '- python3 -c'", "Remove the inline-script entries from the allowlist."),
+           "agent-diff.patch:14 + '- python3 -c'", "Remove the inline-script entries from the allowlist."),
         it("F3", "medium", "R5", "Memory step ran without max_tokens.",
            'slots.json: "n_decoded": 131072, "n_predict": -1', "Set max_tokens for the memory step."),
         it("F4", "medium", "R7", "A memory entry about the edge host lost its key path.",
-           "local-diff.patch:40 - IdentityFile line removed", "Restore the entry."),
+           "agent-diff.patch:40 - IdentityFile line removed", "Restore the entry."),
     ])
     return run_hook(review)["context"]
 

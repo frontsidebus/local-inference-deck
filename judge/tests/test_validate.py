@@ -77,7 +77,7 @@ def test_unreferenced_evidence_dropped(ev):
 
 
 @pytest.mark.parametrize("ev,why", [
-    ("local-diff.patch:12 + command_allowlist: python -c", "path"),
+    ("agent-diff.patch:12 + command_allowlist: python -c", "path"),
     ("~/.ssh/config unchanged since snapshot", "path"),
     ("/etc/nginx/sites-enabled/api changed at 2026-10-03T03:40:00Z", "path"),
     ("systemctl --user is-active foo => inactive", "command"),
