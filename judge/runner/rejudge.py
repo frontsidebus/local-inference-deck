@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-run the judge on EXISTING evidence bundles, for comparing prompts/validators/models on identical input.
 
-    rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget]
+    rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget] [--sensitive-local]
 
 Reads the request from queue/ or done/ and the bundle from evidence/<id>/ under $JUDGE_REVIEW_DIR (else the
 usual review dir). It never collects evidence, never runs probes (PROBES ALLOWED: no) and never writes to
@@ -12,8 +12,11 @@ queue/, done/, findings/, acks/ or the evidence bundle. Per request it writes to
   <id>.input.txt   the exact user message sent to the judge
 and finally DIR/summary.json + a stdout table comparing each new finding with findings/<id>.json (read only).
 
---mode    default: what run_judge.py would choose. A sensitive bundle is always judged locally; asking for
-          frontier on one is refused for that request (noted, judged locally).
+--mode    default: what run_judge.py would choose (a sensitive bundle is judged locally). An explicit
+          `--mode frontier` on a sensitive bundle is REFUSED for that request: no model call, an error in
+          summary.json and the table, exit 1. The local model may be a large one that evicts other models,
+          so rejudge never falls back to it silently.
+--sensitive-local  with `--mode frontier`, judge sensitive bundles locally instead (with a note).
 --model   sets JUDGE_LOCAL_MODEL or JUDGE_FRONTIER_MODEL (by --mode; both without --mode), e.g. `--model vision`.
 --no-budget  do not count frontier calls against JUDGE_FRONTIER_DAILY_MAX (usage.json is then not touched).
 Exit: 0 all judged, 1 at least one request failed, 64 usage.
@@ -55,7 +58,8 @@ def _check_out(out: Path) -> Optional[str]:
     return None
 
 
-def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool) -> Dict[str, Any]:
+def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
+                sensitive_local: bool = False) -> Dict[str, Any]:
     row: Dict[str, Any] = {"request": rid}
     request = C.request_for(rid)
     if request is None:
@@ -73,7 +77,14 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool) 
     mode, notes = RJ.choose_mode(data_class)
     if mode_arg:
         if data_class != "infra" and mode_arg == "frontier":
-            notes.append(f"rejudge: --mode frontier refused for data_class={data_class}; judged locally")
+            if not sensitive_local:
+                row["refused"] = True
+                row["error"] = (f"refused: --mode frontier on a data_class={data_class} bundle (sensitive data never "
+                                f"goes to the frontier judge); not judged. Pass --sensitive-local to judge it "
+                                f"locally with JUDGE_LOCAL_MODEL instead")
+                return row
+            notes.append(f"rejudge: --mode frontier refused for data_class={data_class}; judged locally "
+                         f"(--sensitive-local)")
             mode = "local"
         else:
             mode = mode_arg
@@ -105,6 +116,8 @@ def main(argv: List[str]) -> int:
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-budget", action="store_true")
+    ap.add_argument("--sensitive-local", action="store_true",
+                    help="with --mode frontier: judge sensitive bundles locally instead of refusing them")
     try:
         args = ap.parse_args(argv)
     except SystemExit as exc:
@@ -124,13 +137,13 @@ def main(argv: List[str]) -> int:
         if args.mode != "frontier":  # no --mode: the mode is chosen per request, so set both
             os.environ["JUDGE_LOCAL_MODEL"] = args.model
     out.mkdir(parents=True, exist_ok=True)
-    rows = [rejudge_one(rid, out, args.mode, not args.no_budget) for rid in args.ids]
+    rows = [rejudge_one(rid, out, args.mode, not args.no_budget, args.sensitive_local) for rid in args.ids]
     C.write_json(out / "summary.json", {"created": C.iso(C.utc_now()), "mode": args.mode, "model": args.model,
-                                        "requests": rows})
+                                        "sensitive_local": args.sensitive_local, "requests": rows})
     print(f"{'request':40} {'old (mode items high-false)':32} new (mode items high-false)")
     for r in rows:
         if "error" in r:
-            print(f"{r['request']:40} ERROR {r['error']}")
+            print(f"{r['request']:40} {'REFUSED' if r.get('refused') else 'ERROR'} {r['error']}")
             continue
         o, n = r["old"], r["new"]
         fo = f"{o['mode']} {o['items']} {o['high_false']}" if o else "-"
