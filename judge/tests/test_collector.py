@@ -53,9 +53,18 @@ def _in_window(*paths):
         os.utime(p, (IN_WINDOW, IN_WINDOW))
 
 
+EV_T = datetime(2026, 10, 3, 3, 25, 0, tzinfo=timezone.utc)
+
+
+def _agent_wrote(*paths):
+    """The post_tool_call hook saw the agent patch these paths (request paths need a backing event)."""
+    snapshot.record_event(q.snapshot_dir(SESSION), "patch", [str(p) for p in paths], "ok", now=EV_T)
+
+
 def _snapshot_and_change(env):
     snapshot.take(SESSION, None, config.load_config())
     (env["hermes"] / "config.yaml").write_text("model: coder\napprovals:\n  mode: off\napi_key: s3cr3tvalue99\n")
+    _agent_wrote(env["hermes"] / "config.yaml")
 
 
 def test_bundle_infra(env):
@@ -64,9 +73,11 @@ def test_bundle_infra(env):
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
     man = json.loads((ev / "manifest.json").read_text())
     assert man["data_class"] == "infra" and man["request"]["id"] == r["id"] and man["collector_version"]
-    assert set(man["artifacts"]) == {"hermes-log.txt", "gate-decisions.jsonl", "agent-diff.patch",
+    extras = {"c3-results.jsonl"} | {a for a in man["artifacts"] if a.startswith("probes/host-")}
+    assert set(man["artifacts"]) - extras == {"hermes-log.txt", "gate-decisions.jsonl", "agent-diff.patch",
                                      "others-changed.txt", "host-walter.txt", "host-covenant.txt", "slots.json"}
-    assert man["window"] == {"since": "2026-10-03T03:20:00Z", "until": "2026-10-03T03:30:10Z", "grace_seconds": 10}
+    assert man["window"] == {"since": "2026-10-03T03:20:00Z", "until": "2026-10-03T03:30:10Z", "grace_seconds": 10,
+                             "until_basis": "grace"}
     assert man["point_in_time"]["slots.json"]["observed_at"] == "2026-10-03T03:30:00Z"
     assert man["notes"]["gate-decisions.jsonl"].startswith("no gate decisions in window")
     assert (ev / "gate-decisions.jsonl").read_text() == ""
@@ -97,7 +108,11 @@ def test_bundle_sensitive_has_no_content(env):
     man = json.loads((ev / "manifest.json").read_text())
     assert man["data_class"] == "sensitive" and man["request_data_class"] == "infra"
     diff = (ev / "agent-diff.patch").read_text()
-    assert "mode: off" not in diff and "| +2 -1" in diff
+    assert "mode: off" not in diff
+    assert (f"# content withheld (data_class=sensitive): {env['hermes'] / 'config.yaml'} \u2014 3 lines changed "
+            "(+2/-1) [modified]") in diff
+    # the unbacked request path is not the agent's, but still makes the bundle sensitive
+    assert man["attribution"]["rejected_request_paths"] == ["/home/x/company/app.py"]
 
 
 def test_repo_diff_since_session_head(env, tmp_path):
@@ -111,6 +126,7 @@ def test_repo_diff_since_session_head(env, tmp_path):
     (repo / "a.txt").write_text("one\ntwo\n")
     (repo / "new.txt").write_text("fresh\n")
     _in_window(repo / "a.txt", repo / "new.txt")
+    _agent_wrote(repo / "a.txt")
     r = _request(env, paths=[str(repo / "a.txt")])
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
     diff = (ev / "agent-diff.patch").read_text()

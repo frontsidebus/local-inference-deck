@@ -18,16 +18,26 @@ Bundle (judge/CONTRACT.md):
     host-<name>.txt      walter/covenant: UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local
                          + `systemctl --failed` (at collection time)
     slots.json           llama-server slot summary (probe `slots`; at collection time)
-    probes/              probe outputs (at the time they ran)
-Window: [request.since, request.created + JUDGE_WINDOW_GRACE_SECONDS] for the log, the host find and the gate
-decisions, no matter when the bundle is collected.
+    c3-results.jsonl     C3 (pre_verify) verifier results in the window, latest per (path, check) `final: true`
+                         (from collector/extras.py when present)
+    probes/              probe outputs (at the time they ran); probes/host-<name>.txt = host-state probes
+                         chosen by extras.host_state_probes for the request's host claims
+Window: [request.since, min(request.created + JUDGE_WINDOW_GRACE_SECONDS, next turn start - 1 s)] for the log,
+the host find, the gate decisions and the C3 results, no matter when the bundle is collected. The next turn's
+start comes from the session's `agent.turn_context: conversation turn:` log lines; only when the log has none,
+from the `since` of the session's next request (see window_info).
+Attribution: a request's changed_paths count as the agent's only when a session tool event (events.jsonl) names
+them; the others are listed in manifest attribution.rejected_request_paths. Hermes bookkeeping files
+(lib/snapshot.NOISE_GLOBS) never count.
 data_class=sensitive (from the request, or from re-classifying the agent-attributed paths: the stricter wins):
-agent diff is a stat summary only (no file contents).  Hosts that cannot be reached are recorded, never fatal.
+agent diff carries one `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b)` line per
+changed path (no file contents).  Hosts that cannot be reached are recorded, never fatal.
 
 Exit: 0 bundle written, 2 request not found / bad id, 64 bad probe (nothing executed).
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -62,12 +72,99 @@ def _write(path: Path, text: str) -> Path:
 
 
 # ---------------------------------------------------------------- window
-def window(req: Dict, cfg: Mapping[str, str]) -> Tuple[datetime, datetime]:
-    """[request.since, request.created + JUDGE_WINDOW_GRACE_SECONDS] (UTC). Independent of when the bundle is
-    collected, so a later turn's evidence cannot leak into an earlier request's bundle."""
+TURN_START_LOGGER = "agent.turn_context"
+TURN_START_MSG = "conversation turn:"
+
+
+def _turn_starts(req: Dict, cfg: Mapping[str, str], since: datetime, end: datetime) -> Optional[List[datetime]]:
+    """Times of the session's `agent.turn_context: conversation turn:` lines in [since, end]; None when the
+    Hermes log is missing."""
+    log = Path(cfg["HERMES_HOME"]) / "logs" / "agent.log"
+    session = str(req.get("session") or "")
+    if not session or not log.is_file():
+        return None
+    tz = hermeslog.log_tz(cfg)
+    out = []
+    for line in hermeslog.session_lines(log, session, since, end, tz, include_untagged=False):
+        m = hermeslog.LINE_RE.match(line)
+        if m and m.group("logger") == TURN_START_LOGGER and m.group("msg").startswith(TURN_START_MSG):
+            try:
+                out.append(hermeslog._parse_ts(m.group("ts"), tz))
+            except ValueError:
+                continue
+    return out
+
+
+def _next_turn_from_requests(req: Dict, root: Optional[Path], created: datetime) -> Optional[datetime]:
+    """Earliest `since` >= this request's `created` among the session's other requests (queue/ + done/): a
+    request whose window starts after this one was created belongs to a later turn."""
+    session = str(req.get("session") or "")
+    if not session or root is None:
+        return None
+    best = None
+    for other in q._iter_all_requests(root):
+        if other.get("id") == req.get("id") or str(other.get("session") or "") != session:
+            continue
+        try:
+            s = q.parse_utc(str(other.get("since") or ""))
+        except ValueError:
+            continue
+        if s >= created and (best is None or s < best):
+            best = s
+    return best
+
+
+def window_info(req: Dict, cfg: Mapping[str, str], root: Optional[Path] = None) -> Dict:
+    """{"since", "until", "basis", "next_turn_start"?} (datetimes, UTC).
+
+    until = min(created + JUDGE_WINDOW_GRACE_SECONDS, next turn start - 1 s), never before `created`.
+    The next turn's start is the first `agent.turn_context: conversation turn:` line of the session at or after
+    `created` (basis "next_turn_log"). Only when the log has no such line anywhere in [since, created + grace]
+    (missing log, a Hermes without these lines) is the earliest `since` >= created of the session's other
+    requests used instead (basis "next_request"). Otherwise basis "grace". Log times have 1 s resolution.
+    Independent of when the bundle is collected, so a later turn's evidence cannot leak into this bundle."""
     since = q.parse_utc(req["since"])
-    until = q.parse_utc(req["created"]) + timedelta(seconds=config.window_grace(cfg))
-    return since, max(until, since)
+    created = q.parse_utc(req["created"])
+    until = created + timedelta(seconds=config.window_grace(cfg))
+    info: Dict = {"basis": "grace"}
+    nxt, basis = None, ""
+    try:
+        starts = _turn_starts(req, cfg, min(since, created), until)
+    except (OSError, KeyError):
+        starts = None
+    if starts:
+        later = [t for t in starts if t >= created]
+        nxt, basis = (min(later) if later else None), "next_turn_log"
+    else:
+        nxt, basis = _next_turn_from_requests(req, root, created), "next_request"
+    if nxt is not None and nxt - timedelta(seconds=1) < until:
+        until = max(created, nxt - timedelta(seconds=1))
+        info.update(basis=basis, next_turn_start=nxt)
+    info.update(since=since, until=max(until, since))
+    return info
+
+
+def turn_end(req: Dict, cfg: Mapping[str, str], root: Optional[Path], until: datetime, now: datetime) -> datetime:
+    """End of the request's turn, for evidence that can legitimately trail `created + grace` (C3 re-runs on
+    pre_verify attempt > 0): next turn start - 1 s (same sources and precedence as window_info, but searched
+    up to *now*); with no next turn known, *now*. Never before *until*."""
+    since, created = q.parse_utc(req["since"]), q.parse_utc(req["created"])
+    try:
+        starts = _turn_starts(req, cfg, min(since, created), max(now, until))
+    except (OSError, KeyError):
+        starts = None
+    if starts:
+        later = [t for t in starts if t >= created]
+        nxt = min(later) if later else None
+    else:
+        nxt = _next_turn_from_requests(req, root, created)
+    end = (nxt - timedelta(seconds=1)) if nxt is not None else now
+    return max(end, until)
+
+
+def window(req: Dict, cfg: Mapping[str, str], root: Optional[Path] = None) -> Tuple[datetime, datetime]:
+    w = window_info(req, cfg, root)
+    return w["since"], w["until"]
 
 
 # ---------------------------------------------------------------- pieces
@@ -211,14 +308,24 @@ def _mtime(path: str) -> Optional[datetime]:
 def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) -> Dict[str, List[str]]:
     """Split the session's snapshot changes (as of now) into the agent's and others'.
 
-    agent:  changed paths named by the session's tool events up to the window end, plus the request's own
-            changed_paths (already attributed by the hook that wrote it)
-    others: changed paths that no agent tool event of the session names, last modified by the window end
-    later:  changed paths the agent touched only after the window, or others' changes after it (omitted)"""
-    res: Dict[str, List[str]] = {"agent": [], "others": [], "later": []}
+    agent:    changed paths named by the session's tool events up to the window end (or under a HERMES_HOME
+              dir of a self-write tool the session ran)
+    accepted: request changed_paths backed by such an event (or self-write prefix); they join the agent set
+    rejected: request changed_paths NO tool event of the session backs: never attributed to the agent (a
+              legacy or forged request, or an operator's change the hook misread)
+    noise:    request changed_paths that are Hermes bookkeeping (snapshot.NOISE_GLOBS): ignored
+    others:   changed paths that no agent tool event of the session names, last modified by the window end
+    later:    changed paths the agent touched only after the window, or others' changes after it (omitted)"""
+    res: Dict[str, List[str]] = {"agent": [], "others": [], "later": [], "accepted": [], "rejected": [],
+                                 "noise": []}
     d = q.snapshot_dir(req["session"], root)
     meta = snapshot.load_meta(d)
+    noise = snapshot.noise_globs(cfg, meta)
+    req_paths = sorted({p for p in req.get("changed_paths") or [] if isinstance(p, str) and p.strip()})
+    res["noise"] = [p for p in req_paths if snapshot.is_noise(p, noise)]
+    req_paths = [p for p in req_paths if p not in res["noise"]]
     if not meta:
+        res["rejected"] = req_paths
         return res
     changed = [p for _, p in snapshot.changed_files(d, cfg)]
     tz = hermeslog.log_tz(cfg)
@@ -233,7 +340,7 @@ def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) 
         return hermeslog.tools_used(log, req["session"], started, end, tz) if log.is_file() else set()
 
     keys, prefixes = snapshot.agent_touched(d, cfg, until=until, tools=tools(until))
-    keys |= {snapshot._key(p) for p in req.get("changed_paths") or [] if isinstance(p, str) and p}
+    res["accepted"], res["rejected"] = snapshot.attribute(req_paths, keys, prefixes)
     agent, rest = snapshot.attribute(changed, keys, prefixes)
     keys_any, prefixes_any = snapshot.agent_touched(
         d, cfg, tools=tools(datetime.now(timezone.utc) + timedelta(days=1)))
@@ -246,11 +353,14 @@ def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) 
 
 
 def agent_diff(req: Dict, cfg: Mapping[str, str], sensitive: bool, root: Path, paths: List[str],
-               until: datetime) -> str:
+               until: datetime, rejected=()) -> str:
     d = q.snapshot_dir(req["session"], root)
     text = snapshot.diff_text(d, cfg, sensitive=sensitive, include=paths, until=until)
     if snapshot.load_meta(d) and not paths:
         text += "# no changed path is attributed to the agent (other changes, if any: others-changed.txt)\n"
+    if rejected:
+        text += (f"# {len(rejected)} path(s) listed by the request are NOT attributed to the agent: no tool event "
+                 "of this session names them (see manifest attribution.rejected_request_paths)\n")
     return text if sensitive else redact(text)
 
 
@@ -273,7 +383,8 @@ def others_changed(req: Dict, cfg: Mapping[str, str], root: Path, att: Dict[str,
     body = snapshot.stat_lines(d, cfg, others)
     out = hdr + [f"# {len(body)} path(s)"] + (body or ["(none)"])
     if withheld:
-        out.append(f"# {withheld} non-infra path(s) withheld (data_class=infra bundle)")
+        out.append(f"# {withheld} non-infra path(s) withheld (data_class=infra bundle): changed by others, "
+                   "paths not shown")
     if att["later"]:
         out.append(f"# {len(att['later'])} path(s) changed after the window end ({q.utc_now_iso(until)}) omitted")
     return "\n".join(out) + "\n"
@@ -313,6 +424,106 @@ def host_diff(name: str, req: Dict, cfg: Mapping[str, str], runner, since: str, 
     return hdr + redact(out) + tail
 
 
+# ---------------------------------------------------------------- extras (collector/extras.py, optional)
+EXTRAS_MODULE = "extras"
+C3_ARTIFACT = "c3-results.jsonl"
+_PROBE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _load_extras():
+    """collector/extras.py (C3 results, host-state probes) or None when it is not installed."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        return importlib.import_module(EXTRAS_MODULE)
+    except ImportError:
+        return None
+
+
+def c3_lines(results) -> List[str]:
+    """JSON lines for c3-results.jsonl: every record re-redacted, `final` always present (bool). When the
+    source did not flag finals, the latest record per (path, check) is final."""
+    recs = [dict(r) for r in (results or []) if isinstance(r, dict)]
+    if not any("final" in r for r in recs):
+        last: Dict[Tuple[str, str], int] = {}
+        for i, r in enumerate(recs):
+            last[(str(r.get("path")), str(r.get("check")))] = i
+        for i, r in enumerate(recs):
+            r["final"] = last[(str(r.get("path")), str(r.get("check")))] == i
+    out = []
+    for r in recs:
+        r["final"] = bool(r.get("final"))
+        if isinstance(r.get("detail"), str):
+            r["detail"] = r["detail"][:300]
+        out.append(redact(json.dumps(r, ensure_ascii=False, sort_keys=True, default=str)))
+    return out
+
+
+def probe_artifact_name(name: str) -> str:
+    """`probes/host-<name>.txt` for a host-state probe called *name* (sanitised, no path separators)."""
+    base = str(name or "probe").strip()
+    if base.endswith(".txt"):
+        base = base[:-4]
+    if base.startswith("host-"):
+        base = base[5:]
+    base = _PROBE_NAME_RE.sub("_", base).strip("._-")[:80] or "probe"
+    return f"probes/host-{base}.txt"
+
+
+def collect_extras(req: Dict, cfg: Mapping[str, str], root: Path, ev: Path, since: datetime, until: datetime,
+                   now_s: str, notes: Dict[str, str], windowed: List[str], pit: Dict[str, Dict],
+                   c3_until: Optional[datetime] = None, runner=None, gate_lines: Optional[List[str]] = None) -> Dict:
+    """Write c3-results.jsonl and probes/host-*.txt from collector/extras.py. Never fatal.
+
+    C3 results cover [since, c3_until] (the turn end, see turn_end): verify.py re-runs the verifiers on
+    pre_verify attempt > 0 and those final-state lines can land after created + grace."""
+    info: Dict = {"available": False}
+    ex = _load_extras()
+    if ex is None:
+        notes[C3_ARTIFACT] = "not collected: collector/extras.py is not installed"
+        notes["probes/host-*.txt"] = "not collected: collector/extras.py is not installed"
+        return info
+    info["available"] = True
+    fn = getattr(ex, "c3_results", None)
+    if callable(fn):
+        try:
+            c3_until = c3_until or until
+            lines = c3_lines(fn(str(req.get("session") or ""), since, c3_until, Path(root)))
+            info["c3_window"] = {"since": q.utc_now_iso(since), "until": q.utc_now_iso(c3_until)}
+            _write(ev / C3_ARTIFACT, "".join(ln + "\n" for ln in lines))
+            windowed.append(C3_ARTIFACT)
+            info["c3_results"] = len(lines)
+            if not lines:
+                notes[C3_ARTIFACT] = "no C3 verifier results in window (empty file): no verifier ran"
+            else:
+                notes[C3_ARTIFACT] = ("one line per C3 verifier run in the window; `final: true` marks the latest "
+                                      "result per (path, check), i.e. the state the turn ended with")
+        except Exception as e:  # extras must never break the bundle
+            notes[C3_ARTIFACT] = f"not collected: extras.c3_results failed ({e.__class__.__name__})"
+    fn = getattr(ex, "host_state_probes", None)
+    if callable(fn):
+        try:
+            probes = fn(req, cfg, runner=runner, root=root, gate_lines=gate_lines) or {}
+            written = []
+            for name, text in sorted(probes.items()):
+                art = probe_artifact_name(name)
+                _write(ev / art, redact(str(text)))
+                written.append(art)
+                head = str(text).lstrip().splitlines()[0] if str(text).strip() else ""
+                if head.startswith("# WINDOWED"):
+                    windowed.append(art)
+                else:
+                    pit[art] = {"observed_at": now_s, "note": "host-state probe run at collection time, NOT the "
+                                "state during the session"}
+            info["host_probes"] = written
+            if not written:
+                notes["probes/host-*.txt"] = "no host-state claims to probe"
+        except Exception as e:
+            notes["probes/host-*.txt"] = f"not collected: extras.host_state_probes failed ({e.__class__.__name__})"
+    return info
+
+
 # ---------------------------------------------------------------- bundle
 def _artifacts(ev: Path) -> List[str]:
     return sorted(str(p.relative_to(ev)) for p in ev.rglob("*") if p.is_file() and p.name != "manifest.json"
@@ -339,13 +550,16 @@ def _host_rule_gate(req: Dict) -> bool:
 
 def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
     """The stricter of the request's own data_class and the collector's independent classification of the
-    agent-attributed paths (request changed_paths + *agent_paths*).
+    agent-attributed paths (request changed_paths + *agent_paths*, Hermes bookkeeping noise excluded).
+    Request paths rejected by attribution still count here: they can only make the bundle stricter.
 
     With no paths, only a host-rule gate request keeps the hook's answer (its evidence is the redacted
     command). Any other path-less request is classified from the session cwd (classify([], cfg, cwd)), so
     an `infra` label alone never lets a request reach the frontier judge."""
     cwd = (req.get("detail") or {}).get("cwd") or None
-    paths = sorted(set(req.get("changed_paths") or []) | set(agent_paths or []))
+    noise = snapshot.noise_globs(cfg)
+    paths = sorted(p for p in set(req.get("changed_paths") or []) | set(agent_paths or [])
+                   if isinstance(p, str) and p.strip() and not snapshot.is_noise(p, noise))
     if paths:
         mine = config.classify(paths, cfg, cwd)
     elif _host_rule_gate(req):
@@ -365,7 +579,8 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     if errs:
         raise q.ValidationError(errs)
     now = now or datetime.now(timezone.utc)
-    since, until = window(req, cfg)
+    win = window_info(req, cfg, root)
+    since, until = win["since"], win["until"]
     since_s, until_s, now_s = q.utc_now_iso(since), q.utc_now_iso(until), q.utc_now_iso(now)
     att = attribution(req, cfg, root, until)
     data_class = effective_class(req, cfg, att["agent"])
@@ -383,9 +598,24 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     _write(ev / "gate-decisions.jsonl", "".join(ln + "\n" for ln in gates))
     if not gates:
         notes["gate-decisions.jsonl"] = "no gate decisions in window (empty file)"
-    agent_paths = sorted(set(att["agent"]) | set(req.get("changed_paths") or []))
-    _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until))
+    agent_paths = sorted(set(att["agent"]) | set(att["accepted"]))
+    _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"]))
     _write(ev / "others-changed.txt", others_changed(req, cfg, root, att, sensitive, until))
+    cwd = (req.get("detail") or {}).get("cwd") or None
+    withheld: Dict[str, str] = {}
+    if sensitive:
+        withheld["agent-diff.patch"] = (
+            "data_class=sensitive: file contents withheld; every changed agent path has a `# content withheld` "
+            "line with a line-count stat. Such a line means the file changed; it is not 'no change'.")
+    if not sensitive and any(not config.is_infra_path(p, cfg, cwd) for p in att["others"]):
+        withheld["others-changed.txt"] = "data_class=infra bundle: non-infra paths changed by others withheld"
+    if att["rejected"]:
+        notes["attribution"] = (
+            f"{len(att['rejected'])} request changed_path(s) rejected: no tool event of this session names them "
+            + ("(the gated call never ran, or ran after the window)" if req.get("kind") == "gate" else
+               "(legacy/forged request or another actor's change)") + "; they are NOT the agent's changes")
+    if att["noise"]:
+        notes["noise"] = f"{len(att['noise'])} request changed_path(s) are Hermes bookkeeping files; ignored"
     for host in config.HOSTS:
         _write(ev / f"host-{host}.txt", host_diff(host, req, cfg, runner, since_s, until_s))
     try:
@@ -394,11 +624,42 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
         slots = {"error": str(e)}
     _write(ev / "slots.json", redact(json.dumps(slots, indent=2)) + "\n")
     pit = {"observed_at": now_s, "note": POINT_IN_TIME}
+    windowed = ["hermes-log.txt", "gate-decisions.jsonl"] + [f"host-{h}.txt (find)" for h in config.HOSTS]
+    extra_pit: Dict[str, Dict] = {}
+    gate_excerpts = []
+    for ln in gates:
+        try:
+            x = json.loads(ln).get("excerpt")
+        except (ValueError, AttributeError):
+            x = None
+        if isinstance(x, str) and x:
+            gate_excerpts.append(x)
+    ex_info = collect_extras(req, cfg, root, ev, since, until, now_s, notes, windowed, extra_pit,
+                             c3_until=turn_end(req, cfg, root, until, now), runner=runner,
+                             gate_lines=gate_excerpts)
+    window_rec = {"since": since_s, "until": until_s, "grace_seconds": config.window_grace(cfg),
+                  "until_basis": win["basis"]}
+    if win.get("next_turn_start"):
+        window_rec["next_turn_start"] = q.utc_now_iso(win["next_turn_start"])
+    meta = snapshot.load_meta(q.snapshot_dir(req["session"], root))
+    snap_rec = {"dir_roots": [x.get("root") for x in meta.get("dir_roots") or [] if isinstance(x, dict)],
+                "truncated_roots": [{"root": x.get("root"), "files": x.get("files")}
+                                    for x in meta.get("dir_roots") or [] if isinstance(x, dict) and x.get("truncated")],
+                "skipped_roots": [x for x in meta.get("skipped_roots") or [] if isinstance(x, dict)],
+                "caps": meta.get("snapshot_caps") or snapshot.snapshot_caps(cfg),
+                "noise_globs": snapshot.noise_globs(cfg, meta)} if meta else {"available": False}
+    if snap_rec.get("truncated_roots") or snap_rec.get("skipped_roots"):
+        notes["snapshot"] = ("some opted-in dirs were truncated or not snapshotted at session start (see "
+                             "manifest snapshot); changes there may be missing from agent-diff.patch")
     _write_manifest(ev, req, data_class, {
         "collected": now_s,
-        "window": {"since": since_s, "until": until_s, "grace_seconds": config.window_grace(cfg)},
-        "windowed": ["hermes-log.txt", "gate-decisions.jsonl"] + [f"host-{h}.txt (find)" for h in config.HOSTS],
+        "window": window_rec,
+        "windowed": windowed,
+        "snapshot": snap_rec,
+        "extras": ex_info,
+        "withheld": withheld,
         "point_in_time": {
+            **extra_pit,
             "slots.json": dict(pit),
             **{f"host-{h}.txt (systemctl --failed, host clock)": dict(pit) for h in config.HOSTS},
             "agent-diff.patch": {"observed_at": now_s,
@@ -409,8 +670,12 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
         "attribution": {"agent_paths": sorted(att["agent"]),
                         "changed_by_others": sorted(att["others"]) if sensitive else
                         sorted(p for p in att["others"]
-                               if config.is_infra_path(p, cfg, (req.get("detail") or {}).get("cwd") or None)),
-                        "omitted_after_window": len(att["later"])},
+                               if config.is_infra_path(p, cfg, cwd)),
+                        "omitted_after_window": len(att["later"]),
+                        "rejected_request_paths": sorted(att["rejected"]) if sensitive else
+                        sorted(p for p in att["rejected"] if config.is_infra_path(p, cfg, cwd)),
+                        "rejected_request_paths_total": len(att["rejected"]),
+                        "ignored_noise_paths": len(att["noise"])},
         "notes": notes,
         "request_data_class": req.get("data_class"),
         "content_policy": "stat summaries only, no file contents" if sensitive else "redacted content diffs",
