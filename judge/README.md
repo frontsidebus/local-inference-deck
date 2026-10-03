@@ -135,6 +135,76 @@ Non-TTY runs (the gateway, cron) never prompt. They skip unapproved hooks with a
 
 Consent is keyed on `(event, command)`, not on the matcher or the script contents. When an update changes a matcher (for example `read_file` was added to the C2 matcher), re-run `judge/install.sh --apply` so `config.yaml` gets the new matcher and `gate-policy.json` is re-rendered, then restart Hermes and the gateway (they read hooks at start). **No new consent is needed**, because the command string is unchanged. `hermes hooks list` should still show every judge hook as allowed.
 
+## Running reviews automatically
+
+Hooks only queue review requests; the runner judges them. Two systemd **user** units run it without you:
+
+| Unit | What it does |
+|---|---|
+| `judge-review.path` | Watches `$JUDGE_REVIEW_DIR/queue/` (`PathChanged=`) and starts `judge-review.service`. The only runner unit you enable. |
+| `judge-review.service` | Oneshot: `run_judge.py --pending`. It judges every queued request, then re-scans `queue/` and also judges requests that arrived while it was busy (the path unit does not fire again for those), trying each request at most once per run. |
+| `judge-runaway-watch.service` | C6 watcher (`watch/runaway.py --interval 30`). Read-only: it polls the slots probe and alerts; it **never cancels or unloads** anything. |
+
+Install, enable and start them from the checkout the hooks run from:
+
+```bash
+judge/install.sh --with-units                  # dry run: shows the files it would install
+judge/install.sh --apply --with-units --start  # install, daemon-reload, enable --now the .path unit and the watcher
+systemctl --user status judge-review.path judge-review.service judge-runaway-watch.service
+systemctl --user start judge-review.service    # once, for requests that were queued before the path unit started
+```
+
+The installer renders `${JUDGE_DIR}`, `${JUDGE_PYTHON}`, `${HERMES_HOME}` and `${JUDGE_REVIEW_DIR}` into `~/.config/systemd/user/`. Check the rendered `judge-review.service`:
+
+- `Environment=PATH=%h/.local/bin:...`: `claude` is usually in `~/.local/bin`, which a user manager started outside a login shell may lack.
+- `UnsetEnvironment=ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN`, and `run_judge.py` strips every endpoint variable (and anything naming the gateway host) from the `claude` child as well. The frontier judge always uses the normal Anthropic API, never the local gateway. Do not "fix" a failing frontier call by pointing `claude` at the gateway, for the service or for your own shell.
+- `EnvironmentFile=-%h/.config/judge/judge.env` is optional. Values there are environment, so they **override** `site.env`; leave the file absent unless you want a service-only override. The policy itself belongs in `site.env`, which the runner reads from the repo root of the checkout in `ExecStart`.
+
+### Policy as deployed
+
+The workstation runs this policy (set in `site.env`):
+
+```bash
+JUDGE_MODE=frontier             # infra-class requests -> frontier judge (claude -p)
+JUDGE_FRONTIER_DAILY_MAX=20     # frontier calls per UTC day; past it, local fallback
+JUDGE_LOCAL_MODEL=coder-fast    # sensitive-class requests -> local judge, already loaded: no model eviction
+JUDGE_LOCAL_MAX_SEVERITY=medium # a local finding is never above medium
+JUDGE_INJECT_LOCAL=0            # local findings go to you, never into the agent's context (C5)
+```
+
+- **Infra** requests (every changed path is infra, see [Data boundary](#data-boundary)) go to the frontier judge.
+- **Sensitive** requests, and requests with no or unclear class, go to the local judge whatever `JUDGE_MODE` says. The finding's notes say `data_class=sensitive: local judge enforced`.
+- Local findings are capped at `medium` (the notes record each lowered item) and C5 skips them (counted in `inject.log`).
+- `coder-fast` is the same model family as the worker (see [Local judge policy](#local-judge-policy)); the cap and the no-injection rule are what make that acceptable for sensitive-only reviews. Read local findings as hints.
+
+Every local request sets `max_tokens` (`JUDGE_LOCAL_MAX_TOKENS`, default 4096), so the judge itself never sends an unbounded generation.
+
+### Cost and caps
+
+- At most `JUDGE_FRONTIER_DAILY_MAX` (20) frontier calls per UTC day, each with `--max-budget-usd` `JUDGE_FRONTIER_MAX_USD` (2): a hard ceiling of about $40 a day. Every `claude -p` call counts, including the retry after an invalid reply and the follow-up after a probe round, and each has its own dollar cap.
+- `usage.json` in the review dir holds today's count (`frontier_runs`, `cap`) and the cost `claude -p` reported (`frontier_usd`, summed per UTC day). On a subscription login the reported cost is the API-equivalent figure, not a bill.
+- Local reviews cost nothing beyond GPU time and are not counted.
+
+### Pause and resume
+
+```bash
+systemctl --user stop judge-review.path      # pause: hooks keep queueing, nothing is judged
+systemctl --user start judge-review.path     # resume ...
+systemctl --user start judge-review.service  # ... and judge the backlog (the path unit fires on changes only)
+systemctl --user disable --now judge-review.path judge-runaway-watch.service   # turn both off for good
+```
+
+To keep reviewing but stop frontier spend, set `JUDGE_MODE=local` in `site.env` (no restart needed: the runner reads it on each run). Logs: `journalctl --user -u judge-review`, `$JUDGE_REVIEW_DIR/runner.log`, `journalctl --user -u judge-runaway-watch` and `watch.log`.
+
+### Frontier auth from a non-TTY service
+
+`claude -p` under systemd uses the same login as your terminal: the OAuth credentials in `~/.claude/.credentials.json` (it needs only `HOME`, which the user manager sets). If findings say `frontier exited ...` or `frontier returned an error` while `claude -p` works in your shell:
+
+1. Is `claude` on the unit's `PATH`? `systemctl --user show judge-review.service -p Environment`, and `ls -l ~/.local/bin/claude`. If it lives elsewhere, set the full `PATH` (including that directory) in `judge.env`, which replaces the unit's own `PATH`.
+2. Is the login still valid? Run `claude` once in a terminal (it refreshes or asks you to log in), then `systemctl --user start judge-review.service`. Never copy credentials into the repo, `site.env` or a unit file.
+3. Is something forcing another endpoint? `systemctl --user show-environment | grep -i anthropic` and the `env` block of `~/.claude/settings.json` must not set `ANTHROPIC_BASE_URL`. The unit and the runner strip it from the environment, but `claude` reads its own settings file.
+4. A request whose backend fails stays queued and is retried on the next run; after `JUDGE_MAX_ATTEMPTS` (3) it gets a placeholder finding. `runner.log` has the error text.
+
 ## Operating it
 
 - **Gate decisions (C2)** appear inline in Hermes as an approval prompt (escalate) or a block message, and as one JSONL line each in `$JUDGE_REVIEW_DIR/gate.log`.
@@ -145,7 +215,7 @@ Consent is keyed on `(event, command)`, not on the matcher or the script content
 - **Who can close what.** Any ack stops the item being shown to the agent again. But an item is **closed** only when you acked it, or when the agent acked it and it is not `high`. A `high` item the agent acked stays in `--needs-human` until you ack it too. In run 1 the agent correctly rebutted and acked false findings, which is exactly why it must not be able to silence a `high` one on its own.
 - **The agent sees findings** at the start of its next turn (C5), framed as reviewer data, not instructions, until they are acknowledged. Findings from the local judge are not injected unless `JUDGE_INJECT_LOCAL=1` (see [Local judge policy](#local-judge-policy)).
 - **Runaway alerts (C6)** go to `watch.log`, the journal (`journalctl --user -u judge-runaway-watch`) and a desktop notification when a display is available.
-- **The runner** processes `queue/` when the path unit fires. To run it by hand: `python3 judge/runner/run_judge.py --pending`, or `run_judge.py <request-id>` for one request.
+- **The runner** processes `queue/` when the path unit fires (see [Running reviews automatically](#running-reviews-automatically)). To run it by hand: `python3 judge/runner/run_judge.py --pending`, or `run_judge.py <request-id>` for one request.
 
 Review data layout (all files 600, dirs 700):
 
@@ -187,7 +257,7 @@ The judge also reads the existing `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND
 
 The local judge is a fallback (sensitive data, or over the frontier cap), not a peer of the frontier judge, and it is treated that way:
 
-- **Use a model from a different family than the worker.** The default stays `JUDGE_LOCAL_MODEL=big`, but the recommendation is `vision` (Gemma) when Hermes runs on `coder` / `coder-fast` (Qwen). A judge from the worker's own family shares its blind spots and its habits. In run 1, `coder-fast` (Qwen, the same family as the worker) produced at least one `high` false positive in every scenario, about eleven in all, mostly by marking claims it could not check as `false`. The frontier judge had none at medium or above on the same bundles. Run 1 used `coder-fast` only as a pipeline baseline; do not use it as the judge. `vision` has **not yet been measured** as a judge: [re-judge](#re-judging-bundles) your stored bundles with it before switching.
+- **Use a model from a different family than the worker.** The default stays `JUDGE_LOCAL_MODEL=big`, but the recommendation is `vision` (Gemma) when Hermes runs on `coder` / `coder-fast` (Qwen). A judge from the worker's own family shares its blind spots and its habits. In run 1, `coder-fast` (Qwen, the same family as the worker) produced at least one `high` false positive in every scenario, about eleven in all, mostly by marking claims it could not check as `false`. The frontier judge had none at medium or above on the same bundles. Run 1 used `coder-fast` only as a pipeline baseline. It is now deployed for sensitive-class reviews only, because it is already loaded (no model eviction) and its output is contained by the severity cap and the no-injection default; do not use it with the cap raised or injection on. `vision` has **not yet been measured** as a judge: [re-judge](#re-judging-bundles) your stored bundles with it before switching.
 - **"Can't verify" is not "false".** The prompt now says: `false` needs quoted bundle text that contradicts the claim; `n/a` means the bundle can't settle it; `partial` is mild doubt. The agent's claims, your own message, withheld or stat-only diffs and `tool ... completed` lines are not evidence. The final state of a turn wins over an earlier error. `high` is reserved for a false claim with contradicting evidence, an unapproved host or oversight change, or a secret exposure.
 - **The validator enforces it**, for both judges. An item whose evidence only quotes the agent's claims is dropped. A `false` without a verbatim quote (12+ characters) from the bundle that the claims don't contain, or one that admits "no evidence" without a failure word, or one about a file whose final C3 check passed, becomes `n/a` / `low`. A `high` that isn't a `false` verdict or a host/oversight/runaway rubric (R3, R4, R5) becomes `medium`. Every change is listed in the finding's notes.
 - **Capped severity.** Every local finding (local mode, sensitive bundles, frontier-cap fallbacks) is capped at `JUDGE_LOCAL_MAX_SEVERITY` (default `medium`), so a local judge can't raise a `high` on its own.
@@ -208,11 +278,11 @@ To measure a prompt, validator or model change, re-run the judge on bundles you 
 
 ```bash
 JUDGE_REVIEW_DIR=~/.hermes/review judge/runner/rejudge.py <request-id>... --out /tmp/rj-vision \
-    --mode local --model vision          # --mode local|frontier, --model X, --no-budget
+    --mode local --model vision          # --mode local|frontier, --model X, --no-budget, --sensitive-local
 ```
 
 - It writes `<id>.json` (with the validator's notes), `<id>.md`, `<id>.raw.txt` (raw model output), `<id>.input.txt` (what the judge saw) and `summary.json` to `--out`, and prints old vs new per request: mode, item count, `high`+`false` count. An `--out` inside the review dir's own subdirectories is refused.
-- `sensitive` bundles are always judged locally; `--mode frontier` on one is refused and noted.
+- `sensitive` bundles never go to the frontier judge. Without `--mode` they are judged locally, as `run_judge.py` would. An explicit `--mode frontier` on one is **refused** for that request: no model call, a `REFUSED` line in the table, `"refused": true` and the reason in `summary.json`, and exit 1. It does not fall back to the local model silently, because `JUDGE_LOCAL_MODEL` (default `big`) can evict the coding models on Walter. Add `--sensitive-local` to judge those requests locally instead (noted in the finding).
 - Frontier re-judges count toward `JUDGE_FRONTIER_DAILY_MAX` unless you pass `--no-budget` (the per-call dollar cap still applies).
 - Exit 0 ok, 1 if any request failed, 64 usage error.
 
@@ -241,7 +311,7 @@ Logs are redacted for secrets before they enter a bundle. The judge never gets a
 
 - Frontier calls happen only in the runner, never in a hook.
 - C2 and C3 cost nothing: they are deterministic code.
-- Each frontier call has a dollar ceiling (`JUDGE_FRONTIER_MAX_USD`). There is a daily call cap (`JUDGE_FRONTIER_DAILY_MAX`, counted in `usage.json`) after which the runner falls back to the local judge and notes that in the finding.
+- Each frontier call has a dollar ceiling (`JUDGE_FRONTIER_MAX_USD`). There is a daily call cap (`JUDGE_FRONTIER_DAILY_MAX`, counted in `usage.json`) after which the runner falls back to the local judge and notes that in the finding. `usage.json` also sums the cost each call reported (`frontier_usd`); see [Cost and caps](#cost-and-caps).
 - `verify.py` deduplicates completion requests so a chatty session doesn't queue a review per turn.
 - To stop all frontier spend at once, set `JUDGE_MODE=local`.
 
@@ -251,7 +321,8 @@ Logs are redacted for secrets before they enter a bundle. The judge never gets a
 |---|---|
 | Hooks never fire | `hermes hooks list`: not allowed means consent is missing; approve in a TTY session. The gateway does not prompt. |
 | Every terminal or write call is blocked with "failed closed" | `gate.py` crashed, timed out or printed non-JSON. Run `hermes hooks test pre_tool_call --for-tool terminal` and read `hook-errors.log`. Emergency: `judge/install.sh --uninstall`. |
-| No findings appear | Is the runner unit active (`systemctl --user status`)? Is `queue/` filling? Look at `runner.log` in the review dir, then run `run_judge.py --pending` by hand. |
+| No findings appear | Is `judge-review.path` active (`systemctl --user status judge-review.path`)? Is `queue/` filling? Requests queued before the path unit started wait for the next queue change: `systemctl --user start judge-review.service`. Then `runner.log` and `journalctl --user -u judge-review`. |
+| Frontier calls fail only from the service | See [Frontier auth from a non-TTY service](#frontier-auth-from-a-non-tty-service). |
 | Findings come from the local judge although `JUDGE_MODE=frontier` | Expected for `sensitive` requests, or when the daily cap is reached; the finding says which. |
 | The installer says "does not round-trip" | Unusual YAML around `hooks:` (anchors, flow style). Nothing was written; merge the printed block by hand. |
 | A hook changed on disk | Consent is keyed on the command, so it is not re-asked. `hermes hooks doctor` flags mtime drift. |

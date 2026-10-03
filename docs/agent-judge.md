@@ -255,6 +255,7 @@ C5 works: the agent received the injected findings, correctly rebutted the false
 | 14 | Read-only `hermes config` subcommands were escalated | `--help` anywhere passes, read-only `config` and `hooks` subcommands pass; the policy gains `oversight_config.hermes_cli`, which also newly blocks `hooks remove\|rm`, `approvals suggest --apply` and `import` |
 | 16 | The grace window could take in the next turn | `until = min(created + grace, next turn start − 1 s)`, from the Hermes log or the next request; `window.until_basis` in the manifest |
 | 17 | `read_file` on secret paths was not gated | `read_file` is gated: secret-shaped paths (by name, by the new `secret_output.secret_paths` list, or through a symlink) escalate as `secret-output`; other reads pass. The same path list now also applies to terminal reads |
+| 18 | `rejudge.py --mode frontier` judged `sensitive` bundles locally without asking, on the default `big` model, which evicts the coding models | The request is refused instead: no model call, an error in `summary.json` and the table, exit 1. `--sensitive-local` restores local judging, with a note |
 | — | No way to check claims about host state | The collector picks up to 4 read-only probes from the claims and gate excerpts (`unit_state`, the new `unit_journal`, `port_listening`); `JUDGE_HOST_PROBES` switches them |
 
 Numbers follow the run log; #15 is not part of this set.

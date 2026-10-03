@@ -285,14 +285,56 @@ def test_rejudge_frontier_infra(env, frontier, tmp_path, monkeypatch):
     assert not (env / "usage.json").exists()
 
 
-def test_rejudge_refuses_frontier_for_sensitive(env, frontier, local, tmp_path):
+def test_rejudge_refuses_frontier_for_sensitive(env, frontier, local, tmp_path, capsys):
+    """Bug #18: an explicit --mode frontier on a sensitive bundle is refused, with no model call at all."""
     r = rid()
     enqueue(env, r, data_class="sensitive")
     out = tmp_path / "out"
-    assert RG.main([r, "--mode", "frontier", "--out", str(out)]) == 0
+    assert RG.main([r, "--mode", "frontier", "--out", str(out)]) == 1
+    assert frontier.calls() == [] and local["requests"] == []  # neither backend touched
+    assert not (out / f"{r}.json").exists()
+    row = json.loads((out / "summary.json").read_text())["requests"][0]
+    assert row["refused"] is True
+    assert "data_class=sensitive" in row["error"] and "--sensitive-local" in row["error"]
+    printed = capsys.readouterr().out
+    assert f"{r}" in printed and "REFUSED" in printed and "--sensitive-local" in printed
+
+
+def test_rejudge_refusal_does_not_stop_other_requests(env, frontier, local, tmp_path):
+    """A refused sensitive request fails the run (exit 1) but the infra request beside it is still judged."""
+    rs, ri = rid(short="aaaaaa"), rid(short="bbbbbb")
+    enqueue(env, rs, data_class="sensitive")
+    _judged(env, ri)
+    out = tmp_path / "out"
+    assert RG.main([rs, ri, "--mode", "frontier", "--out", str(out), "--no-budget"]) == 1
+    rows = {x["request"]: x for x in json.loads((out / "summary.json").read_text())["requests"]}
+    assert rows[rs].get("refused") and "error" not in rows[ri]
+    assert len(frontier.calls()) == 1 and local["requests"] == []
+    assert json.loads((out / f"{ri}.json").read_text())["mode"] == "frontier"
+
+
+def test_rejudge_sensitive_local_flag_judges_locally(env, frontier, local, tmp_path):
+    r = rid()
+    enqueue(env, r, data_class="sensitive")
+    out = tmp_path / "out"
+    assert RG.main([r, "--mode", "frontier", "--sensitive-local", "--out", str(out)]) == 0
     new = json.loads((out / f"{r}.json").read_text())
-    assert new["mode"] == "local" and frontier.calls() == []
-    assert any("refused" in n for n in new["notes"])
+    assert new["mode"] == "local" and frontier.calls() == [] and len(local["requests"]) == 1
+    assert local["requests"][0]["body"]["model"] == "big"
+    assert any("refused" in n and "--sensitive-local" in n for n in new["notes"])
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["sensitive_local"] is True and "error" not in summary["requests"][0]
+
+
+def test_rejudge_no_mode_sensitive_goes_local_unchanged(env, frontier, local, tmp_path):
+    """Without --mode the mode is chosen per request as before: sensitive is judged locally, no refusal."""
+    r = rid()
+    enqueue(env, r, data_class="sensitive")
+    out = tmp_path / "out"
+    assert RG.main([r, "--out", str(out)]) == 0
+    new = json.loads((out / f"{r}.json").read_text())
+    assert new["mode"] == "local" and frontier.calls() == [] and len(local["requests"]) == 1
+    assert not any("refused" in n for n in new["notes"])
 
 
 def test_rejudge_never_collects(env, local, tmp_path, monkeypatch):
