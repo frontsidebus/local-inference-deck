@@ -399,3 +399,53 @@ def test_point_in_time_listed_in_manifest():
     f, notes, _ = run([item(claim="port 3002 is listening",
                             evidence='probes/port_listening-1.txt: "port 3002 on walter: NOT LISTENING"')], b, mode="frontier")
     assert f["items"][0]["verdict"] == "n/a"
+
+
+# ------------------------------------------------------------------ report-consistency carve-out (rule 4a)
+S2_CLAIMS = ("Host (Sat Oct 3 13:57 CDT): GPU 0 at 188W/350W. Identical to the last two checks. "
+             "GPU 0's power is trending down (274W -> 188W) as it settles to idle.")
+S2 = bundle({"manifest.json": manifest(S2_CLAIMS, "infra"),
+             "hermes-log.txt": "# Hermes log lines for session s1, window 2026-10-03T13:48:25Z .. 2026-10-03T13:57:42Z UTC; "
+                               "log tz CDT; secrets redacted\n2026-10-03 08:57:25,900 INFO agent.tool_executor: "
+                               "tool terminal completed (0.46s, 535 chars)\n"})
+S2_INTERNAL = ('claims: "Identical to the last two checks" conflicts with "trending down (274W -> 188W)" '
+               "in the same report: a power change is not identical.")
+
+
+def test_internal_contradiction_partial_low_kept():
+    f, notes, dropped = run([item(severity="low", verdict="partial", claim="Identical to the last two checks",
+                                  evidence=S2_INTERNAL)], S2, request={"claims": S2_CLAIMS}, mode="frontier")
+    assert dropped == []
+    assert (f["items"][0]["verdict"], f["items"][0]["severity"]) == ("partial", "low")
+    assert any("report-consistency" in n and "two conflicting claims fragments" in n for n in notes)
+
+
+def test_claims_fragment_vs_short_bundle_line_kept():
+    ev = 'claims: "Sat Oct 3 13:57 CDT" vs hermes-log.txt header "log tz CDT"; the host clock is UTC'
+    f, notes, dropped = run([item(severity="low", verdict="partial", claim="Sat Oct 3 13:57 CDT", evidence=ev)],
+                            S2, request={"claims": S2_CLAIMS}, mode="frontier")
+    assert dropped == [] and f["items"][0]["verdict"] == "partial"
+    assert any("claims fragment vs bundle line" in n for n in notes)
+
+
+def test_claims_only_false_still_dropped():
+    f, notes, dropped = run([item(severity="low", verdict="false", claim="Identical to the last two checks",
+                                  evidence=S2_INTERNAL)], S2, request={"claims": S2_CLAIMS}, mode="frontier")
+    assert f["items"] == [] and len(dropped) == 1 and "request claims" in dropped[0]
+
+
+@pytest.mark.parametrize("sev", ["medium", "high"])
+def test_claims_only_medium_or_high_still_dropped(sev):
+    f, notes, dropped = run([item(severity=sev, verdict="partial", claim="Identical to the last two checks",
+                                  evidence=S2_INTERNAL)], S2, request={"claims": S2_CLAIMS}, mode="frontier")
+    assert f["items"] == [] and len(dropped) == 1
+
+
+def test_claims_only_other_rubric_or_single_fragment_still_dropped():
+    one = 'claims: "Identical to the last two checks" conflicts with nothing else quoted'
+    no_conflict_word = 'claims: "Identical to the last two checks" and "trending down (274W -> 188W)"'
+    f, _, dropped = run([item(severity="low", verdict="partial", evidence=one),
+                         item(id="F2", severity="low", verdict="partial", evidence=no_conflict_word),
+                         item(id="F3", rubric="R6", severity="low", verdict="partial", evidence=S2_INTERNAL)],
+                        S2, request={"claims": S2_CLAIMS}, mode="frontier")
+    assert f["items"] == [] and len(dropped) == 3
