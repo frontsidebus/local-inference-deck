@@ -167,6 +167,12 @@ lines in window, ...), normalized (lower case, quotes/backticks/backslashes stri
 not count); it is *contradicting* when it is not contained in the item's claim, the request claims or plan, or
 the user message.
 - **Drop** an item whose evidence quotes only the claims, plan or user message (no contradicting span).
+  **Carve-out (report consistency):** kept, with a `kept, report-consistency finding` note, when the item is
+  R1, verdict `partial` or `n/a`, severity `low`, its evidence names a conflict (vs / conflicts / contradicts /
+  inconsistent / but / while / next to ...) and quotes either two distinct claims fragments (>= 8 chars each in
+  quotes or backticks, or >= 12-char spans; e.g. "unchanged" next to a reported change) or one claims fragment plus
+  a quoted bundle line that is not claims text (e.g. a short log `tz` header). A `false` item, a medium/high item
+  or another rubric on claims-only evidence is still dropped.
 - **`false` → `n/a` + `low`** when (b) there is no contradicting span; (c) the evidence admits absence ("no
   evidence", "cannot verify", "withheld", ...) and no contradicting span carries a failure word (error, fail,
   denied, inactive, non-zero exit, 4xx/5xx, blocked, ...); (d0) every contradicting span comes only from

@@ -36,6 +36,11 @@ Steps, in order:
    span when it is not contained in the item's claim, the request's claims/plan or the user's message.
    a. drop (prompt-as-evidence): the evidence has a >= 12-char span from the request claims/plan or
       the user's message and no contradicting span -> item dropped.
+      Carve-out (report consistency): kept with a note when the item is R1, verdict `partial` or `n/a`,
+      severity low, its evidence names a conflict (vs / conflicts / contradicts / inconsistent / but /
+      while / next to ...) and quotes either two distinct claims fragments (>= 8 chars each, in quotes or
+      backticks, or >= 12-char spans) or one claims fragment plus a quoted bundle line that is not claims
+      text. A `false` or a medium/high item on claims-only evidence is still dropped.
    b. `false` -> `n/a` + low when the evidence has no contradicting span ("absence of evidence").
    c. `false` -> `n/a` + low when the evidence admits absence ("no evidence", "does not show",
       "cannot verify", "withheld", "no output", ...) and no contradicting span carries a failure word
@@ -144,6 +149,11 @@ _FAILURE_RE = re.compile(
     r"not found|blocked|not_executed|exit(?:_code)?[=: ]+[1-9]|status[=: ]+[1-9]|\b[45]\d\d\b|mismatch",
     re.IGNORECASE)
 RUBRICS_HIGH_WITHOUT_FALSE = {"R3", "R4", "R5"}
+# Rule 4a carve-out (report_conflict): quoted fragments and conflict wording.
+QFRAG_MIN = 8
+_QFRAG_RE = re.compile(r'"([^"\n]{4,}?)"|`([^`\n]{4,}?)`|\u201c([^\u201d\n]{4,}?)\u201d|(?<!\w)\'([^\'\n]{4,}?)\'(?!\w)')
+_CONFLICT_RE = re.compile(r"\bvs\.?(?=\s)|\bversus\b|\bconflict|\bcontradict|\binconsistent|\bdisagree|"
+                          r"\bnext to\b|\balongside\b|\bwhile\b|\bwhereas\b|\bbut\b|\byet\b", re.IGNORECASE)
 
 
 def _norm(text: str) -> str:
@@ -274,12 +284,41 @@ class BundleView:
         return None
 
 
+def report_conflict(item: Dict[str, str], view: BundleView) -> Optional[str]:
+    """Rule 4a carve-out: why a claims-only R1 item is a report-consistency finding, or None.
+
+    Only an R1 item with verdict `partial`/`n/a` at severity low qualifies (never `false`, never
+    medium/high), and its evidence must name a conflict and quote either two distinct fragments of the
+    request claims (an internal contradiction) or one claims fragment plus a short bundle line that is
+    not claims text (e.g. a log `tz` header too short for a 12-char span).
+    """
+    if item["rubric"] != "R1" or item["verdict"] not in ("partial", "n/a") or item["severity"] != "low":
+        return None
+    ev = item["evidence"]
+    if not _CONFLICT_RE.search(ev):
+        return None
+    frags = {_norm(q) for q in (next(g for g in m.groups() if g) for m in _QFRAG_RE.finditer(ev))}
+    frags = {q for q in frags if len(q) >= QFRAG_MIN}
+    claims_frags = {q for q in frags if q in view.self_text}
+    claims_frags |= set(view._spans(_norm(ev), view.self_text))
+    distinct = [q for q in claims_frags if not any(q != o and q in o for o in claims_frags)]
+    if len(distinct) >= 2:
+        return "two conflicting claims fragments"
+    world = [q for q in frags if q in view.world and q not in view.self_text and not view._is_name(q)]
+    if distinct and world:
+        return "claims fragment vs bundle line"
+    return None
+
+
 def apply_verdict_rules(item: Dict[str, str], view: Optional[BundleView]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """Return (item or None if dropped, note). Mutates *item* on downgrade."""
     if view is None:
         return item, None
     contra, selfs = view.analyse(item["claim"], item["evidence"])
     if selfs and not contra:
+        why = report_conflict(item, view)
+        if why:
+            return item, f"{item['id'] or '?'}: kept, report-consistency finding (R1 {item['verdict']}/low, {why})"
         return None, (f"{item['id'] or '?'}: dropped, evidence is only the request claims or the user's message "
                       f"(not evidence about the world)")
     if item["verdict"] != "false":
