@@ -127,6 +127,15 @@ The frontier judge sees **infra-class** data only: plans, configs, diffs of infr
 
 The collector assigns the class by path rules, and defaults to `sensitive` when unsure.
 
+How each request type is classified:
+
+| Request | Class |
+|---|---|
+| Plan, completion, or gate request **with** changed paths | `infra` only if every path matches an infra rule; the collector re-checks and the stricter answer wins |
+| Gate request about a command to the backend or edge with **no** local paths (rules `remote-mutation`, `remote-opaque`, `remote-copy`) | `infra`: the evidence is the redacted command itself |
+| Gate request for any other rule (`secret-output`, `sensitive-path`, `public-push`, oversight) | `sensitive` |
+| Completion request with **no** changed paths | `sensitive`, unless the session's working directory is an infra path. The agent's final answer can quote anything it read, and reads are not tracked. Add a directory to `JUDGE_INFRA_REPOS` to opt it in deliberately. |
+
 ## Injection safety
 
 - Findings reach Hermes through `pre_llm_call`, clearly labelled as *reviewer findings (data)*. Hermes does **not** scan hook-injected context (as of the version this was built against, `pre_llm_call` output bypasses its context-file scanner), so `inject.py` runs Hermes's own threat patterns over every item itself: a matching item is withheld (pointer to its finding file instead), and if the assembled block still matches, nothing is injected.

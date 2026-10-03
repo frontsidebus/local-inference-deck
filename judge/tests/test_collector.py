@@ -134,3 +134,18 @@ def test_redact_shapes():
     assert tok not in s and "p@ss" not in s and "abcdefghijklmnop" not in s and "A" * 43 not in s
     assert "hunter2hunter2" not in s
     assert "max_tokens=4096" in s and "tokens=~3,545" in s
+
+
+# --- effective_class with no changed paths (gate requests about host commands) ---
+
+@pytest.mark.parametrize("req_class,expected", [("infra", "infra"), ("sensitive", "sensitive"), (None, "sensitive")])
+def test_effective_class_no_paths_keeps_hook_decision(env, req_class, expected):
+    req = {"changed_paths": [], "data_class": req_class, "detail": {}}
+    if req_class is None:
+        del req["data_class"]
+    assert collect.effective_class(req, config.load_config()) == expected
+
+
+def test_effective_class_paths_still_rechecked(env):
+    req = {"changed_paths": ["/home/x/company/app.py"], "data_class": "infra", "detail": {}}
+    assert collect.effective_class(req, config.load_config()) == "sensitive"

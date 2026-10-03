@@ -481,3 +481,54 @@ def test_timing_subprocess(env):
         assert r.returncode == 0
     # budget: <100 ms typical (python startup + policy render + gate.log + queue write); ~35 ms measured
     assert statistics.median(times) < 0.1, times
+
+
+# --- data_class of gate review requests (what may reach a frontier judge) ---
+
+class _Cfg:
+    """Stand-in for lib.config: classify() says infra only for /srv paths."""
+    @staticmethod
+    def classify(paths, cwd=None):
+        return "infra" if all(str(p).startswith("/srv/") for p in paths) else "sensitive"
+
+
+class _Boom:
+    @staticmethod
+    def classify(paths, cwd=None):
+        raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize("rules,paths,expected", [
+    (["remote-mutation"], [], "infra"),
+    (["remote-opaque"], [], "infra"),
+    (["remote-copy"], ["/srv/digest/compose.yaml"], "infra"),
+    (["remote-copy"], ["/home/u/company/app.py"], "sensitive"),      # local source may be sensitive
+    (["remote-mutation", "secret-output"], [], "sensitive"),         # any non-host rule wins
+    (["secret-output"], [], "sensitive"),
+    (["sensitive-path"], ["/etc/hosts"], "sensitive"),
+    (["public-push"], [], "sensitive"),
+    (["oversight-config"], [], "sensitive"),
+    ([], [], "sensitive"),
+])
+def test_gate_data_class(rules, paths, expected):
+    assert gate.gate_data_class(_Cfg, rules, paths, None) == expected
+
+
+def test_gate_data_class_fails_safe():
+    assert gate.gate_data_class(_Boom, ["remote-copy"], ["/srv/x"], None) == "sensitive"
+
+
+def test_cli_host_mutation_request_is_infra(env):
+    r = run_cli(json.dumps(payload("terminal", {"command": f"ssh {B} 'sudo systemctl reload nginx'"},
+                                   cwd=env["HOME"])), env)
+    assert r.returncode == 0 and json.loads(r.stdout)["action"] == "approve"
+    req = json.loads(next((Path(env["JUDGE_REVIEW_DIR"]) / "queue").glob("*-gate.json")).read_text())
+    assert req["data_class"] == "infra" and req["detail"]["rules"] == ["remote-mutation"]
+
+
+def test_cli_secret_output_request_stays_sensitive(env):
+    r = run_cli(json.dumps(payload("terminal", {"command": "cat ~/.config/spark/hermes.key"},
+                                   cwd=env["HOME"])), env)
+    assert json.loads(r.stdout)["action"] == "approve"
+    req = json.loads(next((Path(env["JUDGE_REVIEW_DIR"]) / "queue").glob("*-gate.json")).read_text())
+    assert req["data_class"] == "sensitive"
