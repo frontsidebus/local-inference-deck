@@ -25,10 +25,17 @@ Public API:
     write_finding(finding, root=None) -> (json_path, md_path)   drops items with empty evidence, validates
     render_finding_md(finding) -> str
     read_findings(root=None, request_id=None) -> list[dict]
-    ack(request_id, item_id, reason="", root=None) -> Path   (alias: write_ack)
-    is_acked(request_id, item_id, root=None) -> bool
+    ack(request_id, item_id, reason="", root=None, *, actor="human", via=None) -> Path   (alias: write_ack)
+                                              JSON {"actor", "reason", "ts"[, "via"]}
+    is_acked(request_id, item_id, root=None) -> bool        any ack (stops C5 injection)
+    read_ack(request_id, item_id, root=None) -> dict | None  legacy plain text reads as actor "human"
+    agent_wrote_ack(...) / ack_actor(...) -> effective actor ("agent" if an agent tool call wrote the file)
+    closure(actor, severity) / item_status(request_id, item) -> "open" | "agent-acked" | "closed"
+    is_closed(request_id, item) / needs_human(status, item) / items_by_status(root=None)
     unacked_items(root=None) -> list[(finding, item)]
     is_duplicate(req, window_s=None, root=None) -> str | None   completion dedupe (pre_verify vs on_session_end)
+    merge_into_pending_completion(req, since=None, root=None) -> str | None
+                                              fold on_session_end into the turn's pending pre_verify request
     evidence_dir(request_id, root=None, create=False) -> Path
     snapshot_dir(session, root=None, create=False) -> Path
     atomic_write(path, data, mode=0o600) / atomic_write_json(path, obj) / ensure_dir(path) / ensure_dirs(root)
@@ -356,6 +363,103 @@ def is_duplicate(req: Dict[str, Any], window_s: Optional[float] = None, root=Non
     return None
 
 
+def _is_pre_verify(req: Dict[str, Any]) -> bool:
+    return req.get("source_event") == "pre_verify" or (req.get("detail") or {}).get("hook") == "pre_verify"
+
+
+def merge_into_pending_completion(req: Dict[str, Any], since: Optional[str] = None,
+                                  root=None) -> Optional[str]:
+    """Fold an on_session_end completion request *req* (built, not written) into the same turn's pending
+    pre_verify completion request instead of queueing a second review of the same turn (#12).
+
+    Target: the newest request in queue/ with kind "completion", the same session, written by pre_verify
+    (source_event or detail.hook), not merged before, and created at or after *since* (the previous
+    on_session_end of the session, i.e. the start of this turn). A request whose evidence bundle already
+    exists (evidence/<id>/: the runner is judging it) is left alone, as is one already in done/.
+
+    Merge: changed_paths = union; since = the earlier; claims, plan, created (the turn's end, so the
+    evidence window covers the whole turn) and detail fields (turn_id ...) from *req*, with the
+    pre_verify detail kept underneath; data_class "sensitive" if either side is; id, kind, session and
+    source_event stay. detail.merged records both creation times. Validated, written atomically.
+
+    Returns the merged request's id, or None when nothing was merged (the caller then writes *req* as a
+    new request, subject to is_duplicate)."""
+    if req.get("kind") != "completion" or not req.get("session"):
+        return None
+    floor = None
+    if since:
+        try:
+            floor = parse_utc(since)
+        except ValueError:
+            floor = None
+    r = _root(root)
+    best = None
+    for e in list_pending(root):
+        if (e.get("kind") != "completion" or e.get("session") != req.get("session")
+                or not _is_pre_verify(e) or (e.get("detail") or {}).get("merged")):
+            continue
+        try:
+            ec = parse_utc(e.get("created") or "")
+        except ValueError:
+            continue
+        if floor is not None and ec < floor:
+            continue
+        if best is None or ec >= best[0]:
+            best = (ec, e)
+    if best is None:
+        return None
+    pv = best[1]
+    rid = _check_request_id(str(pv["id"]))
+    if (r / "evidence" / rid).exists():  # being judged right now: a merge would not be reviewed
+        return None
+    try:
+        end_created = parse_utc(req.get("created") or "")
+    except ValueError:
+        end_created = datetime.now(timezone.utc)
+    try:
+        sinces = [parse_utc(pv["since"])]
+    except (KeyError, ValueError):
+        sinces = []
+    try:
+        sinces.append(parse_utc(req["since"]))
+    except (KeyError, ValueError):
+        pass
+    detail = dict(pv.get("detail") or {})
+    detail.update(req.get("detail") or {})
+    detail["merged"] = {"from": ["pre_verify", "on_session_end"], "pre_verify_created": pv.get("created"),
+                        "session_end_created": req.get("created")}
+    merged = dict(pv)
+    merged.update({
+        "created": utc_now_iso(max(best[0], end_created)),
+        "since": utc_now_iso(min(sinces)) if sinces else pv.get("since"),
+        "changed_paths": sorted(set(pv.get("changed_paths") or []) | set(req.get("changed_paths") or [])),
+        "claims": (req.get("claims") or pv.get("claims") or "")[:4000],
+        "plan": req.get("plan") or pv.get("plan"),
+        "data_class": "sensitive" if "sensitive" in (pv.get("data_class"), req.get("data_class")) else "infra",
+        "detail": detail,
+    })
+    errs = validate_request(merged)
+    if errs:
+        raise ValidationError(errs)
+    qp, dp = r / "queue" / f"{rid}.json", r / "done" / f"{rid}.json"
+    if not qp.is_file() or dp.exists():
+        return None
+    atomic_write_json(qp, merged)
+    if dp.exists() or (r / "evidence" / rid).exists():
+        # The runner took the request between our check and our write: do not leave a second, stale copy
+        # in queue/ (it would be judged again on the old evidence). The caller writes a new request.
+        # If it is still in queue/ (judging), put the original back so is_duplicate sees what is judged.
+        try:
+            if dp.exists():
+                os.unlink(qp)
+            else:
+                atomic_write_json(qp, pv)
+        except OSError:
+            pass
+        return None
+    return rid
+
+
 # ---------------------------------------------------------------- findings
 def render_finding_md(finding: Dict[str, Any]) -> str:
     lines = [f"# Judge findings: {finding.get('request', '?')}", "",
@@ -420,6 +524,23 @@ def read_findings(root=None, request_id: Optional[str] = None) -> List[Dict[str,
 
 
 # ---------------------------------------------------------------- acks
+# An ack file acks/<request-id>.<item-id> holds one JSON object {"actor": "human"|"agent", "reason": str,
+# "ts": "<UTC Z>"} plus an optional "via" provenance object written by bin/judge-ack. A legacy ack (empty
+# or a plain-text reason) reads as actor "human".
+#
+# Semantics: ANY ack stops C5 re-injection (is_acked). An item is CLOSED only when a human acked it, or
+# an agent acked it and its severity is not high. An agent ack of a high item leaves it "agent-acked":
+# not injected any more, but still awaiting a human (judge-findings --needs-human).
+#
+# Forgery: the agent runs as the same user and the gate lets it write acks/, so it can write any ack
+# content. agent_wrote_ack() catches the direct case: an ack file that one of the agent's recorded tool
+# calls (snapshots/*/events.jsonl: write_file/patch targets, terminal path tokens) wrote to is read as
+# actor "agent" whatever it claims. See bin/judge-ack for the process-side check.
+ACK_ACTORS = ("human", "agent")
+ACK_STATUSES = ("open", "agent-acked", "closed")
+MAX_ACK_BYTES = 8192
+
+
 def _ack_path(request_id: str, item_id: str, root=None) -> Path:
     _check_request_id(request_id)
     if not isinstance(item_id, str) or not ITEM_ID_RE.match(item_id):
@@ -427,21 +548,133 @@ def _ack_path(request_id: str, item_id: str, root=None) -> Path:
     return _root(root) / "acks" / f"{request_id}.{item_id}"
 
 
-def ack(request_id: str, item_id: str, reason: str = "", root=None) -> Path:
+def ack(request_id: str, item_id: str, reason: str = "", root=None, *, actor: str = "human",
+        via: Optional[Dict[str, Any]] = None, now: Optional[datetime] = None) -> Path:
+    """Write acks/<request-id>.<item-id> as {"actor", "reason", "ts"[, "via"]} (first line of reason,
+    <= 500 chars). bin/judge-ack decides the actor; library callers default to "human"."""
+    if actor not in ACK_ACTORS:
+        raise ValueError(f"bad ack actor: {actor!r}")
     p = _ack_path(request_id, item_id, root)
     ensure_dirs(root)
     line = (reason or "").strip().splitlines()[0][:500] if (reason or "").strip() else ""
-    return atomic_write(p, line + "\n" if line else "")
+    obj: Dict[str, Any] = {"actor": actor, "reason": line, "ts": utc_now_iso(now)}
+    if via:
+        obj["via"] = via
+    return atomic_write(p, json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 write_ack = ack
 
 
 def is_acked(request_id: str, item_id: str, root=None) -> bool:
+    """Any ack (human or agent, JSON or legacy). This is what stops C5 re-injection."""
     try:
         return _ack_path(request_id, item_id, root).exists()
     except ValueError:
         return False
+
+
+def read_ack(request_id: str, item_id: str, root=None) -> Optional[Dict[str, Any]]:
+    """The ack as written: {"actor", "reason", "ts", "legacy": bool[, "via"]}, or None when not acked.
+    Legacy plain-text acks read as actor "human" (ts = file mtime). A JSON object without a valid actor
+    reads as "agent" (not trusted)."""
+    try:
+        p = _ack_path(request_id, item_id, root)
+        with open(p, "rb") as fh:
+            raw = fh.read(MAX_ACK_BYTES).decode("utf-8", errors="replace")
+        mtime = utc_now_iso(datetime.fromtimestamp(p.stat().st_mtime, timezone.utc))
+    except (ValueError, OSError):
+        return None
+    text = raw.strip()
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            actor = obj.get("actor") if obj.get("actor") in ACK_ACTORS else "agent"
+            out = {"actor": actor, "reason": str(obj.get("reason") or "")[:500],
+                   "ts": str(obj.get("ts") or mtime), "legacy": False}
+            if isinstance(obj.get("via"), dict):
+                out["via"] = obj["via"]
+            return out
+    return {"actor": "human", "reason": (text.splitlines() or [""])[0][:500], "ts": mtime, "legacy": True}
+
+
+def agent_event_paths(root=None) -> set:
+    """Every path the agent's recorded tool calls named (all sessions' snapshots/*/events.jsonl)."""
+    out: set = set()
+    d = _root(root) / "snapshots"
+    if not d.is_dir():
+        return out
+    for ev_file in d.glob("*/events.jsonl"):
+        try:
+            lines = ev_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and isinstance(ev.get("paths"), list):
+                out.update(os.path.normpath(str(x)) for x in ev["paths"] if isinstance(x, str))
+    return out
+
+
+def agent_wrote_ack(request_id: str, item_id: str, root=None, _paths: Optional[set] = None) -> bool:
+    """True when one of the agent's recorded tool calls named this ack file (a direct write_file/patch,
+    or a terminal command with the ack path in it). Best effort: an obfuscated path is not caught."""
+    try:
+        p = os.path.normpath(str(_ack_path(request_id, item_id, root)))
+    except ValueError:
+        return False
+    paths = _paths if _paths is not None else agent_event_paths(root)
+    if p in paths:
+        return True
+    try:  # same file through a symlinked or differently spelled review dir
+        rp = os.path.realpath(p)
+        return any(os.path.realpath(x) == rp for x in paths if os.path.basename(x) == os.path.basename(p))
+    except OSError:
+        return False
+
+
+def ack_actor(request_id: str, item_id: str, root=None, _paths: Optional[set] = None) -> Optional[str]:
+    """Effective actor of the item's ack ("human" | "agent"), or None when not acked. An ack the agent
+    wrote directly (agent_wrote_ack) is "agent" whatever the file claims."""
+    a = read_ack(request_id, item_id, root)
+    if a is None:
+        return None
+    if a["actor"] == "human" and agent_wrote_ack(request_id, item_id, root, _paths):
+        return "agent"
+    return a["actor"]
+
+
+def _is_high(item: Dict[str, Any]) -> bool:
+    return str(item.get("severity") or "").strip().lower() == "high"
+
+
+def closure(actor: Optional[str], severity: Any) -> str:
+    """The closure rule on its own: "open" (no ack), "closed" (human ack, or agent ack of a non-high
+    item) or "agent-acked" (agent ack of a high item: awaiting a human)."""
+    if actor is None:
+        return "open"
+    if actor == "human" or str(severity or "").strip().lower() != "high":
+        return "closed"
+    return "agent-acked"
+
+
+def item_status(request_id: str, item: Dict[str, Any], root=None, _paths: Optional[set] = None) -> str:
+    return closure(ack_actor(request_id, str(item.get("id")), root, _paths), item.get("severity"))
+
+
+def is_closed(request_id: str, item: Dict[str, Any], root=None) -> bool:
+    return item_status(request_id, item, root) == "closed"
+
+
+def needs_human(status: str, item: Dict[str, Any]) -> bool:
+    """A high item that no human has closed (open, or acked only by the agent)."""
+    return status != "closed" and _is_high(item)
 
 
 def unacked_items(root=None) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
@@ -450,4 +683,14 @@ def unacked_items(root=None) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
         for it in f.get("items") or []:
             if not is_acked(f["request"], str(it.get("id")), root):
                 out.append((f, it))
+    return out
+
+
+def items_by_status(root=None) -> Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
+    """{"open": [...], "agent-acked": [...], "closed": [...]} of (finding, item)."""
+    out: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {s: [] for s in ACK_STATUSES}
+    paths = agent_event_paths(root)
+    for f in read_findings(root):
+        for it in f.get("items") or []:
+            out[item_status(f["request"], it, root, paths)].append((f, it))
     return out
