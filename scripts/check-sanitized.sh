@@ -31,6 +31,8 @@ if [[ -f site.env ]]; then
     case $k in
       SPARK_USERS|HARNESS_KEYS) continue;;           # names: whole-word list in .sanitize-words
       *_PORT|*_IF|*_GROUP|*_CLIENT_ID|MODELS_DIR|BACKEND_SSH_USER) continue;;  # generic, not identifying
+      JUDGE_SSH_ALIASES|JUDGE_INFRA_REPOS) ;;          # site-identifying judge settings: still checked
+      JUDGE_*) continue;;                               # judge policy knobs (modes, model aliases, caps): public values
     esac
     if [[ $k == ADMIN_SOURCE_IPS ]]; then items=($v); else items=("$v"); fi
     for w in "${items[@]}"; do
