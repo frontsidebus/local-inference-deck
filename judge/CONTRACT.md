@@ -257,7 +257,8 @@ via git); plain dirs are copied (`snapshot.dir_roots`), skipping `.git`, `node_m
 directory), `snapshot_caps: {max_files, max_bytes}` and `noise_globs`. `meta.json`,
 `index.json` (`{abs_path: {"sha256", "size"}}`, plus `"skipped"` when a file was not copied), `files/<abs path>`
 copies, `events.jsonl` (tool calls seen by post_tool_call: `{"t","tool","paths","status"}`; `paths` are the
-write_file/patch targets, or the path-like tokens of a terminal command, used only for attribution; plus
+write_file/patch targets, or the path-like tokens of a terminal command, used only for attribution, and empty
+for read_file/memory/skill_manage; plus
 `call_id` = Hermes `extra.tool_call_id` when sent and `call_hash` = `lib/redact.call_hash(tool, tool_input)`;
 never the command text).
 
@@ -342,6 +343,21 @@ exit 64, no execution.
   - escalate as `secret-output`: `config get --raw` (prints credentials unmasked; passes when captured).
   - escalate as `hermes-config`: any other `config` action (`migrate`, `set|unset` of a non-oversight key,
     unknown), any other `hooks` action (e.g. `test`), `setup`, `migrate`.
+- **Shell structure** (`gate.shell_structure`, terminal commands local and remote, #22): reserved words count
+  only in command position. `if then elif else fi`, `while until do done`, `{ }`, `!`, `time` are dropped and
+  the commands between them judged one by one; `for`/`select` headers (`for x in ...`, `for x do`,
+  `for (( ... ))`) and `case WORD in` + patterns (`a|b)`, `(c)`) are dropped (arms end at `;;`, `;&`, `;;&`);
+  `[[ ... ]]` is dropped whole (its `&& || < > ( )` are not shell operators); `(( ... ))` and `$(( ... ))` are
+  inert, except command substitutions inside them, which are analyzed like any other; `name() {...}` /
+  `function name {...}`: the body is judged where it is defined, and a later call of that name is not an
+  unknown command (its own redirects still count). Redirects after `done`/`fi`/`esac`/`}` apply as written
+  (remote `done > f` = `remote-mutation`). Unparseable structure is left as words, i.e. an unknown command,
+  which escalates remotely. Read-only remote builtins added to the policy: `typeset`, `readonly`, `shift`,
+  `break`, `continue`, `let`, `wait` (`[`, `test`, `true`, `false`, `:` were already there; a bare `X=1` never
+  was a command).
+- **post_tool_call matcher** (`install.sh`): `write_file|patch|terminal|memory|skill_manage|read_file`. A
+  `read_file` event in `events.jsonl` has `paths: []` plus `call_id`/`call_hash`, so a gated read gets an
+  `outcome` (#23); it never attributes a change to the agent.
 - Hermes keys consent on `(event, command)` (`agent/shell_hooks.py` `_entry_matches`), not the matcher, so the
   matcher change needs `install.sh --apply` (re-renders `gate-policy.json`, rewrites the hooks block) and a
   restart of Hermes and the gateway, but no new consent.
