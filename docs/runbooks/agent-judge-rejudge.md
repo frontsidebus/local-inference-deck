@@ -12,13 +12,13 @@ Why bundles and not live runs: a live re-run changes the agent's behaviour, the 
 ## The tool
 
 ```bash
-judge/runner/rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model ALIAS] [--no-budget]
+judge/runner/rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model ALIAS] [--no-budget] [--sensitive-local]
 ```
 
 - It reads requests and bundles from `$JUDGE_REVIEW_DIR` and **writes only to `DIR`**: `<id>.json` (with the validator's notes), `<id>.md`, `<id>.raw.txt` (the model's raw reply), `<id>.input.txt` (exactly what was sent), and `summary.json`. It never writes to `queue/`, `done/`, `findings/`, `acks/` or `evidence/`, and refuses an `--out` inside them. So it can point at the live review directory without changing what the agent sees.
 - It prints a table comparing each new finding with the existing `findings/<id>.json`: mode, items, and the count of high `false` items.
 - It sends `PROBES ALLOWED: no`, so every run sees the bundle exactly as saved.
-- **The data boundary holds.** A `sensitive` bundle is always judged locally; `--mode frontier` on one is refused and noted.
+- **The data boundary holds.** A `sensitive` bundle never goes to the frontier judge. Without `--mode` it is judged locally. With `--mode frontier` it is **refused**: no model call, `REFUSED` in the table with the reason, `"refused": true` in `summary.json`, and exit 1 (the other requests are still judged). It is not silently judged locally instead, because the default local model `big` unloads the coding models on Walter. If you do want those requests judged locally, add `--sensitive-local` (and usually `--model`); each such finding carries a note. For a mixed set of ids, the cleaner route is two runs: `--mode frontier` on the `infra` ids, `--mode local` on the rest.
 - `--model` sets the local or frontier model according to `--mode` (both when `--mode` is absent).
 - Frontier calls count against `JUDGE_FRONTIER_DAILY_MAX` unless you pass `--no-budget`. Each still costs up to `JUDGE_FRONTIER_MAX_USD`.
 - Exit codes: 0 ok, 1 when any request failed, 64 for usage errors.

@@ -355,7 +355,7 @@ count goes to `inject.log` only when it changes for the session. The footer name
 `judge-ack --agent <request-id> <item-id> "<reason>"` and says a HIGH item stays open until the human reviews it.
 
 ## Re-judging (`runner/rejudge.py`)
-`rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget]` judges existing bundles
+`rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget] [--sensitive-local]` judges existing bundles
 again with the current prompt and validator, via `run_judge.judge_bundle(request_id, request, evidence_dir, mode,
 notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, input, mode, model, notes}`, raises
 `JudgeError`).
@@ -364,7 +364,11 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 - Never writes to queue/, done/, findings/, acks/ or evidence/; an `--out` inside any of them is refused (64).
 - Writes `DIR/<id>.json` (with notes), `<id>.md`, `<id>.raw.txt`, `<id>.input.txt` and `DIR/summary.json`, and
   prints old (`findings/<id>.json`) vs new: mode, items, high+false count.
-- A `sensitive` bundle is always judged locally; `--mode frontier` on one is refused and noted.
+- A `sensitive` bundle is never judged by the frontier. Without `--mode` it is judged locally. With an explicit
+  `--mode frontier` that request is refused: no backend call, no `<id>.*` files, its summary row gets
+  `"refused": true` and an `error` naming the data class and `--sensitive-local`, the table prints `REFUSED`, and
+  the exit code is 1. `--sensitive-local` judges it locally instead, with a note (`summary.json` records
+  `"sensitive_local"`).
 - `--model` sets `JUDGE_LOCAL_MODEL` or `JUDGE_FRONTIER_MODEL` by `--mode` (both without `--mode`).
 - Frontier calls count in `usage.json` against `JUDGE_FRONTIER_DAILY_MAX` unless `--no-budget`.
 - Exit 0 ok, 1 when any request failed, 64 usage.
