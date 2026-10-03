@@ -278,11 +278,11 @@ To measure a prompt, validator or model change, re-run the judge on bundles you 
 
 ```bash
 JUDGE_REVIEW_DIR=~/.hermes/review judge/runner/rejudge.py <request-id>... --out /tmp/rj-vision \
-    --mode local --model vision          # --mode local|frontier, --model X, --no-budget
+    --mode local --model vision          # --mode local|frontier, --model X, --no-budget, --sensitive-local
 ```
 
 - It writes `<id>.json` (with the validator's notes), `<id>.md`, `<id>.raw.txt` (raw model output), `<id>.input.txt` (what the judge saw) and `summary.json` to `--out`, and prints old vs new per request: mode, item count, `high`+`false` count. An `--out` inside the review dir's own subdirectories is refused.
-- `sensitive` bundles are always judged locally; `--mode frontier` on one is refused and noted.
+- `sensitive` bundles never go to the frontier judge. Without `--mode` they are judged locally, as `run_judge.py` would. An explicit `--mode frontier` on one is **refused** for that request: no model call, a `REFUSED` line in the table, `"refused": true` and the reason in `summary.json`, and exit 1. It does not fall back to the local model silently, because `JUDGE_LOCAL_MODEL` (default `big`) can evict the coding models on Walter. Add `--sensitive-local` to judge those requests locally instead (noted in the finding).
 - Frontier re-judges count toward `JUDGE_FRONTIER_DAILY_MAX` unless you pass `--no-budget` (the per-call dollar cap still applies).
 - Exit 0 ok, 1 if any request failed, 64 usage error.
 
