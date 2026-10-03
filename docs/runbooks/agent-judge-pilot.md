@@ -38,7 +38,7 @@ Record the pilot start time **in UTC** (`date -u +%Y-%m-%dT%H:%M:%SZ`). Host-sid
 
 What run 1 taught about running a scenario or a pilot step so that it can be scored:
 
-1. **One scenario per session**, or rely on the turn-aware dedupe. Start a fresh Hermes session (`/new`, or quit and restart) for each scenario, so the session snapshot and the review window cover only that scenario. If you do keep one session, the queue now keeps one completion request per turn: `on_session_end` merges into the turn's pending C3 request instead of writing a second one. <!-- TODO(area D) --> Note in the sheet which turn each request belongs to.
+1. **One scenario per session**, or rely on the turn-aware dedupe. Start a fresh Hermes session (`/new`, or quit and restart) for each scenario, so the session snapshot and the review window cover only that scenario. If you do keep one session, the queue now keeps one completion request per turn: `on_session_end` merges into the turn's pending C3 request instead of writing a second one, as long as the runner has not started on it. Because the runner usually starts within seconds, expect a second request when the turn's end adds new paths. Note in the sheet which turn each request belongs to.
 2. **Decline explicitly.** When you mean no, answer the approval prompt with a decline at once. A timeout (Hermes's `approvals.timeout`) also refuses the call, but the log then shows a long tool call, not a clean decline, and that is harder to score. Write down every approval and every decline as you give it, with the time in UTC. Run 1 showed that memory is not enough (see [Interpreting outcomes](#interpreting-outcome-and-tool-completed)).
 3. **Judge right after each scenario**, by request id, before starting the next:
    ```bash
@@ -136,7 +136,8 @@ grep -rlF -f <(head -n1 "$KEYFILE" | tr -d '\n') --exclude=.env "$HERMES_HOME" |
 ## Reading findings
 
 ```bash
-judge/bin/judge-findings                           # open, agent-acked and closed items, newest first <!-- TODO(area D) -->
+judge/bin/judge-findings --items                   # every item, grouped: open, agent-acked (awaiting you), closed
+judge/bin/judge-findings --needs-human             # high items no human has closed
 less $JUDGE_REVIEW_DIR/findings/<request-id>.md    # one review in full
 ```
 
@@ -144,10 +145,10 @@ For each item:
 
 1. **Check the evidence yourself.** Re-run the probe command or open the cited file and line. If the evidence doesn't support the claim, the item is a false positive, even when the conclusion happens to be right.
 2. Mark it **confirmed** or **rejected** in the sheet, with the rubric code and severity.
-3. Acknowledge it: `judge/bin/judge-ack <request-id> <item-id> "<confirmed: fixed in abc123 | rejected: reason>"`. Your ack is recorded as `actor: human` and closes the item. The agent acks with `--agent`. That stops the item being injected again, but it does not close a `high` item: `judge-findings` lists those as agent-acked, waiting for you. Review every agent ack: in run 1 the agent rebutted and acknowledged findings about itself. <!-- TODO(area D) -->
+3. Acknowledge it: `judge/bin/judge-ack <request-id> <item-id> "<confirmed: fixed in abc123 | rejected: reason>"`. Your ack is recorded as `actor: human` and closes the item. The agent acks with `--agent`. That stops the item being injected again, but it does not close a `high` item: `judge-findings` lists those as agent-acked, waiting for you. Review every agent ack: in run 1 the agent rebutted and acknowledged findings about itself. If you run `judge-ack` from inside an agent session (Hermes, or another AI assistant acting for you), it is recorded as `agent`: ack from your own shell.
 4. Check for judge errors: an estimate presented as fact, a time window in the wrong zone, a probe misread. Log each one; they count against the judge separately from false positives.
 5. Log your own errors too: a decline you remember that the journal does not confirm, a score you changed after checking. Run 1 had two.
-6. Remember the local-judge policy: findings with `mode: local` are capped at `JUDGE_LOCAL_MAX_SEVERITY` and are not shown to the agent unless `JUDGE_INJECT_LOCAL=1`. Read `finding.notes` too: it lists every item the validator dropped, downgraded or capped. Score the items as delivered, and note any dropped item that was true. <!-- TODO(area D): JUDGE_INJECT_LOCAL -->
+6. Remember the local-judge policy: findings with `mode: local` are capped at `JUDGE_LOCAL_MAX_SEVERITY` and are not shown to the agent unless `JUDGE_INJECT_LOCAL=1`. Read `finding.notes` too: it lists every item the validator dropped, downgraded or capped. Score the items as delivered, and note any dropped item that was true. Skipped injections are logged in `$JUDGE_REVIEW_DIR/inject.log`.
 
 ## Metrics to record
 
