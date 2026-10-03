@@ -17,7 +17,8 @@ edge (Covenant) ──wg0──► BACKEND_WG_IP
 ```
 
 Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `coder-fast`, `big`,
-`vision`, `hermes`, `local/*`, `claude-*`) → llama-swap `:8080` → llama.cpp `llama-server`
+`vision`, `hermes`, `local/*`, `claude-*`; every request gets a bounded output limit, see
+[Output cap](#output-cap-no-unbounded-generations)) → llama-swap `:8080` → llama.cpp `llama-server`
 (image pinned by digest). Models and the GPU matrix are in `llama-swap/config.yaml.tmpl` and
 [`models.md`](models.md).
 
@@ -206,6 +207,28 @@ Existing values are never overwritten and never printed.
 
 Backups (`${MODELS_DIR}/backups`) contain all of these and are root-only but **not encrypted**.
 
+## Output cap (no unbounded generations)
+
+llama-server's default `n_predict` is -1: a request without `max_tokens` generates until the context
+is full. One such request to `coder` ran for 21 minutes to 131072 tokens. Two layers prevent that:
+
+| layer | where | what it does |
+|---|---|---|
+| gateway (per request) | `gateway/hooks/spark_hooks.py`, `cap_output()` | A request with no output limit (or a non-positive or non-integer one) gets `max_tokens` (chat, text completion, `/v1/messages`) or `max_output_tokens` (`/v1/responses`) = 16384. A limit above the model's maximum is clamped to it; a smaller limit passes unchanged. Maxima: `coder`, `coder-fast`, `big` 32768; `vision`, `hermes` 16384; `claude-*` as `coder`; `local/<id>` as that ID's alias, unknown IDs 16384. The LiteLLM log shows `spark_hooks: output cap ...` for every change. `SPARK_DEFAULT_MAX_OUTPUT` (env of the litellm service) overrides the default. |
+| llama-server (backstop) | `llama-swap/config.yaml.tmpl`, `-n <N>` in every model's `cmd` | Same maxima as the gateway. Covers anything that reaches llama-swap without a limit (direct calls from Walter, a hook failure). **`-n` is only a default**: on build 11277 a request that asks for more than `-n` still gets more (tested with `-n 8` and `max_tokens 20` → 20 tokens). The clamp therefore has to stay in the gateway. |
+
+The three places that hold the maxima (`model_info.max_tokens` in `litellm.yaml`, `-n` in the llama-swap
+config, `MODEL_MAX_OUTPUT` in the hook) are checked against each other by
+`gateway/tests/test_spark_hooks.py` (`python3 -m pytest walter/gateway/tests -q -p no:cacheprovider`).
+
+Check on the host (`/slots` shows the `n_predict` of the slot's **last** task; a fresh slot has none):
+```bash
+docker ps --filter label=llama-swap=1 --format '{{.Names}} {{.Ports}}'         # per-model ports
+docker inspect qwen3.8-27b --format '{{join .Args " "}}' | grep -o -- '-n [0-9]*'  # backstop flag
+curl -s 127.0.0.1:<port>/slots | jq '.[].params.n_predict'   # 16384 after a gateway request without a limit
+sudo docker logs --since 10m gateway-litellm-1 2>&1 | grep 'output cap'
+```
+
 ## Verify
 
 ```bash
@@ -226,6 +249,11 @@ systemctl list-timers 'spark-*'
 - **A config change:** every stack is a plain directory. Revert the file (or `git checkout` the
   previous repo revision and re-run deploy), then `docker compose up -d --force-recreate` that stack.
   `llama-swap` reloads `config.yaml` by itself.
+- **Output cap:** restore the `*.bak-outputcap-<ts>` copies of `/etc/llama-swap/config.yaml`
+  (`install -m 0640 -o root -g llamaswap`; `--watch-config` reloads and restarts the loaded models) and
+  `/srv/gateway/hooks/spark_hooks.py`, then `docker compose -f /srv/gateway/compose.yaml up -d
+  --force-recreate --no-deps litellm`. The hook is a single-file bind mount, so a new file needs a
+  recreate, not just a restart.
 - **A stack:** `sudo docker compose -f /srv/<stack>/compose.yaml down`. Volumes are kept unless
   you add `-v`.
 - **Host units:** `sudo systemctl disable --now llama-swap spark-backup.timer spark-update-check.timer`.

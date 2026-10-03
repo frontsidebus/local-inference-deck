@@ -150,6 +150,8 @@ Claude Code inserts `system` or `developer` messages in the middle of a conversa
 
 The fix lives in the gateway, not the client. `spark_hooks.py` is a LiteLLM pre-call hook (shipped under [walter/](walter/README.md)) that rewrites every system or developer message after the first into a user message wrapped in `<system-reminder>` tags. It covers `/v1/messages`, `/v1/chat/completions` and `/v1/responses`.
 
+The same hook also caps output. A request without `max_tokens` (`max_output_tokens` on `/v1/responses`) gets 16384, and a limit above the model's maximum (32768 for `coder`, `coder-fast` and `big`, 16384 for `vision` and `hermes`) is clamped to it. llama-server additionally runs with `-n` set to the same maximum, but on the pinned build `-n` is only a default that a request can exceed, so the gateway clamp is the real limit. Root cause: a request with no `max_tokens` ran for 21 minutes to the 131K context limit ([walter/README.md](walter/README.md#output-cap-no-unbounded-generations)).
+
 Why here:
 - It protects every harness and every model behind the alias, not only one client config.
 - The client-side workaround was an undocumented Claude Code variable (`CLAUDE_CODE_MODEL_CAPABILITIES="-mid_conv_system,-mid_conv_tool_change"`) found in the binary, which can break on any upgrade. It is no longer needed.
@@ -196,6 +198,7 @@ How to act on the report: [docs/runbooks/upgrade.md](docs/runbooks/upgrade.md).
 
 **Models and llama.cpp**
 - Qwen and Gemma think by default. A small `max_tokens` returns empty content; clients need a bigger budget or `enable_thinking: false`.
+- Output is never unbounded: the gateway sets `max_tokens` 16384 when a request has none and clamps larger values to the model's maximum (32768 or 16384). A long thinking answer can end with `finish_reason: length`; ask for more explicitly, up to the maximum.
 - The startup preload logs `status 404` for each model, yet both models load and stay warm. Harmless; cause unknown.
 - Loads over the x1 link are slow: `coder-fast` ~16 s, `big` ~20 s.
 
