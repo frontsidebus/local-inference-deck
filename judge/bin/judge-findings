@@ -3,13 +3,19 @@
 
 List or summarize judge findings in $JUDGE_REVIEW_DIR/findings/.
 
-  (no args)              one line per finding from the last 7 days: counts by severity, unacked count
-  <request-id>           every item of that finding, with ack status
-  --items                every item (not one line per finding), filtered by the options below
-  --unacked              only unacknowledged items (implies --items)
+Every item has a status:
+  open          not acknowledged (C5 keeps showing it to the agent)
+  agent-acked   a HIGH item acknowledged only by the agent: no longer injected, awaits a human
+  closed        acknowledged by a human, or by the agent when its severity is not high
+
+  (no args)              one line per finding from the last 7 days: counts by severity and by status
+  <request-id>           every item of that finding, grouped by status
+  --items                every item (not one line per finding), grouped by status, filtered as below
+  --unacked              only items with no acknowledgement at all (implies --items)
+  --needs-human          only HIGH items no human has closed: open or agent-acked (implies --items)
   --min-severity LEVEL   low|medium|high (default low)
   --since HOURS          only findings created in the last HOURS (default 168; 0 = all)
-  --json                 machine-readable output
+  --json                 machine-readable output (each item gets "acked", "status" and "ack")
 Colors are used only when stdout is a TTY and NO_COLOR is unset.
 """
 import json
@@ -18,11 +24,16 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "runner"))
+JUDGE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(JUDGE_DIR / "runner"))
+sys.path.insert(0, str(JUDGE_DIR))
 import common as C  # noqa: E402
+from lib import queue as Q  # noqa: E402
 
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 SEV_COLOR = {"high": "31;1", "medium": "33", "low": "36"}
+STATUS_COLOR = {"open": "1", "agent-acked": "35", "closed": "32"}
+GROUPS = (("open", "open"), ("agent-acked", "agent-acked: awaiting a human"), ("closed", "closed"))
 
 
 def paint(text, code):
@@ -34,7 +45,8 @@ def sev(s):
 
 
 def parse(argv):
-    opts = {"items": False, "unacked": False, "min": "low", "since": 168.0, "json": False, "rid": None}
+    opts = {"items": False, "unacked": False, "needs_human": False, "min": "low", "since": 168.0, "json": False,
+            "rid": None}
     it = iter(argv)
     for a in it:
         if a in ("-h", "--help"):
@@ -44,6 +56,8 @@ def parse(argv):
             opts["items"] = True
         elif a == "--unacked":
             opts["unacked"] = opts["items"] = True
+        elif a == "--needs-human":
+            opts["needs_human"] = opts["items"] = True
         elif a == "--json":
             opts["json"] = True
         elif a == "--min-severity":
@@ -61,9 +75,33 @@ def parse(argv):
     return opts
 
 
+def ack_info(rid, iid, root, paths):
+    a = Q.read_ack(rid, iid, root)
+    if a is None:
+        return None
+    actor = Q.ack_actor(rid, iid, root, paths)
+    out = {"actor": actor, "reason": a.get("reason", ""), "ts": a.get("ts", "")}
+    if actor != a["actor"]:
+        out["claimed_actor"] = a["actor"]  # the file says human, but an agent tool call wrote it
+    if a.get("legacy"):
+        out["legacy"] = True
+    return out
+
+
+def describe_ack(it):
+    a = it.get("ack")
+    if not a:
+        return ""
+    who = a["actor"] + (f" (file claims {a['claimed_actor']}; written by an agent tool call)"
+                        if a.get("claimed_actor") else "")
+    return f"     ack: {who} {a.get('ts', '')}: {a.get('reason', '')}"
+
+
 def main(argv):
     o = parse(argv)
     floor = C.SEVERITY_RANK[o["min"]]
+    root = C.review_dir()
+    paths = Q.agent_event_paths(root)
     rows = []
     for path, f in C.iter_findings():
         rid = str(f.get("request") or path.stem)
@@ -75,10 +113,18 @@ def main(argv):
         for it in f.get("items") or []:
             if not isinstance(it, dict) or C.SEVERITY_RANK.get(str(it.get("severity")), 0) < floor:
                 continue
-            acked = C.is_acked(rid, str(it.get("id")))
-            if o["unacked"] and acked:
+            iid = str(it.get("id"))
+            try:
+                C.check_ids(rid, iid)
+                ack = ack_info(rid, iid, root, paths)
+            except ValueError:
+                ack = None
+            status = Q.closure(ack["actor"] if ack else None, it.get("severity"))
+            if o["unacked"] and ack is not None:
                 continue
-            items.append({**it, "acked": acked})
+            if o["needs_human"] and not Q.needs_human(status, it):
+                continue
+            items.append({**it, "acked": ack is not None, "status": status, "ack": ack})
         rows.append((rid, f, items))
     if o["rid"] and not rows:
         print(f"judge-findings: no finding {o['rid']}", file=sys.stderr)
@@ -89,30 +135,37 @@ def main(argv):
                           for _, f, items in rows], indent=2, ensure_ascii=False))
         return 0
     if o["rid"] or o["items"]:
-        for rid, f, items in rows:
-            if not items and not o["rid"]:
+        shown = 0
+        for status, title in GROUPS:
+            group = [(rid, f, it) for rid, f, items in rows for it in C.items_sorted(items) if it["status"] == status]
+            if not group:
                 continue
-            print(paint(f"{rid}", "1") + f"  {f.get('mode')} {f.get('judge')}  {f.get('created')}")
-            for n in f.get("notes") or []:
-                print(f"  note: {n}")
-            if not items:
-                print("  (no items)")
-            for it in C.items_sorted(items):
-                ack = paint("acked", "32") if it["acked"] else paint("open", "1")
-                print(f"  {it.get('id')} {sev(it.get('severity'))} {it.get('rubric')} verdict={it.get('verdict')} [{ack}]")
+            print(paint(f"== {title} ({len(group)}) ==", STATUS_COLOR[status]))
+            for rid, f, it in group:
+                print(f"  {rid} {it.get('id')} {sev(it.get('severity'))} {it.get('rubric')} "
+                      f"verdict={it.get('verdict')}  [{f.get('mode')} {f.get('judge')}]")
                 print(f"     claim: {it.get('claim')}")
                 print(f"     evidence: {it.get('evidence')}")
                 print(f"     recommendation: {it.get('recommendation')}")
+                if it.get("ack"):
+                    print(describe_ack(it))
+                shown += 1
             print()
+        if o["rid"]:
+            for n in rows[0][1].get("notes") or []:
+                print(f"note: {n}")
+        if not shown:
+            print("(no items)")
         return 0
     if not rows:
         print("no findings")
         return 0
     for rid, f, items in rows:
         counts = {s: sum(1 for i in items if i.get("severity") == s) for s in ("high", "medium", "low")}
-        open_n = sum(1 for i in items if not i["acked"])
+        by_status = {s: sum(1 for i in items if i["status"] == s) for s, _ in GROUPS}
         parts = " ".join(paint(f"{s[0].upper()}:{counts[s]}", SEV_COLOR[s] if counts[s] else "") for s in counts)
-        print(f"{rid:<44} {f.get('mode', '?'):<8} {parts}  open:{open_n}")
+        st = " ".join(paint(f"{s}:{n}", STATUS_COLOR[s] if n and s != "closed" else "") for s, n in by_status.items())
+        print(f"{rid:<44} {f.get('mode', '?'):<8} {parts}  {st}")
     return 0
 
 

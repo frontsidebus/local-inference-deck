@@ -10,6 +10,8 @@ Selects finding items that are
   - not acknowledged (acks/<request-id>.<item-id> absent),
   - from a finding created in the last JUDGE_INJECT_WINDOW_HOURS (default 24),
   - for this session, or for no specific session (request without a session),
+  - not from a local-mode finding (finding.mode == "local"), unless JUDGE_INJECT_LOCAL=1; the number
+    skipped this way is logged to $JUDGE_REVIEW_DIR/inject.log,
 and renders them as a block framed as reviewer findings (data, not instructions), capped at
 JUDGE_INJECT_MAX_CHARS (default 2000).
 
@@ -104,7 +106,10 @@ def _request_session(common, rid: str) -> Optional[str]:
     return common.request_session_short(rid) or None
 
 
-def select_items(common, session_id: str, min_sev: str, window: timedelta) -> List[Dict[str, Any]]:
+def select_items(common, session_id: str, min_sev: str, window: timedelta,
+                 inject_local: bool = True, skipped: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+    """Eligible items, highest severity first. Items of local-mode findings are left out unless
+    *inject_local*; their count goes to skipped["local"]."""
     floor = common.SEVERITY_RANK.get(min_sev, 2)
     out: List[Dict[str, Any]] = []
     for path, finding in common.iter_findings():
@@ -123,7 +128,11 @@ def select_items(common, session_id: str, min_sev: str, window: timedelta) -> Li
             if common.SEVERITY_RANK.get(str(it.get("severity")), 0) < floor:
                 continue
             iid = str(it.get("id") or "")
-            if not iid or common.is_acked(rid, iid):
+            if not iid or common.is_acked(rid, iid):  # any ack (human or agent) stops re-injection
+                continue
+            if not inject_local and str(finding.get("mode") or "").strip().lower() == "local":
+                if skipped is not None:
+                    skipped["local"] = skipped.get("local", 0) + 1
                 continue
             out.append({**it, "_request": rid, "_created": str(finding.get("created") or "")})
     # highest severity first, newest first within a severity (stable sorts)
@@ -148,7 +157,8 @@ def render_item(it: Dict[str, Any], scan: Callable[[str], List[str]]) -> str:
 
 def build_block(items: List[Dict[str, Any]], scan: Callable[[str], List[str]], cap: int) -> str:
     footer = ("If you have handled an item or disagree with it, you may acknowledge it with: "
-              f"{ack_command()} <request-id> <item-id> \"<reason>\"")
+              f"{ack_command()} --agent <request-id> <item-id> \"<reason>\"\n"
+              "Your acknowledgement stops this reminder. A HIGH item stays open until the human reviews it.")
     parts, used, shown = [HEADER], len(HEADER) + len(footer) + 80, 0
     for it in items:
         chunk = render_item(it, scan)
@@ -165,13 +175,41 @@ def build_block(items: List[Dict[str, Any]], scan: Callable[[str], List[str]], c
     return "".join(parts)
 
 
+def log_local_skips(common, session_id: str, n: int) -> None:
+    """One inject.log line when the number of skipped local-mode items changes for a session (pre_llm_call
+    fires on every model call, so an unchanged count is not logged again)."""
+    state_path = common.review_dir() / ".inject-local-skips.json"
+    try:
+        state = common.read_json(state_path) if state_path.exists() else {}
+    except Exception:
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    key = session_id or "-"
+    if state.get(key) == n:
+        return
+    common.log_error("inject.log", f"inject: session {key}: skipped {n} item(s) from local-mode findings "
+                                   "(JUDGE_INJECT_LOCAL=0)")
+    state[key] = n
+    if len(state) > 200:
+        state = dict(list(state.items())[-200:])
+    try:
+        common.write_json(state_path, state)
+    except Exception:
+        pass
+
+
 def run(payload: Dict[str, Any]) -> Dict[str, Any]:
     import common  # noqa: E402  (judge/runner/common.py)
     session_id = str(payload.get("session_id") or (payload.get("extra") or {}).get("session_id") or "")
     min_sev = common.setting("JUDGE_INJECT_MIN_SEVERITY", "medium").strip().lower()
     hours = float(common.setting("JUDGE_INJECT_WINDOW_HOURS", "24"))
     cap = int(common.setting("JUDGE_INJECT_MAX_CHARS", "2000"))
-    items = select_items(common, session_id, min_sev, timedelta(hours=hours))
+    inject_local = common.setting("JUDGE_INJECT_LOCAL", "0").strip() == "1"
+    skipped: Dict[str, int] = {}
+    items = select_items(common, session_id, min_sev, timedelta(hours=hours), inject_local, skipped)
+    if skipped.get("local"):
+        log_local_skips(common, session_id, skipped["local"])
     if not items:
         return {}
     scan, _src = load_scanner()
