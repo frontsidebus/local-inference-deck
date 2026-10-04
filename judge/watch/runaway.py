@@ -356,6 +356,17 @@ def run_once(slots_data: Any, out: Any, now: Optional[float] = None) -> List[Dic
     return alerts
 
 
+def release_deferred() -> List[str]:
+    """Wake deferred review requests whose not_before passed (#34). The hooks do this on every event, but a
+    turn that never ends (agent crashed or timed out) fires no further hook; this poll is the backstop."""
+    q = _import("queue")
+    try:
+        return list(q.release_due()) if q is not None and hasattr(q, "release_due") else []
+    except Exception as e:  # never let queue trouble stop the watcher
+        print(f"runaway watch: release_due failed: {e}", file=sys.stderr)
+        return []
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--once", action="store_true", help="single pass, then exit")
@@ -379,6 +390,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"runaway watch: poll failed: {e}", file=sys.stderr)
             if args.once:
                 return 1
+        release_deferred()
         if args.once:
             return 0
         time.sleep(max(5.0, args.interval))

@@ -898,7 +898,7 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
 
 def pending_ids() -> List[str]:
     q = C.sub("queue")
-    return sorted(p.stem for p in q.glob("*.json")) if q.is_dir() else []
+    return sorted(p.stem for p in q.glob("*.json") if C._queue is None or C._queue.is_ready(p)) if q.is_dir() else []  # #34: skip not_before
 
 
 def main(argv: List[str]) -> int:

@@ -178,3 +178,85 @@ def test_cli_prints_empty_object(env):
     cp = subprocess.run([sys.executable, str(JUDGE_DIR / "hooks" / "enqueue.py")], input="{bad",
                         capture_output=True, text=True)
     assert cp.returncode == 0 and cp.stdout.strip() == "{}"
+
+
+# ---------------------------------------------------------------- #34 plan coalescing / debounce
+def _plan_patch(env, plan, n, turn="turn-1"):
+    run(ev(env, "post_tool_call", tool_name="patch",
+           tool_input={"path": str(plan), "old_string": "a", "new_string": "b"},
+           extra={"status": "ok", "tool_call_id": f"call-{n}", "turn_id": turn}))
+
+
+def _runner(monkeypatch):
+    sys.path.insert(0, str(JUDGE_DIR / "runner"))
+    import run_judge as RJ
+    judged = []
+
+    def fake_judge(rid):
+        judged.append(rid)
+        q.move_done(rid)
+        return True
+    monkeypatch.setattr(RJ, "judge_request", fake_judge)
+    return RJ, judged
+
+
+def test_five_plan_patches_one_request_judged_once_after_turn_end(env, monkeypatch):
+    """Phase A: 5 patches to the plan in one turn produced 5 plan reviews of half-applied edits."""
+    RJ, judged = _runner(monkeypatch)
+    run(ev(env, "on_session_start"))
+    plan = env["cwd"] / ".hermes" / "plans" / "2026-10-02-master.md"
+    for n in range(1, 6):
+        plan.write_text(f"# plan v{n}\n")
+        _plan_patch(env, plan, n)
+        assert RJ.main(["--pending"]) == 0  # the runner fires on every queue change: nothing is ready yet
+    pending = q.list_pending()
+    assert len(pending) == 1 and judged == []
+    r = pending[0]
+    assert r["kind"] == "plan" and r["not_before"] > r["created"] and not q.is_ready(r)
+    assert r["detail"]["coalesced"]["writes"] == 5
+    assert r["detail"]["coalesced"]["tool_call_ids"] == [f"call-{n}" for n in range(1, 6)]
+    assert r["claims"].startswith("# plan v5") and r["changed_paths"] == [str(plan)]
+    # the turn ends: the request becomes ready and is judged once, on the final plan text
+    plan.write_text("# plan final\n")
+    run(ev(env, "on_session_end", extra={"turn_id": "turn-1", "completed": True}))
+    [done_plan] = [x for x in q.list_pending() if x["kind"] == "plan"]
+    assert q.is_ready(done_plan) and done_plan["detail"]["turn_ended"]
+    assert done_plan["claims"].startswith("# plan final")
+    assert RJ.main(["--pending"]) == 0
+    assert [x for x in judged if x.endswith("-plan")] == [r["id"]]
+    assert RJ.main(["--pending"]) == 0
+    assert [x for x in judged if x.endswith("-plan")] == [r["id"]]
+
+
+def test_plan_write_in_next_turn_is_a_new_request(env, monkeypatch):
+    run(ev(env, "on_session_start"))
+    plan = env["cwd"] / ".hermes" / "plans" / "p.md"
+    plan.write_text("# v1\n")
+    _plan_patch(env, plan, 1, turn="turn-1")
+    run(ev(env, "on_session_end", extra={"turn_id": "turn-1"}))
+    plan.write_text("# v2\n")
+    _plan_patch(env, plan, 2, turn="turn-2")
+    plans = [x for x in q.list_pending() if x["kind"] == "plan"]
+    assert len(plans) == 2
+    assert [bool(x["detail"].get("turn_ended")) for x in plans] == [True, False]
+
+
+def test_plan_debounce_expiry_releases_without_turn_end(env, monkeypatch):
+    monkeypatch.setenv("JUDGE_PLAN_DEBOUNCE_S", "0")
+    run(ev(env, "on_session_start"))
+    plan = env["cwd"] / ".hermes" / "plans" / "p.md"
+    plan.write_text("# v1\n")
+    _plan_patch(env, plan, 1)
+    [r] = q.list_pending()
+    assert "not_before" not in r and q.is_ready(r)
+    monkeypatch.setenv("JUDGE_PLAN_DEBOUNCE_S", "120")
+    _plan_patch(env, plan, 2)
+    [r] = q.list_pending()
+    assert not q.is_ready(r)
+    # 121 s later (no plan write): ready, and any hook event rewrites it so judge-review.path fires
+    from datetime import datetime, timedelta, timezone
+    later = datetime.now(timezone.utc) + timedelta(seconds=121)
+    assert q.is_ready(r, now=later)
+    assert q.release_due(now=later) == [r["id"]]
+    assert q.list_pending()[0]["detail"]["released"]
+    assert q.release_due(now=later) == []

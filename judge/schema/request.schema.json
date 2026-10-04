@@ -16,6 +16,7 @@
     "plan": {"type": ["string", "null"]},
     "data_class": {"type": "string", "enum": ["infra", "sensitive"]},
     "source_event": {"type": "string", "enum": ["post_tool_call", "pre_tool_call", "pre_verify", "on_session_end", "watch"]},
+    "not_before": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "description": "optional: run_judge.py --pending leaves the request queued until this UTC time (plan debounce, #34)"},
     "detail": {"type": "object"}
   }
 }

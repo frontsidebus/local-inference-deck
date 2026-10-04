@@ -157,3 +157,61 @@ def test_is_duplicate_pre_verify_without_turn_id_still_dedupes(env):
     end = _req(changed_paths=[], source_event="on_session_end", created="2026-10-03T04:00:00Z",
                detail={"turn_id": "sess:sess:aaaa"})
     assert q.is_duplicate(end) == pv["id"]
+
+
+# ---------------------------------------------------------------- #34 deferred plan requests
+def _plan(session="s-1", turn="t1", plan="/w/.hermes/plans/p.md", created="2026-10-04T04:46:52Z",
+          not_before="2026-10-04T04:48:52Z", call="c1", root=None):
+    return q.make_request("plan", session, "2026-10-04T04:43:18Z", source_event="post_tool_call",
+                          changed_paths=[plan], claims="# plan", plan=plan, data_class="infra",
+                          detail={"turn_id": turn, "tool_call_id": call}, created=created,
+                          not_before=not_before, root=root)
+
+
+def test_is_ready_not_before(tmp_path):
+    from datetime import datetime, timezone
+    r = _plan(root=tmp_path)
+    assert not q.is_ready(r, now=datetime(2026, 10, 4, 4, 48, tzinfo=timezone.utc))
+    assert q.is_ready(r, now=datetime(2026, 10, 4, 4, 49, tzinfo=timezone.utc))
+    assert q.is_ready({"not_before": "garbage"}) and q.is_ready({})
+    p = q.write_request(r, tmp_path)
+    early = datetime(2026, 10, 4, 4, 47, tzinfo=timezone.utc)
+    assert q.is_ready(p, now=early) is False and q.is_ready(tmp_path / "missing.json", now=early) is True
+    assert not q.validate_request(r)
+
+
+def test_merge_into_pending_plan_rules(tmp_path):
+    first = _plan(root=tmp_path)
+    q.write_request(first, tmp_path)
+    second = _plan(created="2026-10-04T04:47:24Z", not_before="2026-10-04T04:49:24Z", call="c2", root=tmp_path)
+    second["since"] = "2026-10-04T04:40:00Z"
+    second["data_class"] = "sensitive"
+    assert q.merge_into_pending_plan(second, tmp_path) == first["id"]
+    [m] = q.list_pending(tmp_path)
+    assert m["since"] == "2026-10-04T04:40:00Z" and m["created"] == "2026-10-04T04:47:24Z"
+    assert m["not_before"] == "2026-10-04T04:49:24Z" and m["data_class"] == "sensitive"
+    assert m["detail"]["coalesced"] == {"writes": 2, "first_created": "2026-10-04T04:46:52Z",
+                                        "tool_call_ids": ["c1", "c2"]}
+    # other plan path, other turn, other session: no merge
+    assert q.merge_into_pending_plan(_plan(plan="/w/.hermes/plans/other.md", root=tmp_path), tmp_path) is None
+    assert q.merge_into_pending_plan(_plan(turn="t2", root=tmp_path), tmp_path) is None
+    assert q.merge_into_pending_plan(_plan(session="s-2", root=tmp_path), tmp_path) is None
+    # the runner took it (evidence dir exists): no merge
+    (tmp_path / "evidence" / first["id"]).mkdir(parents=True)
+    assert q.merge_into_pending_plan(_plan(call="c3", root=tmp_path), tmp_path) is None
+
+
+def test_release_plan_requests_at_turn_end(tmp_path):
+    from datetime import datetime, timezone
+    r = _plan(root=tmp_path)
+    q.write_request(r, tmp_path)
+    q.write_request(q.make_request("completion", "s-1", "2026-10-04T04:43:18Z", source_event="pre_verify",
+                                   root=tmp_path), tmp_path)
+    now = datetime(2026, 10, 4, 4, 47, tzinfo=timezone.utc)
+    assert q.release_plan_requests("s-1", tmp_path, now=now) == [r["id"]]
+    rel = q.read_request(r["id"], tmp_path)
+    assert rel["not_before"] == "2026-10-04T04:47:00Z" and rel["detail"]["turn_ended"] == "2026-10-04T04:47:00Z"
+    assert q.is_ready(rel, now=now)
+    assert q.release_plan_requests("s-1", tmp_path, now=now) == []  # already released
+    # a released request takes no more merges: the next write starts a new request
+    assert q.merge_into_pending_plan(_plan(root=tmp_path), tmp_path) is None
