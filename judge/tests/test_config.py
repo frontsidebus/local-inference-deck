@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -84,3 +85,71 @@ def test_config_sh(env):
                          capture_output=True, text=True, env=os.environ.copy())
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == f"{env['review']}|single # not a comment|frontier"
+
+
+# ---------------------------------------------------------------- #37 git worktrees of the deck repo
+def _git(*args, cwd):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main",
+                    *args], cwd=str(cwd), check=True, capture_output=True)
+
+
+def _main_repo(path):
+    path.mkdir(parents=True)
+    _git("init", "-q", cwd=path)
+    (path / "README.md").write_text("x\n")
+    _git("add", "README.md", cwd=path)
+    _git("commit", "-q", "-m", "init", cwd=path)
+    return path
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not installed")
+def test_classify_git_worktree_of_repo_is_infra(env, tmp_path, monkeypatch):
+    main = _main_repo(tmp_path / "deck")
+    wt = tmp_path / "deck-feature"
+    _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=main)
+    assert (wt / ".git").is_file() and (wt / ".git").read_text().startswith("gitdir:")
+    other = _main_repo(tmp_path / "unrelated")
+    monkeypatch.setenv("JUDGE_REPO_DIR", str(main))
+    assert config.git_common_dir(str(wt / "walter" / "new.sh")) == os.path.realpath(main / ".git")
+    assert config.classify([str(wt / "walter" / "deploy.sh"), str(wt / "README.md")]) == "infra"
+    assert config.classify([], cwd=str(wt)) == "infra"
+    assert config.classify([str(other / "README.md")]) == "sensitive"
+    assert config.classify([str(wt / "README.md"), str(other / "README.md")]) == "sensitive"
+    assert config.classify([str(wt / ".env")]) == "sensitive"
+    # live layout: JUDGE_REPO_DIR is itself a worktree; a sibling worktree shares its common dir
+    wt2 = tmp_path / "deck-main"
+    _git("worktree", "add", "-q", "-b", "main2", str(wt2), cwd=main)
+    monkeypatch.setenv("JUDGE_REPO_DIR", str(wt2))
+    assert config.classify([str(wt / "covenant" / "x.tmpl")]) == "infra"
+    assert config.classify([str(main / "README.md")]) == "infra"
+    # JUDGE_INFRA_REPOS works the same way
+    monkeypatch.setenv("JUDGE_REPO_DIR", str(tmp_path / "nowhere"))
+    monkeypatch.setenv("JUDGE_INFRA_REPOS", str(main))
+    assert config.classify([str(wt / "README.md")]) == "infra"
+    monkeypatch.delenv("JUDGE_INFRA_REPOS")
+    assert config.classify([str(wt / "README.md")]) == "sensitive"
+
+
+def test_classify_unknown_gitdir_stays_sensitive(env, tmp_path, monkeypatch):
+    """No git needed: a .git file pointing nowhere useful (or at a submodule dir) is never infra."""
+    main = tmp_path / "deck"
+    (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
+    (main / ".git" / "worktrees" / "wt" / "commondir").write_text("../..\n")
+    monkeypatch.setenv("JUDGE_REPO_DIR", str(main))
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/wt\n")
+    assert config.classify([str(wt / "a.sh")]) == "infra"
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: /nonexistent/.git/worktrees/x\n")
+    assert config.classify([str(broken / "a.sh")]) == "sensitive"
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (main / ".git" / "modules" / "sub").mkdir(parents=True)
+    (sub / ".git").write_text(f"gitdir: {main}/.git/modules/sub\n")
+    assert config.classify([str(sub / "a.sh")]) == "sensitive"
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / ".git").write_text("not a gitdir line\n")
+    assert config.classify([str(plain / "a.sh")]) == "sensitive"

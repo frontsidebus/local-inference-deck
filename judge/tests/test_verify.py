@@ -235,7 +235,11 @@ def test_claim_of_missing_new_file(v, env):
     v.check_claims("Created scripts/check.sh as requested.", [str(a)], str(env["work"]), r, 3600)
     assert r.failures == []  # parent dir does not exist -> ignored
     (env["work"] / "scripts").mkdir()
+    # #35: a missing RELATIVE path is not resolvable against cwd (it may name a file of another checkout)
     v.check_claims("Created scripts/check.sh as requested.", [str(a)], str(env["work"]), r, 3600)
+    assert r.failures == []
+    # an absolute one still is checked
+    v.check_claims(f"Created {env['work']}/scripts/check.sh as requested.", [str(a)], str(env["work"]), r, 3600)
     assert r.claim_flags and "does not exist" in r.failures[0]
 
 
@@ -424,3 +428,83 @@ def test_c3_results_unsafe_session_name(v, env):
     call(v, env, [f], session="../../etc/evil")
     assert not (env["tmp"] / "etc").exists()
     assert list((env["review"] / "snapshots").glob("*/c3-results.jsonl"))
+
+
+# ---------------------------------------------------------------- #35 mentions are not claims
+# The pilot's (Phase A) final answer, abridged: plan files edited; .hermes.md, walter/deploy.sh and
+# walter/README.md only mentioned (a quoted before/after, the plan's "Files likely to change" list, a
+# suggestion). C3 resolved the bare names against cwd and nudged on all three.
+PILOT_ANSWER = """All edits verified in place. Here's the report.
+
+## Changes made
+
+**Master plan** (`2026-10-02_181225-digest-site-master.md`)
+- Header `Updated:` line — "(rewritten to .hermes.md architecture)" → "(applied review fixes: CLI runs via SSH + curl -X POST http://10.0.0.2:3300, LiteLLM key via /srv/gateway/keys, build in lid-digest worktree, deploy/README/test file list)"
+- Repo line — "local checkout ~/source/deck" → "build happens in the worktree ~/source/deck-digest (branch feat/digest-site)"
+- "Files likely to change" — added: `walter/deploy.sh` (render+install+compose_up), `covenant/deploy.sh` (60-digest in SITES + 2nd oauth2-proxy install), `scripts/secrets.d/walter.sh` (key copy), `walter/README.md` + `covenant/README.md`, pipeline tests
+
+**Companion plans** (01-threat-intel, 02-ai-security, 03-ai-research) — same one-line fix each on the "LLM curation (spark API)" pipeline step.
+
+Everything else (theme palette, port 3300 free, firewall rules, DNS, open questions) already matched .hermes.md and was left untouched.
+
+## What .hermes.md still doesn't reflect (reverse direction)
+
+The plan correctly points at the worktree per your instruction, but the two files are now inconsistent on where the work lives. Worth a one-line update to .hermes.md so a future session doesn't assume the old checkout.
+"""
+
+
+def _pilot_cwd(env):
+    work = env["work"]
+    write(work / "walter" / "BENCHMARKS.md", "x\n")  # the pilot's cwd had an unrelated walter/ dir
+    plans = work / ".hermes" / "plans"
+    changed = [write(plans / f"2026-10-02_181225-{n}.md", "# plan\n") for n in
+               ("digest-site-master", "01-threat-intel", "02-ai-security", "03-ai-research")]
+    ctx = write(work / ".hermes.md", "# context\n")  # exists in cwd, untouched
+    _age(ctx, 2 * 86400)
+    return changed
+
+
+def test_pilot_answer_mentions_are_not_claims(v, env):
+    changed = _pilot_cwd(env)
+    r = v.Result()
+    v.check_claims(PILOT_ANSWER, [str(p) for p in changed], str(env["work"]), r, 3600)
+    assert r.failures == [] and r.claim_flags == []
+    assert not [x for x in r.records if x["check"] == "claim" and not x["ok"]]
+    # through the hook: no nudge
+    assert call(v, env, changed, response=PILOT_ANSWER) == {}
+
+
+def test_claimed_relative_paths_resolve_under_cwd_or_repo_root(v, env):
+    """The same phrasing IS checked when the paths exist under the session cwd or its repo root."""
+    repo = env["work"]
+    (repo / ".git").mkdir()
+    for rel in ("walter/deploy.sh", "walter/README.md"):
+        _age(write(repo / rel, "x\n"), 2 * 86400)
+    sub = repo / "judge"
+    sub.mkdir()
+    a = write(repo / "a.py", "x = 1\n")
+    r = v.Result()
+    v.check_claims("Updated `walter/deploy.sh` (render step).", [str(a)], str(sub), r, 3600)
+    assert [f["path"] for f in r.claim_flags] == ["walter/deploy.sh"]
+    r = v.Result()
+    v.check_claims("See walter/README.md; I fixed the retry logic in a.py.", [str(a)], str(repo), r, 3600)
+    assert r.failures == [] and r.claim_flags == []
+
+
+def test_mentions_and_unresolvable_names_are_not_checked(v, env):
+    a = write(env["work"] / "a.py", "x = 1\n")
+    _age(write(env["work"] / "notes.md", "x\n"), 2 * 86400)
+    r = v.Result()
+    for text in ("Read notes.md and fixed a.py.",                      # notes.md only read
+                 "Updated the plan; notes.md has the background.",       # other clause
+                 'Changed the header "(see notes.md)" to the new form.', # quoted content
+                 "Edited hermes.md and walter/deploy.sh.",               # exist nowhere under cwd
+                 "Worth a one-line update to notes.md later."):          # suggestion, no edit verb
+        v.check_claims(text, [str(a)], str(env["work"]), r, 3600)
+    assert r.failures == [] and r.claim_flags == []
+    # a real claim on the same file still nudges
+    v.check_claims("I updated notes.md with the new steps.", [str(a)], str(env["work"]), r, 3600)
+    assert [f["path"] for f in r.claim_flags] == ["notes.md"]
+    r = v.Result()
+    v.check_claims("notes.md was updated.", [str(a)], str(env["work"]), r, 3600)
+    assert [f["path"] for f in r.claim_flags] == ["notes.md"]

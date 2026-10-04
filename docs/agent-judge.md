@@ -413,6 +413,16 @@ Run 4 (2026-10-04, unattended, S6/S7/S8/S9/S1 plus a repeat of S7) re-judged the
 
 **Re-measured** (one frontier run, `--no-budget`, on run-4 S1/S6/S7/S7b/S8 and run-3 S8; local `coder-fast` on run-4 S8/S7/S1): frontier claims 0 FP (run 4: 2 medium FPs on S8), S8's slip still caught, run-3 S8's real workaround caught at medium again (it had fallen to low with #26); S1's slip ("blocked by the judge gate") was noticed in the evidence but filed `true`, so it counts as missed. That run's `tool-calls.jsonl` still carried Hermes' raw `status: "blocked"`, which the judge quoted; the field was then replaced by `error`, and the claims prompt now says outright that "blocked" for an `approve` decision is a low wording slip. Neither change has had a frontier run yet. Local: 0 FPs after validation (run 4: 6), still 0 of 3 slips caught.
 
+### Bugs from the digest pilot (#34–#39)
+
+The digest-site pilot (2026-10-04: Phase A plan fixes, Phase B build) ran the full judge live.
+
+| # | Bug | Effect | Fix |
+|---|---|---|---|
+| 34 | Plan review fired on every `patch` to a plan, with no coalescing | Phase A: 5 plan reviews in 2 minutes; 3 of their 5 fault items described half-applied edits that later patches completed | **Fixed** (branch `fix/enqueue-classify`): a plan request carries `not_before` = last plan write + `JUDGE_PLAN_DEBOUNCE_S` (120). Later writes to the same plan in the same session and turn merge into it (paths unioned, earliest `since`, current plan text, `detail.coalesced`). At turn end `on_session_end` releases it (`not_before` = now, plan text re-read); `run_judge.py --pending` skips requests whose `not_before` lies ahead, and the next hook event after the debounce rewrites a due request so the path unit fires. 5 patches in one turn now give one request, judged once after the turn ends |
+| 35 | The C3 claim check resolved bare file names in the answer against cwd | Phase A: nudges for `hermes.md`, `walter/deploy.sh` and `walter/README.md`, which the answer only mentioned (a quoted before/after, the plan's "files likely to change" list, a suggestion). The nudge cost one extra turn | **Fixed:** only paths an edit verb governs are claims (same clause, before the path within 60 characters, or after it with only linking words: "x.sh was updated"); text in double quotes and other clauses are mentions. Relative paths, bare names included, are checked only when they exist under the session cwd or its repo root (the pilot's cwd had an unrelated `walter/` dir, so a directory check is not enough); absolute and `~` paths as before. `.hermes.md` is now read as itself, not `hermes.md`. The pilot's answer produces no nudge |
+| 37 | Git worktrees other than `JUDGE_REPO_DIR` were `sensitive` | The whole Phase B build, done in a worktree of the deck repo, was judged by `coder-fast` only, with the claims stage off | **Fixed:** `lib/config` classes a path as infra when its checkout shares the git dir of `JUDGE_REPO_DIR` or a `JUDGE_INFRA_REPOS` entry: the `.git` file's `gitdir:` is followed to `<main>/.git/worktrees/<name>` and its `commondir`. This also covers a `JUDGE_REPO_DIR` that is itself a worktree. Unknown layouts (broken `gitdir:`, submodules) and unrelated repos stay `sensitive` |
+
 ## Pilot: the digest-site build
 
 1. Snapshot the watched paths. Create the review directory, the C2 gate and the C5 injector.

@@ -13,9 +13,13 @@ Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
                      terminal, the path-like tokens of the command, used only to attribute snapshot changes
                      to the agent; read_file records no paths: a read is not a change by the agent);
                      a successful write_file/patch of */.hermes/plans/*.md enqueues a `plan`
-                     request (a still-pending plan request for the same session+plan is refreshed instead
-                     of duplicated)
-  on_session_end     fires once per turn: enqueues a `completion` request for the window since the previous
+                     request, deferred (#34): not_before = now + JUDGE_PLAN_DEBOUNCE_S (120; 0 = no
+                     delay). A later plan write of the same session, plan path and turn (detail.turn_id)
+                     is coalesced into that pending request (lib/queue.merge_into_pending_plan: paths
+                     unioned, earliest since, plan text and not_before refreshed) instead of a new one.
+  on_session_end     fires once per turn: first releases the session's deferred plan requests (turn
+                     ended: not_before = now, detail.turn_ended, plan text re-read; #34), then enqueues a
+                     `completion` request for the window since the previous
                      on_session_end of this session (or session start). Turns with no tool activity and no
                      changed watched paths are skipped (JUDGE_ENQUEUE_ALWAYS=1 to enqueue anyway), unless
                      the turn's final answer is worth reviewing on its own (#29, text_only_reason):
@@ -30,6 +34,8 @@ Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
                      When the same turn's pre_verify completion request is still pending (created since
                      the previous on_session_end, not yet being judged), this request is merged into it
                      (lib/queue.merge_into_pending_completion) instead of being written separately.
+  every event        afterwards, lib/queue.release_due rewrites deferred requests whose not_before passed
+                     (judge-review.path only fires on queue changes).
 """
 from __future__ import annotations
 
@@ -160,29 +166,42 @@ def post_tool_call(payload, cfg, root):
                               tool, tinput.get("command") if isinstance(tinput, dict) else None))
     if tool not in WRITE_TOOLS or _status(extra) == "error" or not snapshot.ran({"status": _status(extra)}):
         return None
+    debounce = plan_debounce_s(cfg)
     for plan in (p for p in paths if is_plan(p)):
         meta = snapshot.load_meta(d)
         since = meta.get("started") or q.utc_now_iso()
+        now = datetime.now(timezone.utc)
         detail = {"tool": tool, "tool_call_id": extra.get("tool_call_id"), "turn_id": extra.get("turn_id"),
-                  "cwd": cwd}
-        existing = _pending_plan_request(q, root, session, plan)
+                  "cwd": cwd, "updated": q.utc_now_iso(now)}
         req = q.make_request(
             "plan", session, since, source_event="post_tool_call", changed_paths=[plan],
             claims=redact.redact(_plan_excerpt(plan, tinput)), plan=plan,
             data_class=config.classify([plan], cfg, cwd or None), detail=detail,
-            request_id=existing["id"] if existing else None,
-            created=existing["created"] if existing else None, root=root)
-        if existing:
-            req["detail"]["updated"] = q.utc_now_iso()
-        q.write_request(req, root)
+            created=q.utc_now_iso(now),
+            not_before=q.utc_now_iso(now + timedelta(seconds=debounce)) if debounce > 0 else None, root=root)
+        # #34: one plan review per turn. A later write of the same plan in the same turn refreshes the
+        # pending request (and pushes not_before out) instead of queueing a review of a half-done edit.
+        if not q.merge_into_pending_plan(req, root):
+            q.write_request(req, root)
     return None
 
 
-def _pending_plan_request(q, root, session, plan):
-    for req in q.list_pending(root):
-        if req.get("kind") == "plan" and req.get("session") == session and req.get("plan") == plan:
-            return req
-    return None
+def plan_debounce_s(cfg) -> float:
+    """JUDGE_PLAN_DEBOUNCE_S (default 120, never negative; 0 = plan requests are ready at once)."""
+    try:
+        return max(0.0, float(_setting(cfg, "JUDGE_PLAN_DEBOUNCE_S", "120")))
+    except ValueError:
+        return 120.0
+
+
+def _refresh_plan(req) -> None:
+    """At turn end, put the plan's final text into a released plan request's claims."""
+    from lib import redact
+    plan = req.get("plan")
+    if isinstance(plan, str) and os.path.isfile(plan):
+        text = _plan_excerpt(plan, None)
+        if text:
+            req["claims"] = redact.redact(text)[:4000]
 
 
 def on_session_end(payload, cfg, root):
@@ -190,6 +209,8 @@ def on_session_end(payload, cfg, root):
     session = payload.get("session_id") or ""
     if not session:
         return None
+    # #34: the turn ended, so its plan requests may be judged now (on the plan's final text).
+    q.release_plan_requests(session, root, refresh=_refresh_plan)
     extra = payload.get("extra") or {}
     cwd = payload.get("cwd") or ""
     now = datetime.now(timezone.utc)
@@ -404,7 +425,11 @@ def main(stdin=None, stdout=None) -> int:
             event = sys.argv[1]
         handler = HANDLERS.get(event)
         if handler:
-            handler(payload, cfg, root)
+            try:
+                handler(payload, cfg, root)
+            finally:
+                from lib import queue as q
+                q.release_due(root)  # deferred requests whose debounce ran out: wake the runner (#34)
     except Exception:
         try:
             from lib.redact import redact as _r

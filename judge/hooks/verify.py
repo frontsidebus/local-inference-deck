@@ -680,17 +680,99 @@ _URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.I)
 _PATH_RE = re.compile(
     r"(?:~|\.{1,2})?/[\w.@%+=,~-][\w.@%+=,~/-]*"      # /abs, ~/x, ./x, ../x
     r"|[\w.-]+(?:/[\w.@+-]+)+"                          # rel/dir/file
-    r"|[\w-]+(?:\.[\w-]+)*\.(?:sh|py|json|ya?ml|conf|tmpl|md|toml|service|timer|env|ini|cfg|js|ts|css|html)\b")
+    r"|\.?[\w-]+(?:\.[\w-]+)*\.(?:sh|py|json|ya?ml|conf|tmpl|md|toml|service|timer|env|ini|cfg|js|ts|css|html)\b")
+# Quoted text is content being described (a before/after of an edit, a heading), not a claim (#35).
+_QUOTED_RE = re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d')
+_PAREN_RE = re.compile(r"\([^()]*\)")
+# Between an edit verb and the path it governs: same clause, at most this many characters (after removing
+# other paths and parentheticals, so "Updated a.sh (quoting), b.sh and c.sh" claims all three).
+CLAIM_GAP = 60
+_CLAUSE_BREAK_RE = re.compile(r"[;\u2014\u2013\u2192]|->|=>|\s-\s")
+# After a path, only linking words may separate it from its verb ("x.sh was updated", "x.sh: fixed").
+_PASSIVE_GAP_RE = re.compile(r"^[\s`*_:,\u2014\u2013-]*(?:(?:was|were|is|are|has|have|been|got|now|also|all|both)\s+)*$",
+                             re.I)
 
 
 def _claim_tokens(sentence: str) -> List[str]:
-    s = _URL_RE.sub(" ", sentence)
-    out = []
+    return [tok for tok, _, _ in _claimed_paths(sentence, any_mention=True)]
+
+
+def _governs(sentence: str, verb_re: "re.Pattern[str]", start: int, end: int,
+             spans: List[Tuple[int, int]]) -> bool:
+    """True when a verb of *verb_re* governs the path at sentence[start:end]: the verb precedes it in the
+    same clause within CLAIM_GAP characters (other paths and parentheticals not counted), or follows it
+    separated only by linking words ("was", "is", ":", ...)."""
+    for m in verb_re.finditer(sentence):
+        if m.end() <= start:
+            gap = sentence[m.end():start]
+            for a, b in sorted(spans, reverse=True):  # drop the other paths inside the gap
+                if a >= m.end() and b <= start:
+                    gap = gap[:a - m.end()] + " " + gap[b - m.end():]
+            gap = _PAREN_RE.sub(" ", gap).replace("`", "")
+            if _CLAUSE_BREAK_RE.search(gap):
+                continue
+            if len(re.sub(r"[\s,]+", " ", gap).strip()) <= CLAIM_GAP:
+                return True
+        elif m.start() >= end and _PASSIVE_GAP_RE.match(sentence[end:m.start()]):
+            return True
+    return False
+
+
+def _claimed_paths(sentence: str, any_mention: bool = False) -> List[Tuple[str, bool, bool]]:
+    """(token, hard, soft) for each path the sentence claims as changed (hard: an edit verb governs it) or
+    verified (soft). A path that is only mentioned (no verb governs it, or it sits inside quoted text) is
+    not a claim (#35); any_mention=True returns every path token with its flags."""
+    s = _URL_RE.sub(lambda m: " " * len(m.group(0)), sentence)
+    s = _QUOTED_RE.sub(lambda m: " " * len(m.group(0)), s)
+    found = []
     for m in _PATH_RE.finditer(s):
         tok = m.group(0).rstrip(".,:;)]}'\"`")
         if len(tok) > 2:
-            out.append(tok)
+            found.append((tok, m.start(), m.start() + len(tok)))
+    spans = [(a, b) for _, a, b in found]
+    out = []
+    for tok, a, b in found:
+        others = [x for x in spans if x != (a, b)]
+        hard = _governs(s, _EDIT_RE, a, b, others)
+        soft = _governs(s, _SOFT_RE, a, b, others)
+        if hard or soft or any_mention:
+            out.append((tok, hard, soft))
     return out
+
+
+def repo_root(start: str) -> Optional[str]:
+    """Nearest ancestor of *start* (inclusive) holding a `.git` entry (directory or worktree file)."""
+    d = os.path.abspath(start or "")
+    while d:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    return None
+
+
+def resolve_claim_path(tok: str, cwd: str) -> Optional[str]:
+    """Where a claimed path token points, or None when it cannot be resolved (then it is not checked, #35).
+
+    Absolute and ~ paths: as written (a missing one is still checked: "created /x/new.sh" that does not
+    exist is a false claim). Relative paths (bare names included): against the session cwd, then the cwd's
+    repo root; they count only when they exist there. A relative path that exists in neither place names
+    some other file (the pilot: `walter/deploy.sh` of another checkout, while cwd had an unrelated
+    `walter/` dir), so it is not checked."""
+    raw = os.path.expanduser(tok)
+    if os.path.isabs(raw):
+        return os.path.normpath(raw)
+    bases = [cwd or os.getcwd()]
+    root = repo_root(bases[0])
+    if root and os.path.normpath(root) != os.path.normpath(bases[0]):
+        bases.append(root)
+    for base in bases:
+        p = os.path.normpath(os.path.join(base, raw))
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def check_claims(final_response: str, changed: List[str], cwd: str, res: Result,
@@ -699,13 +781,16 @@ def check_claims(final_response: str, changed: List[str], cwd: str, res: Result,
     """Flag file paths the answer says were fixed/updated/... that are not in changed_paths.
 
     - Split the answer into sentences/lines; skip any with a negation ("not", "unchanged", "n't", ...).
-    - Edit verbs (fixed, updated, edited, added, ...) + a path -> hard claim; verify-only verbs
-      (verified, checked, done, ...) + a path -> soft claim (recorded for the judge, never a nudge,
-      since reading/testing a file legitimately leaves it unchanged).
+    - Only CLAIMED paths count (#35): an edit verb (fixed, updated, edited, added, ...) must govern the
+      path (same clause, before it within CLAIM_GAP chars, or after it with only linking words between:
+      "x.sh was updated") -> hard claim; a verify-only verb (verified, checked, done, ...) -> soft claim
+      (recorded for the judge, never a nudge). Quoted text ("...") is content, not a claim. A path merely
+      mentioned in a sentence that also has an edit verb is not a claim.
     - A path counts as changed if it equals a changed path, is a directory containing one, or (bare
       file name) shares a changed path's basename.
-    - Only paths that exist, or would be a new file with an extension in an existing directory, are
-      considered (so URL paths such as /healthz are ignored). Directories are ignored.
+    - Paths are resolved by resolve_claim_path: absolute and ~ paths as written; relative ones only when
+      they exist under the session cwd or its repo root. Unresolvable tokens (a name of a file elsewhere)
+      are skipped. Directories are ignored.
     - Hermes only lists edits made by its file tools in changed_paths, so a terminal ``sed -i`` would
       otherwise look like a false claim. When the collector's session-start snapshot (index.json) has a
       hash for the file, that decides: hash changed -> not flagged, hash equal -> flagged. Without a
@@ -720,23 +805,34 @@ def check_claims(final_response: str, changed: List[str], cwd: str, res: Result,
     for sentence in re.split(r"\n+|(?<=[.!?])\s+", final_response):
         if not sentence.strip() or _NEG_RE.search(sentence):
             continue
-        hard = bool(_EDIT_RE.search(sentence))
-        soft = bool(_SOFT_RE.search(sentence))
-        if not (hard or soft):
+        if not (_EDIT_RE.search(sentence) or _SOFT_RE.search(sentence)):
             continue
-        for tok in _claim_tokens(sentence):
+        for tok, hard, soft in _claimed_paths(sentence):
             p = norm(tok, cwd)
             rp = _real(p)
             if rp in seen:
                 continue
-            seen.add(rp)
             if rp in changed_real or any(c.startswith(rp.rstrip("/") + "/") for c in changed_real):
+                seen.add(rp)
                 if hard:
                     res.record(p, "claim", True, "claimed changed; in changed_paths")
                 continue
             if "/" not in tok and tok in changed_base:
+                seen.add(rp)
                 if hard:
                     res.record(p, "claim", True, "claimed changed; a changed path has this name")
+                continue
+            resolved = resolve_claim_path(tok, cwd)
+            if resolved is None:
+                continue  # a mention of a file elsewhere, not checkable here
+            p = resolved
+            rp = _real(p)
+            if rp in seen:
+                continue
+            seen.add(rp)
+            if rp in changed_real:
+                if hard:
+                    res.record(p, "claim", True, "claimed changed; in changed_paths")
                 continue
             if os.path.isdir(p):
                 continue

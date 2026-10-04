@@ -13,6 +13,8 @@ Public API (other judge parts depend on it; keep it stable):
     review_dir(cfg=None, create=False) -> Path       create=True makes it (mode 700)
     classify(paths, cfg=None, cwd=None) -> "infra" | "sensitive"
     is_infra_path(path, cfg=None, cwd=None) -> bool
+    git_common_dir(path) -> str | None               the repo's shared .git dir (worktrees: the main repo's)
+    infra_git_dirs(cfg=None) -> set[str]              git_common_dir of JUDGE_REPO_DIR and JUDGE_INFRA_REPOS
     host_ssh(name, cfg=None) -> list[str]             argv prefix; append ONE remote command string
     window_grace(cfg=None) -> int                     JUDGE_WINDOW_GRACE_SECONDS (evidence window end grace)
     HOSTS = ("walter", "covenant")
@@ -64,6 +66,7 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_LOG_TZ": "",                    # tz of Hermes log timestamps: "" = system local, "UTC", "+02:00", IANA
     "JUDGE_COMPLETION_DEDUPE_SECONDS": "900",  # completion requests of a session within this window dedupe
     "JUDGE_WINDOW_GRACE_SECONDS": "10",    # evidence window = [request.since, request.created + this]
+    "JUDGE_PLAN_DEBOUNCE_S": "120",        # plan review waits for turn end or this long with no plan write (#34)
     # run-1 fixes (one place for every default; site.env and the environment override)
     "JUDGE_HOST_PROBES": "1",              # collector runs read-only host-state probes for host claims
     "JUDGE_NOISE_GLOBS": "",               # extra globs added to snapshot.NOISE_GLOBS
@@ -189,7 +192,8 @@ def infra_rules(cfg: Optional[Mapping[str, str]] = None) -> List[str]:
     """Absolute glob patterns (fnmatch; `*` crosses `/`) whose matches are infra-class.
 
     Hermes config/skills/memories/plans, ~/.ssh/config, the deck repo (JUDGE_REPO_DIR plus JUDGE_INFRA_REPOS),
-    /etc, /srv.  Anything else (incl. ~/.hermes/.env, other repos, home files) is sensitive."""
+    /etc, /srv.  Anything else (incl. ~/.hermes/.env, other repos, home files) is sensitive, except git
+    worktrees and clones' worktrees that share a repo's .git with an infra repo (see is_infra_path, #37)."""
     c = _cfg(cfg)
     hh = _real(c["HERMES_HOME"])
     rules = [
@@ -212,6 +216,102 @@ def infra_rules(cfg: Optional[Mapping[str, str]] = None) -> List[str]:
 _REMOTE_RE = re.compile(r"^(walter|covenant):(/.*)$")
 
 
+# ---------------------------------------------------------------- git worktrees (#37)
+def _read_gitdir_file(dotgit: str) -> Optional[str]:
+    """The `gitdir:` target of a `.git` FILE (a worktree or submodule checkout), absolute; None if unreadable."""
+    try:
+        with open(dotgit, encoding="utf-8", errors="replace") as fh:
+            first = fh.read(4096).splitlines()[:1]
+    except OSError:
+        return None
+    if not first or not first[0].startswith("gitdir:"):
+        return None
+    target = first[0][len("gitdir:"):].strip()
+    if not target:
+        return None
+    if not os.path.isabs(target):
+        target = os.path.join(os.path.dirname(dotgit), target)
+    return os.path.realpath(target)
+
+
+def _common_from_gitdir(gitdir: str) -> Optional[str]:
+    """Shared .git dir of a worktree's private gitdir (<main>/.git/worktrees/<name>): its `commondir` file,
+    else the `worktrees/` layout. None when it is neither (e.g. a submodule's .git/modules/<x>)."""
+    try:
+        with open(os.path.join(gitdir, "commondir"), encoding="utf-8", errors="replace") as fh:
+            rel = fh.read(4096).strip()
+        if rel:
+            common = rel if os.path.isabs(rel) else os.path.join(gitdir, rel)
+            common = os.path.realpath(common)
+            if os.path.isdir(common):
+                return common
+    except OSError:
+        pass
+    parent = os.path.dirname(gitdir)
+    if os.path.basename(parent) == "worktrees" and os.path.isdir(gitdir):
+        return os.path.realpath(os.path.dirname(parent))
+    return None
+
+
+_COMMON_CACHE: Dict[str, Optional[str]] = {}
+
+
+def git_common_dir(path: str) -> Optional[str]:
+    """The shared git dir (`git rev-parse --git-common-dir`, resolved) of the checkout holding *path*, found
+    from the nearest ancestor with a `.git` entry: a `.git` directory is the common dir itself; a `.git`
+    file (`gitdir: <main>/.git/worktrees/<name>`) is a linked worktree whose common dir is the main repo's
+    .git. Parsed from the files (no subprocess). None when there is no checkout or the layout is unknown
+    (submodules, broken gitdir): callers treat None as "not the same repo" (sensitive by default)."""
+    if not isinstance(path, str) or not path:
+        return None
+    d = os.path.realpath(os.path.expanduser(path))
+    while d and not os.path.isdir(d):  # a new or deleted file: start from its nearest existing directory
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    seen: List[str] = []
+    out: Optional[str] = None
+    while True:
+        if d in _COMMON_CACHE:
+            out = _COMMON_CACHE[d]
+            break
+        seen.append(d)
+        dotgit = os.path.join(d, ".git")
+        if os.path.isdir(dotgit):
+            out = os.path.realpath(dotgit)
+            break
+        if os.path.isfile(dotgit):
+            gitdir = _read_gitdir_file(dotgit)
+            out = _common_from_gitdir(gitdir) if gitdir else None
+            break
+        if os.path.basename(d) == ".git":  # inside a repo's git dir itself
+            out = d
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            out = None
+            break
+        d = parent
+    if len(_COMMON_CACHE) > 4096:
+        _COMMON_CACHE.clear()
+    for s in seen:
+        _COMMON_CACHE[s] = out
+    return out
+
+
+def infra_git_dirs(cfg: Optional[Mapping[str, str]] = None) -> set:
+    """git_common_dir of JUDGE_REPO_DIR and each JUDGE_INFRA_REPOS entry (those that are git checkouts)."""
+    c = _cfg(cfg)
+    out = set()
+    for r in [c.get("JUDGE_REPO_DIR") or ""] + (c.get("JUDGE_INFRA_REPOS") or "").split():
+        if r and os.path.isdir(os.path.expanduser(r)):
+            g = git_common_dir(os.path.join(_real(r), ".judge-repo-probe"))
+            if g:
+                out.add(g)
+    return out
+
+
 def _normalize(path: str, cwd: Optional[str]) -> str:
     p = os.path.expanduser(str(path))
     if not os.path.isabs(p):
@@ -221,7 +321,9 @@ def _normalize(path: str, cwd: Optional[str]) -> str:
 
 def is_infra_path(path: str, cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> bool:
     """True when *path* matches an infra rule. `walter:/etc/x` / `covenant:/srv/x` (host files) count when
-    under /etc or /srv.  Paths are expanded (~), made absolute against *cwd*, and symlink-resolved."""
+    under /etc or /srv.  Paths are expanded (~), made absolute against *cwd*, and symlink-resolved.
+    A path in a git worktree whose shared git dir (git_common_dir) is that of JUDGE_REPO_DIR or a
+    JUDGE_INFRA_REPOS entry is infra too (#37: worktrees are classed like their main repo)."""
     if not isinstance(path, str) or not path.strip():
         return False
     m = _REMOTE_RE.match(path.strip())
@@ -229,11 +331,16 @@ def is_infra_path(path: str, cfg: Optional[Mapping[str, str]] = None, cwd: Optio
         rp = os.path.normpath(m.group(2))
         return rp.startswith("/etc/") or rp.startswith("/srv/")
     p = _normalize(path.strip(), cwd)
+    if p.endswith("/.env"):
+        # ~/.hermes/.env and similar secrets never count as infra, even if a rule were broadened.
+        return False
     rules = infra_rules(cfg)
     if any(fnmatch.fnmatchcase(p, r) for r in rules):
-        # ~/.hermes/.env and similar secrets never count as infra, even if a rule were broadened.
-        return not p.endswith("/.env")
-    return False
+        return True
+    # #37: another worktree (or the main clone) of an infra repo is the same repo: same class. Decided by
+    # the shared git dir; anything undetermined stays sensitive.
+    common = git_common_dir(p)
+    return bool(common) and common in infra_git_dirs(cfg)
 
 
 def classify(paths: Iterable[str], cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> str:

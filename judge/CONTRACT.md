@@ -85,6 +85,23 @@ undone; a sub-second race remains in which the merged extra paths land in done/ 
 path unit fires on every queue/ change, the merge often finds the pre_verify request already being judged; it
 removes the duplicate whenever the session end arrives first.
 
+**One plan review per turn** (#34, `hooks/enqueue.py` `post_tool_call`; `lib/queue.merge_into_pending_plan`,
+`release_plan_requests`, `release_due`, `is_ready`). A successful `write_file`/`patch` of `*/.hermes/plans/*.md`
+builds a `plan` request with `not_before` = now + `JUDGE_PLAN_DEBOUNCE_S` (default 120; `0` = no `not_before`,
+ready at once). **Coalesced** into a pending plan request of the same session, `plan` path and turn
+(`detail.turn_id`; a missing turn id on either side matches) whose turn has not ended (no `detail.turn_ended`) and
+which the runner has not taken (no `evidence/<id>/`, not in done/): `changed_paths` = union; `since` = the earlier;
+`created` = the later (the last plan write); `claims` (the plan's current text), `not_before` and `detail` from
+the new write; `data_class` = `sensitive` if either is; `id`, `kind`, `session`, `plan`, `source_event` stay;
+`detail.coalesced = {"writes", "first_created", "tool_call_ids" (≤ 50)}`. Otherwise a new request is written.
+**Turn end:** `on_session_end` first releases every pending plan request of the session not yet released:
+`not_before` = now (if it had one), `detail.turn_ended` = now, `claims` re-read from the plan file (its final
+text). A plan write after that starts a new request. **Debounce expiry:** after every hook event,
+`release_due` rewrites each pending request whose `not_before` has passed and that carries neither
+`detail.released` nor `detail.turn_ended` (adds `detail.released`), because `judge-review.path` fires only on
+queue/ changes. **Runner:** `run_judge.py --pending` skips a request while `not_before` lies ahead
+(`queue.is_ready`; a missing or unparsable field is ready); `run_judge.py <id>` judges it regardless.
+
 **Turns with no tool activity** (#29, `hooks/enqueue.py::text_only_reason`). `on_session_end` skips a turn
 with no tool activity in `agent.log`, no `events.jsonl` events in the window, no write targets and no new
 snapshot changes (`JUDGE_ENQUEUE_ALWAYS=1` overrides), **unless** the turn's final answer is worth reviewing:
@@ -107,7 +124,8 @@ and dedupe apply unchanged.
  "since": "2026-10-03T03:20:00Z",                // start of window for diffs (UTC)
  "changed_paths": ["..."], "claims": "<agent final response or plan excerpt, ≤4000 chars>",
  "plan": "<path or null>", "data_class": "infra|sensitive",
- "source_event": "post_tool_call|pre_tool_call|pre_verify|on_session_end|watch", "detail": {}}
+ "source_event": "post_tool_call|pre_tool_call|pre_verify|on_session_end|watch", "detail": {},
+ "not_before": "2026-10-03T03:54:10Z"}          // optional (plan requests, #34): not judged before this UTC time
 ```
 `changed_paths` lists only paths **the agent touched** (see "Attribution" below), never every snapshot change.
 `since` of a `pre_verify` completion (`hooks/verify.py::since_for`): earliest mtime of the changed paths − 5 min
@@ -121,6 +139,12 @@ snapshot changes (paths only, at most 200; `detail.changed_by_others_total` when
 `data_class`.
 `data_class` defaults to **sensitive** unless every changed path matches an infra path rule
 (rules in `lib/config.py`: hermes config/skills/memories/plans, ~/.ssh/config, the deck repo, /etc, /srv).
+**Git worktrees** (#37): a path whose checkout shares its git dir with `JUDGE_REPO_DIR` or a `JUDGE_INFRA_REPOS`
+entry is infra too, so every worktree of the deck repo (and its main clone) is classed like the repo itself.
+`lib/config.git_common_dir(path)` finds the nearest ancestor with a `.git` entry: a `.git` directory is the
+common dir; a `.git` file `gitdir: <main>/.git/worktrees/<name>` resolves through that gitdir's `commondir` file
+(or the `worktrees/` layout) to `<main>/.git`. Parsed from files, no subprocess. Undetermined layouts (broken
+`gitdir:`, submodules' `.git/modules/<x>`, no checkout) stay **sensitive**; `*/.env` is never infra.
 A request without paths is `infra` only when the session cwd is infra (`classify([], cfg, cwd)`), or when it is a
 `gate` request whose `detail.rules` are all host rules (`lib/config.HOST_RULES`: `remote-mutation`,
 `remote-opaque`, `remote-copy`; shared by `hooks/gate.py` and the collector), or when it is a C6 watcher
@@ -351,6 +375,14 @@ tool name for other tools; bug #33); never the command text or arguments).
 - `check`: `bash-n`, `shellcheck`, `py-compile`, `json`, `yaml`, `check-sanitized` (`path` = repo root),
   `ssh-config`, `ssh-alias:<alias>` (`path` = `~/.ssh/config`), `claim` (`path` = the claimed path; `ok: false` is
   a claim mismatch, `ok: true` means changed_paths, the snapshot hash or a recent mtime confirms the change).
+- `claim` covers only paths the final answer **claims** as changed (#35, `verify.py::_claimed_paths`): an edit
+  verb (fixed/updated/edited/added/created/wrote/...) governs the path (same clause, before it within 60 chars
+  not counting other paths and parentheticals, or after it with only linking words between: "x.sh was updated").
+  A mention is not a claim: text in double quotes, a path in another clause (`;`, dashes, arrows), a sentence
+  with a negation. Paths are resolved by `resolve_claim_path`: absolute and `~` paths as written; relative ones
+  (bare names included) only when the path exists under the session cwd or the cwd's repo root (`.git` entry).
+  Anything else (a name of a file in another checkout) is not checked; a claimed new file is only checked
+  when the answer gives it as an absolute or `~` path.
 - Checks that did not run (budget spent, no PyYAML, probe refused or missing) are not recorded. A shellcheck
   timeout is recorded `ok: true`, detail "timed out (not counted as a failure)".
 - `detail` is redacted before it is cut, so a cut can't defeat a pattern; if `lib/redact` can't load it is `""`.
@@ -687,6 +719,7 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
 `EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
 `JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
+`JUDGE_PLAN_DEBOUNCE_S=120` (a plan request waits for the turn end or this many seconds without a plan write; #34),
 `JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`,
 `JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions),
 `JUDGE_REVIEW_TEXT_ONLY=1`, `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS=200`, `JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1` (#29),

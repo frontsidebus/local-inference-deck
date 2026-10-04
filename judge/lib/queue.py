@@ -36,6 +36,15 @@ Public API:
     is_duplicate(req, window_s=None, root=None) -> str | None   completion dedupe (pre_verify vs on_session_end)
     merge_into_pending_completion(req, since=None, root=None) -> str | None
                                               fold on_session_end into the turn's pending pre_verify request
+    is_ready(req_or_path, now=None) -> bool   False while the request's optional `not_before` lies ahead
+                                              (run_judge.py --pending skips it; #34 plan debounce)
+    merge_into_pending_plan(req, root=None) -> str | None
+                                              coalesce a plan write into the same turn's pending plan request
+    release_plan_requests(session, root=None, now=None, refresh=None) -> list[str]
+                                              turn ended: the session's deferred plan requests become ready
+    release_due(root=None, now=None) -> list[str]
+                                              rewrite deferred requests whose not_before passed (wakes the
+                                              judge-review.path unit, which only fires on queue changes)
     evidence_dir(request_id, root=None, create=False) -> Path
     snapshot_dir(session, root=None, create=False) -> Path
     atomic_write(path, data, mode=0o600) / atomic_write_json(path, obj) / ensure_dir(path) / ensure_dirs(root)
@@ -225,11 +234,13 @@ def new_request_id(kind: str, session: str, now: Optional[datetime] = None, root
 def make_request(kind: str, session: str, since: str, *, source_event: str, changed_paths: Iterable[str] = (),
                  claims: str = "", plan: Optional[str] = None, data_class: str = "sensitive",
                  detail: Optional[Dict[str, Any]] = None, created: Optional[str] = None,
-                 request_id: Optional[str] = None, root=None) -> Dict[str, Any]:
-    """Build a request dict (claims truncated to 4000 chars). Does not write it."""
+                 request_id: Optional[str] = None, not_before: Optional[str] = None,
+                 root=None) -> Dict[str, Any]:
+    """Build a request dict (claims truncated to 4000 chars). Does not write it. *not_before* (UTC ISO) is
+    only set when given: the runner leaves the request queued until then (see is_ready)."""
     now = datetime.now(timezone.utc)
     created = created or utc_now_iso(now)
-    return {
+    req = {
         "id": request_id or new_request_id(kind, session, parse_utc(created), root),
         "kind": kind,
         "session": session or "",
@@ -242,6 +253,9 @@ def make_request(kind: str, session: str, since: str, *, source_event: str, chan
         "source_event": source_event,
         "detail": detail or {},
     }
+    if not_before:
+        req["not_before"] = utc_now_iso(parse_utc(not_before))
+    return req
 
 
 # ---------------------------------------------------------------- requests
@@ -458,6 +472,160 @@ def merge_into_pending_completion(req: Dict[str, Any], since: Optional[str] = No
             pass
         return None
     return rid
+
+
+# ---------------------------------------------------------------- deferred requests / plan coalescing (#34)
+def is_ready(req: Union[Dict[str, Any], str, Path], now: Optional[datetime] = None) -> bool:
+    """False while the request's `not_before` lies in the future; True otherwise (no field, unparsable
+    field, or an unreadable file: never hold a request back by mistake). Accepts a request dict or the path
+    of its queue file. run_judge.py --pending skips requests that are not ready."""
+    if not isinstance(req, dict):
+        try:
+            req = _read_json(Path(req))
+        except (OSError, ValueError):
+            return True
+        if not isinstance(req, dict):
+            return True
+    nb = req.get("not_before")
+    if not isinstance(nb, str) or not nb.strip():
+        return True
+    try:
+        return parse_utc(nb) <= (now or datetime.now(timezone.utc))
+    except ValueError:
+        return True
+
+
+def _rewrite_pending(new: Dict[str, Any], old: Dict[str, Any], root=None) -> bool:
+    """Replace queue/<id>.json with *new* unless the runner has taken the request (done/ or evidence/
+    exists). Same race handling as merge_into_pending_completion. True when *new* is what is queued."""
+    errs = validate_request(new)
+    if errs:
+        raise ValidationError(errs)
+    r = _root(root)
+    rid = _check_request_id(str(new["id"]))
+    qp, dp, ev = r / "queue" / f"{rid}.json", r / "done" / f"{rid}.json", r / "evidence" / rid
+    if not qp.is_file() or dp.exists() or ev.exists():
+        return False
+    atomic_write_json(qp, new)
+    if dp.exists() or ev.exists():
+        try:
+            if dp.exists():
+                os.unlink(qp)
+            else:
+                atomic_write_json(qp, old)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _same_turn(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    ta, tb = _turn_id(a), _turn_id(b)
+    return not (ta and tb) or ta == tb
+
+
+MAX_COALESCED_IDS = 50
+
+
+def merge_into_pending_plan(req: Dict[str, Any], root=None) -> Optional[str]:
+    """Coalesce a plan request *req* (built, not written) into the pending plan request of the same session,
+    plan path and turn (#34: one plan review per turn instead of one per `patch`).
+
+    Target: a request in queue/ with kind "plan", the same session and plan, the same Hermes turn
+    (detail.turn_id; a missing turn id on either side matches), whose turn has not ended (no
+    detail.turn_ended) and which the runner has not taken (no evidence/<id>/, not in done/).
+
+    Merge: changed_paths = union; since = the earlier; created = the later (the last plan write, so the
+    evidence window covers every write); claims (the plan's current text), not_before and detail fields
+    from *req*; data_class "sensitive" if either side is; id, kind, session, plan, source_event stay.
+    detail.coalesced = {"writes", "first_created", "tool_call_ids"}. Returns the id, or None (the caller
+    writes *req* as a new request)."""
+    if req.get("kind") != "plan" or not req.get("session"):
+        return None
+    for e in list_pending(root):
+        if (e.get("kind") != "plan" or e.get("session") != req.get("session") or e.get("plan") != req.get("plan")
+                or (e.get("detail") or {}).get("turn_ended") or not _same_turn(e, req)):
+            continue
+        if (_root(root) / "evidence" / str(e.get("id"))).exists():
+            continue
+        try:
+            sinces = [parse_utc(x) for x in (e.get("since"), req.get("since")) if x]
+            createds = [parse_utc(x) for x in (e.get("created"), req.get("created")) if x]
+        except ValueError:
+            continue
+        old_detail = dict(e.get("detail") or {})
+        co = dict(old_detail.get("coalesced") or {})
+        ids = list(co.get("tool_call_ids") or ([old_detail["tool_call_id"]] if old_detail.get("tool_call_id") else []))
+        new_id = (req.get("detail") or {}).get("tool_call_id")
+        if new_id and new_id not in ids:
+            ids.append(new_id)
+        detail = old_detail
+        detail.update(req.get("detail") or {})
+        detail["coalesced"] = {"writes": int(co.get("writes") or 1) + 1,
+                               "first_created": co.get("first_created") or e.get("created"),
+                               "tool_call_ids": ids[-MAX_COALESCED_IDS:]}
+        merged = dict(e)
+        merged.update({
+            "since": utc_now_iso(min(sinces)) if sinces else e.get("since"),
+            "created": utc_now_iso(max(createds)) if createds else e.get("created"),
+            "changed_paths": sorted(set(e.get("changed_paths") or []) | set(req.get("changed_paths") or [])),
+            "claims": (req.get("claims") or e.get("claims") or "")[:4000],
+            "data_class": "sensitive" if "sensitive" in (e.get("data_class"), req.get("data_class")) else "infra",
+            "detail": detail,
+        })
+        if req.get("not_before"):
+            merged["not_before"] = req["not_before"]
+        if _rewrite_pending(merged, e, root):
+            return str(e["id"])
+    return None
+
+
+def release_plan_requests(session: str, root=None, now: Optional[datetime] = None,
+                          refresh=None) -> List[str]:
+    """The session's turn ended: every pending plan request of *session* not yet released gets
+    not_before = now and detail.turn_ended = now (later plan writes start a new request). *refresh*
+    (optional) is called with each request dict before it is written, e.g. to re-read the plan's final
+    text. The rewrite also wakes judge-review.path. Returns the released ids."""
+    if not session:
+        return []
+    now_s = utc_now_iso(now)
+    out = []
+    for e in list_pending(root):
+        if e.get("kind") != "plan" or e.get("session") != session or (e.get("detail") or {}).get("turn_ended"):
+            continue
+        new = dict(e)
+        new["detail"] = dict(e.get("detail") or {})
+        new["detail"]["turn_ended"] = now_s
+        if e.get("not_before"):
+            new["not_before"] = min(now_s, str(e["not_before"]))
+        if refresh is not None:
+            try:
+                refresh(new)
+            except Exception:
+                pass
+        if _rewrite_pending(new, e, root):
+            out.append(str(e["id"]))
+    return out
+
+
+def release_due(root=None, now: Optional[datetime] = None) -> List[str]:
+    """Rewrite each pending request whose not_before has passed and that was not released yet (adds
+    detail.released). judge-review.path only fires on queue changes: without this, a plan request whose
+    debounce ran out with no turn end would wait for an unrelated queue write. Returns the ids."""
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for e in list_pending(root):
+        if not e.get("not_before") or not is_ready(e, now):
+            continue
+        d = e.get("detail") or {}
+        if d.get("released") or d.get("turn_ended"):
+            continue
+        new = dict(e)
+        new["detail"] = dict(d)
+        new["detail"]["released"] = utc_now_iso(now)
+        if _rewrite_pending(new, e, root):
+            out.append(str(e["id"]))
+    return out
 
 
 # ---------------------------------------------------------------- findings
