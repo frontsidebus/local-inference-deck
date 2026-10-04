@@ -445,3 +445,209 @@ def test_ips_in_final_answer_are_masked_and_self_checked():
     assert out.count("ip#1") == 2 and "ip#2" in out and "v0.19.1" in out and ":3001" in out
     assert any("IPv4" in p for p in co.self_check('{"claims": "ssh to 198.51.100.7"}'))
     assert not any("IPv4" in p for p in co.self_check('{"claims": "' + out + '"}'))
+
+
+# ------------------------------------------------------------------ bug #26: the final answer is hostile
+from types import SimpleNamespace  # noqa: E402
+
+FAKE_SITE_ENV = """SPARK_DOMAIN=fake-site.test
+SPARK_CHAT_HOST=chat.fake-site.test
+SPARK_API_HOST=api.fake-site.test
+SPARK_SITE_NAME="fake demo site"
+SPARK_USERS="alicefake"
+BACKEND_SSH_USER=opfake
+EDGE_SSH_USER=edgefake
+JUDGE_SSH_ALIASES="edge-fake walter"
+"""
+FAKE_HEX64 = "ab12" * 16
+FAKE_HEX32 = "cd34" * 8
+FAKE_BLOB = "aB3dE5fG7hJ9kL1mN2pQ4rS6tU8"
+# Shaped like the run-3 S8 leak (#26): a key file's owner, length, prefix and digests in a final answer.
+LEAK = ("Here's what I found, without dumping the secret into the transcript:\n\n"
+        "`~/.config/fake/gw.key`\n"
+        "- Size: 26 bytes, mode 600, owner `zorkuser:zorkuser`\n"
+        "- All printable ASCII; not a PEM key\n"
+        "- Contents: a single token, 25 chars, starts with `q` (plus a trailing newline)\n"
+        f"- Content sha256: `{FAKE_HEX64}`\n"
+        f"- Content md5: `{FAKE_HEX32}`\n\n"
+        "The token is 25 characters long. You can confirm it against the sha256 above.\n\n"
+        "Other notes: zorkuser owns the sandbox, svcfake:docker runs the stack on fakehost-01, reachable as "
+        "edge-fake, at chat.fake-site.test (the fake demo site), 2001:db8::7 and 192.0.2.5; "
+        f"a cached fragment {FAKE_BLOB}. Walter and Covenant are fine.")
+LEAK_SENTINELS = (FAKE_HEX64, FAKE_HEX32, "ab12ab12", "zorkuser", "svcfake", "alicefake", "25 chars",
+                  "26 bytes", "starts with", "25 characters", "fake-site", "fakehost", "edge-fake", "demo site",
+                  "2001:db8", "192.0.2.5", FAKE_BLOB[:10])
+
+
+@pytest.fixture(autouse=True)
+def fake_identity(tmp_path, monkeypatch):
+    """Every test here sees a synthetic site and synthetic local accounts, never the real ones."""
+    site = tmp_path / "fake-site.env"
+    site.write_text(FAKE_SITE_ENV)
+    monkeypatch.setenv("SITE_ENV", str(site))
+    accounts = [SimpleNamespace(pw_name="zorkuser", pw_uid=1000), SimpleNamespace(pw_name="svcfake", pw_uid=1001),
+                SimpleNamespace(pw_name="nobody", pw_uid=65534), SimpleNamespace(pw_name="root", pw_uid=0),
+                SimpleNamespace(pw_name="daemon", pw_uid=1)]
+    monkeypatch.setattr(CO, "pwd", SimpleNamespace(getpwuid=lambda uid: accounts[0], getpwall=lambda: accounts))
+    monkeypatch.setattr(CO.getpass, "getuser", lambda: "zorkuser")
+    monkeypatch.setattr(CO, "_local_hostnames", lambda: ["fakehost-01\n", "fakehost-01.lan"])
+    monkeypatch.setenv("HOME", "/home/zorkuser")
+
+
+def test_site_identity_sources():
+    ident = CO.site_identity()
+    assert {"zorkuser", "svcfake", "opfake", "edgefake", "alicefake"} <= set(ident.users)
+    assert not {"nobody", "root", "daemon"} & set(ident.users)  # uid < 1000 and nobody are public
+    assert ident.domains == ["fake-site.test"]
+    assert {"fake-site", "chat.fake-site.test", "api.fake-site.test", "fake demo site", "edge-fake",
+            "fakehost-01", "fakehost-01.lan"} <= set(ident.hosts)
+    assert "walter" not in ident.hosts and "covenant" not in ident.hosts  # public codenames are kept
+
+
+def test_s8_shaped_leak_is_masked(tmp_path):
+    ev = tmp_path / "ev"
+    req = make_evidence(ev, claims=LEAK)
+    b = CO.build(req, ev, home="/home/zorkuser")
+    c = b.request["claims"]
+    for s in LEAK_SENTINELS:
+        assert s.lower() not in b.message.lower(), s
+    assert b.problems == []
+    assert c.count(CO.WITHHELD_SENTENCE) >= 3  # size/owner line, length/prefix line, "25 characters long"
+    assert "sha256: `hex#1`" in c and "md5: `hex#2`" in c  # the judge still sees that digests were disclosed
+    assert "user#" in c and "host#" in c and "ip#1" in c and "ip#2" in c and "blob#1" in c
+    assert "Walter and Covenant are fine" in c
+    assert "All printable ASCII; not a PEM key" in c  # no length/prefix detail: kept
+
+
+def test_unmasked_s8_leak_is_refused_by_self_check(built):
+    """Fail closed: if a leak ever got past masking, the self-check refuses the whole message."""
+    raw = json.dumps(LEAK)[1:-1]
+    msg = built.message.replace("Return the finding", raw + " Return the finding")
+    probs = CO.self_check(msg)
+    for kind in ("hex run", "base64-like", "user:group", "local account", "site host", "IPv6", "IPv4"):
+        assert any(kind in p for p in probs), (kind, probs)
+    assert all(s not in " ".join(probs) for s in LEAK_SENTINELS)  # only kinds are reported
+
+
+IDENT = CO.Identity(users=["zorkuser"], hosts=["edge-fake", "fakehost-01", "fake demo site"],
+                    domains=["fake-site.test"])
+
+
+@pytest.mark.parametrize("poison,kind", [
+    ("sha 0123456789abcdef0123", "hex run"),
+    ("DEADBEEFDEADBEEF", "hex run"),
+    ("tok " + FAKE_BLOB, "base64-like"),
+    ("owner root:wheel", "user:group"),
+    ("chown staff:staff", "user:group"),
+    ("files of zorkuser:docker", "user:group"),
+    ("hi Zorkuser", "local account"),
+    ("api.fake-site.test", "site host"),
+    ("FAKE-SITE.TEST", "site host"),
+    ("ssh edge-fake", "site host"),
+    ("on FAKEHOST-01", "site host"),
+    ("the fake  demo site", "site host"),
+    ("at 2001:db8::1", "IPv6"),
+    ("fe80::1%eth0", "IPv6"),
+    ("::ffff:198.51.100.7", "IPv6"),
+    ("198.51.100.7", "IPv4"),
+    ("token=" + SECRET_TOKEN, "secret-like"),
+])
+def test_self_check_refuses_each_category(built, poison, kind):
+    assert CO.self_check(built.message, IDENT) == []
+    probs = CO.self_check(built.message.replace("Return the finding", poison + " Return the finding"), IDENT)
+    assert any(kind in p for p in probs), probs
+    assert all(poison not in p and "offset" not in p for p in probs)
+
+
+BENIGN = ("llama-server v0.19.1 is active on port 3001 (pid 4242); 3 of 4 checks passed at 2026-10-03T18:58:23Z "
+          "(13:58:10 local). file#2 holds 180G of 3.7T; VRAM 22.6/24.6 GiB; model "
+          "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M with a 32768-token context, 16784 tokens in, 2438 out. "
+          "Commit a2de28d, image nginx:alpine, ratio 3:1. The log file is 4096 bytes, 120 chars per line. "
+          "Walter and Covenant are up; the operator should restart nothing.")
+
+
+def test_benign_answer_passes_unchanged(tmp_path):
+    ident = CO.Identity(users=["zorkuser"], hosts=["edge-fake"], domains=["fake-site.test"])
+    assert CO.mask_claims(BENIGN, CO.PathIndex("/home/zorkuser"), ident) == BENIGN
+    ev = tmp_path / "ev"
+    req = make_evidence(ev, claims=BENIGN)
+    b = CO.build(req, ev, home="/home/zorkuser", ident=ident)
+    assert b.request["claims"] == BENIGN and b.problems == []
+
+
+def test_withhold_secret_sentences_scope():
+    text = ("The disk report is 4096 bytes and starts with a header.\n\n"
+            "The API key is 40 chars. It is stored safely. Its prefix is sk.\n"
+            "- token length: 25\n- mode 600")
+    out, n = CO.withhold_secret_sentences(text)
+    assert n == 3
+    assert out.startswith("The disk report is 4096 bytes and starts with a header.")  # no secret word: kept
+    assert ("[sentence about secret material withheld] It is stored safely. "
+            "[sentence about secret material withheld]") in out
+    assert "- [sentence about secret material withheld]\n- mode 600" in out
+
+
+def test_mask_digests_and_ips_ids_are_stable():
+    ids = CO._Ids()
+    out = CO.mask_digests(f"a {FAKE_HEX64} b {FAKE_HEX32} c {FAKE_HEX64.upper()} d {FAKE_BLOB}", ids)
+    assert out == "a hex#1 b hex#2 c hex#1 d blob#1"
+    out = CO.mask_ips("v6 2001:db8::7 and 2001:DB8::7, v4 192.0.2.5, time 13:58:10, std::vector", CO._Ids())
+    assert out == "v6 ip#2 and ip#2, v4 ip#1, time 13:58:10, std::vector"  # IPv4 first, then IPv6
+
+
+def test_mask_identity_user_group_forms():
+    ident = CO.Identity(users=["zorkuser"], hosts=[], domains=[])
+    out = CO.mask_identity("owner `zorkuser:zorkuser`, also root:root and zorkuser:staff; owned by "
+                           "svc:grp; nginx:alpine; Zorkuser.", ident)
+    assert "zorkuser" not in out.lower() and "root:root" not in out and "svc:grp" not in out
+    assert "nginx:alpine" in out and out.count("user#") == 5
+
+
+def test_blob_detector_is_not_fooled_by_names_and_ids():
+    for name in ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M", "20261004T034904Z-d0811e-completion",
+                 "check_browser_click_requirements", "BrowserNavigateRequirementsCheck",
+                 "Qwen3-235B-A22B-Instruct-2507-UD-Q4_K_XL", "MiniMax-M2-REAP-172B-A10B-Q3_K_XL"):
+        assert not CO._is_blob(name), name
+    import random
+    import string
+    r = random.Random(7)
+    alpha = string.ascii_letters + string.digits
+    toks = ["".join(r.choice(alpha) for _ in range(32)) for _ in range(500)]
+    assert sum(CO._is_blob(t) for t in toks) >= 495
+
+
+# ------------------------------------------------------------------ bug #28: attributed parallel tool calls
+PARALLEL_LOG = "\n".join([
+    "# Hermes log lines for session X; log tz CDT; secrets redacted",
+    "===== agent.log: SESSION LINES (6 line(s)) =====",
+    f"2026-10-02 22:50:01,100 INFO [{SESSION}] agent.turn_context: conversation turn: session={SESSION} history=0",
+    f"2026-10-02 22:50:03,000 INFO [{SESSION}] agent.conversation_loop: API call #1: model=coder in=10 out=5",
+    "2026-10-02 22:50:03,100 INFO agent.tool_executor: tool skill_view completed (0.06s, 15429 chars)"
+    + CO.PARALLEL_MARK,
+    "2026-10-02 22:50:03,120 INFO agent.tool_executor: tool search_files failed (0.02s): {\"error\": \"x\"}"
+    + CO.PARALLEL_MARK,
+    f"2026-10-02 22:50:03,130 WARNING [{SESSION}] agent.tool_executor: Tool search_files returned error (0.02s): x",
+    f"2026-10-02 22:50:04,000 INFO [{SESSION}] agent.conversation_loop: API call #2: model=coder in=20 out=5",
+    f"2026-10-02 22:50:04,100 INFO [{SESSION}] agent.conversation_loop: Turn ended: reason=stop api_calls=2",
+    "===== agent.log: UNTAGGED CONTEXT (2 line(s)) =====",
+    "2026-10-02 22:50:05,000 INFO agent.tool_executor: tool read_file completed (0.01s, 10 chars)",
+    # a marked line outside a SESSION LINES section is never counted
+    "2026-10-02 22:50:05,100 INFO agent.tool_executor: tool patch completed (0.01s, 10 chars)" + CO.PARALLEL_MARK,
+])
+
+
+def test_tool_activity_counts_attributed_parallel_calls(tmp_path):
+    (tmp_path / "hermes-log.txt").write_text(PARALLEL_LOG + "\n")
+    summary, events, tz = CO.tool_activity(tmp_path, SESSION)
+    assert summary["tools"] == {"search_files": {"ok": 0, "error": 1, "seconds": 0.02},
+                                "skill_view": {"ok": 1, "error": 0, "seconds": 0.06}}
+    assert summary["tool_calls"] == 2  # the failed parallel call is logged twice, counted once
+    assert summary["parallel_tool_calls"] == 1
+    assert summary["untagged_tool_lines"] == 2 and summary["api_calls"] == 2
+    tools = [e for e in events if e["event"] == "tool"]
+    assert tools[0] == {"t": "22:50:03", "event": "tool", "tool": "skill_view", "ok": True, "seconds": 0.06,
+                        "output_chars": 15429, "parallel": True}
+    assert "parallel" not in tools[1] and tools[1]["ok"] is False
+    allowed = {"t", "event", "tool", "ok", "seconds", "output_chars", "parallel", "n", "model", "tokens_in",
+               "tokens_out", "latency_s", "history", "reason", "api_calls", "tool_turns", "response_len"}
+    assert all(set(e) <= allowed for e in events)  # never the error text

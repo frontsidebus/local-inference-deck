@@ -172,7 +172,15 @@
         "cut", "sort", "uniq", "column", "jq", "yq", "rev", "fold", "paste", "dd"
       ],
       "safe_sinks": ["wc", "sha256sum", "sha1sum", "sha512sum", "md5sum", "b2sum", "cksum", "true", "test"],
-      "secret_grep_pattern": "(?i)(api[_-]?key|secret|passw(or)?d|private[_ -]?key|bearer|master[_-]?key|auth[_-]?token|access[_-]?token)"
+      "secret_grep_pattern": "(?i)(api[_-]?key|secret|passw(or)?d|private[_ -]?key|bearer|master[_-]?key|auth[_-]?token|access[_-]?token)",
+      "_doc_variables": "#27: shell variables assigned to literal values in the same command line or script (X=..., export/local/declare/readonly/typeset X=..., ~ and $HOME expanded) are substituted into later words before the path checks, including inside bash -c / eval / $(...). A copy of a secret (cp/mv/install/ln, or a captured read redirected to a file) is treated as a secret for the rest of the command. A digest of a byte-limited part of a secret (head -c/tail -c/cut -c/dd count= piped to a hash) escalates: it is brute-forceable."
+    },
+    {
+      "id": "secret-output-unknown",
+      "kind": "secret_output_unknown",
+      "action": "approve",
+      "description": "A printing command reads a file the gate cannot resolve (command substitution, unknown or loop variable, read, xargs/find -exec argument) in a command that names a secret path or secret-shaped file; it may print that secret",
+      "_doc": "#27. Uses the secret_output lists (secret_paths, secret_names, not_secret_names, print_commands). Fires only when the same command line (or a script it runs) mentions something secret-shaped anywhere (an assignment, a glob such as ~/.config/spark/*, a find root/filter), or when a find/xargs listing walks a directory that contains a secret path; otherwise an unresolved argument passes, to avoid approval fatigue."
     }
   ]
 }

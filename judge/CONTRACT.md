@@ -85,6 +85,21 @@ undone; a sub-second race remains in which the merged extra paths land in done/ 
 path unit fires on every queue/ change, the merge often finds the pre_verify request already being judged; it
 removes the duplicate whenever the session end arrives first.
 
+**Turns with no tool activity** (#29, `hooks/enqueue.py::text_only_reason`). `on_session_end` skips a turn
+with no tool activity in `agent.log`, no `events.jsonl` events in the window, no write targets and no new
+snapshot changes (`JUDGE_ENQUEUE_ALWAYS=1` overrides), **unless** the turn's final answer is worth reviewing:
+`JUDGE_REVIEW_TEXT_ONLY=1` (default) and the answer (`hermeslog.last_assistant_message`, stripped) is at least
+`JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS` (200) characters and (contains a whole-word `CLAIM_WORDS` match, e.g.
+done/fixed/blocked/ran/verified/changed/deployed/restarted/denied/escalated/approved/gate, case-insensitive, or
+`gate.log` (last 512 KiB) has a decision of the session with `ts` in `[since − 1 s, now + 5 s]`).
+`JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=0` drops the claim-word/gate condition. Never when the answer's hash equals
+`last_claims_sha` in `snapshots/<session>/meta.json` (set whenever a completion request is written, merged or
+deduped), so a turn without a new answer does not re-review the previous one. These keys are read
+environment > site.env > default by enqueue.py itself. The request is an ordinary completion request (empty
+`changed_paths`, so normally `data_class: sensitive`: local judge + frontier claims stage) with
+`detail.text_only = {"chars", "claim_words" (≤ 12), "gate_decisions", "rule": "claims|gate|min_chars"}`; merge
+and dedupe apply unchanged.
+
 ## Request (schema/request.schema.json)
 ```json
 {"id": "...", "kind": "plan|gate|completion|runaway",
@@ -258,7 +273,8 @@ untagged context lines, after the session lines), window ... UTC; log tz ...`; l
 this order: `===== agent.log: SESSION LINES (N line(s)) =====`, `===== errors.log: SESSION LINES (...) =====`,
 `===== agent.log: UNTAGGED CONTEXT (M line(s); K noise line(s) dropped: <logger> xN, ...) =====`,
 `===== errors.log: UNTAGGED CONTEXT (...) =====`. SESSION LINES = every line tagged `[<session>]` (with its
-continuation lines); lines tagged with another session never appear. UNTAGGED CONTEXT = lines without a session
+continuation lines), plus the untagged parallel tool-call lines attributed to the session (bug #28, below); lines
+tagged with another session never appear. UNTAGGED CONTEXT = lines without a session
 tag, which may come from this or any other Hermes process; those `lib/hermeslog.is_noise` classifies as
 startup/housekeeping noise are dropped and only counted: loggers `hermes_cli.plugins`,
 `hermes_cli.plugin_capabilities`, `hermes_cli.mem_trim`, `hermes_cli.gateway_multiplex_mode`, `hermes_cli.main`,
@@ -267,10 +283,26 @@ startup/housekeeping noise are dropped and only counted: loggers `hermes_cli.plu
 per-process-start messages `state.db: linked SQLite ... vulnerable`, `Background MCP discovery previously exited`,
 `Loaded environment variables from`, `OpenAI client created (agent_init|chat_completion_stream_request ...`.
 Every other untagged line is kept, e.g. `agent.message_sanitization` "Unrepairable tool_call arguments" warnings
-(Hermes does not tag them) and untagged `agent.tool_executor` lines of parallel tool calls. errors.log lines that
+(Hermes does not tag them) and untagged `agent.tool_executor` lines of parallel tool calls that could not be
+attributed. errors.log lines that
 also appear in agent.log are counted (`also in agent.log not repeated`), not repeated. At most 3000 lines per
 section (the last ones). A C6 watcher request has SESSION LINES sections only. S9 (run 2) went from 32.6K chars
 with the session's first line at char ~26K to 5.2K chars with the 17 session lines on top.
+
+**Parallel tool calls** (`lib/hermeslog.parallel_attribution`, bug #28). Hermes keeps the session tag in
+thread-local state, so the calls of a concurrent tool batch, which run in worker threads, are logged UNTAGGED
+(`agent.tool_executor: tool skill_view completed (0.06s, 15429 chars)`; also `failed`/`cancelled`/`abandoned`),
+with no thread, task or tool_call id. Such a line is attributed to session S only when S's own turn brackets it
+and nobody else was active: going back, the session-tagged lines are S's up to S's `API call #n`; going forward,
+S's up to S's next `API call` or `Turn ended`; and no other session's turn (`conversation turn:` to
+`Turn ended`; a turn with no end counts as busy until 30 min after its last line; a session first seen mid-turn
+counts as busy from the start of the scanned log) overlaps that bracket. Otherwise the line stays untagged
+context; another session's lines are never attributed. An attributed line goes into SESSION LINES with the suffix
+`  # judge: untagged parallel tool call, attributed to this session by turn adjacency` (`PARALLEL_MARK`), and
+counts for `session_lines`/`tool_activity`/`tools_used` (so the enqueue hook and file attribution see it). A failed
+parallel call is logged twice (untagged `tool X failed`, then tagged `Tool X returned error`); exact counters pair
+them. Residual risk: a Hermes process that never logs a session tag is invisible to the rule. On the real
+agent.log (2026-10-02..04) all 38 untagged tool lines were attributed, each inside one session's own turn.
 
 `data_class` of the bundle: the stricter of the request's class and the collector's own classification of the
 agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request or a C6 watcher request (shape above) keeps its own class; any other
@@ -354,9 +386,9 @@ runaway requests get no claims stage (their `claims` is synthetic or a plan, not
 **Contents: a positive allowlist.** Every value is constructed by the builder from parsed fields; nothing from the
 bundle is copied through as text except the final answer:
 - REVIEW REQUEST: `id`, `kind`, `data_class`, `created`, `since`, `claims`. `claims` = `request.claims` (cut to
-  8000 chars), `lib/redact`ed, then path-masked: absolute (`/x`), home (`~/x`, `~user/x`, `$HOME/x`) and relative
-  paths with a directory part (a dotfile segment, a file extension or 2+ separators) become `file#N`. URLs, ratios
-  (`22.6/24.6`), `I/O`, `and/or` and a bare `/` are left alone. Bare file names (`config.yaml`) stay.
+  8000 chars), masked by `claims_only.mask_claims` (below). The final answer is free text written by an agent that
+  may have read secrets and site data, so it is treated as **hostile to the data boundary** (bug #26): it is
+  masked, and the whole message must still pass the self-check, which refuses rather than trusts the masking.
 - `manifest.json`: `bundle_mode: "claims-only"`, `request` (the fields above minus claims), `window` (`since`,
   `until`, `grace_seconds`, `until_basis`), `timing` (`request_created`, `collected`, `log_tz` from the
   hermes-log header, `host_times: "UTC"`), `attribution_counts` (`agent_paths`, `changed_by_others`, `withheld` =
@@ -369,21 +401,52 @@ bundle is copied through as text except the final answer:
   `outcome_basis`, call hash, call id or session.
 - `c3-results.jsonl`: per result `check`, `ok`, `final`, `file` (`file#N`, shared index with the claims). No
   `detail`, `path`, `t` or `attempt`.
-- `tool-activity.jsonl`: a summary line (`tools: {name: {ok, error, seconds}}`, `tool_calls`, `api_calls`,
-  `tokens_in`, `tokens_out`, `turns`, `other_session_lines`), then one line per session-tagged `hermes-log.txt`
-  event, parsed by pattern: `tool` (`tool`, `ok`, `seconds`, `output_chars`), `api_call` (`n`, `model`,
+- `tool-activity.jsonl`: a summary line (`tools: {name: {ok, error, seconds}}`, `tool_calls`,
+  `parallel_tool_calls`, `api_calls`, `tokens_in`, `tokens_out`, `turns`, `other_session_lines`,
+  `untagged_tool_lines` = untagged tool lines left in UNTAGGED CONTEXT, which may be this or any other session's),
+  then one line per session `hermes-log.txt` event (session-tagged, or an attributed parallel tool-call line in a
+  SESSION LINES section, which gets `"parallel": true`; a failed parallel call logged twice counts once), parsed
+  by pattern: `tool` (`tool`, `ok`, `seconds`, `output_chars`), `api_call` (`n`, `model`,
   `tokens_in`, `tokens_out`, `latency_s`), `turn_start` (`history`), `turn_end` (`reason`, `api_calls`,
   `tool_turns`, `response_len`), each with log-local `t`. Duplicate log lines (WARNING+ lines appear in both the
-  agent.log and errors.log sections) count once; other session lines are only counted; untagged lines and other
-  sessions' lines are ignored. At most 300 events (middle-cut with an `omitted` count).
+  agent.log and errors.log sections) count once; other session lines are only counted; other untagged lines and
+  other sessions' lines are ignored. At most 300 events (middle-cut with an `omitted` count).
 - Never: file contents, diffs, paths, command arguments or output, tool error text, host or probe output, slots,
   `others-changed.txt`, snapshot data, the user's message (`msg=`), `plan`, `detail`, `changed_paths`, session id.
 
-**Self-check** (`claims_only.self_check`, run on the exact message, and on a JSON-unescaped copy). Refuses when
-`lib/redact` would change the text, a `/`-prefixed or `~/`/`$HOME/` path is found, a `msg=` marker, a diff hunk or
-header, a `# content withheld` / `# WINDOWED` / `# POINT IN TIME` marker or an unknown `=== FILE:` header appears.
-A refused bundle is not sent: the stage is skipped, `runner.log` and the main finding's notes say why (kind and
-offset only, never the offending text), and no frontier call is counted.
+**Masking of the final answer** (`mask_claims`, in this order; ids are stable within one answer):
+1. `lib/redact`.
+2. **Sentences about secret material** (`withhold_secret_sentences`): in a paragraph (or list) that mentions a
+   key/keyfile/token/secret/password/passphrase/credential or a `.key`/`.pem` file, every sentence that gives a
+   length or prefix/suffix detail (`25 chars`, `26 bytes`, `starts with`, `prefix`, `first N chars`, `length`)
+   is replaced as a whole by `[sentence about secret material withheld]`. It errs on the side of withholding (a
+   byte count next to a key mention goes too). `32768-token context` and `16784 tokens` are not secret words.
+   Digest words are not a trigger: the digest value is a hex run (step 6) and `sha256: hex#1` keeps the fact that a
+   digest of a secret was disclosed visible to the judge.
+3. Paths -> `file#N`: absolute (`/x`), home (`~/x`, `~user/x`, `$HOME/x`) and relative paths with a directory part
+   (a dotfile segment, a file extension or 2+ separators). URLs, ratios (`22.6/24.6`), `I/O`, `and/or` and a bare
+   `/` are left alone. Bare file names (`config.yaml`) stay.
+4. IPv4 and IPv6 addresses -> `ip#N` (IPv6 validated with `ipaddress`; times like `13:58:10` stay).
+5. Site identifiers -> `host#N`: `SPARK_DOMAIN` and any subdomain of it, the domain without its TLD, every
+   `SPARK_*_HOST`, `SPARK_SITE_NAME`, the `JUDGE_SSH_ALIASES`, `/etc/hostname` and this host's names (case
+   insensitive). The Walter/Covenant codenames are kept (public lore). Local accounts -> `user#N`: `user:group`
+   pairs (either side a known account, both sides equal like `x:x`, or after owner/owned by/chown/uid/gid) as one
+   id, then the names themselves: the current user, every `/etc/passwd` account with 1000 <= uid < 65534 (`nobody`
+   is public), `getpass` and home-dir basenames, `BACKEND_SSH_USER`, `EDGE_SSH_USER`, `SPARK_USERS`
+   (`claims_only.site_identity`). Common words that are account names (e.g. a default `operator`) are masked too.
+6. Hex runs of 16+ chars -> `hex#N` (digests, hashes, ids, key fragments); base64-like runs of 24+ chars
+   (`[A-Za-z0-9+/=_-]`, letters and digits, a 9+ char piece between separators, random-looking character
+   classes) -> `blob#N`. Model names (`Qwen3-Coder-30B-A3B-Instruct-Q4_K_M`), identifiers and request ids are not
+   blobs; measured on random tokens, ~1% of 24-char base64url tokens and ~0.1% of 32-char ones are missed (redact
+   and step 2 still apply).
+
+**Self-check** (`claims_only.self_check(text, ident=None)`, run on the exact message, and on a JSON-unescaped
+copy). It **fails closed**: any hit refuses the whole bundle. Refuses when `lib/redact` would change the text; a
+`/`-prefixed or `~/`/`$HOME/` path; an IPv4 or IPv6 address; a hex run of 16+; a base64-like run of 24+; a
+`user:group` pattern (as in step 5); a known local account name; a site host or domain (step 5); a `msg=` marker;
+a diff hunk or header; a `# content withheld` / `# WINDOWED` / `# POINT IN TIME` marker; an unknown `=== FILE:`
+header. A refused bundle is not sent: the stage is skipped, `runner.log` and the main finding's notes name the
+problem KIND only (no text, no offset), and no frontier call is counted.
 
 **Runner.** `judge_request`: local stage first (as before); then, before the main finding is written, the claims
 stage when `data_class != infra`, `JUDGE_SENSITIVE_FRONTIER_CLAIMS` != `0` (default `1`), `JUDGE_MODE=frontier`
@@ -419,6 +482,18 @@ Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a st
   lines (headers, section titles) always stay. A non-priority file that no longer fits is listed as
   `[omitted by runner: bundle size cap]`.
 
+- **Truncated local replies** (#30). Every local call is capped at `JUDGE_LOCAL_MAX_TOKENS` (4096).
+  `call_local(messages, max_tokens=None)` records `finish_reason`/`max_tokens` of its reply in
+  `run_judge.LAST_LOCAL`. When a local reply ends with `finish_reason=length`, `_judge_loop` adds a finding note
+  `local judge reply N was truncated at max_tokens=M (finish_reason=length); the partial reply had K item(s) with a
+  parseable severity (… high, … medium; as written by the judge, before any severity cap) | no item could be parsed
+  …; it is kept in evidence/<id>/judge-raw.txt` (`truncation_note`), plus `the finding below comes from reply N
+  (max_tokens=M); compare …` or `… itself truncated: items may be missing`; the same line goes to `runner.log`.
+  `judge-raw.txt` keeps every reply; a truncated one's header reads `(local, <model>, TRUNCATED:
+  finish_reason=length)`. The next call after a truncated reply (the validation re-ask, which also says the reply
+  was cut off and asks to keep every item with shorter text) uses `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default
+  2 × `JUDGE_LOCAL_MAX_TOKENS`, never less than it). Frontier replies have no finish_reason and get no such note.
+
 ## Probes (`judge/probes/probe.py <name> [args...]`)
 Allowlisted names with per-arg regex validation; each runs read-only with a timeout (default 20s):
 `ssh_alias_test <alias>`, `port_listening <host:walter|covenant> <port>`, `http_status <https-url-on-SPARK_DOMAIN>`,
@@ -452,6 +527,40 @@ exit 64, no execution.
   `$HERMES_HOME/config.yaml` passes on purpose (settings, not credentials; see the policy's `_doc_read_file`).
 - **`rule_key`** for a secret read = `judge-gate:secret-output:<sha256(tool \0 resolved-abs-path)[:12]>`: one key
   per file whatever the spelling or page, so a human's "always" covers that one file, never the whole rule.
+- **Shell variables in terminal commands** (#27, local and remote, incl. `bash -c`, `eval`, function bodies,
+  `$(...)`, scripts the gate peeks into): assignments to literal values (`X=v`, prefix `X=v cmd`,
+  `export|local|declare|readonly|typeset X=v`; `~` / `$HOME` / `$HERMES_HOME` / `$JUDGE_REVIEW_DIR` /
+  `$JUDGE_DIR` expanded; earlier known variables substituted) are tracked in order, and `$X` / `${X}` (quoted or
+  not) are substituted into later words and redirect targets before every rule. A value holding a substitution,
+  an unknown variable, `${X:-...}`-style expansion, an array element or `+=` is unknown; so are `for`/`select`
+  loop variables, names set by `read` / `mapfile` / `readarray` / `getopts` / `printf -v`, and positional
+  parameters (`$1`, `$@`; `$0` counts as known). `unset` forgets a name. Over-approximations on purpose: a prefix
+  assignment stays known after its command; single-quoted `$X` is substituted too.
+  Command substitutions are analyzed in order with the command that holds them (substitutions in dropped
+  loop/case headers and `[[ ]]` first).
+- **`secret-output`, terminal** (print commands = policy `print_commands`): a print command, `< file`, `$(<file)`,
+  `openssl rsa|pkey|ec|pkcs12 -in` without `-noout`/`-pubout`, `cp|install|ln|mv <secret> /dev/stdout|-|...`,
+  `python|perl|ruby|node|php -c|-e` code (or code on stdin) that reads (`open(`, `.read*(`, `read_text`, ...) a
+  secret path named in the code or passed as an operand, `perl|ruby -n|-p <secret>`, `echo|printf` of a variable
+  or `$(...)` that read a secret, or `<(cmd)` where cmd read one; each only when stdout is not captured. Captured =
+  inside `$(...)`, stdout redirected (`>`, `>>`, `&>`; `2>` alone is not, fixed with #27), or piped into a
+  `safe_sinks` command. Whole-file digests and counts (`sha256sum`, `md5sum`, `wc`, ...) pass by design; a
+  digest of a byte-limited part (`head -c` / `tail -c` / `cut -c|-b` / `dd count=|skip=` piped to a hash) escalates
+  (brute-forceable). A copy made in the same command (`cp|mv|install|ln <secret> dst`, or a captured secret read
+  redirected to a file) is treated as the secret for the rest of that command.
+- **`secret-output-unknown`** (approve; #27; added to older pre-rendered policies by `load_policy`): a print
+  command (or the commands above) whose operand stays unresolved (`$X` unknown, `$(...)`, loop variable,
+  `xargs` stdin / `-I{}`, `find -exec ... {}`, `sh -c '... "$1"' _ {}`) escalates when the same command line
+  mentions a secret-shaped word anywhere (`Gate.is_secret_file` on every word: assignments, loop lists, globs such
+  as `~/.config/spark/*`), or, for scripts the gate peeks into, a configured `secret_paths` match only (names like
+  `site.env` in long scripts were too noisy); or when the `find` feeding it (`find R ... -exec`, `find R ... | xargs`)
+  has a root R that is or contains a `secret_paths` entry (`~/.config`, `/etc`, `~`) and no `-name` filter that is
+  entirely in `not_secret_names`. Otherwise it passes. The reason names the secret-shaped word, never content.
+- **Not seen by the gate** (known limits): values built at run time (`f=$(printf '%s/%s' ~/.config spark)/k`
+  without any secret-shaped word, base64-decoded names, `$IFS` tricks); copies or symlinks made in an earlier tool
+  call (`cp key /tmp/x`, then `cat /tmp/x` next turn); secrets read by programs that are not print commands and
+  print what they read (`vim`, a compiled tool, `git diff --no-index`); interpreter code that builds the path at
+  run time; `execute_code` (outside the matcher). Each `terminal` call is judged on its own.
 - **hermes CLI** (policy key `oversight_config.hermes_cli`; gate.py carries the same values as a fallback for
   older rendered policies):
   - pass: `-h`/`--help` anywhere before `--` (block flags `--yolo`/`--accept-hooks` are still checked);
@@ -549,7 +658,9 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
 `JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
 `JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`,
-`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions).
+`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions),
+`JUDGE_REVIEW_TEXT_ONLY=1`, `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS=200`, `JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1` (#29),
+`JUDGE_LOCAL_MAX_TOKENS=4096`, `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default 2 × `JUDGE_LOCAL_MAX_TOKENS`; #30).
 Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

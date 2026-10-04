@@ -41,7 +41,12 @@ TEMPLATE = os.path.join(JUDGE_DIR, "policy", "gate-policy.json.tmpl")
 SITE_VARS = ("BACKEND_LAN_IP", "BACKEND_WG_IP", "EDGE_PUBLIC_IP", "EDGE_WG_IP", "SPARK_DOMAIN",
              "BACKEND_SSH_USER", "EDGE_SSH_USER", "JUDGE_SSH_ALIASES")
 KNOWN_KINDS = ("oversight_config", "oversight_path", "hermes_config", "sensitive_path", "remote_mutation",
-               "remote_copy", "remote_opaque", "public_push", "secret_output")
+               "remote_copy", "remote_opaque", "public_push", "secret_output", "secret_output_unknown")
+# #27: added after the first policies were rendered; an older pre-rendered gate-policy.json gets this default.
+DEFAULT_SECRET_UNKNOWN_RULE = {
+    "id": "secret-output-unknown", "kind": "secret_output_unknown", "action": "approve",
+    "description": "A printing command reads a file the gate cannot resolve in a command that names a secret "
+                   "path or secret-shaped file; it may print that secret"}
 GATED_TOOLS = ("terminal", "write_file", "patch", "read_file")
 # Fallbacks when an older pre-rendered $JUDGE_REVIEW_DIR/gate-policy.json lacks these keys (the template has them).
 DEFAULT_HERMES_CLI = {
@@ -120,6 +125,8 @@ def load_policy(rt=None):
         if r["kind"] in seen:
             raise GateError(f"gate policy {source}: duplicate rule kind {r['kind']}")
         seen.add(r["kind"])
+    if "secret_output" in seen and "secret_output_unknown" not in seen:
+        pol["rules"].append(dict(DEFAULT_SECRET_UNKNOWN_RULE))
     pol["_source"] = source
     return pol
 
@@ -222,10 +229,27 @@ SUB_RE = re.compile(r"__GATE_SUB(\d+)__")
 HD_TOKEN_RE = re.compile(r"__GATE_HD(\d+)__")
 ARITH = "__GATE_ARITH__"      # an arithmetic command (( ... )) (runs nothing)
 ARITH_NUM = "__GATE_NUM__"    # an arithmetic expansion $(( ... )) (a number)
+LOOPVAR = "__GATE_LOOPVAR__"  # value of a for/select loop variable (unknown)
+XARG = "__GATE_XARG__"        # an argument supplied at run time by xargs / find -exec {}
+# #27 shell variables: $NAME / ${NAME} are substituted when NAME holds a known literal value
+VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+# a word still holding something the gate can't resolve: a variable/parameter, a substitution, an xargs/find arg
+# ($0 is the script/shell name, not data: `sed -n '2,20p' "$0"` prints the script's own usage)
+UNRES_RE = re.compile(r"\$[{A-Za-z_1-9@*#?!]|__GATE_SUB\d+__|__GATE_XARG__|__GATE_LOOPVAR__|`")
+DECL_BUILTINS = ("export", "declare", "local", "readonly", "typeset")
+STDOUT_FILES = ("/dev/stdout", "/dev/stderr", "/dev/tty", "-", "/proc/self/fd/1", "/proc/self/fd/2", "/dev/fd/1",
+                "/dev/fd/2")
+HASH_SINKS = ("sha256sum", "sha1sum", "sha512sum", "sha224sum", "sha384sum", "md5sum", "b2sum", "cksum", "sum",
+              "openssl", "xxh64sum", "xxhsum")
+INTERPRETERS = ("python", "python3", "perl", "ruby", "node", "php")
 # Reserved words (recognized only in command position). Openers are followed by a command; closers end a
 # compound command and may only be followed by redirects/separators.
 KW_OPEN = {"if", "then", "else", "elif", "while", "until", "do", "!", "{", "time"}
 KW_CLOSE = {"fi", "done", "esac", "}"}
+
+
+class ProcSub(str):
+    """Source of a process substitution <(...) / >(...): its placeholder stands for a pipe, not a file name."""
 
 
 def _match_close(s, i):
@@ -328,7 +352,7 @@ def preprocess(s):
             arith = False
         elif c in "<>" and i + 1 < n and s[i + 1] == "(":
             j = _match_close(s, i + 2)
-            substs.append(s[i + 2:j])
+            substs.append(ProcSub(s[i + 2:j]))
             out.append(f" __GATE_SUB{len(substs) - 1}__ ")
             i = j + 1
             continue
@@ -419,13 +443,15 @@ def tokenize(s):
             i += 1
             continue
         if c in ";&|<>()":
+            fd = ""
             if c in "<>" and inword and "".join(buf).isdigit():
-                buf, inword = [], False  # fd number of a redirect (2>, 1>>)
+                fd = "".join(buf)  # fd number of a redirect (2>, 1>>): kept on the op as "2>"
+                buf, inword = [], False
             else:
                 flush()
             for op in _OPS:
                 if s.startswith(op, i):
-                    toks.append(("op", op))
+                    toks.append(("op", (fd + op) if fd and fd not in ("0", "1") else op))
                     i += len(op)
                     break
             continue
@@ -496,6 +522,8 @@ def shell_structure(toks):
             if j < n and toks[j] != ("w", "do"):
                 while j < n and toks[j][0] == "w":
                     j += 1
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", toks[i + 1][1]):
+                out.append(("lv", toks[i + 1][1]))  # #27: the loop variable no longer holds a known value
             i = j
             continue
         if val == "case":
@@ -529,17 +557,20 @@ def shell_structure(toks):
 
 class SC:
     """One simple command."""
-    __slots__ = ("argv", "assigns", "redirects", "stdin", "pipe_in", "pipe_out")
+    __slots__ = ("argv", "assigns", "redirects", "fds", "stdin", "pipe_in", "pipe_out")
 
     def __init__(self):
         self.argv, self.assigns, self.redirects = [], [], []
+        self.fds = []  # fd number of each redirect ("" = default; "2" for 2>/dev/null)
         self.stdin, self.pipe_in, self.pipe_out = None, False, False
 
     def out_targets(self):
         return [t for op, t in self.redirects if op in OUT_REDIRS and t not in DEV_SINKS]
 
     def stdout_captured(self):
-        return any(op in (">", ">>", ">|", "&>", "&>>") for op, _ in self.redirects)
+        # `2>/dev/null` hides only stderr: the secret still reaches the transcript on stdout
+        return any(op in (">", ">>", ">|", "&>", "&>>") and (op.startswith("&") or fd == "")
+                   for (op, _), fd in zip(self.redirects, self.fds + [""] * len(self.redirects)))
 
 
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
@@ -559,6 +590,11 @@ def simple_commands(toks, heredocs, inherited_stdin=None):
         cur.pipe_in = pipe
 
     for kind, val in toks:
+        if kind == "lv":  # loop variable (shell_structure): an assignment of an unknown value
+            close(False)
+            cur.assigns.append(f"{val}={LOOPVAR}")
+            close(False)
+            continue
         if kind == "op":
             if val in SEPS:
                 expect = None
@@ -568,10 +604,12 @@ def simple_commands(toks, heredocs, inherited_stdin=None):
             continue
         if expect:
             m = HD_TOKEN_RE.fullmatch(val)
+            fd, op = re.match(r"(\d*)(.*)", expect, re.S).groups()
             if m:
                 cur.stdin = heredocs[int(m.group(1))]
             else:
-                cur.redirects.append((expect, val))
+                cur.redirects.append((op, val))
+                cur.fds.append(fd)
             expect = None
             continue
         m = HD_TOKEN_RE.fullmatch(val)
@@ -837,6 +875,9 @@ class Gate:
         self._pat_cache = {}
         self.full_text = ""
         self.subject = None  # rule_key subject override (read_file: the resolved path)
+        self.tainted = set()     # #27: copies of a secret made earlier in this command (abs paths)
+        self.extra_texts = []    # script files read while analyzing (for the secret-mention scan)
+        self._mention = None     # cached result of _line_mentions_secret()
 
     # ------------------------------------------------------------ hit bookkeeping
     def hit(self, kind, reason, subject=""):
@@ -903,24 +944,28 @@ class Gate:
                 return "sensitive"
         return None
 
-    def is_secret_file(self, word, cwd=None):
+    def is_secret_file(self, word, cwd=None, names=True):
         """Secret-shaped file: basename in secret_names, or the path under secret_paths (~/.config/spark/**,
         ~/.ssh/id_*, ...); not_secret_names (*.pub, *.example, ...) wins. The symlink target counts too.
         Shared by the terminal secret-output checks and read_file."""
         if not word or word in DEV_SINKS:
             return False
         b = os.path.basename(word.rstrip("/"))
-        if b and not any(fnmatch.fnmatch(b, x) for x in self.not_secret) and \
+        if names and b and not any(fnmatch.fnmatch(b, x) for x in self.not_secret) and \
                 any(fnmatch.fnmatch(b, x) for x in self.secret_names):
             return True
         if any(t in word for t in ("__GATE_SUB", "`")):
             return False
         pats = self._pats("secret_output", "secret_paths")
-        for p in variants(expand(word, self.rt, cwd)):
+        pvs = variants(expand(word, self.rt, cwd))
+        if self.tainted and pvs & self.tainted:
+            return True
+        for p in pvs:
             pb = os.path.basename(p)
             if not pb or any(fnmatch.fnmatch(pb, x) for x in self.not_secret):
                 continue
-            if any(fnmatch.fnmatch(pb, x) for x in self.secret_names) or any(path_match(p, x) for x in pats):
+            if (names and any(fnmatch.fnmatch(pb, x) for x in self.secret_names)) or \
+                    any(path_match(p, x) for x in pats):
                 return True
         return False
 
@@ -962,30 +1007,189 @@ class Gate:
         if not text or not text.strip():
             return False
         ctx.setdefault("secret_vars", set())
+        if "vars" not in ctx:
+            ctx["vars"] = self._seed_vars()
         body, substs, heredocs = preprocess(text)
-        sub_secret = {}
-        for k, src in enumerate(substs):
-            sub_secret[k] = self.analyze(src, dict(ctx, captured=True), depth + 1)
         toks, funcs = shell_structure(tokenize(body))
         ctx.setdefault("functions", set()).update(funcs)
         cmds = simple_commands(toks, heredocs, stdin)
+        # Command substitutions run in order with the commands that hold them (#27: `f=key; echo "$(head
+        # "$f")"` must see f). Substitutions in dropped loop/case headers and [[ ]] run first.
+        sub_secret = {}
+        procsubs = {k for k, src in enumerate(substs) if isinstance(src, ProcSub)}
+
+        def run_sub(k):
+            if k < len(substs) and k not in sub_secret:
+                sub_secret[k] = False
+                sub_secret[k] = self.analyze(substs[k], dict(ctx, captured=True), depth + 1)
+
+        held = {int(m) for sc in cmds for w in sc.assigns + sc.argv + [t for _, t in sc.redirects]
+                for m in SUB_RE.findall(w)}
+        for k in range(len(substs)):
+            if k not in held:
+                run_sub(k)
         reads_secret = False
         cwd = ctx["cwd"]
-        secret_vars = ctx.setdefault("secret_vars", set())
+        secret_vars = ctx["secret_vars"]
         for i, sc in enumerate(cmds):
+            self._bind(sc, ctx, run_sub, sub_secret)
             sink = cmds[i + 1] if sc.pipe_out and i + 1 < len(cmds) else None
             captured = ctx["captured"] or sc.stdout_captured() or (sink is not None and self._safe_sink(sink))
-            sctx = dict(ctx, captured=captured, cwd=cwd)
+            sctx = dict(ctx, captured=captured, cwd=cwd, procsubs=procsubs, sub_secret=sub_secret)
+            if sc.pipe_in and i > 0 and not sctx.get("maybe_secret"):
+                # `find <dir holding a secret> | xargs cat`: the names on stdin may be secrets
+                sctx["maybe_secret"] = self._listing_maybe(cmds[i - 1], cwd)
             r = self.simple(sc, sctx, depth, sub_secret, sink)
             reads_secret = reads_secret or r
-            decl = sc.argv[1:] if sc.argv and sc.argv[0] in ("export", "declare", "local", "readonly",
-                                                                 "typeset") else []
-            for a in sc.assigns + [x for x in decl if _ASSIGN_RE.match(x)]:
-                name = a.split("=", 1)[0].rstrip("+")
-                if any(sub_secret.get(int(m)) for m in SUB_RE.findall(a)):
-                    secret_vars.add(name)
+            if r:
+                self._after_secret_read(sc, sink, sctx)
             cwd = sctx["cwd"]
         return reads_secret
+
+    # ------------------------------------------------------------ shell variables (#27)
+    def _seed_vars(self):
+        return {k: self.rt[k] for k in ("HOME", "HERMES_HOME", "JUDGE_REVIEW_DIR", "JUDGE_DIR")}
+
+    @staticmethod
+    def subst(word, env):
+        """$X / ${X} replaced by the known literal value of X; anything else is left in place."""
+        if "$" not in word:
+            return word
+
+        def rep(m):
+            v = env.get(m.group(1) or m.group(2))
+            return m.group(0) if v is None else v
+        return VAR_RE.sub(rep, word)
+
+    def _bind(self, sc, ctx, run_sub, sub_secret):
+        """Run the substitutions this command holds, substitute known variables into its words and record
+        its assignments (prefix assignments, X=..., export/local/declare/readonly/typeset X=..., read X, unset X).
+        Over-approximates bash on purpose: a prefix assignment (`X=1 cmd`) is kept for later commands too."""
+        env, secret_vars = ctx["vars"], ctx["secret_vars"]
+
+        def assign(a):
+            for m in SUB_RE.findall(a):
+                run_sub(int(m))
+            name, _, raw = a.partition("=")
+            name = name.rstrip("+")
+            arr = "[" in name
+            name = name.split("[", 1)[0]
+            val = self.subst(raw, env)
+            if val == "~" or val.startswith("~/"):
+                val = self.rt["HOME"] + val[1:]
+            tainted = any(sub_secret.get(int(m)) for m in SUB_RE.findall(a)) or \
+                self._mentions_secret_var([raw], ctx, {})
+            if tainted:
+                secret_vars.add(name)
+            else:
+                secret_vars.discard(name)
+            env[name] = None if (arr or a.split("=", 1)[0].endswith("+") or UNRES_RE.search(val)) else val
+            return f"{name}={val}" if not arr else a
+
+        sc.assigns = [assign(a) for a in sc.assigns]
+        for w in sc.argv + [t for _, t in sc.redirects]:
+            for m in SUB_RE.findall(w):
+                run_sub(int(m))
+        sc.argv = [self.subst(w, env) for w in sc.argv]
+        sc.redirects = [(op, self.subst(t, env)) for op, t in sc.redirects]
+        argv, _, _ = unwrap(sc.argv)
+        if not argv:
+            return
+        name = argv[0]
+        if name in DECL_BUILTINS:
+            for a in argv[1:]:
+                if _ASSIGN_RE.match(a):
+                    assign(a)
+                elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", a) and name in ("local", "declare", "typeset"):
+                    env[a] = None if a not in env else env[a]
+        elif name in ("read", "mapfile", "readarray", "getopts") or (name == "printf" and "-v" in argv):
+            names = opt_values(argv[1:], "v") if name == "printf" else positional(argv[1:], "adnNptuOsCc")
+            for v in names:
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", v):
+                    env[v] = None
+        elif name == "unset":
+            for v in argv[1:]:
+                env.pop(v, None)
+                secret_vars.discard(v)
+
+    def _line_mentions_secret(self):
+        """First secret-shaped word anywhere in the command (and the scripts it runs), or None.
+        Used only when a printing command has an argument the gate can't resolve."""
+        if self._mention is None:
+            self._mention = ""
+            seen = set()
+            # the command line itself: any secret-shaped word; script files it runs (often long, with comments
+            # and site.env plumbing): configured secret paths only, to avoid approval fatigue
+            for text, names in [(self.full_text, True)] + [(t, False) for t in self.extra_texts]:
+                for frag in re.split(r"[\s'\"`;|&<>(){}=,:\[\]]+", self.subst(text, self._seed_vars())):
+                    frag = frag.lstrip("-+?!@")
+                    if not frag or (frag, names) in seen or len(frag) > 512 or UNRES_RE.search(frag):
+                        continue
+                    seen.add((frag, names))
+                    if self.is_secret_file(frag, None, names=names):
+                        self._mention = frag
+                        return frag
+        return self._mention or None
+
+    def _covers_secret(self, word, cwd):
+        """A directory that holds a configured secret path (`~/.config`, `/etc`, `~`), as a find root."""
+        if not word or UNRES_RE.search(word) or any(c in word for c in "*?"):
+            return False
+        roots = [x[:-3] if x.endswith("/**") else x for x in self._pats("secret_output", "secret_paths")]
+        for p in variants(expand(word, self.rt, cwd)):
+            pre = p.rstrip("/") + "/"
+            if any(r.startswith(pre) or r == p for r in roots):
+                return True
+        return False
+
+    def _maybe_secret(self, ctx):
+        return ctx.get("maybe_secret") or self._line_mentions_secret()
+
+    def _listing_maybe(self, sc, cwd):
+        """Producer of a pipeline (`find ... | xargs cat`): why its output may name a secret file, or None."""
+        argv, _, _ = unwrap(sc.argv)
+        if not argv or base(argv[0]) != "find":
+            return None
+        return self._find_maybe(argv[1:], cwd)
+
+    def _find_maybe(self, args, cwd):
+        roots = []
+        for a in args:
+            if a.startswith(("-", "(", "!")):
+                break
+            roots.append(a)
+        filters = [args[k + 1] for k, a in enumerate(args[:-1]) if a in ("-name", "-iname", "-path", "-ipath",
+                                                                          "-wholename", "-regex", "-iregex")]
+        for f in filters:
+            if self.is_secret_file(f, cwd):
+                return f
+        exempt = filters and all(any(fnmatch.fnmatch(f, x) for x in self.not_secret) for f in filters)
+        for r in roots or ["."]:
+            if self.is_secret_file(r, cwd):
+                return r
+            if not exempt and self._covers_secret(r, cwd):
+                return r
+        return None
+
+    def _after_secret_read(self, sc, sink, ctx):
+        """A command that read a secret: a file it writes is a copy of the secret (taint), and a digest of a
+        byte-limited part of it is brute-forceable."""
+        for t in sc.out_targets():
+            if not re.fullmatch(r"&?\d+", t) and not ctx["remote"]:
+                self.tainted |= variants(expand(t, self.rt, ctx["cwd"]))
+        if sink is None:
+            return
+        sargv, _, _ = unwrap(sink.argv)
+        if not sargv or base(sargv[0]) not in HASH_SINKS:
+            return
+        argv, _, _ = unwrap(sc.argv)
+        name, args = (base(argv[0]), argv[1:]) if argv else ("", [])
+        partial = (name in ("head", "tail") and has_flag(args, "c", ("bytes",))) or \
+                  (name == "cut" and has_flag(args, "cb", ("bytes", "characters"))) or \
+                  (name == "dd" and any(a.startswith(("count=", "skip=")) for a in args))
+        if partial:
+            self.hit("secret_output", f"{name} of part of a secret piped to {base(sargv[0])}: a digest of a few "
+                     "bytes is brute-forceable", " ".join(argv)[:120])
 
     def _safe_sink(self, sink):
         argv, _, _ = unwrap(sink.argv)
@@ -1020,9 +1224,15 @@ class Gate:
                     self.hit("remote_opaque", f"interactive root shell on {remote} (sudo -i/-s)", "sudo -s")
                 return False
             # `$(<file)` / `x=$(<file)`: a bare input redirect reads the file into the capture.
-            reads = [t for op, t in sc.redirects if op == "<" and self.is_secret_file(t, ctx["cwd"])]
+            reads = [t for op, t in sc.redirects if op == "<" and self._file_kind(t, ctx) == "secret"]
             if reads and not ctx["captured"]:
                 self.hit("secret_output", f"prints {reads[0]}", reads[0])
+            unk = [t for op, t in sc.redirects if op == "<" and self._file_kind(t, ctx) == "unknown"]
+            if not reads and unk and self._maybe_secret(ctx):
+                reads = unk
+                if not ctx["captured"]:
+                    self.hit("secret_output_unknown", f"reads {unk[0]} (not resolvable) in a command that "
+                             f"names {self._maybe_secret(ctx)}", unk[0])
             for t in sc.out_targets():
                 if remote:
                     self.hit("remote_mutation", f"redirect > {t} on {remote}", t)
@@ -1067,7 +1277,7 @@ class Gate:
         if name in ("ssh", "scp", "rsync", "sftp", "mosh"):
             return self._ssh_family(name, args, sc, ctx, depth, sink)
 
-        reads_secret = self._secret_check(name, args, sc, ctx, sub_secret)
+        reads_secret = self._secret_check(name, args, sc, ctx, sub_secret, depth)
 
         if remote:
             for reason in self.remote_reasons(name, args, sc, ctx, depth):
@@ -1092,6 +1302,8 @@ class Gate:
             if os.path.isfile(p) and os.path.getsize(p) <= MAX_SCRIPT_PEEK:
                 with open(p, encoding="utf-8", errors="replace") as fh:
                     head = fh.read(MAX_SCRIPT_PEEK)
+                self.extra_texts.append(head)
+                self._mention = None
                 first = head.split("\n", 1)[0]
                 if not first.startswith("#!") or re.search(r"\b(ba|z|da|k)?sh\b", first):
                     return self.analyze(head, dict(ctx, captured=ctx["captured"]), depth + 1)
@@ -1231,47 +1443,68 @@ class Gate:
         return False
 
     # ------------------------------------------------------------ secrets in output
-    def _secret_check(self, name, args, sc, ctx, sub_secret):
+    def _print_files(self, name, args, sc, ctx):
+        """Files a printing command reads (positional operands and `<` redirects); [] when it prints none."""
+        files = []
+        if name in ("grep", "egrep", "fgrep", "rg", "zgrep"):
+            pos = positional(args, "efABCmd", ("regexp", "file", "max-count", "after-context",
+                                               "before-context", "context"))
+            explicit = opt_values(args, "e", ("regexp",))
+            pats = explicit or pos[:1]
+            files = pos if explicit else pos[1:]
+            quiet = has_flag(args, "qlLc", ("quiet", "silent", "count", "files-with-matches",
+                                            "files-without-match"))
+            if not quiet and any(self.secret_grep.search(p) for p in pats) and not ctx["captured"]:
+                self.hit("secret_output", f"{name} for secret-looking pattern prints matching lines",
+                         " ".join([name] + args)[:120])
+            if quiet:
+                return []
+        elif name == "sed":
+            if has_flag(args, "i", ("in-place",)):
+                return []
+            pos = positional(args, "ef", ("expression", "file"))
+            files = pos if opt_values(args, "e", ("expression",)) else pos[1:]
+        elif name in ("awk", "gawk", "mawk"):
+            pos = positional(args, "fvF")
+            files = pos if opt_values(args, "f") else pos[1:]
+        elif name == "dd":
+            files = [a[3:] for a in args if a.startswith("if=")]
+        elif name == "jq":
+            pos = positional(args, "", ("arg", "argjson", "slurpfile", "rawfile", "indent"))
+            files = pos[1:]
+        else:
+            files = positional(args, "nNcwsk" if name in ("head", "tail", "base64", "cut", "fold") else "")
+        return files + [t for op, t in sc.redirects if op == "<"]
+
+    def _secret_or_unknown(self, name, files, ctx, verb="prints"):
+        """Shared tail of the read checks: a secret operand escalates as secret-output; an operand the gate can't
+        resolve escalates as secret-output-unknown when the command names a secret somewhere (#27).
+        Returns True when the command (may have) read a secret."""
+        kinds = [(f, self._file_kind(f, ctx)) for f in files]
+        hits = [f for f, k in kinds if k == "secret"]
+        where = f" on {ctx['remote']}" if ctx["remote"] else ""
+        if hits:
+            if not ctx["captured"]:
+                shown = hits[0] if not SUB_RE.fullmatch(hits[0]) else "a process substitution that reads a secret"
+                self.hit("secret_output", f"{name} {shown} {verb} a secret{where}", hits[0])
+            return True
+        unk = [f for f, k in kinds if k == "unknown"]
+        why = self._maybe_secret(ctx) if unk else None
+        if why:
+            if not ctx["captured"]:
+                shown = unk[0].replace(XARG, "{xargs/find argument}").replace(LOOPVAR, "{loop variable}")
+                self.hit("secret_output_unknown", f"{name} {verb} {shown} (not resolvable) in a command that "
+                         f"names {why}{where}", unk[0])
+            return True
+        return False
+
+    def _secret_check(self, name, args, sc, ctx, sub_secret, depth=0):
         """Returns True when the command reads a secret file (printed or captured)."""
         reads = False
-        files = []
+        if depth > MAX_DEPTH:
+            return False
         if name in self.print_cmds:
-            if name in ("grep", "egrep", "fgrep", "rg", "zgrep"):
-                pos = positional(args, "efABCmd", ("regexp", "file", "max-count", "after-context",
-                                                   "before-context", "context"))
-                explicit = opt_values(args, "e", ("regexp",))
-                pats = explicit or pos[:1]
-                files = pos if explicit else pos[1:]
-                quiet = has_flag(args, "qlLc", ("quiet", "silent", "count", "files-with-matches",
-                                                "files-without-match"))
-                if not quiet and any(self.secret_grep.search(p) for p in pats) and not ctx["captured"]:
-                    self.hit("secret_output", f"{name} for secret-looking pattern prints matching lines",
-                             " ".join([name] + args)[:120])
-                if quiet:
-                    files = []
-            elif name == "sed":
-                if has_flag(args, "i", ("in-place",)):
-                    files = []
-                else:
-                    pos = positional(args, "ef", ("expression", "file"))
-                    files = pos if opt_values(args, "e", ("expression",)) else pos[1:]
-            elif name in ("awk", "gawk", "mawk"):
-                pos = positional(args, "fvF")
-                files = pos if opt_values(args, "f") else pos[1:]
-            elif name == "dd":
-                files = [a[3:] for a in args if a.startswith("if=")]
-            elif name == "jq":
-                pos = positional(args, "", ("arg", "argjson", "slurpfile", "rawfile", "indent"))
-                files = pos[1:]
-            else:
-                files = positional(args, "nNcwsk" if name in ("head", "tail", "base64", "cut", "fold") else "")
-            files += [t for op, t in sc.redirects if op == "<"]
-            hits = [f for f in files if self.is_secret_file(f, ctx["cwd"])]
-            if hits:
-                reads = True
-                if not ctx["captured"]:
-                    where = f" on {ctx['remote']}" if ctx["remote"] else ""
-                    self.hit("secret_output", f"{name} {hits[0]} prints a secret{where}", hits[0])
+            reads = self._secret_or_unknown(name, self._print_files(name, args, sc, ctx), ctx)
         elif name in ("echo", "printf") and not ctx["captured"]:
             if self._mentions_secret_var(args, ctx, sub_secret):
                 self.hit("secret_output", f"{name} of a value read from a secret file", name)
@@ -1285,13 +1518,139 @@ class Gate:
                 ins = [args[k + 1] for k, a in enumerate(args[:-1]) if a == "-in"]
                 if any(self.is_secret_file(x, ctx["cwd"]) for x in ins):
                     self.hit("secret_output", f"openssl {args[0]} prints a private key", args[0])
+                elif any(UNRES_RE.search(x) for x in ins):
+                    self._secret_or_unknown(f"openssl {args[0]}", ins, ctx)
+        elif name in ("cp", "install", "ln", "mv") and not ctx["remote"]:
+            reads = self._copy_check(name, args, ctx)
+        elif name == "xargs":
+            reads = self._xargs_check(args, ctx, sub_secret, depth)
+        elif name == "find":
+            reads = self._find_check(args, ctx, sub_secret, depth)
+        elif name in INTERPRETERS or re.fullmatch(r"python3\.\d+", name):
+            reads = self._interp_check(name, args, sc, ctx)
         if name == "read":
             for op, t in sc.redirects:
-                if op == "<" and self.is_secret_file(t, ctx["cwd"]):
+                if op == "<" and (self.is_secret_file(t, ctx["cwd"]) or
+                                  (UNRES_RE.search(t) and self._maybe_secret(ctx))):
                     for v in positional(args, "adnNptu"):
                         ctx.setdefault("secret_vars", set()).add(v)
                     reads = True
         return reads
+
+    def _file_kind(self, word, ctx):
+        """'secret' | 'unknown' | None for a file operand. A process substitution <(cmd) is a pipe: it is a
+        secret when cmd read one, and never unknown (cmd itself was analyzed)."""
+        m = SUB_RE.fullmatch(word)
+        if m and int(m.group(1)) in (ctx.get("procsubs") or ()):
+            return "secret" if (ctx.get("sub_secret") or {}).get(int(m.group(1))) else None
+        if self.is_secret_file(word, ctx["cwd"]):
+            return "secret"
+        return "unknown" if UNRES_RE.search(word) else None
+
+    def _copy_check(self, name, args, ctx):
+        """cp/install/ln/mv of a secret: to stdout prints it; to a file makes a copy that counts as the secret for
+        the rest of this command (`cp key /tmp/x; cat /tmp/x`)."""
+        tdir = opt_values(args, "t", ("target-directory",))
+        pos = positional(args, "tSmogb" if name == "install" else "tS",
+                         ("target-directory", "suffix", "mode", "owner", "group", "backup"))
+        if tdir:
+            srcs, dest = pos, tdir[0]
+        elif len(pos) >= 2:
+            srcs, dest = pos[:-1], pos[-1]
+        else:
+            return False
+        if dest in STDOUT_FILES:
+            return self._secret_or_unknown(name, srcs, ctx, verb=f"to {dest} prints")
+        secret = [s for s in srcs if self.is_secret_file(s, ctx["cwd"])]
+        if secret:
+            d = expand(dest, self.rt, ctx["cwd"])
+            self.tainted |= variants(d)
+            for s in secret:
+                self.tainted.add(os.path.join(d, os.path.basename(s.rstrip("/"))))
+            return True
+        return False
+
+    def _inner_check(self, inner, ctx, sub_secret, depth):
+        """A command run by xargs / find -exec, whose XARG words are filled in at run time."""
+        inner, _, _ = unwrap(inner)
+        if not inner:
+            return False
+        iname, iargs = base(inner[0]), inner[1:]
+        if iname in ("bash", "sh", "zsh", "dash", "ksh", "ash"):
+            code = opt_values(iargs, "c")
+            if code:
+                # `sh -c 'cat "$1"' _ {}`: $1 stays unresolved; `sh -c 'cat {}'`: the XARG word does
+                return self.analyze(code[0], ctx, depth + 1)
+            return False
+        if iname in ("xargs", "find"):
+            return False
+        fake = SC()
+        fake.argv = inner
+        return self._secret_check(iname, iargs, fake, ctx, sub_secret, depth + 1)
+
+    def _xargs_check(self, args, ctx, sub_secret, depth):
+        """`... | xargs cat`: the file names come from stdin. `echo ~/.config/spark/k | xargs cat` escalates
+        (the line names a secret), as does `find <dir holding a secret> | xargs cat`."""
+        first, more = split_after_opts(args, "IinPdLsEa", ("replace", "max-args", "max-procs", "delimiter",
+                                                           "max-lines", "max-chars", "eof", "arg-file"))
+        if not first:
+            return False
+        rep = opt_values(args, "I", ("replace",)) or (["{}"] if has_flag(args, "i") else [])
+        inner = [first] + more
+        if rep and rep[0]:
+            inner = [w.replace(rep[0], XARG) for w in inner]
+        else:
+            inner = inner + [XARG]
+        return self._inner_check(inner, ctx, sub_secret, depth)
+
+    def _find_check(self, args, ctx, sub_secret, depth):
+        """`find <roots> ... -exec cat {} +`: each {} is a file under the roots."""
+        reads = False
+        maybe = None
+        i = 0
+        while i < len(args):
+            if args[i] in ("-exec", "-execdir", "-ok", "-okdir"):
+                j = i + 1
+                while j < len(args) and args[j] not in (";", "+"):
+                    j += 1
+                inner = [w.replace("{}", XARG) for w in args[i + 1:j]]
+                if maybe is None:
+                    maybe = self._find_maybe(args, ctx["cwd"]) or ""
+                sctx = dict(ctx, maybe_secret=ctx.get("maybe_secret") or maybe or None)
+                reads = self._inner_check(inner, sctx, sub_secret, depth) or reads
+                i = j
+            i += 1
+        return reads
+
+    def _interp_check(self, name, args, sc, ctx):
+        """python/perl/ruby/node -c/-e code (or a script on stdin) that reads a secret file and prints it.
+        Write detection for the same code lives in _inline_code."""
+        flag = "r" if name == "php" else "ce"
+        code = opt_values(args, flag)
+        if not code and sc.stdin is not None and (not positional(args) or "-" in args):
+            code = [sc.stdin]
+        operands = [a for a in positional(args, flag) if a not in code]
+        if not code:
+            return False
+        c = code[0]
+        cands = set(re.findall(r"(?:~|\$\{?HOME\}?|\$\{?HERMES_HOME\}?)?/[A-Za-z0-9_./@+-]+", c))
+        cands |= set(re.findall(r"['\"]([^'\"\s]{1,300})['\"]", c))
+        cands |= set(operands)
+        reads_code = re.search(r"\.read\w*\(|read_text|read_bytes|readlines|readFileSync|readFile\(|File\.read|"
+                               r"IO\.read|file_get_contents|open\(|<\s*\$?\w*\s*>|\bslurp\b", c)
+        implicit = name in ("perl", "ruby") and has_flag(args, "np")  # -n/-p read the operands line by line
+        if not (reads_code or implicit):
+            return False
+        files = [x for x in cands if "/" in x or "." in x or x in operands]
+        hits = [x for x in files if self.is_secret_file(x, ctx["cwd"])]
+        if hits:
+            if not ctx["captured"]:
+                self.hit("secret_output", f"{name} code reads {hits[0]} and may print it", hits[0])
+            return True
+        unk = [x for x in operands if UNRES_RE.search(x)]
+        if unk:
+            return self._secret_or_unknown(name, unk, ctx, verb="code reads")
+        return False
 
     # ------------------------------------------------------------ remote classification
     def remote_reasons(self, name, args, sc, ctx, depth):
