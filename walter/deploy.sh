@@ -15,7 +15,7 @@
 #   --with-hermes      also configure Hermes Agent for BACKEND_SSH_USER (needs Hermes installed)
 #
 # Order: render -> packages -> users -> /models mount -> llama-swap binary -> files ->
-#        env files -> gen-secrets -> systemd units + firewall -> gateway -> keys -> webui ->
+#        env files -> gen-secrets -> systemd units + firewall -> (offsite backups) -> gateway -> keys -> webui ->
 #        monitoring -> telemetry -> (hermes). Never deletes anything; never overwrites a secret.
 set -euo pipefail
 
@@ -323,6 +323,19 @@ if [[ $NO_START == 0 ]]; then
   if ! compgen -G "$T$MODELS_DIR/gguf/*/*.gguf" >/dev/null; then
     warn "no GGUF files under $MODELS_DIR/gguf yet: run $MODELS_DIR/fetch-models.sh as $BACKEND_SSH_USER (see walter/models.md)"
   fi
+fi
+
+# ---- 9b. offsite backups (optional: restic to S3, walter/backup/OFFSITE.md) ---------------
+if [[ -z ${RESTIC_BUCKET:-} || ${RESTIC_BUCKET} == CHANGEME ]]; then
+  step "offsite backups: off (RESTIC_BUCKET empty)"
+elif [[ -n $DESTDIR ]]; then
+  step "offsite backups: skipped (--destdir)"
+elif [[ $DRY == 0 && ! -s /etc/spark-restic/aws.env ]]; then
+  step "offsite backups"; warn "RESTIC_BUCKET is set but /etc/spark-restic/aws.env is missing: see walter/backup/OFFSITE.md section 1"
+else
+  step "offsite backups (walter/backup/offsite-setup.sh)"
+  os_args=(--site-env "$SITE_ENV_FILE"); [[ $DRY == 1 ]] && os_args+=(--dry-run); [[ $NO_START == 1 ]] && os_args+=(--no-start)
+  "$HERE/backup/offsite-setup.sh" "${os_args[@]}" 2>&1 | sed 's/^/  /'
 fi
 
 # ---- 10. compose stacks, in dependency order ---------------------------------------------

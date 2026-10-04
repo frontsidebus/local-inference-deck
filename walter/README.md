@@ -38,6 +38,7 @@ Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `co
 | `monitoring/*` | `/srv/monitoring/` | Prometheus, Grafana, node-exporter, cAdvisor, dcgm-exporter, blackbox, llama-swap SD sidecar ([README](monitoring/README.md.tmpl)) |
 | `telemetry/*` | `/srv/telemetry/` | Starlette dashboard app + backup-status sidecar ([README](telemetry/README.md.tmpl)) |
 | `backup/*` | `/usr/local/sbin/spark-backup*.sh`, units, `${MODELS_DIR}/backups/RESTORE.md` | nightly local backup + non-destructive restore test ([RESTORE](backup/RESTORE.md.tmpl)) |
+| `backup/spark-offsite*`, `backup/offsite-setup.sh` | `/usr/local/sbin/spark-offsite.sh`, `spark-offsite.{service,timer}`, `/usr/local/bin/restic`, `/etc/spark-restic/` | optional encrypted offsite copy of the backups (restic to S3, bucket-scoped IAM user), when `RESTIC_BUCKET` is set ([OFFSITE](backup/OFFSITE.md)) |
 | `update-check/*` | `/usr/local/sbin/spark-update-check.py`, units, `/etc/update-motd.d/90-spark-updates`, `/var/lib/spark-update-check/README.md` | weekly report-only update/advisory check ([README](update-check/README.md.tmpl)) |
 | `firewall/docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/`, `/etc/systemd/system/` | `WALTER-PUBLISHED` chain in DOCKER-USER |
 | `firewall/ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` | ufw defaults + the two INPUT allows |
@@ -59,6 +60,7 @@ Templates of installed docs (`*.md.tmpl`) render to the host copy of the doc.
 | NVIDIA container toolkit | 1.20.1-1 from NVIDIA's apt repo (`deploy.sh` pins it) |
 | Docker | Ubuntu `docker.io` (live 29.1.3) + `docker-compose-v2` (live 2.40.3) |
 | Hermes Agent (optional) | tag `v2026.9.24` (v0.21.5) |
+| restic (offsite backups) | 0.19.1 release binary, sha256 `f4154156…` of the `.bz2` (`backup/offsite-setup.sh` verifies it) |
 
 ## Prerequisites
 
@@ -88,7 +90,8 @@ free) and `docker` group membership → fstab line + mount for `${MODELS_DIR}` �
 (download, sha256 check) → install files → create `.env` files from their `.example` (never
 overwrites; reports drift) → `scripts/gen-secrets.sh walter` → enable units
 (`nvidia-persistenced`, `wg-quick@wg0`, `docker-user-rules`, `docker`, `llama-swap`,
-`spark-backup.timer`, `spark-update-check.timer`) and run `ufw-rules.sh` → compose stacks in order:
+`spark-backup.timer`, `spark-update-check.timer`) and run `ufw-rules.sh` → offsite backups
+(`backup/offsite-setup.sh`, only when `RESTIC_BUCKET` is set and `/etc/spark-restic/aws.env` exists) → compose stacks in order:
 gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build`).
 A stack is force-recreated only when one of its files changed.
 
@@ -204,8 +207,12 @@ Existing values are never overwritten and never printed.
 | Grafana admin password | `/srv/monitoring/grafana-admin-password` | 0600 root | 32 alnum |
 | container copies | `/srv/monitoring/secrets/grafana-admin-password` (0400 472:472), `/srv/monitoring/secrets/llama-swap-api-key` (0400 65534:65534), `/srv/telemetry/secrets/llama-swap-api-key` (0440 root:10001) | | copies. After a rotation, re-copy by hand (gen-secrets warns on mismatch) |
 | Hermes key (optional) | `~${BACKEND_SSH_USER}/.config/spark/hermes.key` | 0600 user | copy of `keys/hermes.key` |
+| restic repo password (offsite) | `/etc/spark-restic/password` | 0600 root, dir 0700 | `openssl rand -hex 24` by `offsite-setup.sh`, once. **Owner keeps an offline copy; without it the offsite backups are unrecoverable** |
+| AWS key of IAM user `spark-restic` | `/etc/spark-restic/aws.env` | 0600 root | `aws iam create-access-key`, piped straight to Walter (backup/OFFSITE.md) |
 
-Backups (`${MODELS_DIR}/backups`) contain all of these and are root-only but **not encrypted**.
+Backups (`${MODELS_DIR}/backups`) contain all of these and are root-only but **not encrypted**. The offsite copy
+is encrypted by restic. `/etc/spark-restic` is deliberately in neither, so the restic password is never inside the
+repo it protects.
 
 ## Output cap (no unbounded generations)
 
@@ -242,6 +249,7 @@ curl -s http://${BACKEND_WG_IP}:4000/metrics/ | head -3                      # L
 ssh -N -L 3001:127.0.0.1:3001 -L 9090:127.0.0.1:9090 ${BACKEND_SSH_USER}@${BACKEND_LAN_IP}   # Grafana / Prometheus: all targets up
 sudo systemctl start spark-backup && sudo /usr/local/sbin/spark-backup-restore-test.sh
 systemctl list-timers 'spark-*'
+cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsite (if enabled)
 ```
 
 ## Rollback
@@ -256,10 +264,11 @@ systemctl list-timers 'spark-*'
   recreate, not just a restart.
 - **A stack:** `sudo docker compose -f /srv/<stack>/compose.yaml down`. Volumes are kept unless
   you add `-v`.
-- **Host units:** `sudo systemctl disable --now llama-swap spark-backup.timer spark-update-check.timer`.
+- **Host units:** `sudo systemctl disable --now llama-swap spark-backup.timer spark-update-check.timer spark-offsite.timer`.
   `docker-user-rules` should stay enabled while any port is published.
 - **Data:** restore from `${MODELS_DIR}/backups` (`backup/RESTORE.md.tmpl`, installed as
-  `${MODELS_DIR}/backups/RESTORE.md`).
+  `${MODELS_DIR}/backups/RESTORE.md`), or from the offsite restic repo (its section 7).
+- **Offsite backups:** remove units, restic, the IAM user and the bucket: `backup/OFFSITE.md` section 6.
 
 ## Deliberately not captured
 

@@ -123,6 +123,7 @@ for p in /srv/*/ /etc/llama-swap \
          /etc/systemd/system/docker-user-rules.service \
          /etc/systemd/system/nvidia-persistenced.service.d \
          /etc/systemd/system/spark-backup.service /etc/systemd/system/spark-backup.timer \
+         /etc/systemd/system/spark-offsite.* \
          /usr/local/sbin/*.sh /etc/ufw/user*.rules /etc/fstab \
          /home/${BACKEND_SSH_USER}/.hermes/config.yaml; do
   if [[ -e "$p" ]]; then cfg+=("${p#/}"); else log "WARN: config path missing: $p"; fi
