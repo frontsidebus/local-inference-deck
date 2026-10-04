@@ -1,0 +1,18 @@
+# systemd USER timer: self-healing backstop for judge-review.path (#40). Starts judge-review.service
+# (run_judge.py --pending, which also releases due deferred requests) 2 min after the timer starts and
+# then 5 min after each run of the service ends, whatever triggered it. A failed or stopped path unit can
+# therefore delay reviews by a few minutes, never stall them for good.
+#   systemctl --user daemon-reload && systemctl --user enable --now judge-review.timer
+# Persistent= is not set: it only applies to OnCalendar= timers; the monotonic timers below already fire
+# again after boot (OnActiveSec counts from when the timer is started).
+[Unit]
+Description=judge: run the review queue every few minutes (backstop for judge-review.path)
+
+[Timer]
+Unit=judge-review.service
+OnActiveSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

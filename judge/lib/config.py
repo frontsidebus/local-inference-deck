@@ -12,7 +12,8 @@ Public API (other judge parts depend on it; keep it stable):
     hermes_home(cfg=None) -> Path
     review_dir(cfg=None, create=False) -> Path       create=True makes it (mode 700)
     classify(paths, cfg=None, cwd=None) -> "infra" | "sensitive"
-    is_infra_path(path, cfg=None, cwd=None) -> bool
+    is_infra_path(path, cfg=None, cwd=None) -> bool   False for every is_secret_path (#42)
+    is_secret_path(path, cfg=None) -> bool            site.env, *.env, keys, secrets/ ... (SECRET_GLOBS + JUDGE_SECRET_GLOBS)
     git_common_dir(path) -> str | None               the repo's shared .git dir (worktrees: the main repo's)
     infra_git_dirs(cfg=None) -> set[str]              git_common_dir of JUDGE_REPO_DIR and JUDGE_INFRA_REPOS
     host_ssh(name, cfg=None) -> list[str]             argv prefix; append ONE remote command string
@@ -67,6 +68,8 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_COMPLETION_DEDUPE_SECONDS": "900",  # completion requests of a session within this window dedupe
     "JUDGE_WINDOW_GRACE_SECONDS": "10",    # evidence window = [request.since, request.created + this]
     "JUDGE_PLAN_DEBOUNCE_S": "120",        # plan review waits for turn end or this long with no plan write (#34)
+    "JUDGE_STALL_MINUTES": "15",           # #41: warn when a ready queue request waited this long (0 = off)
+    "JUDGE_SECRET_GLOBS": "",              # #42: extra basename globs of secret files (never infra-class)
     # run-1 fixes (one place for every default; site.env and the environment override)
     "JUDGE_HOST_PROBES": "1",              # collector runs read-only host-state probes for host claims
     "JUDGE_NOISE_GLOBS": "",               # extra globs added to snapshot.NOISE_GLOBS
@@ -216,6 +219,52 @@ def infra_rules(cfg: Optional[Mapping[str, str]] = None) -> List[str]:
 _REMOTE_RE = re.compile(r"^(walter|covenant):(/.*)$")
 
 
+# ---------------------------------------------------------------- secret-shaped files (#42)
+# Basename globs (fnmatch, case-insensitive) of files that hold secrets or site values. They are never
+# infra-class, wherever they live (an infra repo or its worktree, /etc, /srv, a host path), so a change to
+# one keeps the whole bundle sensitive: local judge, no file contents in any frontier bundle.
+SECRET_GLOBS = (
+    # the gate's secret_output.secret_names (policy/gate-policy.json.tmpl), so both agree on "secret-shaped"
+    "*.key", "*.pem", ".env", "*.env", "api-key", "api_key", "apikey", "*-api-key", "*_api_key",
+    "*secret*", "admin-password", "*password*", "shadow", "gshadow", "id_rsa", "id_ecdsa", "id_ed25519",
+    "id_dsa", "*.p12", "*.pfx", "*.keystore", "credentials", "credentials.json", ".netrc", ".pgpass",
+    "auth.json", "wg*.conf", "token", "*.token", "*-token", "*_token", "privkey*", "*.age", "*.kdbx",
+    # plus env-file variants and backups (site.env.bak-*), more key stores, and the sanitizer's word lists
+    ".env.*", "*.env.*", "*.jks", ".htpasswd", ".git-credentials", "id_*_sk", ".sanitize-*",
+)
+# Templates, examples, public keys, code and docs carry no values (the gate's not_secret_names, plus .dist):
+# they stay classified by location (site.env.example, gen-secrets.sh, rotate-secrets.md).
+SECRET_EXEMPT_SUFFIXES = (".pub", ".example", ".sample", ".tmpl", ".template", ".dist", ".md", ".sh", ".py", ".rs",
+                          ".go", ".js", ".ts", ".d", ".service", ".j2", ".html", ".css")
+SECRET_DIRS = ("secrets", ".secrets", "private")   # any path component -> secret (secrets/, /etc/ssl/private/)
+
+
+def secret_globs(cfg: Optional[Mapping[str, str]] = None) -> List[str]:
+    """SECRET_GLOBS plus JUDGE_SECRET_GLOBS (space-separated basename globs from site.env or the env)."""
+    extra = (_cfg(cfg).get("JUDGE_SECRET_GLOBS") or "").split()
+    return list(SECRET_GLOBS) + extra
+
+
+def is_secret_path(path: str, cfg: Optional[Mapping[str, str]] = None) -> bool:
+    """True when *path* (local, `walter:/x` or `covenant:/x`) names a secret-shaped file: its basename matches
+    secret_globs() (and is not a template/example), or a directory component is secrets/, .secrets/ or
+    private/. Purely lexical: no file is opened."""
+    if not isinstance(path, str) or not path.strip():
+        return False
+    m = _REMOTE_RE.match(path.strip())
+    p = m.group(2) if m else os.path.expanduser(path.strip())
+    p = os.path.normpath(p)
+    parts = [x for x in p.split(os.sep) if x]
+    if not parts:
+        return False
+    if any(x.lower() in SECRET_DIRS for x in parts[:-1]):
+        return True
+    base = parts[-1].lower()
+    if base.endswith(SECRET_EXEMPT_SUFFIXES):
+        return False
+    return any(fnmatch.fnmatchcase(base, g.lower()) for g in secret_globs(cfg))
+
+
 # ---------------------------------------------------------------- git worktrees (#37)
 def _read_gitdir_file(dotgit: str) -> Optional[str]:
     """The `gitdir:` target of a `.git` FILE (a worktree or submodule checkout), absolute; None if unreadable."""
@@ -326,13 +375,17 @@ def is_infra_path(path: str, cfg: Optional[Mapping[str, str]] = None, cwd: Optio
     JUDGE_INFRA_REPOS entry is infra too (#37: worktrees are classed like their main repo)."""
     if not isinstance(path, str) or not path.strip():
         return False
+    if is_secret_path(path, cfg):
+        # #42: site.env, *.env, keys, secrets/ ... never count as infra, even inside an infra repo or /etc.
+        return False
     m = _REMOTE_RE.match(path.strip())
     if m:
         rp = os.path.normpath(m.group(2))
         return rp.startswith("/etc/") or rp.startswith("/srv/")
     p = _normalize(path.strip(), cwd)
-    if p.endswith("/.env"):
-        # ~/.hermes/.env and similar secrets never count as infra, even if a rule were broadened.
+    if p.endswith("/.env") or is_secret_path(p, cfg):
+        # ~/.hermes/.env and similar secrets never count as infra, even if a rule were broadened; the
+        # resolved path is checked too (a symlink named like a plain file that points at a key).
         return False
     rules = infra_rules(cfg)
     if any(fnmatch.fnmatchcase(p, r) for r in rules):

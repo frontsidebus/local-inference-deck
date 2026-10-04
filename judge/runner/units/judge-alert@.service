@@ -1,0 +1,17 @@
+# systemd USER template: alert that a judge unit failed (#41). Started by OnFailure= of judge-review.service
+# and judge-review.path with the failed unit's name as the instance (%i). Logs one line to
+# $JUDGE_REVIEW_DIR/runner.log and, when a display is set, runs notify-send (at most once per unit per
+# JUDGE_ALERT_MIN_INTERVAL_S, default 900). Never enabled on its own; never restarts anything.
+# ${JUDGE_DIR}, ${JUDGE_PYTHON} and ${JUDGE_REVIEW_DIR} are rendered by judge/install.sh --with-units.
+[Unit]
+Description=judge: alert that %i failed
+
+[Service]
+Type=oneshot
+Environment=JUDGE_REVIEW_DIR=${JUDGE_REVIEW_DIR}
+EnvironmentFile=-%h/.config/judge/judge.env
+# notify-send needs the session's display; harmless when there is none
+PassEnvironment=DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
+ExecStart=${JUDGE_PYTHON} ${JUDGE_DIR}/runner/alert.py %i
+TimeoutStartSec=30
+NoNewPrivileges=yes

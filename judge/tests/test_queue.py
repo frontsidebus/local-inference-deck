@@ -215,3 +215,97 @@ def test_release_plan_requests_at_turn_end(tmp_path):
     assert q.release_plan_requests("s-1", tmp_path, now=now) == []  # already released
     # a released request takes no more merges: the next write starts a new request
     assert q.merge_into_pending_plan(_plan(root=tmp_path), tmp_path) is None
+
+
+# ---------------------------------------------------------------- #40 queue/deferred/
+def test_deferred_requests_live_outside_the_watched_dir(tmp_path):
+    from datetime import datetime, timezone
+    r = _plan(not_before="2999-01-01T00:00:00Z", root=tmp_path)
+    p = q.write_request(r, tmp_path)
+    assert p == tmp_path / "queue" / q.DEFERRED / f"{r['id']}.json"
+    assert [x["id"] for x in q.list_pending(tmp_path)] == [r["id"]] and q.list_ready(tmp_path) == []
+    assert q.read_request(r["id"], tmp_path)["id"] == r["id"] and q.pending_path(r["id"], tmp_path) == p
+    # ids stay unique across queue/, queue/deferred/ and done/
+    assert q.new_request_id("plan", "s-1", q.parse_utc(r["created"]), tmp_path) != r["id"]
+    # a ready request goes straight to queue/
+    c = q.make_request("completion", "s-1", "2026-10-04T04:43:18Z", source_event="pre_verify", root=tmp_path)
+    assert q.write_request(c, tmp_path).parent == tmp_path / "queue"
+    assert [x["id"] for x in q.list_ready(tmp_path)] == [c["id"]]
+    # a merge keeps it deferred; the turn end moves it into queue/
+    assert q.merge_into_pending_plan(_plan(not_before="2999-01-01T00:00:00Z", call="c2", root=tmp_path),
+                                     tmp_path) == r["id"]
+    assert p.is_file() and not (tmp_path / "queue" / f"{r['id']}.json").exists()
+    now = datetime(2026, 10, 4, 5, 0, tzinfo=timezone.utc)
+    assert q.release_plan_requests("s-1", tmp_path, now=now) == [r["id"]]
+    assert not p.exists() and (tmp_path / "queue" / f"{r['id']}.json").is_file()
+    assert {x["id"] for x in q.list_ready(tmp_path, now=now)} == {r["id"], c["id"]}
+
+
+def test_release_due_moves_deferred_into_queue(tmp_path):
+    from datetime import datetime, timezone
+    r = _plan(not_before="2026-10-04T04:48:52Z", root=tmp_path)
+    q.write_request(r, tmp_path)  # written "now" (2026+): not_before already passed -> ready -> queue/
+    assert q.pending_path(r["id"], tmp_path).parent == tmp_path / "queue"
+    late = _plan(session="s-2", not_before="2999-01-01T00:00:00Z", root=tmp_path)
+    q.write_request(late, tmp_path)
+    assert q.pending_path(late["id"], tmp_path).parent == q.deferred_dir(tmp_path)
+    assert q.release_due(tmp_path, now=datetime(2998, 1, 1, tzinfo=timezone.utc)) == [r["id"]]  # legacy: in place
+    assert q.release_due(tmp_path, now=datetime(2999, 1, 2, tzinfo=timezone.utc)) == [late["id"]]
+    assert q.pending_path(late["id"], tmp_path) == tmp_path / "queue" / f"{late['id']}.json"
+    assert not (q.deferred_dir(tmp_path) / f"{late['id']}.json").exists()
+    assert q.read_request(late["id"], tmp_path)["detail"]["released"] == "2999-01-02T00:00:00Z"
+
+
+def test_deferred_rewrite_loses_to_a_concurrent_release(tmp_path, monkeypatch):
+    """A merge that rewrites the deferred copy while another hook released the request into queue/ must not
+    leave a second copy behind: the queue/ copy wins and the merge reports failure (the caller then writes a
+    new request)."""
+    r = _plan(not_before="2999-01-01T00:00:00Z", root=tmp_path)
+    q.write_request(r, tmp_path)
+    released = dict(r, not_before="2026-10-04T04:47:00Z", detail=dict(r["detail"], turn_ended="2026-10-04T04:47:00Z"))
+    real = q.atomic_write_json
+
+    def racing_write(path, obj):
+        out = real(path, obj)
+        if path.parent == q.deferred_dir(tmp_path):  # the other process releases right after our write
+            real(tmp_path / "queue" / f"{r['id']}.json", released)
+        return out
+    monkeypatch.setattr(q, "atomic_write_json", racing_write)
+    assert q.merge_into_pending_plan(_plan(not_before="2999-01-01T00:00:00Z", call="c2", root=tmp_path),
+                                     tmp_path) is None
+    monkeypatch.setattr(q, "atomic_write_json", real)
+    assert not (q.deferred_dir(tmp_path) / f"{r['id']}.json").exists()
+    [only] = q.list_pending(tmp_path)
+    assert only["detail"]["turn_ended"] and q.pending_path(r["id"], tmp_path).parent == tmp_path / "queue"
+
+
+# ---------------------------------------------------------------- #41 stall detection
+def test_stall_status(tmp_path, monkeypatch):
+    import fcntl
+    import os
+    import time
+    from datetime import datetime, timezone
+    assert q.stall_status(tmp_path) is None                    # no queue dir
+    c = q.make_request("completion", "s-1", "2026-10-04T04:43:18Z", source_event="pre_verify", root=tmp_path)
+    p = q.write_request(c, tmp_path)
+    assert q.stall_status(tmp_path, minutes=15) is None        # fresh
+    old = time.time() - 20 * 60
+    os.utime(p, (old, old))
+    st = q.stall_status(tmp_path, minutes=15)
+    assert st["count"] == 1 and st["oldest"] == c["id"] and st["minutes"] >= 19 and st["limit"] == 15
+    assert "judge runner is not running or stalled" in q.stall_line(st) and "reset-failed" in q.stall_line(st)
+    assert q.stall_status(tmp_path, minutes=0) is None         # off
+    assert q.stall_status(tmp_path, minutes=30) is None
+    monkeypatch.setenv("JUDGE_STALL_MINUTES", "60")
+    assert q.stall_status(tmp_path) is None                    # the setting is read
+    monkeypatch.delenv("JUDGE_STALL_MINUTES")
+    # a deferred request is not a stall (not ready, and not in queue/ at all)
+    d = _plan(not_before="2999-01-01T00:00:00Z", root=tmp_path)
+    dp = q.write_request(d, tmp_path)
+    os.utime(dp, (old, old))
+    assert q.stall_status(tmp_path, minutes=15)["count"] == 1
+    # a runner holding the lock is busy, not stalled
+    with open(tmp_path / ".runner.lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        assert q.runner_busy(tmp_path) and q.stall_status(tmp_path, minutes=15) is None
+    assert not q.runner_busy(tmp_path) and q.stall_status(tmp_path, minutes=15) is not None

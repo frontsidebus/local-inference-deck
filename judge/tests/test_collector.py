@@ -185,3 +185,67 @@ def test_effective_class_host_gate_keeps_hook_decision(env, req_class, expected)
 def test_effective_class_paths_still_rechecked(env):
     req = {"changed_paths": ["/home/x/company/app.py"], "data_class": "infra", "detail": {}}
     assert collect.effective_class(req, config.load_config()) == "sensitive"
+
+
+# ---------------------------------------------------------------- #42 site.env in an infra worktree
+SITE_VALUES = {"SPARK_DOMAIN": "r7-site-domain.invalid", "BACKEND_LAN_IP": "10.77.66.55",
+               "LITELLM_MASTER_KEY": "r7ExampleMasterValue0987", "ADMIN_EMAIL": "owner-r7@r7-site-domain.invalid",
+               "WG_EDGE_PUBLIC_KEY": "R7wgPublicKeyValueAbCdEfGhIjKlMnOpQrStUvWx="}
+
+
+def _git_c(repo, *args):
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t",
+                    "-c", "init.defaultBranch=main", *args], check=True, capture_output=True)
+
+
+@pytest.mark.parametrize("edited_site_env", [True, False])
+def test_site_env_values_never_reach_a_bundle(env, tmp_path, monkeypatch, edited_site_env):
+    """The agent works in a worktree of the deck repo (infra), reads site.env (gitignored, real values) and edits
+    deploy.sh, and in one variant also edits site.env. No site.env value may appear in any bundle file:
+      - edited: site.env is secret-shaped, so the request (even one labelled infra by an older hook) is
+        re-classified sensitive by the collector: stat lines only, no contents;
+      - read only: the bundle stays infra (frontier-eligible), and nothing in it carries what a read returned
+        (Hermes logs only `tool read_file completed (Ns, N chars)`; tool-calls.jsonl has names, never output)."""
+    main = env["repo"]
+    _git_c(main, "init", "-q")
+    (main / ".gitignore").write_text("site.env\n")
+    (main / "walter").mkdir()
+    (main / "walter" / "deploy.sh").write_text("#!/bin/sh\necho deploy\n")
+    _git_c(main, "add", ".")
+    _git_c(main, "commit", "-qm", "init")
+    wt = tmp_path / "deck-digest"
+    _git_c(main, "worktree", "add", "-q", "-b", "digest", str(wt))
+    site = wt / "site.env"
+    site.write_text("".join(f"{k}={v}\n" for k, v in SITE_VALUES.items()))
+    deploy = wt / "walter" / "deploy.sh"
+    snapshot.take(SESSION, str(wt), config.load_config())
+    deploy.write_text("#!/bin/sh\necho deploy\necho digest\n")
+    paths = [str(deploy)]
+    if edited_site_env:
+        site.write_text(site.read_text() + "BACKEND_WG_IP=10.77.66.56\n")
+        paths.append(str(site))
+    _in_window(*([deploy, site]))
+    d = q.snapshot_dir(SESSION)
+    snapshot.record_event(d, "read_file", [], "ok", now=EV_T)            # reads are markers only
+    snapshot.record_event(d, "patch", [str(p) for p in paths], "ok", now=EV_T)
+    with open(env["hermes"] / "logs" / "agent.log", "a") as fh:
+        fh.write(f"2026-10-02 22:24:00,000 INFO [{SESSION}] agent.tool_executor: tool read_file completed "
+                 "(0.01s, 812 chars)\n")
+    r = q.make_request("completion", SESSION, "2026-10-03T03:20:00Z", source_event="on_session_end",
+                       changed_paths=paths, claims="Updated deploy.sh for the digest site.", data_class="infra",
+                       created="2026-10-03T03:30:00Z", detail={"cwd": str(wt)})
+    q.write_request(r)
+    ev = collect.collect(r["id"], runner=runner(), now=NOW)
+    man = json.loads((ev / "manifest.json").read_text())
+    assert man["data_class"] == ("sensitive" if edited_site_env else "infra")
+    diff = (ev / "agent-diff.patch").read_text()
+    if edited_site_env:
+        # site.env is gitignored, so the worktree snapshot has no diff for it at all; deploy.sh is stat-only
+        assert f"# content withheld (data_class=sensitive): {deploy}" in diff and "echo digest" not in diff
+        assert man["content_policy"] == "stat summaries only, no file contents"
+    else:
+        assert "+echo digest" in diff and str(site) not in diff
+    leaked = {k: str(p.relative_to(ev)) for p in ev.rglob("*") if p.is_file()
+              for k, v in SITE_VALUES.items() if v in p.read_text(errors="replace")}
+    assert leaked == {}, f"site.env values in the bundle: {leaked}"
+    assert "10.77.66.56" not in "".join(p.read_text(errors="replace") for p in ev.rglob("*") if p.is_file())

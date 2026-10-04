@@ -62,7 +62,7 @@ Gates are synchronous and dumb; judging is asynchronous and smart. No model call
 | `collector/collect.py` | Builds the evidence bundle for one request. |
 | `collector/extras.py` | Adds C3 results and read-only host-state probes to the bundle. |
 | `probes/probe.py` | The only way the judge touches hosts: an allowlist of read-only probes with per-argument validation. |
-| `runner/` | Judge prompt, `run_judge.py` (frontier or local), `rejudge.py` (re-judge stored bundles), the findings validator, and the systemd user units. |
+| `runner/` | Judge prompt, `run_judge.py` (frontier or local), `rejudge.py` (re-judge stored bundles), the findings validator, `alert.py` (unit failure alerts), and the systemd user units (`units/`: path, service, timer, alert template). |
 | `bin/` | `judge-findings` and `judge-ack`, the operator CLIs. |
 | `watch/runaway.py` | The C6 slot watcher and its user unit. |
 | `lib/` | `config.py`/`config.sh` (site.env and defaults), `queue.py` (atomic files and schema checks). |
@@ -140,20 +140,23 @@ Consent is keyed on `(event, command)`, not on the matcher or the script content
 
 ## Running reviews automatically
 
-Hooks only queue review requests; the runner judges them. Two systemd **user** units run it without you:
+Hooks only queue review requests; the runner judges them. systemd **user** units run it without you:
 
 | Unit | What it does |
 |---|---|
-| `judge-review.path` | Watches `$JUDGE_REVIEW_DIR/queue/` (`PathChanged=`) and starts `judge-review.service`. The only runner unit you enable. |
-| `judge-review.service` | Oneshot: `run_judge.py --pending`. It judges every queued request, then re-scans `queue/` and also judges requests that arrived while it was busy (the path unit does not fire again for those), trying each request at most once per run. |
+| `judge-review.path` | Watches `$JUDGE_REVIEW_DIR/queue/` (`PathChanged=`) and starts `judge-review.service`. Plan requests that wait for their turn to end sit in `queue/deferred/`, which it does not watch, so plan edits don't start the runner (#40). `TriggerLimitBurst=1000` per 2 s, so a burst of writes can't fail it. |
+| `judge-review.service` | Oneshot: `run_judge.py --pending`. It releases deferred requests that are due, judges every ready request, then re-scans `queue/` and also judges requests that arrived while it was busy (the path unit does not fire again for those), trying each request at most once per run. `StartLimitIntervalSec=0`: many quick starts can't latch it `failed` (#40). Never enabled itself. |
+| `judge-review.timer` | Backstop (#40): starts the service 2 min after the timer starts, then 5 min after each run ends. If the path unit is ever down, reviews are late, not lost. |
+| `judge-alert@.service` | Template started by `OnFailure=` of the path unit and the service (#41): logs `ALERT: judge unit … failed … Fix: …` to `runner.log` and runs `notify-send` when a display is set (at most once per unit per 15 min). Never enabled. |
 | `judge-runaway-watch.service` | C6 watcher (`watch/runaway.py --interval 30`). Read-only: it polls the slots probe and alerts; it **never cancels or unloads** anything. |
 
 Install, enable and start them from the checkout the hooks run from:
 
 ```bash
 judge/install.sh --with-units                  # dry run: shows the files it would install
-judge/install.sh --apply --with-units --start  # install, daemon-reload, enable --now the .path unit and the watcher
-systemctl --user status judge-review.path judge-review.service judge-runaway-watch.service
+judge/install.sh --apply --with-units --start  # install, daemon-reload, reset-failed, enable --now the .path and .timer
+                                               # units and the watcher, restart the .path/.timer so new settings apply
+systemctl --user status judge-review.path judge-review.timer judge-review.service judge-runaway-watch.service
 systemctl --user start judge-review.service    # once, for requests that were queued before the path unit started
 ```
 
@@ -201,13 +204,15 @@ JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1  # 0 = every answer of at least MIN_CHAR
 ### Pause and resume
 
 ```bash
-systemctl --user stop judge-review.path      # pause: hooks keep queueing, nothing is judged
-systemctl --user start judge-review.path     # resume ...
+systemctl --user stop judge-review.path judge-review.timer   # pause: hooks keep queueing, nothing is judged
+systemctl --user start judge-review.path judge-review.timer  # resume ...
 systemctl --user start judge-review.service  # ... and judge the backlog (the path unit fires on changes only)
-systemctl --user disable --now judge-review.path judge-runaway-watch.service   # turn both off for good
+systemctl --user disable --now judge-review.path judge-review.timer judge-runaway-watch.service   # turn all off for good
 ```
 
-To keep reviewing but stop frontier spend, set `JUDGE_MODE=local` in `site.env` (no restart needed: the runner reads it on each run). Logs: `journalctl --user -u judge-review`, `$JUDGE_REVIEW_DIR/runner.log`, `journalctl --user -u judge-runaway-watch` and `watch.log`.
+Stopping only the path unit is not a pause any more: the timer still runs the queue every 5 minutes. To keep reviewing but stop frontier spend, set `JUDGE_MODE=local` in `site.env` (no restart needed: the runner reads it on each run). Logs: `journalctl --user -u judge-review`, `$JUDGE_REVIEW_DIR/runner.log` (alerts included), `journalctl --user -u judge-runaway-watch` and `watch.log`.
+
+**Is the runner healthy?** `judge-findings` prints a `WARNING:` line on stderr when a judge-review unit is `failed` or when the oldest ready request has waited more than `JUDGE_STALL_MINUTES` (15). The agent gets the stall warning once per stall through C5 ("The judge runner is not running or is stalled …"), with the instruction to tell you rather than fix it (#41).
 
 ### Frontier auth from a non-TTY service
 
@@ -293,6 +298,9 @@ Values come from `site.env` at the repo root (defaults < `site.env` < environmen
 | `JUDGE_REFUSAL_NEXT_CALLS` | `6` | How many tool calls after each refusal `refusals.jsonl` lists (1 to 20; site.env only). |
 | `JUDGE_SENSITIVE_FRONTIER_CLAIMS` | `1` | For a sensitive completion, also run the frontier judge on its claims-only bundle (only with `JUDGE_MODE=frontier`; counts against `JUDGE_FRONTIER_DAILY_MAX`). `0` = local judge only. |
 | `JUDGE_ACK_AGENT_ENV` | empty | Environment only (not read from `site.env`): comma-separated extra env names that mark an agent session for `judge-ack`. It can only add markers. |
+| `JUDGE_STALL_MINUTES` | `15` | C5 and `judge-findings` warn "judge runner is not running or stalled" when the oldest ready request in `queue/` has waited this long and no runner is busy (#41). `0` = off. |
+| `JUDGE_SECRET_GLOBS` | empty | Extra basename globs (space-separated) of secret files that are never `infra`, on top of the built-in ones (`site.env`, `*.env`, `*.key`, `*.pem`, `secrets/`, `.sanitize-*`, ...; #42). |
+| `JUDGE_ALERT_MIN_INTERVAL_S` | `900` | Environment only (e.g. `~/.config/judge/judge.env`): seconds between two desktop alerts for the same failed unit. `runner.log` gets every alert. |
 | `JUDGE_HOST_PROBES` | `1` | `0` stops the collector running read-only host-state probes for claims about services and ports. |
 | `JUDGE_NOISE_GLOBS` | empty | Extra globs (space- or comma-separated, over absolute paths) of bookkeeping files that never count as anyone's change, on top of the built-in Hermes ones (`skills/.usage.json`, `skills/.locks/`, `skills/.curator_*`, `$HERMES_HOME/*.lock`). |
 | `JUDGE_INFRA_REPOS` | empty | Extra dirs whose files count as infra. Git worktrees of `JUDGE_REPO_DIR` or of these repos (same shared `.git`) count as infra automatically (#37); list a dir here only for a separate repo. Plain dirs are now also snapshotted at session start and git repos are diffed via git, so the bundle carries their diffs. |
@@ -352,7 +360,9 @@ Real prevention needs a boundary the agent can't cross: human acks signed with a
 
 ## Data boundary
 
-Every request carries a `data_class`. It is `infra` only when **every** path the agent changed matches an infrastructure rule: the Hermes config, skills, memories and plans, `~/.ssh/config`, this repo, `/etc` or `/srv`. Changes made by someone else (`others-changed.txt`) never count. Anything else, or anything unclear, is `sensitive`.
+Every request carries a `data_class`. It is `infra` only when **every** path the agent changed matches an infrastructure rule: the Hermes config, skills, memories and plans, `~/.ssh/config`, this repo (and its git worktrees), `/etc` or `/srv`. Changes made by someone else (`others-changed.txt`) never count. Anything else, or anything unclear, is `sensitive`.
+
+Secret-shaped files are `sensitive` wherever they are, even inside this repo, a worktree of it, `/etc` or `/srv` (#42). The names are the gate's `secret-output` list (`*.key`, `*.pem`, `.env`, `*.env`, `api-key`, `*secret*`, `*password*`, SSH private keys, `credentials`, `wg*.conf`, `*.token`, ...) plus `*.env.*` backups (`site.env.bak-*`), `.htpasswd`, `.git-credentials` and `.sanitize-*`, and anything under a `secrets/`, `.secrets/` or `private/` directory. Templates, public keys, code and docs (`*.example`, `*.tmpl`, `*.pub`, `*.sh`, `*.md`, ...) are not. Add your own with `JUDGE_SECRET_GLOBS`. Check a path with `python3 judge/lib/config.py --classify <path>`. A file the agent only **read** never enters a bundle: Hermes logs a read as `tool read_file completed (…, N chars)`, and the bundle carries changed paths, tool names and program names, not what a tool returned.
 
 - `infra`: the frontier judge may see it.
 - `sensitive`: the full bundle goes to the **local judge only**, whatever `JUDGE_MODE` says, and it carries diff stats and metadata rather than file contents. For a sensitive **completion**, the frontier judge additionally gets a **claims-only** bundle (`collector/claims_only.py`, spec in [CONTRACT.md](CONTRACT.md#claims-only-bundle-collectorclaims_onlypy-and-the-frontier-claims-stage)):
@@ -380,10 +390,11 @@ Logs are redacted for secrets before they enter a bundle. The judge never gets a
 |---|---|
 | Hooks never fire | `hermes hooks list`: not allowed means consent is missing; approve in a TTY session. The gateway does not prompt. |
 | Every terminal or write call is blocked with "failed closed" | `gate.py` crashed, timed out or printed non-JSON. Run `hermes hooks test pre_tool_call --for-tool terminal` and read `hook-errors.log`. Emergency: `judge/install.sh --uninstall`. |
-| No findings appear | Is `judge-review.path` active (`systemctl --user status judge-review.path`)? Is `queue/` filling? Requests queued before the path unit started wait for the next queue change: `systemctl --user start judge-review.service`. Then `runner.log` and `journalctl --user -u judge-review`. |
+| No findings appear | Is `judge-review.path` active (`systemctl --user status judge-review.path judge-review.timer`)? Is `queue/` filling? Requests queued before the path unit started wait for the next queue change or the timer (≤ 5 min): `systemctl --user start judge-review.service` runs them now. Then `runner.log` and `journalctl --user -u judge-review`. `judge-findings` warns on stderr when the queue is stalled. |
+| `judge-review.service failed (start-limit-hit)` and `judge-review.path` failed (`unit-start-limit-hit`); `runner.log` has `ALERT: judge unit … failed` | Pilot 2 (#40): many quick starts in 10 s (a burst of plan writes, each run exiting in ~60 ms with nothing ready) hit systemd's default start limit, and nothing was judged after that. Fixed by `StartLimitIntervalSec=0`, `TriggerLimitBurst=1000`, deferred requests in the unwatched `queue/deferred/`, and `judge-review.timer`. Units installed before the fix need a re-install: `judge/install.sh --apply --with-units --start` (it resets the failed state). By hand: `systemctl --user reset-failed judge-review.service judge-review.path && systemctl --user start judge-review.path`, then `systemctl --user start judge-review.service` for the backlog. |
 | Frontier calls fail only from the service | See [Frontier auth from a non-TTY service](#frontier-auth-from-a-non-tty-service). |
-| Findings come from the local judge although `JUDGE_MODE=frontier` | Expected for `sensitive` requests, or when the daily cap is reached; the finding says which. Work in a git worktree of the deck repo is `infra` since #37; if it still comes out `sensitive`, check `python3 judge/lib/config.py --classify <path>` and that the worktree's `.git` file points into the main repo's `.git/worktrees/` (a broken `gitdir:` stays sensitive). |
-| A plan review is queued but not judged | Expected for up to `JUDGE_PLAN_DEBOUNCE_S` (120 s) after the last plan write, or until the turn ends: the request has a `not_before` and `run_judge.py --pending` skips it (#34). It is released at turn end (`detail.turn_ended`) or by the next hook event after the debounce (`detail.released`). If the turn never ends (Hermes crashed or a one-shot timed out), the C6 runaway watcher releases due requests on every poll (default 30 s), so the review still runs. To judge it at once: `run_judge.py <id>`. |
+| Findings come from the local judge although `JUDGE_MODE=frontier` | Expected for `sensitive` requests, or when the daily cap is reached; the finding says which. A change to `site.env` or another secret-shaped file makes the whole request `sensitive`, even in the repo (#42). Work in a git worktree of the deck repo is `infra` since #37; if it still comes out `sensitive`, check `python3 judge/lib/config.py --classify <path>` and that the worktree's `.git` file points into the main repo's `.git/worktrees/` (a broken `gitdir:` stays sensitive). |
+| A plan review is queued but not judged | Expected for up to `JUDGE_PLAN_DEBOUNCE_S` (120 s) after the last plan write, or until the turn ends: the request waits in `queue/deferred/` with a `not_before` (#34, #40). It moves into `queue/` at turn end (`detail.turn_ended`) or after the debounce (`detail.released`), released by the next hook event, the C6 watcher's poll (30 s) or the next `run_judge.py --pending` (timer: ≤ 5 min), so a turn that never ends still gets its review. To judge it at once: `run_judge.py <id>` after moving the file into `queue/`. |
 | Desktop alerts "Runaway generation: coder-fast … task 4711, n_decoded=25000" while tests run | That was test data. Before the digest-pilot fixes, one end-to-end test drove the real watcher with `DISPLAY` set, so every full suite run sent one real `notify-send`. `judge/tests/conftest.py` now removes `DISPLAY`, `WAYLAND_DISPLAY` and `DBUS_SESSION_BUS_ADDRESS` for every test. A real alert names a real task id and a live model. |
 | Several plan reviews for one turn | Only one per plan file and turn is expected. Each plan file gets its own request, and so does a write after the turn ended or after the runner took the request (`evidence/<id>/` existed). `detail.coalesced.writes` counts the merged writes. |
 | C3 nudged about a file the answer only mentioned | Since #35 only paths an edit verb governs are checked (quoted text, another clause or a negated sentence is a mention), and relative names only when they exist under the session cwd or its repo root. Report the sentence if it still happens: it is in the request's `detail.claim_flags`. |

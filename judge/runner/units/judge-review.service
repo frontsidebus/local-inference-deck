@@ -4,6 +4,14 @@
 [Unit]
 Description=judge: review pending agent-judge requests (frontier or local judge)
 After=network-online.target
+# #40: --pending often exits in ~60 ms (deferred plan requests are not ready yet), so a burst of queue
+# writes used to start this unit 5+ times in 10 s, hit systemd's default start limit and leave both this
+# unit and judge-review.path failed: nothing was judged until a human ran reset-failed. No start limit:
+# the runner takes a lock and is idempotent, so extra starts are harmless.
+StartLimitIntervalSec=0
+# #41: a failure (a judge run that exited non-zero, or any start failure) is logged to runner.log and
+# shown on the desktop by judge-alert@.service. %n = this unit's name.
+OnFailure=judge-alert@%n.service
 
 [Service]
 Type=oneshot

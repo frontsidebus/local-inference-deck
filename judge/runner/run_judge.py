@@ -2,7 +2,8 @@
 """Run the judge on one review request, or on every pending one.
 
     run_judge.py <request-id>      judge queue/<request-id>.json
-    run_judge.py --pending         judge everything in queue/ (oldest first), then re-scan for requests that
+    run_judge.py --pending         release due deferred requests (queue/deferred/ -> queue/), judge everything
+                                   ready in queue/ (oldest first), then re-scan for requests that
                                    arrived meanwhile (each tried once per run); used by judge-review.service
 
 Flow per request: make sure evidence/<id>/ exists (if not: wait until request.created +
@@ -897,8 +898,22 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
 
 
 def pending_ids() -> List[str]:
+    """Ready requests in queue/ (not queue/deferred/, #40). A legacy request in queue/ whose not_before lies
+    ahead is skipped (#34)."""
     q = C.sub("queue")
-    return sorted(p.stem for p in q.glob("*.json") if C._queue is None or C._queue.is_ready(p)) if q.is_dir() else []  # #34: skip not_before
+    return sorted(p.stem for p in q.glob("*.json") if C._queue is None or C._queue.is_ready(p)) if q.is_dir() else []
+
+
+def release_due() -> List[str]:
+    """Move deferred requests whose not_before passed into queue/ first, so judge-review.timer's runs judge
+    them even when no hook event or watcher poll released them (#40). Never fatal."""
+    if C._queue is None or not hasattr(C._queue, "release_due"):
+        return []
+    try:
+        return list(C._queue.release_due(C.review_dir()))
+    except Exception as exc:
+        log(f"release_due failed: {type(exc).__name__}: {exc}")
+        return []
 
 
 def main(argv: List[str]) -> int:
@@ -913,6 +928,8 @@ def main(argv: List[str]) -> int:
         # --pending re-scans queue/ until nothing new is left: a request queued while this run is busy
         # must not wait for the next queue change (judge-review.path does not re-fire for it). Each
         # request is tried at most once per run; failures stay queued for the next run.
+        if argv[0] == "--pending":
+            release_due()
         ids = pending_ids() if argv[0] == "--pending" else [argv[0]]
         while ids:
             for rid in ids:

@@ -11,3 +11,10 @@ import pytest
 def _no_desktop_notifications(monkeypatch):
     for var in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_unit_queries(monkeypatch):
+    """bin/judge-findings asks `systemctl --user is-failed` about the live judge units: keep tests independent of
+    the machine's unit state (the check is exercised with a stub systemctl where it is tested)."""
+    monkeypatch.setenv("JUDGE_CHECK_UNITS", "0")
