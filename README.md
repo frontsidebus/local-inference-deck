@@ -8,6 +8,7 @@ A self-hosted LLM stack: two RTX 3090s at home, a thin edge in the cloud, and on
 - **API:** LiteLLM at `https://${SPARK_API_HOST}/v1`, with one virtual key per person and per harness. It speaks `/v1/chat/completions`, `/v1/responses` (Codex) and `/v1/messages` (Claude Code).
 - **Harnesses:** Claude Code, Codex, Hermes Agent, OpenCode and Cline all point at the same endpoint and the same stable model aliases (`coder`, `coder-fast`, `big`, `vision`, `hermes`).
 - **Telemetry:** a live GPU and request dashboard at `https://${SPARK_TELEMETRY_HOST}`, behind the same passkey login.
+- **Digest (optional):** on-demand threat-intel and AI digests curated by the local `coder` model at `https://${SPARK_DIGEST_HOST}`, behind its own passkey gate. Off unless `SPARK_DIGEST_HOST` is set.
 
 This is the third generation of the project. Gen2 (Ollama, basic auth and a static chat page) is archived in [docs/history/gen2](docs/history/gen2/INDEX.md).
 
@@ -57,8 +58,8 @@ Every Walter port binds to `BACKEND_WG_IP` (or loopback) and only accepts traffi
 
 | Dir | What it holds |
 |---|---|
-| [walter/](walter/README.md) | Backend VM: llama-swap config, gateway (LiteLLM + Postgres + hooks), webui (Open WebUI + Pocket-ID + theme), monitoring, telemetry app, backups, update-check, systemd units and drop-ins, firewall. |
-| [covenant/](covenant/README.md) | Edge: nginx sites and snippets, oauth2-proxy, fail2ban, ufw, WireGuard, certbot hooks. |
+| [walter/](walter/README.md) | Backend VM: llama-swap config, gateway (LiteLLM + Postgres + hooks), webui (Open WebUI + Pocket-ID + theme), monitoring, telemetry app, the optional [digest app](walter/digest/README.md), backups, update-check, systemd units and drop-ins, firewall. |
+| [covenant/](covenant/README.md) | Edge: nginx sites and snippets, oauth2-proxy (plus a second instance for the optional digest), fail2ban, ufw, WireGuard, certbot hooks. |
 | [clients/](clients/README.md) | Workstation wrappers and configs for Claude Code, Codex, Hermes and OpenCode, plus the hermes-gateway service. |
 | [judge/](judge/README.md) | A reviewer for the local agent: Hermes shell hooks gate risky tool calls and queue reviews; a frontier (or local) judge checks the agent's claims against collected evidence. See [docs/agent-judge.md](docs/agent-judge.md). |
 | `hypervisor/` | Pointer only. The host layer (VFIO, libvirt domain, disk passthrough) lives in a private infrastructure repo. |
@@ -128,4 +129,4 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 - [ARCHITECTURE.md](ARCHITECTURE.md): request paths, ports, trust boundaries, the llama-swap matrix, the gateway hook, backups, monitoring, quirks.
 - [docs/decisions.md](docs/decisions.md): why llama.cpp and not vLLM, why nginx, why LiteLLM, and more.
 - [docs/agent-judge.md](docs/agent-judge.md): why and how a judge reviews the local agent, and the [pilot runbook](docs/runbooks/agent-judge-pilot.md).
-- [docs/runbooks/](docs/runbooks/): [power loss](docs/runbooks/power-loss-recovery.md), [rotate secrets](docs/runbooks/rotate-secrets.md), [add a user](docs/runbooks/add-user.md), [add a model](docs/runbooks/add-model.md), [upgrade](docs/runbooks/upgrade.md).
+- [docs/runbooks/](docs/runbooks/): [power loss](docs/runbooks/power-loss-recovery.md), [rotate secrets](docs/runbooks/rotate-secrets.md), [add a user](docs/runbooks/add-user.md), [add a model](docs/runbooks/add-model.md), [upgrade](docs/runbooks/upgrade.md), [deploy the digest](docs/runbooks/digest-deploy.md).

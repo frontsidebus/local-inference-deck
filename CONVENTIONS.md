@@ -26,6 +26,7 @@ SPARK_CHAT_HOST=chat.example.com
 SPARK_API_HOST=api.example.com
 SPARK_ID_HOST=id.example.com
 SPARK_TELEMETRY_HOST=telemetry.example.com
+SPARK_DIGEST_HOST=""                     # optional digest app; empty = off (e.g. digest.example.com)
 LETSENCRYPT_EMAIL=admin@example.com
 ADMIN_EMAIL=admin@example.com            # Open WebUI break-glass local admin
 # --- network

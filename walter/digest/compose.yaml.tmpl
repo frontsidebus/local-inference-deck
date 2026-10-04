@@ -1,0 +1,49 @@
+# /srv/digest/compose.yaml - Walter digest app (${SPARK_DIGEST_HOST} via Covenant)
+#
+# Networking: the app uses network_mode: host. There is no digest docker network to join, and a
+# bridged container cannot reach the host's loopback (the LiteLLM gateway on ${BACKEND_WG_IP}:4000
+# and the WireGuard interface both live on the host). The app binds ${BACKEND_WG_IP}:3300 itself
+# (with IP_FREEBIND so it starts even before wg0 is up). Because it is not a docker-published port,
+# the traffic hits INPUT (ufw), not FORWARD/DOCKER-USER: ufw allows only ${EDGE_WG_IP} on wg0 to
+# 3300. 3300 is also listed in WALTER-PUBLISHED (docker-user-rules.sh) in case it is ever switched
+# to a published port. Host-originated traffic (e.g. the CLI run: ssh then curl -X POST
+# http://${BACKEND_WG_IP}:3300/api/runs/<watch>/now) is not filtered by WALTER-PUBLISHED.
+name: digest
+
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "2" }
+
+services:
+  app:
+    <<: *hardening
+    build: { context: ./build }
+    image: walter-digest:local
+    network_mode: host
+    user: "10001:10001"
+    environment:
+      BIND: ${BACKEND_WG_IP}:3300
+      LITELLM_URL: http://${BACKEND_WG_IP}:4000/v1
+      DIGEST_MODEL: coder
+      DIGEST_MAX_TOKENS: "4096"     # output cap of the curation call (clamped to 256..16384 in the app)
+      LITELLM_KEY_FILE: /run/secrets/digest-litellm-key
+      STATE_DIR: /state
+    volumes:
+      - ./secrets/digest-litellm-key:/run/secrets/digest-litellm-key:ro
+      - ./state:/state
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://${BACKEND_WG_IP}:3300/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

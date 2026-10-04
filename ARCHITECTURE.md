@@ -70,6 +70,29 @@ browser --HTTPS--> Covenant nginx (${SPARK_TELEMETRY_HOST})
 - The app runs Prometheus queries fixed on the server side and shares one cached snapshot between all viewers, so viewer count does not drive query load. It uses about 28 MiB of RAM.
 - Endpoints: `/api/v1/telemetry`, `/api/v1/stream`, `/healthz`.
 
+### Digest (optional)
+
+Only deployed when `SPARK_DIGEST_HOST` is set in `site.env`; otherwise both deploy scripts skip it
+([walter/digest/README.md](walter/digest/README.md), [runbook](docs/runbooks/digest-deploy.md)).
+
+```
+browser --HTTPS--> Covenant nginx (${SPARK_DIGEST_HOST}, 60-digest)
+        --> oauth2-proxy-digest 127.0.0.1:4181 (Pocket-ID OIDC, group ${DIGEST_GROUP})
+        --wg0--> digest app ${BACKEND_WG_IP}:3300
+                 --> public feeds (HTTPS out)
+                 --> LiteLLM ${BACKEND_WG_IP}:4000 (key: digest, model coder, bounded max_tokens)
+                 --> /srv/digest/state (run history, per-source cutoffs)
+operator shell on Walter --curl -X POST--> ${BACKEND_WG_IP}:3300/api/runs/<watch>/now (CLI trigger)
+```
+
+- Auth path: a second, independent oauth2-proxy instance with its own OIDC client
+  (`${OAUTH2_PROXY_DIGEST_CLIENT_ID}`), group, cookie and secrets. A telemetry session does not open
+  the digest. No route skips auth except `/oauth2/*`; `/api/*` returns a JSON 401.
+- On demand only: `POST /api/runs/<watch>/now` starts one background run per watch
+  (collect -> dedupe -> LLM curation -> Markdown + JSON). Progress is streamed over SSE, which
+  nginx passes unbuffered. The only state-changing route also refuses browser cross-site requests.
+- Built by the local Hermes agent under the agent judge (pilot); see [docs/agent-judge.md](docs/agent-judge.md).
+
 ## Ports and bind addresses
 
 ### Walter
@@ -81,6 +104,7 @@ browser --HTTPS--> Covenant nginx (${SPARK_TELEMETRY_HOST})
 | LiteLLM | `${BACKEND_WG_IP}:4000` | `${EDGE_WG_IP}`, Walter | `WALTER-PUBLISHED` |
 | Postgres 17 | gateway docker network only | LiteLLM | not published |
 | telemetry app | `${BACKEND_WG_IP}:3200` (host network) | `${EDGE_WG_IP}` | ufw on `wg0` |
+| digest app (optional) | `${BACKEND_WG_IP}:3300` (host network) | `${EDGE_WG_IP}`, Walter | ufw on `wg0` |
 | llama-swap | `${BACKEND_WG_IP}:8080` | `${GATEWAY_DOCKER_SUBNET}`, Walter | ufw + API key |
 | llama-server instances | `127.0.0.1:10001+` | llama-swap | loopback |
 | Prometheus / Grafana | `127.0.0.1:9090` / `127.0.0.1:3001` | SSH tunnel | loopback |
@@ -95,6 +119,7 @@ browser --HTTPS--> Covenant nginx (${SPARK_TELEMETRY_HOST})
 | WireGuard | `udp/${WG_PORT}` | internet (Walter dials in) |
 | SSH | `:22` | internet, fail2ban-protected |
 | oauth2-proxy | `127.0.0.1:4180` | nginx |
+| oauth2-proxy-digest (optional) | `127.0.0.1:4181` | nginx |
 
 ### Workstation
 
@@ -109,7 +134,7 @@ internet | Covenant (ufw, fail2ban, nginx allowlist + limits) | wg0 | Walter (DO
 ```
 
 1. **Internet to Covenant.** ufw allows 22, 80, 443 and `udp/${WG_PORT}`; the cloud security group matches. fail2ban runs `sshd` (with `journalmatch` for Ubuntu 24.04's `ssh.service`), `nginx-limit-req` and `recidive`. An unknown `Host` gets nginx's 444. The apex redirects to `chat.`.
-2. **Covenant to Walter.** The only path is the tunnel. On Walter, Docker-published ports bypass ufw, so `docker-user-rules.service` installs a chain `WALTER-PUBLISHED` hooked from `DOCKER-USER` that admits ports 3000, 1411 and 4000 only from `${EDGE_WG_IP}` and drops the rest. The telemetry app uses host networking, which bypasses that chain, so it is gated by ufw instead: `allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200`. (Port 3200 is also listed in the chain script for consistency.)
+2. **Covenant to Walter.** The only path is the tunnel. On Walter, Docker-published ports bypass ufw, so `docker-user-rules.service` installs a chain `WALTER-PUBLISHED` hooked from `DOCKER-USER` that admits ports 3000, 1411 and 4000 only from `${EDGE_WG_IP}` and drops the rest. The telemetry app uses host networking, which bypasses that chain, so it is gated by ufw instead: `allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200`. (Port 3200 is also listed in the chain script for consistency.) The optional digest app is gated the same way on port 3300; its two rules sit in `# >>> digest` blocks of the firewall templates, which `walter/deploy.sh` drops unless the digest is on.
 3. **Gateway to models.** ufw allows `${BACKEND_WG_IP}:8080` only from `${GATEWAY_DOCKER_SUBNET}`; the gateway compose network is pinned to that subnet so the rule stays valid. llama-swap also requires its own API key. llama-server containers bind loopback.
 4. **Forwarded headers.** Every app behind the edge trusts `X-Forwarded-*` from `${EDGE_WG_IP}` only:
    - Open WebUI: `FORWARDED_ALLOW_IPS=${EDGE_WG_IP}`

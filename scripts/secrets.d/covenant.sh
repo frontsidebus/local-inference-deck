@@ -10,11 +10,20 @@
 #   /etc/oauth2-proxy/cookie-secret      0600 root:root   32 random bytes, URL-safe base64 (44 chars, no newline)
 #   /etc/oauth2-proxy/client-secret      0600 root:root   NOT generated: comes from Pocket-ID when the OIDC
 #                                                         client is created (see covenant/README.md)
+#   /etc/oauth2-proxy-digest/cookie-secret  0600 root:root   ditto; the digest oauth2-proxy instance (opt-in:
+#                                                         only when SPARK_DIGEST_HOST is set)
+#   /etc/oauth2-proxy-digest/client-secret  0600 root:root   NOT generated: from Pocket-ID for the digest OIDC client
 #   /etc/wireguard/privatekey            0600 root:root   wg genkey
 #   /etc/wireguard/publickey             0644 root:root   wg pubkey < privatekey (not secret; give it to the backend)
 
 _cov_root=${DESTDIR:-}
 _cov_dry=${DRY_RUN:-0}
+# Digest gate: opt-in. covenant/deploy.sh exports SPARK_DIGEST_HOST from site.env; a standalone
+# `gen-secrets.sh covenant` reads it from <repo>/site.env (value only, nothing else is kept).
+_cov_digest=${SPARK_DIGEST_HOST:-}
+if [[ -z $_cov_digest && -n ${REPO:-} && -r $REPO/site.env ]]; then
+  _cov_digest=$(set +u; . "$REPO/site.env" >/dev/null 2>&1; printf '%s' "${SPARK_DIGEST_HOST:-}")
+fi
 
 _cov_note() { printf 'secrets[covenant]: %s\n' "$*" >&2; }
 
@@ -47,9 +56,11 @@ _cov_wg_pubkey() {
 if [[ $_cov_dry != 1 ]]; then
   install -d -m 0700 "$_cov_root/etc/wireguard"
   install -d -m 0750 "$_cov_root/etc/oauth2-proxy"
+  [[ -n $_cov_digest ]] && install -d -m 0750 "$_cov_root/etc/oauth2-proxy-digest"
 fi
 
 _cov_put /etc/oauth2-proxy/cookie-secret 0600 _cov_cookie_secret
+[[ -n $_cov_digest ]] && _cov_put /etc/oauth2-proxy-digest/cookie-secret 0600 _cov_cookie_secret
 _cov_put /etc/wireguard/privatekey       0600 _cov_wg_genkey
 _cov_put /etc/wireguard/publickey        0644 _cov_wg_pubkey
 
@@ -61,5 +72,14 @@ else
   _cov_note "        oauth2-proxy stays stopped until it exists."
 fi
 
+if [[ -z $_cov_digest ]]; then :
+elif [[ -s $_cov_root/etc/oauth2-proxy-digest/client-secret ]]; then
+  _cov_note "keep    /etc/oauth2-proxy-digest/client-secret (exists)"
+else
+  _cov_note "MISSING /etc/oauth2-proxy-digest/client-secret - create the digest Pocket-ID OIDC client, then run"
+  _cov_note "        sudo covenant/deploy.sh --set-client-secret --instance digest"
+  _cov_note "        oauth2-proxy-digest stays stopped until it exists."
+fi
+
 unset -f _cov_note _cov_put _cov_cookie_secret _cov_wg_genkey _cov_wg_pubkey
-unset _cov_root _cov_dry
+unset _cov_root _cov_dry _cov_digest
