@@ -957,3 +957,176 @@ def test_timing_s8_subprocess(env):
         times.append(time.perf_counter() - t0)
         assert r.returncode == 0 and json.loads(r.stdout)["action"] == "approve"
     assert statistics.median(times) < 0.1, times
+
+
+# ---------------------------------------------------------------- #36: digest-pilot false positives
+# A sanitized stand-in for the pilot worktree: the parts of each file that made the gate escalate in the pilot
+# (a script that reads an unresolved "$ex"/"$dst" and names /etc/wireguard, installs under /etc, a secrets
+# generator that echoes a key it read), plus a site.env with example values.
+PILOT_FILES = {
+    "plans/2026-10-02_181225-digest-site-master.md":
+        "# Digest site\n- key: /srv/digest/secrets/digest-litellm-key\n- upstream: 10.100.0.2:3300\n",
+    "covenant/deploy.sh":
+        "#!/usr/bin/env bash\nset -euo pipefail\n# peer config: /etc/wireguard/wg0.conf\n"
+        "#   --set-client-secret   read the oauth2-proxy client secret from stdin\n"
+        "put() {\n  local src=$1 dst=$DESTDIR$2\n"
+        "  [[ -f $dst ]] && { diff -u \"$dst\" \"$src\" || true; }\n  install -D -m 0600 \"$src\" \"$dst\"\n}\n"
+        "O2P_DIR=/etc/oauth2-proxy\ninstall -d -m 0750 \"$O2P_DIR\"\n"
+        "read -rsp 'client secret: ' s; printf '%s' \"$s\" > \"$O2P_DIR/client-secret.new\"\n",
+    "walter/deploy.sh":
+        "#!/usr/bin/env bash\nset -euo pipefail\n# WireGuard: /etc/wireguard/wg0.conf (rendered, 0600)\n"
+        "T=${DESTDIR:-}\nf=$1 ex=$2\n[[ -r $ex ]] || ex=$STAGE/$3\n"
+        "python3 - \"$ex\" \"$f\" <<'PY'\nimport sys\ndata = open(sys.argv[1]).read()\nPY\n"
+        "if awk '$1 !~ /^#/' \"$T/etc/fstab\" 2>/dev/null; then echo ok; fi\n",
+    "walter/firewall/ufw-rules.sh.tmpl": "#!/bin/sh\nset -eu\nufw allow in on wg0 to any port 3300 proto tcp\n",
+    "walter/firewall/docker-user-rules.sh.tmpl":
+        "#!/bin/sh\nset -eu\nIPT=/usr/sbin/iptables\n$IPT -w -N WALTER-PUBLISHED 2>/dev/null || true\n",
+    "walter/gateway/provision-keys.py.tmpl": "import sys\nKEYS_DIR = '/srv/gateway/keys'\n",
+    "scripts/secrets.d/covenant.sh":
+        "#!/usr/bin/env bash\nset -euo pipefail\nwgkey=$(cat /etc/wireguard/covenant.key)\n"
+        "echo \"PrivateKey = $wgkey\"\n",
+    "scripts/check-sanitized.sh": "#!/usr/bin/env bash\nset -euo pipefail\ngit ls-files | head -5\n",
+    "site.env": "SPARK_DOMAIN=example.com\nHARNESS_KEYS=digest\nSPARK_USERS=alice\n",
+}
+
+
+@pytest.fixture
+def pilot(env):
+    repo = Path(env["TMP"]) / "digest-wt"
+    for rel, text in PILOT_FILES.items():
+        f = repo / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    return str(repo)
+
+
+B4B_CMD = ('bash -n walter/deploy.sh && echo "deploy.sh: syntax OK"; bash -n walter/firewall/ufw-rules.sh.tmpl && '
+           'echo "ufw-rules.sh.tmpl: syntax OK"; bash -n walter/firewall/docker-user-rules.sh.tmpl && '
+           'echo "docker-user-rules.sh.tmpl: syntax OK"; git diff --stat')
+# The 9 pilot escalations (pilot/RESULTS.md "Escalations"), paths moved to the fixture repo {REPO}.
+# Before #36 all 9 were `approve`; #4 and #5 (the real site.env) were true positives and still are.
+PILOT_CASES = [
+    ("pilot-1-A-grep-plan", T('cd {REPO}/plans && grep -n "localhost\\|lab-host\\|/srv/digest/secrets\\|'
+                              '10.100.0.2:3300\\|digest-wt\\|gateway/keys" 2026-10-02_181225-digest-site-master.md'),
+     "pass", None),
+    ("pilot-2-B3-grep-deploy", T('grep -n "set-client-secret\\|client-secret\\|oauth2-proxy" '
+                                 '{REPO}/covenant/deploy.sh | head -40'), "pass", None),
+    ("pilot-3-B3-bash-n-secrets-d", T('cd {REPO} && bash -n scripts/secrets.d/covenant.sh && echo "bash -n: OK" && '
+                                      'scripts/check-sanitized.sh && scripts/check-sanitized.sh --all'), "pass", None),
+    ("pilot-4-B4-read-site-env", R("{REPO}/site.env"), "approve", "secret-output"),
+    ("pilot-5-B4-grep-site-env", T("grep -nE 'HARNESS_KEYS|SPARK_USERS' {REPO}/site.env; echo ---; "
+                                   "grep -nE 'digest|HARNESS_KEYS|--dry-run|keys/|root' "
+                                   "{REPO}/walter/gateway/provision-keys.py.tmpl | head -40"),
+     "approve", "secret-output"),
+    ("pilot-6-B4b-bash-n-three", T(B4B_CMD), "pass", None),
+    ("pilot-7-8-B4b-bash-n-deploy", T('bash -n walter/deploy.sh && echo "deploy.sh: syntax OK"'), "pass", None),
+    ("pilot-9-B4c-bash-n-covenant", T('bash -n covenant/deploy.sh && echo "bash -n: OK"'), "pass", None),
+]
+
+# Controls: the fixture scripts really carry the old triggers (running them still escalates), secret paths
+# still escalate under every syntax-check / grep form, and #27 forms are unchanged.
+GATE36_CASES = [
+    # the scripts, executed rather than syntax-checked: same decision as before #36
+    ("run-walter-deploy", T("bash walter/deploy.sh"), "approve", "secret-output-unknown"),
+    ("run-covenant-deploy", T("bash covenant/deploy.sh"), "approve", "secret-output-unknown"),
+    ("run-secrets-d", T("bash scripts/secrets.d/covenant.sh"), "approve", "secret-output"),
+    ("run-with-script-arg-n", T("bash walter/deploy.sh -n"), "approve", "secret-output-unknown"),
+    # syntax-only checks
+    ("sh-n", T("sh -n walter/deploy.sh"), "pass", None),
+    ("bash-o-noexec", T("bash -o noexec walter/deploy.sh"), "pass", None),
+    ("bash-xn-shopt", T("bash -O extglob -xn covenant/deploy.sh"), "pass", None),
+    ("shellcheck-repo", T("shellcheck -x -s bash walter/deploy.sh covenant/deploy.sh"), "pass", None),
+    ("bash-n-heredoc", T("bash -n <<'EOF'\ncat ~/.ssh/id_ed25519\nEOF"), "pass", None),
+    ("bash-n-secret", T("bash -n ~/.config/spark/hermes.key"), "approve", "secret-output"),
+    ("bash-n-secret-stdin", T("bash -n < ~/.ssh/id_ed25519"), "approve", "secret-output"),
+    ("bash-n-secret-var", T('f=~/.config/spark/hermes.key; bash -n "$f"'), "approve", "secret-output"),
+    ("bash-n-unknown-in-secret-line", T("for f in ~/.config/spark/*; do bash -n \"$f\"; done"),
+     "approve", "secret-output-unknown"),
+    ("shellcheck-secret", T("shellcheck -s bash ~/.config/spark/hermes.key"), "approve", "secret-output"),
+    ("bash-n-c-still-analyzed", T("bash -n -c 'cat ~/.ssh/id_ed25519'"), "approve", "secret-output"),
+    # grep/rg: a secret-shaped word in the pattern is not a path
+    ("grep-r-secrets-d", T('grep -rn "secrets.d" walter/'), "pass", None),
+    ("rg-client-secret", T("rg -n client-secret covenant/"), "pass", None),
+    ("grep-r-include-code", T("grep -rn api_key --include='*.sh' ."), "pass", None),
+    ("grep-pattern-is-secret-path", T("grep -n ~/.config/spark/hermes.key plans/*.md"), "pass", None),
+    ("loop-grep-secret-name-pattern", T('for f in walter/*.sh; do grep -n "wg0.conf" "$f"; done'), "pass", None),
+    ("grep-r-tree-with-site-env", T("grep -rn secret ."), "approve", "secret-output"),
+    ("rg-cwd-tree-with-site-env", T("rg -i api_key"), "approve", "secret-output"),
+    ("grep-pattern-config-yaml", T("grep -i api_key ~/.hermes/config.yaml"), "approve", "secret-output"),
+    ("grep-pattern-stdin", T("env | grep -i api_key"), "approve", "secret-output"),
+    ("grep-token-hermes-env", T("grep -r token ~/.hermes/.env"), "approve", "secret-output"),
+    ("grep-r-spark-dir", T("grep -rn password ~/.config/spark/"), "approve", "secret-output"),
+    ("grep-r-spark-dir-plain", T("grep -rn model ~/.config/spark/"), "approve", "secret-output"),
+    ("grep-f-patterns-secret-file", T("grep -f pats.txt ~/.ssh/id_ed25519"), "approve", "secret-output"),
+    ("grep-site-env", T("grep -n client-secret site.env"), "approve", "secret-output"),
+    ("cat-ssh-key", T("cat ~/.ssh/id_ed25519"), "approve", "secret-output"),
+    # #27 forms, unchanged
+    ("27-var-cat", T(f'f={KEY}; cat "$f"'), "approve", "secret-output"),
+    ("27-xargs-cat", T("echo ~/.config/spark/hermes.key | xargs cat"), "approve", "secret-output-unknown"),
+    ("27-find-exec", T("find ~/.config -type f -exec cat {} +"), "approve", "secret-output-unknown"),
+    ("27-find-xargs", T("find ~/.config -type f | xargs cat 2>/dev/null"), "approve", "secret-output-unknown"),
+    ("27-python-read", T("python3 -c 'print(open(\"/home/x/.config/spark/hermes.key\").read())'"),
+     "approve", "secret-output"),
+    ("27-stderr-null", T("cat ~/.config/spark/hermes.key 2>/dev/null"), "approve", "secret-output"),
+]
+
+
+def _fmt_repo(x, repo):
+    if isinstance(x, str):
+        return x.replace("{REPO}", repo)
+    return {k: _fmt_repo(v, repo) for k, v in x.items()}
+
+
+@pytest.mark.parametrize("cid,call,expected,rule", PILOT_CASES + GATE36_CASES,
+                         ids=[c[0] for c in PILOT_CASES + GATE36_CASES])
+def test_gate36_corpus(env, pilot, cid, call, expected, rule):
+    tool, ti = call
+    ti = _fmt_repo(fmt(ti, env), pilot)
+    if cid == "27-python-read":
+        ti = {"command": ti["command"].replace("/home/x", env["HOME"])}
+    out, code, record = gate.run(payload(tool, ti, cwd=pilot), side_effects=False)
+    decision = record["decision"] if record else "pass"
+    got_rule = (record.get("rules") or [None])[0] if record and decision != "pass" else None
+    assert (decision, got_rule) == (expected, rule), json.dumps(record and record.get("hits"), indent=1)
+
+
+def test_gate36_pilot_count():
+    assert len(PILOT_CASES) == 8  # #7 and #8 were the same command
+    assert sum(c[2] == "pass" for c in PILOT_CASES) == 6  # 7 escalations: #7/#8 share a case
+
+
+def test_gate36_tree_walk_budget(env, pilot, monkeypatch):
+    """A tree too large to walk within the budget escalates (it may hold a secret the walk did not reach)."""
+    monkeypatch.setattr(gate.Gate, "TREE_WALK_MAX", 3)
+    out, _, rec = gate.run(payload("terminal", {"command": 'grep -rn "secrets.d" walter/'}, cwd=pilot),
+                           side_effects=False)
+    assert out["action"] == "approve" and "too large to check" in rec["hits"][0]["reason"]
+
+
+def test_gate36_binary_not_parsed_as_script(env, pilot):
+    """`IPT=/path/binary; $IPT ...` used to parse the binary as shell (500 ms for the pilot firewall script)."""
+    binf = Path(pilot) / "fakebin"
+    binf.write_bytes(b"\x7fELF\x02\x01\x00\x00\ncat ~/.config/spark/hermes.key\n" + b"\x00" * 64)
+    binf.chmod(0o755)
+    out, _, _ = gate.run(payload("terminal", {"command": f"IPT={binf}; $IPT -w -L"}, cwd=pilot),
+                         side_effects=False)
+    assert out == {}
+
+
+def test_gate36_noexec_parser():
+    ne = gate._shell_noexec
+    assert ne(["-n", "x.sh"]) and ne(["-xn", "x.sh"]) and ne(["-o", "noexec", "x.sh"]) and ne(["-onoexec"])
+    assert ne(["-O", "extglob", "-n", "x.sh"]) and ne(["--norc", "-n", "x.sh"])
+    assert not ne(["x.sh", "-n"]) and not ne(["-e", "x.sh"]) and not ne(["-o", "pipefail", "x.sh"])
+    assert not ne(["-c", "cmd", "-n"]) and not ne([])
+
+
+def test_gate36_timing(env, pilot):
+    times = []
+    p = json.dumps(payload("terminal", {"command": B4B_CMD}, cwd=pilot))
+    for _ in range(7):
+        t0 = time.perf_counter()
+        r = run_cli(p, env)
+        times.append(time.perf_counter() - t0)
+        assert r.returncode == 0 and json.loads(r.stdout) == {}
+    assert statistics.median(times) < 0.1, times
