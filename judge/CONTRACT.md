@@ -578,6 +578,25 @@ exit 64, no execution.
   digest of a byte-limited part (`head -c` / `tail -c` / `cut -c|-b` / `dd count=|skip=` piped to a hash) escalates
   (brute-forceable). A copy made in the same command (`cp|mv|install|ln <secret> dst`, or a captured secret read
   redirected to a file) is treated as the secret for the rest of that command.
+- **grep/rg patterns** (#36): `grep_operands` splits patterns from files (`-e`/`--regexp` patterns or a `-f`/`--file`
+  pattern file make every positional a file; before #36 `grep -f pats <secret>` took the secret for the pattern and
+  passed). The pattern is never a path. A pattern matching `secret_grep_pattern` escalates as `secret-output` (when
+  not quiet `-q|-l|-L|-c` and not captured) only if what is searched may hold a secret: stdin (no file, or `rg` fed by
+  a pipe/redirect), any remote host, an unresolved operand, a file whose basename is not in `not_secret_names`, or a
+  directory searched recursively (`grep -r|-R|-d recurse`, `rg`; no operand = cwd) that is a secret path, covers one
+  (`_covers_secret`) or holds a secret-shaped file. `Gate._tree_secret` walks the tree (symlinks not followed, `.git`
+  skipped) for at most `TREE_WALK_MAX` = 3000 entries and `TREE_WALK_SECONDS` = 20 ms; over budget escalates.
+  `--include` / `rg -g` globs that are all in `not_secret_names` skip the walk. A secret file operand still
+  escalates through the path rule whatever the pattern (`grep -r token ~/.hermes/.env`, `grep -rn x ~/.config/spark/`).
+- **Syntax-only checks** (#36): `bash|sh|zsh|dash|ksh|ash [opts] -n|-o noexec FILE` (the option must come before
+  FILE; `bash FILE -n` runs FILE) and `shellcheck FILE...` are not analyzed as execution of FILE. They go through
+  the shared read check instead (verb "syntax-checks" / "quotes lines of"): a secret-shaped FILE or `<` stdin
+  redirect escalates as `secret-output` (errors and lint output quote source lines), an unresolved one as
+  `secret-output-unknown` when the line names a secret, else pass. A heredoc on stdin is not run either.
+  `bash -n -c CODE` is still analyzed as before.
+- **Script peeks**: a file run by path (`./x`, `$IPT …` with `IPT=/usr/sbin/iptables`) is parsed as shell only
+  when it is text; a file with a NUL byte in its first 8 KiB is a binary and is skipped (#36: parsing
+  iptables as shell cost ~15 ms per call, 500 ms for the pilot's firewall script).
 - **`secret-output-unknown`** (approve; #27; added to older pre-rendered policies by `load_policy`): a print
   command (or the commands above) whose operand stays unresolved (`$X` unknown, `$(...)`, loop variable,
   `xargs` stdin / `-I{}`, `find -exec ... {}`, `sh -c '... "$1"' _ {}`) escalates when the same command line
@@ -586,6 +605,9 @@ exit 64, no execution.
   `site.env` in long scripts were too noisy); or when the `find` feeding it (`find R ... -exec`, `find R ... | xargs`)
   has a root R that is or contains a `secret_paths` entry (`~/.config`, `/etc`, `~`) and no `-name` filter that is
   entirely in `not_secret_names`. Otherwise it passes. The reason names the secret-shaped word, never content.
+  Words of the command line that occur only inside grep/egrep/fgrep/zgrep/rg patterns, sed scripts or awk
+  programs (`_pattern_args`, also inside `$(...)` and `bash -c`) are not mentions (#36): occurrence counts are
+  compared, so the same word used elsewhere in the line still counts.
 - **Not seen by the gate** (known limits): values built at run time (`f=$(printf '%s/%s' ~/.config spark)/k`
   without any secret-shaped word, base64-decoded names, `$IFS` tricks); copies or symlinks made in an earlier tool
   call (`cp key /tmp/x`, then `cat /tmp/x` next turn); secrets read by programs that are not print commands and

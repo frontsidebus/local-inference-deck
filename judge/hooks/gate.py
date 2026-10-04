@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 JUDGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -717,6 +718,106 @@ def has_flag(args, shorts="", longs=()):
     return False
 
 
+_GREP_TAKES = ("efABCmdD", ("regexp", "file", "max-count", "after-context", "before-context", "context",
+                            "include", "exclude", "exclude-dir", "exclude-from", "label", "binary-files",
+                            "devices", "directories", "color", "colour", "group-separator"))
+_RG_TAKES = ("efABCmgtTMjErd", ("regexp", "file", "max-count", "after-context", "before-context", "context",
+                                "glob", "iglob", "type", "type-not", "type-add", "type-clear", "max-columns",
+                                "threads", "encoding", "replace", "max-depth", "max-filesize", "ignore-file",
+                                "pre", "pre-glob", "sort", "sortr", "colors", "color", "context-separator",
+                                "field-match-separator", "path-separator", "dfa-size-limit", "regex-size-limit",
+                                "engine", "max-columns-preview"))
+
+
+def grep_operands(name, args):
+    """(patterns, files) of a grep/egrep/fgrep/zgrep/rg command line. -e/--regexp patterns or -f/--file
+    pattern files make every positional a file; otherwise the first positional is the pattern."""
+    takes, long_takes = _RG_TAKES if name == "rg" else _GREP_TAKES
+    pos = positional(args, takes, long_takes)
+    explicit = opt_values(args, "e", ("regexp",))
+    if explicit or opt_values(args, "f", ("file",)):
+        return explicit, pos
+    return pos[:1], pos[1:]
+
+
+def _grep_recursive(name, args):
+    """rg always searches a tree; grep with -r/-R/--recursive/--dereference-recursive (or -d recurse)."""
+    if name == "rg":
+        return True
+    return has_flag(args, "rR", ("recursive", "dereference-recursive")) or \
+        "recurse" in opt_values(args, "d", ("directories",))
+
+
+_FRAG_SPLIT = re.compile(r"[\s'\"`;|&<>(){}=,:\[\]]+")
+
+
+def _fragments(text):
+    """Word fragments of a command line for the secret-mention scan."""
+    return [f.lstrip("-+?!@") for f in _FRAG_SPLIT.split(text)]
+
+
+def _pattern_args(text, depth=0):
+    """#36: the pattern/program arguments of grep/egrep/fgrep/zgrep/rg, sed and awk anywhere in `text`
+    (including $(...) and bash -c code). They are text to match or a program, never a file the command reads."""
+    out = []
+    if depth > 3 or not text or not text.strip():
+        return out
+    try:
+        body, substs, heredocs = preprocess(text)
+        toks, _ = shell_structure(tokenize(body))
+        cmds = simple_commands(toks, heredocs)
+    except Exception:  # the real analysis reports parse problems; this scan is best effort
+        return out
+    for sub in substs:
+        out += _pattern_args(sub if isinstance(sub, str) else str(sub), depth + 1)
+    for sc in cmds:
+        argv, _, _ = unwrap(sc.argv)
+        if not argv:
+            continue
+        name, args = base(argv[0]), argv[1:]
+        if name in ("grep", "egrep", "fgrep", "zgrep", "rg"):
+            out += grep_operands(name, args)[0]
+        elif name == "sed":
+            out += opt_values(args, "e", ("expression",)) or positional(args, "ef", ("expression", "file"))[:1]
+        elif name in ("awk", "gawk", "mawk") and not opt_values(args, "f"):
+            out += positional(args, "fvF")[:1]
+        elif name in ("bash", "sh", "zsh", "dash", "ksh", "ash"):
+            for code in opt_values(args, "c"):
+                out += _pattern_args(code, depth + 1)
+    return out
+
+
+def _shell_noexec(args):
+    """#36: sh/bash/zsh/... options (before the script operand) include -n or -o noexec: read and parse the
+    script without running it. A -n after the script name is the script's own argument."""
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a == "--" or not a.startswith(("-", "+")) or a in ("-", "+"):
+            return False
+        if a.startswith("--"):
+            if a[2:] in ("rcfile", "init-file"):
+                i += 1
+        elif a[0] == "-":
+            body = a[1:]
+            if "n" in body.split("o", 1)[0]:
+                return True
+            if "o" in body:
+                val = body.split("o", 1)[1] or (args[i + 1] if i + 1 < n else "")
+                if val == "noexec":
+                    return True
+                if not body.split("o", 1)[1]:
+                    i += 1
+            if "c" in body:
+                return False
+            if body.endswith("O"):
+                i += 1  # -O shopt_name
+        elif "o" in a[1:] and not a[1:].split("o", 1)[1]:
+            i += 1  # +o option: unsets it
+        i += 1
+    return False
+
+
 def base(word):
     return os.path.basename(word) if "/" in word else word
 
@@ -1118,12 +1219,19 @@ class Gate:
         if self._mention is None:
             self._mention = ""
             seen = set()
+            seed = self._seed_vars()
+            # #36: a word that only occurs inside grep/sed/awk patterns is text to match, not a path
+            pat_only = Counter()
+            for p in _pattern_args(self.full_text):
+                pat_only.update(_fragments(self.subst(p, seed)))
+            line_count = Counter(_fragments(self.subst(self.full_text, seed)))
             # the command line itself: any secret-shaped word; script files it runs (often long, with comments
             # and site.env plumbing): configured secret paths only, to avoid approval fatigue
             for text, names in [(self.full_text, True)] + [(t, False) for t in self.extra_texts]:
-                for frag in re.split(r"[\s'\"`;|&<>(){}=,:\[\]]+", self.subst(text, self._seed_vars())):
-                    frag = frag.lstrip("-+?!@")
+                for frag in _fragments(self.subst(text, seed)):
                     if not frag or (frag, names) in seen or len(frag) > 512 or UNRES_RE.search(frag):
+                        continue
+                    if names and pat_only[frag] >= line_count[frag]:
                         continue
                     seen.add((frag, names))
                     if self.is_secret_file(frag, None, names=names):
@@ -1263,6 +1371,12 @@ class Gate:
                 src = code[0] if code else (positional(args)[0] if positional(args) else "")
                 return self.analyze(src, ctx, depth + 1)
             pos = positional(args, "oO", ("rcfile", "init-file"))
+            if _shell_noexec(args):
+                # #36: `bash -n FILE` / `sh -o noexec FILE` only parses FILE; nothing in it runs, so its
+                # contents are not analyzed. Syntax errors quote the offending tokens, so a secret FILE (or
+                # stdin redirect) still escalates, and an unresolved one in a line naming a secret too.
+                files = pos[:1] + [t for op, t in sc.redirects if op == "<"]
+                return self._secret_or_unknown(f"{name} -n", files, ctx, verb="syntax-checks (errors quote it)")
             if sc.stdin is not None and (not pos or has_flag(args, "s")):
                 return self.analyze(sc.stdin, ctx, depth + 1)
             if pos:
@@ -1300,8 +1414,13 @@ class Gate:
             self.hit("oversight_path", f"runs {p} --apply (rewrites the Hermes hooks config)", p)
         try:
             if os.path.isfile(p) and os.path.getsize(p) <= MAX_SCRIPT_PEEK:
-                with open(p, encoding="utf-8", errors="replace") as fh:
-                    head = fh.read(MAX_SCRIPT_PEEK)
+                with open(p, "rb") as fh:
+                    raw = fh.read(MAX_SCRIPT_PEEK)
+                if b"\0" in raw[:8192]:
+                    # #36: a binary (`IPT=/usr/sbin/iptables; $IPT ...`) is not a script; parsing its bytes
+                    # as shell took ~15 ms per call (500 ms for one firewall script)
+                    return False
+                head = raw.decode("utf-8", errors="replace")
                 self.extra_texts.append(head)
                 self._mention = None
                 first = head.split("\n", 1)[0]
@@ -1447,18 +1566,20 @@ class Gate:
         """Files a printing command reads (positional operands and `<` redirects); [] when it prints none."""
         files = []
         if name in ("grep", "egrep", "fgrep", "rg", "zgrep"):
-            pos = positional(args, "efABCmd", ("regexp", "file", "max-count", "after-context",
-                                               "before-context", "context"))
-            explicit = opt_values(args, "e", ("regexp",))
-            pats = explicit or pos[:1]
-            files = pos if explicit else pos[1:]
+            pats, files = grep_operands(name, args)
             quiet = has_flag(args, "qlLc", ("quiet", "silent", "count", "files-with-matches",
                                             "files-without-match"))
             if not quiet and any(self.secret_grep.search(p) for p in pats) and not ctx["captured"]:
-                self.hit("secret_output", f"{name} for secret-looking pattern prints matching lines",
-                         " ".join([name] + args)[:120])
+                # #36: the pattern is text to match, not a path. A secret-looking pattern escalates only when
+                # what grep searches may hold a secret (stdin, an unknown file, a tree with a secret file).
+                where = self._grep_scope_maybe(name, args, files, sc, ctx)
+                if where:
+                    self.hit("secret_output", f"{name} for secret-looking pattern prints matching lines "
+                             f"from {where}", " ".join([name] + args)[:120])
             if quiet:
                 return []
+            if not files and _grep_recursive(name, args) and not (name == "rg" and self._stdin_fed(sc)):
+                files = ["."]
         elif name == "sed":
             if has_flag(args, "i", ("in-place",)):
                 return []
@@ -1475,6 +1596,67 @@ class Gate:
         else:
             files = positional(args, "nNcwsk" if name in ("head", "tail", "base64", "cut", "fold") else "")
         return files + [t for op, t in sc.redirects if op == "<"]
+
+    @staticmethod
+    def _stdin_fed(sc):
+        return bool(sc.pipe_in or sc.stdin is not None or any(op == "<" for op, _ in sc.redirects))
+
+    def _grep_scope_maybe(self, name, args, files, sc, ctx):
+        """#36: why a grep for a secret-looking pattern may print a secret, or None.
+
+        Escalates (as before #36) for stdin (`env | grep -i token`), anything on a remote host, an unresolved
+        operand, and a file whose name is not in not_secret_names (`grep -i api_key config.yaml`). Passes for
+        files that are code/docs by name (*.md, *.sh, *.py, *.tmpl, ...) and for a tree (grep -r, rg) that holds
+        no secret-shaped file (bounded walk; a tree too large to walk escalates)."""
+        if ctx["remote"]:
+            return f"files on {ctx['remote']}"
+        recursive = _grep_recursive(name, args)
+        if not files:
+            if not recursive or (name == "rg" and self._stdin_fed(sc)):
+                return "stdin"
+            files = ["."]
+        includes = opt_values(args, "g" if name == "rg" else "", ("include", "glob", "iglob"))
+        code_only = bool(includes) and all(any(fnmatch.fnmatch(g.lstrip("!"), x) for x in self.not_secret)
+                                           for g in includes if not g.startswith("!"))
+        for f in files:
+            if UNRES_RE.search(f):
+                return f
+            p = expand(f, self.rt, ctx["cwd"])
+            if recursive and os.path.isdir(p):
+                if code_only:
+                    continue
+                if self.is_secret_file(f, ctx["cwd"]) or self._covers_secret(f, ctx["cwd"]):
+                    return f
+                found = self._tree_secret(p)
+                if found:
+                    return found
+                continue
+            if os.path.isdir(p):
+                continue  # grep without -r skips a directory operand
+            b = os.path.basename(f.rstrip("/"))
+            if not (b and any(fnmatch.fnmatch(b, x) for x in self.not_secret)):
+                return f
+        return None
+
+    TREE_WALK_MAX = 3000      # directory entries
+    TREE_WALK_SECONDS = 0.02
+
+    def _tree_secret(self, root):
+        """First secret-shaped file under root (os.walk, symlinks not followed, .git skipped), the root itself
+        when the walk exceeds its entry or time budget, else None."""
+        t0, seen = time.monotonic(), 0
+        try:
+            for d, dirs, fnames in os.walk(root, followlinks=False):
+                dirs[:] = [x for x in dirs if x != ".git"]
+                seen += len(dirs) + len(fnames)
+                if seen > self.TREE_WALK_MAX or time.monotonic() - t0 > self.TREE_WALK_SECONDS:
+                    return f"{root} (too large to check)"
+                for fn in fnames:
+                    if self.is_secret_file(os.path.join(d, fn)):
+                        return os.path.join(d, fn)
+        except OSError:
+            return root
+        return None
 
     def _secret_or_unknown(self, name, files, ctx, verb="prints"):
         """Shared tail of the read checks: a secret operand escalates as secret-output; an operand the gate can't
@@ -1508,6 +1690,11 @@ class Gate:
         elif name in ("echo", "printf") and not ctx["captured"]:
             if self._mentions_secret_var(args, ctx, sub_secret):
                 self.hit("secret_output", f"{name} of a value read from a secret file", name)
+        elif name == "shellcheck":
+            # #36: a lint runs nothing, but its diagnostics quote source lines
+            reads = self._secret_or_unknown(name, positional(args, "efioPsSW", (
+                "exclude", "format", "include", "enable", "source-path", "shell", "severity", "wiki-link-count",
+                "rcfile")), ctx, verb="quotes lines of")
         elif name == "wg" and not ctx["captured"]:
             if (args and args[0] == "showconf") or any(a in ("private-key", "preshared-keys") for a in args):
                 self.hit("secret_output", "wg prints private key material", "wg " + " ".join(args[:2]))

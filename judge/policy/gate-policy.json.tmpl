@@ -173,6 +173,8 @@
       ],
       "safe_sinks": ["wc", "sha256sum", "sha1sum", "sha512sum", "md5sum", "b2sum", "cksum", "true", "test"],
       "secret_grep_pattern": "(?i)(api[_-]?key|secret|passw(or)?d|private[_ -]?key|bearer|master[_-]?key|auth[_-]?token|access[_-]?token)",
+      "_doc_secret_grep": "#36: secret_grep_pattern is matched against the grep/rg PATTERN, which is text to match, never a path. It escalates only when what is searched may hold a secret: stdin, a remote host, an unresolved operand, a file whose name is not in not_secret_names, or a tree (grep -r, rg) that is or covers a secret path or holds a secret-shaped file (bounded walk; a tree too large to walk escalates; --include/-g globs made only of not_secret_names skip the walk). Words that occur only in grep/sed/awk patterns do not count as a secret mention for secret-output-unknown.",
+      "_doc_syntax_check": "#36: bash/sh/zsh/dash/ksh -n (or -o noexec) FILE and shellcheck FILE run nothing, so FILE's contents are not analyzed; they escalate only when FILE (or a < stdin redirect) is itself secret-shaped, since syntax errors and lint output quote source lines. bash -n -c CODE is still analyzed.",
       "_doc_variables": "#27: shell variables assigned to literal values in the same command line or script (X=..., export/local/declare/readonly/typeset X=..., ~ and $HOME expanded) are substituted into later words before the path checks, including inside bash -c / eval / $(...). A copy of a secret (cp/mv/install/ln, or a captured read redirected to a file) is treated as a secret for the rest of the command. A digest of a byte-limited part of a secret (head -c/tail -c/cut -c/dd count= piped to a hash) escalates: it is brute-forceable."
     },
     {
