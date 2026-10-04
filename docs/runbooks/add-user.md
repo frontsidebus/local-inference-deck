@@ -1,11 +1,12 @@
 # Add a user
 
-A user gets up to three things, independently:
+A user gets up to four things, independently:
 
 | Access | Granted by |
 |---|---|
 | Chat (Open WebUI) | Pocket-ID account + membership of `${CHAT_GROUP}` |
 | Telemetry dashboard | Pocket-ID account + membership of `${TELEMETRY_GROUP}` |
+| Digest (optional app) | Pocket-ID account + membership of `${DIGEST_GROUP}` |
 | API (harnesses on their own machine) | A LiteLLM virtual key |
 
 Signup is off everywhere. Pocket-ID is passkey-only: the user never has a password.
