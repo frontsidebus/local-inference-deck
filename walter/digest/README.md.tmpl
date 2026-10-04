@@ -19,7 +19,7 @@ Three watches: `default` (Threat Intel), `ai-security` (AI Security), `ai-resear
 compose.yaml                 app (host network, uid 10001, read-only, cap_drop ALL, tmpfs /tmp)
 build/Dockerfile             python:3.13-alpine pinned by digest; deps pinned in build/requirements.txt
 build/app/main.py            HTTP + run scheduling (all site values from the environment)
-build/app/pipeline.py        per watch: collectors → dedupe → LLM curation → md+JSON → state (STUB until task B2)
+build/app/pipeline.py        per watch: collectors → dedupe → LLM curation → md+JSON → state
 build/app/collectors/        collect_threat_intel.py, collect_ai_digest.py (stdlib only)
 build/app/static/            index.html, app.css, app.js, fonts/ (Orbitron, Inter, JetBrains Mono + OFL licenses)
 secrets/digest-litellm-key   copy of /srv/gateway/keys/digest.key (root:10001 0440)
@@ -40,8 +40,9 @@ watch cutoffs). Do not back up `secrets/`, which is re-creatable.
   must bind the WireGuard IP itself. The app binds `${BACKEND_WG_IP}:3300` (IP_FREEBIND, so it starts
   even before wg0 is up).
 - The container is read-only with a tmpfs `/tmp`; only `state/` is writable.
-- State seeding: the workstation's `~/.hermes/*-watches/*.json` state files are pushed into
-  `state/` once at deploy. After that Walter is the single source of truth — WebUI and CLI runs both
+- State seeding: the workstation's `~/.hermes/*-watches/*.json` state files are pushed once at deploy.
+  The volume is `./state:/state` and the pipeline reads `STATE_DIR/state/<watch>.json`, so they go to
+  `/srv/digest/state/state/{default,ai-security,ai-research}.json`, owned 10001:10001. After that Walter is the single source of truth — WebUI and CLI runs both
   hit the same state. If chat runs on the workstation continue before the first Walter run, state can
   diverge until Walter advances from the seed (acceptable for on-demand use).
 
@@ -79,7 +80,8 @@ sudo install -m 0440 -o root -g 10001 /srv/gateway/keys/digest.key secrets/diges
 ```bash
 cd /srv/digest && sudo docker compose down && sudo docker image rm walter-digest:local
 sudo ufw delete allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3300 proto tcp
-sudo sed -i '/3300/d' /usr/local/sbin/docker-user-rules.sh   # remove 3300 from PORTS (keep a .bak first)
+sudo sed -i.bak 's/ 3300"/"/' /usr/local/sbin/docker-user-rules.sh   # drop only the 3300 token from PORTS
+grep '^PORTS=' /usr/local/sbin/docker-user-rules.sh                    # the other ports must still be listed
 sudo systemctl restart docker-user-rules.service && sudo iptables -S WALTER-PUBLISHED   # no 3300 lines
 sudo rm -rf /srv/digest
 ```
