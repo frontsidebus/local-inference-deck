@@ -8,6 +8,10 @@ Files are written atomically (tmp file in the same dir + rename) with mode 600; 
 
 Public API:
     SUBDIRS                                   ("queue", "evidence", "findings", "acks", "done", "snapshots")
+    DEFERRED                                  "deferred": queue/deferred/ holds requests whose not_before lies
+                                              ahead (#40). judge-review.path watches queue/ only (PathChanged=
+                                              does not see writes in a subdirectory), so deferred plan writes
+                                              never start the runner; release moves them into queue/.
     ValidationError(ValueError)               .errors -> list[str]
     validate(obj, schema) -> list[str]        minimal JSON-schema subset: type, required, properties, items,
                                               enum, pattern, minLength, maxLength (anything else is ignored)
@@ -19,8 +23,10 @@ Public API:
     make_request(kind, session, since, *, changed_paths=(), claims="", plan=None, data_class="sensitive",
                  source_event, detail=None, created=None, request_id=None, root=None) -> dict (not written)
     write_request(req, root=None) -> Path     validates; raises ValidationError
-    read_request(request_id, root=None) -> dict   from queue/ or done/
-    list_pending(root=None) -> list[dict]     queue/*.json, oldest first (invalid files skipped)
+    read_request(request_id, root=None) -> dict   from queue/, queue/deferred/ or done/
+    list_pending(root=None) -> list[dict]     queue/*.json + queue/deferred/*.json (every request not judged
+                                              yet), oldest first (invalid files skipped)
+    list_ready(root=None, now=None) -> list[dict]   queue/*.json that are ready: what run_judge.py --pending judges
     move_done(request_id, root=None) -> Path
     write_finding(finding, root=None) -> (json_path, md_path)   drops items with empty evidence, validates
     render_finding_md(finding) -> str
@@ -43,8 +49,11 @@ Public API:
     release_plan_requests(session, root=None, now=None, refresh=None) -> list[str]
                                               turn ended: the session's deferred plan requests become ready
     release_due(root=None, now=None) -> list[str]
-                                              rewrite deferred requests whose not_before passed (wakes the
-                                              judge-review.path unit, which only fires on queue changes)
+                                              move deferred requests whose not_before passed into queue/ (wakes
+                                              the judge-review.path unit, which only fires on queue/ changes)
+    stall_status(root=None, now=None, minutes=None) -> dict | None
+                                              #41: the oldest ready request in queue/ has waited longer than
+                                              JUDGE_STALL_MINUTES (default 15) and no runner holds the lock
     evidence_dir(request_id, root=None, create=False) -> Path
     snapshot_dir(session, root=None, create=False) -> Path
     atomic_write(path, data, mode=0o600) / atomic_write_json(path, obj) / ensure_dir(path) / ensure_dirs(root)
@@ -63,6 +72,7 @@ from . import config
 
 SCHEMA_DIR = config.JUDGE_DIR / "schema"
 SUBDIRS = ("queue", "evidence", "findings", "acks", "done", "snapshots")
+DEFERRED = "deferred"  # queue/deferred/: not ready yet (not_before ahead); not watched by judge-review.path
 KINDS = ("plan", "gate", "completion", "runaway")
 
 REQUEST_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{1,6}-(plan|gate|completion|runaway)$")
@@ -95,6 +105,7 @@ def ensure_dirs(root=None) -> Path:
     r = ensure_dir(_root(root))
     for s in SUBDIRS:
         ensure_dir(r / s)
+    ensure_dir(r / "queue" / DEFERRED)
     return r
 
 
@@ -226,7 +237,7 @@ def new_request_id(kind: str, session: str, now: Optional[datetime] = None, root
     short = session_short(session)
     for i in range(3600):
         rid = f"{(now + timedelta(seconds=i)).strftime('%Y%m%dT%H%M%SZ')}-{short}-{kind}"
-        if not (r / "queue" / f"{rid}.json").exists() and not (r / "done" / f"{rid}.json").exists():
+        if not any((r / sub / f"{rid}.json").exists() for sub in ("queue", f"queue/{DEFERRED}", "done")):
             return rid
     raise RuntimeError("could not allocate a request id")
 
@@ -259,30 +270,50 @@ def make_request(kind: str, session: str, since: str, *, source_event: str, chan
 
 
 # ---------------------------------------------------------------- requests
+def deferred_dir(root=None) -> Path:
+    return _root(root) / "queue" / DEFERRED
+
+
+def _home_dir(req: Dict[str, Any], root=None, now: Optional[datetime] = None) -> Path:
+    """Where a pending request belongs: queue/deferred/ while its not_before lies ahead, else queue/."""
+    return deferred_dir(root) if not is_ready(req, now) else _root(root) / "queue"
+
+
+def pending_path(request_id: str, root=None) -> Optional[Path]:
+    """queue/<id>.json, else queue/deferred/<id>.json, else None."""
+    _check_request_id(request_id)
+    for d in (_root(root) / "queue", deferred_dir(root)):
+        p = d / f"{request_id}.json"
+        if p.is_file():
+            return p
+    return None
+
+
 def write_request(req: Dict[str, Any], root=None) -> Path:
+    """Validate and write a new request: to queue/deferred/ when its not_before lies ahead (#40), else to
+    queue/ (which starts judge-review.path)."""
     errs = validate_request(req)
     if errs:
         raise ValidationError(errs)
-    r = ensure_dirs(root)
-    return atomic_write_json(r / "queue" / f"{_check_request_id(req['id'])}.json", req)
+    ensure_dirs(root)
+    return atomic_write_json(_home_dir(req, root) / f"{_check_request_id(req['id'])}.json", req)
 
 
 def read_request(request_id: str, root=None) -> Dict[str, Any]:
     r = _root(root)
     _check_request_id(request_id)
-    for sub in ("queue", "done"):
+    for sub in ("queue", f"queue/{DEFERRED}", "done"):
         p = r / sub / f"{request_id}.json"
         if p.is_file():
             return _read_json(p)
-    raise FileNotFoundError(f"request {request_id} not in queue/ or done/")
+    raise FileNotFoundError(f"request {request_id} not in queue/, queue/{DEFERRED}/ or done/")
 
 
-def list_pending(root=None) -> List[Dict[str, Any]]:
-    q = _root(root) / "queue"
+def _scan(d: Path) -> List[Tuple[Path, Dict[str, Any]]]:
     out = []
-    if not q.is_dir():
+    if not d.is_dir():
         return out
-    for p in sorted(q.glob("*.json")):
+    for p in sorted(d.glob("*.json")):
         if not REQUEST_ID_RE.match(p.stem):
             continue
         try:
@@ -290,14 +321,30 @@ def list_pending(root=None) -> List[Dict[str, Any]]:
         except (OSError, ValueError):
             continue
         if isinstance(req, dict) and not validate_request(req):
-            out.append(req)
+            out.append((p, req))
     return out
+
+
+def list_pending(root=None) -> List[Dict[str, Any]]:
+    """Every request not judged yet: queue/ and queue/deferred/, oldest (id) first. A request present in both
+    (a release raced a merge) is listed once, from queue/."""
+    seen: Dict[str, Tuple[Path, Dict[str, Any]]] = {}
+    for p, req in _scan(deferred_dir(root)) + _scan(_root(root) / "queue"):
+        seen[p.stem] = (p, req)  # queue/ comes last: it wins
+    return [seen[k][1] for k in sorted(seen)]
+
+
+def list_ready(root=None, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Requests run_judge.py --pending would judge now: queue/*.json that are ready (is_ready)."""
+    return [req for _, req in _scan(_root(root) / "queue") if is_ready(req, now)]
 
 
 def move_done(request_id: str, root=None) -> Path:
     r = ensure_dirs(root)
     _check_request_id(request_id)
     src, dst = r / "queue" / f"{request_id}.json", r / "done" / f"{request_id}.json"
+    if not src.exists() and (deferred_dir(root) / f"{request_id}.json").exists():
+        src = deferred_dir(root) / f"{request_id}.json"
     os.replace(src, dst)
     return dst
 
@@ -314,7 +361,7 @@ def snapshot_dir(session: str, root=None, create: bool = False) -> Path:
 
 def _iter_all_requests(root=None):
     r = _root(root)
-    for sub in ("queue", "done"):
+    for sub in ("queue", f"queue/{DEFERRED}", "done"):
         d = r / sub
         if not d.is_dir():
             continue
@@ -495,26 +542,49 @@ def is_ready(req: Union[Dict[str, Any], str, Path], now: Optional[datetime] = No
         return True
 
 
-def _rewrite_pending(new: Dict[str, Any], old: Dict[str, Any], root=None) -> bool:
-    """Replace queue/<id>.json with *new* unless the runner has taken the request (done/ or evidence/
-    exists). Same race handling as merge_into_pending_completion. True when *new* is what is queued."""
+def _unlink(p: Path) -> None:
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def _rewrite_pending(new: Dict[str, Any], old: Dict[str, Any], root=None, now: Optional[datetime] = None) -> bool:
+    """Replace the pending request (queue/<id>.json or queue/deferred/<id>.json) with *new* unless the runner
+    has taken it (done/ or evidence/ exists). *new* goes where it belongs (_home_dir): a request that became
+    ready moves from queue/deferred/ into queue/ (that wakes judge-review.path), one pushed out again moves
+    back. Same race handling as merge_into_pending_completion; a concurrent release that moved the request
+    into queue/ while we rewrote the deferred copy wins (our copy is dropped, False). True when *new* is
+    what is pending."""
     errs = validate_request(new)
     if errs:
         raise ValidationError(errs)
     r = _root(root)
     rid = _check_request_id(str(new["id"]))
-    qp, dp, ev = r / "queue" / f"{rid}.json", r / "done" / f"{rid}.json", r / "evidence" / rid
-    if not qp.is_file() or dp.exists() or ev.exists():
+    dp, ev = r / "done" / f"{rid}.json", r / "evidence" / rid
+    cur = pending_path(rid, root)
+    if cur is None or dp.exists() or ev.exists():
         return False
-    atomic_write_json(qp, new)
+    dst = _home_dir(new, root, now) / f"{rid}.json"
+    ensure_dir(dst.parent)
+    atomic_write_json(dst, new)
+    if dst != cur:
+        _unlink(cur)
     if dp.exists() or ev.exists():
-        try:
-            if dp.exists():
-                os.unlink(qp)
-            else:
-                atomic_write_json(qp, old)
-        except OSError:
-            pass
+        # The runner took the request between our check and our write: no second, stale copy.
+        if dp.exists():
+            _unlink(dst)
+        else:  # being judged from queue/: put the original back where it was
+            try:
+                atomic_write_json(cur, old)
+            except OSError:
+                pass
+            if dst != cur:
+                _unlink(dst)
+        return False
+    qp = r / "queue" / f"{rid}.json"
+    if dst != qp and qp.exists():  # released into queue/ by another process meanwhile: that copy wins
+        _unlink(dst)
         return False
     return True
 
@@ -603,15 +673,17 @@ def release_plan_requests(session: str, root=None, now: Optional[datetime] = Non
                 refresh(new)
             except Exception:
                 pass
-        if _rewrite_pending(new, e, root):
+        if _rewrite_pending(new, e, root, now):
             out.append(str(e["id"]))
     return out
 
 
 def release_due(root=None, now: Optional[datetime] = None) -> List[str]:
-    """Rewrite each pending request whose not_before has passed and that was not released yet (adds
-    detail.released). judge-review.path only fires on queue changes: without this, a plan request whose
-    debounce ran out with no turn end would wait for an unrelated queue write. Returns the ids."""
+    """Release each pending request whose not_before has passed and that was not released yet (adds
+    detail.released): a deferred one moves from queue/deferred/ into queue/, a legacy one already in queue/
+    is rewritten in place. judge-review.path only fires on queue/ changes: without this, a plan request whose
+    debounce ran out with no turn end would never be judged. Called by every hook event, the runaway
+    watcher's poll and run_judge.py --pending (so judge-review.timer releases them too). Returns the ids."""
     now = now or datetime.now(timezone.utc)
     out = []
     for e in list_pending(root):
@@ -623,9 +695,77 @@ def release_due(root=None, now: Optional[datetime] = None) -> List[str]:
         new = dict(e)
         new["detail"] = dict(d)
         new["detail"]["released"] = utc_now_iso(now)
-        if _rewrite_pending(new, e, root):
+        if _rewrite_pending(new, e, root, now):
             out.append(str(e["id"]))
     return out
+
+
+def stall_minutes() -> float:
+    """JUDGE_STALL_MINUTES (default 15; 0 or negative = check off)."""
+    try:
+        return float(config.get("JUDGE_STALL_MINUTES", "15"))
+    except (ValueError, TypeError):
+        return 15.0
+
+
+def runner_busy(root=None) -> bool:
+    """True when a run_judge.py holds $JUDGE_REVIEW_DIR/.runner.lock (non-blocking probe; False on errors)."""
+    import fcntl
+    p = _root(root) / ".runner.lock"
+    if not p.exists():
+        return False
+    try:
+        with open(p, "a") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        return False
+    return False
+
+
+def stall_status(root=None, now: Optional[datetime] = None, minutes: Optional[float] = None
+                 ) -> Optional[Dict[str, Any]]:
+    """#41: None, or {"count", "oldest", "since", "minutes", "limit"} when the oldest READY request in queue/
+    has waited more than *minutes* (JUDGE_STALL_MINUTES, default 15) and no runner is busy. Catches a failed
+    judge-review.path/.service and any other stall (backend failing, units never installed). Cheap enough for
+    a per-turn hook: one stat() per queue file; JSON is parsed only for files older than the limit.
+    "Waited" counts from the file's mtime: when it landed in queue/ (or was last rewritten there)."""
+    limit = stall_minutes() if minutes is None else float(minutes)
+    if limit <= 0:
+        return None
+    q = _root(root) / "queue"
+    try:
+        entries = [e for e in os.scandir(q) if e.name.endswith(".json") and e.is_file()
+                   and REQUEST_ID_RE.match(e.name[:-5])]
+    except OSError:
+        return None
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.timestamp() - limit * 60
+    old = []
+    for e in entries:
+        try:
+            mt = e.stat().st_mtime
+        except OSError:
+            continue
+        if mt <= cutoff and is_ready(e.path, now):
+            old.append((mt, e.name[:-5]))
+    if not old or runner_busy(root):
+        return None
+    mt, rid = min(old)
+    since = datetime.fromtimestamp(mt, timezone.utc)
+    return {"count": len(old), "oldest": rid, "since": utc_now_iso(since),
+            "minutes": int((now - since).total_seconds() // 60), "limit": limit}
+
+
+def stall_line(st: Dict[str, Any]) -> str:
+    """One line for humans (judge-findings) about a stall_status() result."""
+    return (f"WARNING: judge runner is not running or stalled: {st['count']} review request(s) waiting, the "
+            f"oldest since {st['since']} ({st['minutes']} min > {st['limit']:g}). Check: systemctl --user status "
+            "judge-review.path judge-review.service judge-review.timer; fix: systemctl --user reset-failed "
+            "judge-review.service judge-review.path && systemctl --user start judge-review.path")
 
 
 # ---------------------------------------------------------------- findings

@@ -260,3 +260,52 @@ def test_plan_debounce_expiry_releases_without_turn_end(env, monkeypatch):
     assert q.release_due(now=later) == [r["id"]]
     assert q.list_pending()[0]["detail"]["released"]
     assert q.release_due(now=later) == []
+
+
+# ---------------------------------------------------------------- #40 deferred requests stay out of queue/
+def _top_level(env):
+    """Entries directly in queue/ (what judge-review.path's PathChanged= sees), deferred/ itself excluded."""
+    return sorted(p.name for p in (env["review"] / "queue").iterdir() if p.name != q.DEFERRED)
+
+
+def test_plan_burst_never_touches_watched_queue_dir(env, monkeypatch):
+    """Pilot 2: 10 parallel plan patches started judge-review.service 5x in 1 s (start-limit-hit). Deferred plan
+    requests now live in queue/deferred/, which the path unit does not watch: no entry of queue/ itself is
+    created, renamed or rewritten until the turn ends (tmp files of the atomic write included)."""
+    RJ, judged = _runner(monkeypatch)
+    run(ev(env, "on_session_start"))
+    plan = env["cwd"] / ".hermes" / "plans" / "p.md"
+    queue_dir = env["review"] / "queue"
+    q.ensure_dirs(env["review"])
+    before = queue_dir.stat().st_mtime_ns
+    for n in range(1, 11):
+        plan.write_text(f"# v{n}\n")
+        _plan_patch(env, plan, n)
+    assert _top_level(env) == [] and queue_dir.stat().st_mtime_ns == before
+    [r] = q.list_pending()
+    assert (q.deferred_dir() / f"{r['id']}.json").is_file() and q.list_ready() == []
+    assert RJ.main(["--pending"]) == 0 and judged == []
+    # turn end: the request moves into queue/ (one change there = one wake-up) and is judged once
+    run(ev(env, "on_session_end", extra={"turn_id": "turn-1", "completed": True}))
+    assert f"{r['id']}.json" in _top_level(env)
+    assert not (q.deferred_dir() / f"{r['id']}.json").exists()
+    assert RJ.main(["--pending"]) == 0
+    assert [x for x in judged if x.endswith("-plan")] == [r["id"]]
+
+
+def test_runner_pending_releases_due_deferred(env, monkeypatch):
+    """judge-review.timer backstop: run_judge.py --pending itself releases deferred requests whose debounce ran
+    out (no hook event, no watcher poll needed) and judges them in the same run."""
+    from datetime import datetime, timedelta, timezone
+    RJ, judged = _runner(monkeypatch)
+    past = datetime.now(timezone.utc) - timedelta(seconds=5)
+    r = q.make_request("plan", SESSION, "2026-10-04T00:00:00Z", source_event="post_tool_call",
+                       changed_paths=["/tmp/p.md"], not_before=q.utc_now_iso(past + timedelta(minutes=10)))
+    q.write_request(r)
+    assert q.pending_path(r["id"]).parent == q.deferred_dir()
+    assert RJ.main(["--pending"]) == 0 and judged == []          # not due yet: left in deferred/
+    d = json.loads(q.pending_path(r["id"]).read_text())
+    d["not_before"] = q.utc_now_iso(past)                         # the debounce ran out
+    (q.deferred_dir() / f"{r['id']}.json").write_text(json.dumps(d))
+    assert RJ.main(["--pending"]) == 0 and judged == [r["id"]]
+    assert (env["review"] / "done" / f"{r['id']}.json").is_file() and q.list_pending() == []

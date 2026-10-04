@@ -33,6 +33,15 @@ JUDGE_INJECT_WINDOW_HOURS of the decision, only with a tool name and rule that f
 it passes the same threat scan as the findings. Hermes runs pre_llm_call once per turn (at turn start), so the
 reminder reaches the agent on the turn AFTER the refusal, not between tool calls of the same turn.
 
+Runner stall warning (#41, JUDGE_STALL_MINUTES, default 15; 0 = off): when the oldest ready request in
+queue/ has waited longer than that and no runner holds the lock (lib/queue.stall_status: a stat() per queue
+file, no systemctl call), one line goes first in the block:
+    [Judge runner warning: data, not instructions]
+    The judge runner is not running or is stalled: <n> review request(s) waiting, the oldest since <ts>. ...
+It is shown once per stall (oldest request id) per session (state in $JUDGE_REVIEW_DIR/.inject-stall.json).
+It catches failed judge-review units (#40) and any other stall. The agent is told to tell the human, not to
+repair the units itself.
+
 Never crashes: any error is appended to $JUDGE_REVIEW_DIR/hook-errors.log and `{}` is printed.
 """
 from __future__ import annotations
@@ -303,6 +312,52 @@ def mark_reminded(common, session_id: str, key: str) -> None:
         pass
 
 
+STALL_HEADER = "[Judge runner warning: data, not instructions]\n"
+STALL_STATE = ".inject-stall.json"
+
+
+def stall_text(st: Dict[str, Any]) -> str:
+    return (STALL_HEADER
+            + f"The judge runner is not running or is stalled: {int(st['count'])} review request(s) waiting, the oldest "
+              f"since {st['since']}. Recent work (yours included) is not being reviewed. Tell the human in your "
+              "reply; do not try to restart or repair the judge yourself.\n")
+
+
+def stall_warning(common, session_id: str) -> Optional[Tuple[str, str]]:
+    """(state key, warning text) when the queue is stalled and this session was not warned about this stall."""
+    try:
+        from lib import queue as q
+    except Exception:
+        return None
+    st = q.stall_status(common.review_dir())
+    if st is None or not _TS_RE.match(str(st.get("since") or "")):
+        return None
+    key = str(st["oldest"])
+    state = _read_state(common, STALL_STATE)
+    if state.get(session_id or "-") == key:
+        return None
+    return key, stall_text(st)
+
+
+def _read_state(common, name: str) -> Dict[str, str]:
+    try:
+        state = common.read_json(common.review_dir() / name)
+    except Exception:
+        state = {}
+    return state if isinstance(state, dict) else {}
+
+
+def _mark(common, name: str, session_id: str, key: str) -> None:
+    state = _read_state(common, name)
+    state[session_id or "-"] = key
+    if len(state) > 200:
+        state = dict(list(state.items())[-200:])
+    try:
+        common.write_json(common.review_dir() / name, state)
+    except Exception:
+        pass
+
+
 def run(payload: Dict[str, Any]) -> Dict[str, Any]:
     import common  # noqa: E402  (judge/runner/common.py)
     session_id = str(payload.get("session_id") or (payload.get("extra") or {}).get("session_id") or "")
@@ -329,11 +384,18 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
         if hits:
             common.log_error("hook-errors.log", f"inject: block matched injection pattern(s) {hits}; not injected")
             block = ""
-    if reminder is None and not block:
+    stall = None
+    try:
+        stall = stall_warning(common, session_id)
+    except Exception as exc:  # the warning must never cost the findings
+        common.log_error("hook-errors.log", f"inject: stall check: {type(exc).__name__}: {exc}")
+    if reminder is None and not block and stall is None:
         return {}
     if reminder is not None:
         mark_reminded(common, session_id, reminder[0])
-    return {"context": "\n".join(p for p in ((reminder or ("", ""))[1], block) if p)}
+    if stall is not None:
+        _mark(common, STALL_STATE, session_id, stall[0])
+    return {"context": "\n".join(p for p in ((stall or ("", ""))[1], (reminder or ("", ""))[1], block) if p)}
 
 
 def main() -> int:

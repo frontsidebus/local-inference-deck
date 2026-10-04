@@ -17,7 +17,9 @@
 #   --review-dir DIR      review data dir (default: $JUDGE_REVIEW_DIR, else site.env, else $HERMES_HOME/review)
 #   --with-units          also install the systemd user units from runner/units/ and watch/
 #   --unit-dir DIR        where units go (default: ${XDG_CONFIG_HOME:-~/.config}/systemd/user)
-#   --start               with --with-units: run systemctl --user daemon-reload/enable --now (else only print)
+#   --start               with --with-units: run systemctl --user daemon-reload, reset-failed and enable --now
+#                         (else only print). Units: judge-review.{service,path,timer}, judge-alert@.service
+#                         (OnFailure= alerts, never enabled), watch/judge-runaway-watch.service
 #
 # The hooks block is merged with the Hermes venv's PyYAML. Managed entries carry `managed_by: agent-judge`
 # (Hermes ignores unknown keys in a hook entry), and are also recognised by their command path
@@ -362,6 +364,7 @@ units_to_enable() { # $@ = installed unit names; .path/.timer units, plus servic
   local u base
   for u in "$@"; do
     case $u in
+      *@.service|*@.path|*@.timer) ;;   # templates (judge-alert@.service) are started by OnFailure=, never enabled
       *.path|*.timer) echo "$u";;
       *.service)
         base=${u%.service}
@@ -394,14 +397,25 @@ PY
   done
   local enable; mapfile -t enable < <(units_to_enable "${names[@]}")
   echo
+  # reset-failed: a unit left failed by an earlier start-limit hit (#40) is cleared before it is (re)started.
+  local reset=("${names[@]}"); local i
+  for i in "${!reset[@]}"; do [[ ${reset[$i]} == *@.* ]] && unset 'reset[i]'; done
   if ((START)) && [[ $1 == apply ]]; then
     systemctl --user daemon-reload
+    ((${#reset[@]})) && { systemctl --user reset-failed "${reset[@]}" 2>/dev/null || true; }
     ((${#enable[@]})) && systemctl --user enable --now "${enable[@]}"
+    # enable --now leaves an already-running unit alone: restart the path/timer units so changed [Path]/[Timer]
+    # settings apply (this never interrupts a judge run; judge-review.service itself is not restarted).
+    local trig=(); for i in "${enable[@]}"; do [[ $i == *.path || $i == *.timer ]] && trig+=("$i"); done
+    ((${#trig[@]})) && systemctl --user restart "${trig[@]}"
     echo "units: enabled and started ${enable[*]}"
   else
     echo "To start the judge units:"
     echo "  systemctl --user daemon-reload"
+    ((${#reset[@]})) && echo "  systemctl --user reset-failed ${reset[*]}"
     ((${#enable[@]})) && echo "  systemctl --user enable --now ${enable[*]}"
+    local trig=(); for i in "${enable[@]}"; do [[ $i == *.path || $i == *.timer ]] && trig+=("$i"); done
+    ((${#trig[@]})) && echo "  systemctl --user restart ${trig[*]}   # apply changed [Path]/[Timer] settings to running units"
     echo "  (add --start to have this script run them)"
   fi
 }
@@ -447,12 +461,12 @@ fi
 if [[ $MODE == apply ]]; then
   mkdir -p "$JUDGE_REVIEW_DIR"
   chmod 700 "$JUDGE_REVIEW_DIR"
-  for d in queue evidence findings acks done snapshots; do
+  for d in queue queue/deferred evidence findings acks done snapshots; do
     mkdir -p "$JUDGE_REVIEW_DIR/$d"; chmod 700 "$JUDGE_REVIEW_DIR/$d"
   done
   echo "review dir: $JUDGE_REVIEW_DIR (mode 700)"
 else
-  echo "review dir: would create $JUDGE_REVIEW_DIR and its queue/ evidence/ findings/ acks/ done/ snapshots/ (mode 700)"
+  echo "review dir: would create $JUDGE_REVIEW_DIR and its queue/ queue/deferred/ evidence/ findings/ acks/ done/ snapshots/ (mode 700)"
 fi
 render_policy "$MODE"
 ((WITH_UNITS)) && { echo; install_units "$MODE"; }

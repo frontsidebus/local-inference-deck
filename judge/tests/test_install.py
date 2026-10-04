@@ -342,3 +342,79 @@ def test_real_units_render_completely(env):
     assert f"Environment=JUDGE_REVIEW_DIR={env.review}" in svc
     assert f"PathChanged={env.review}/queue" in rendered["judge-review.path"]
     assert f"ExecStart={py} {env.judge}/watch/runaway.py" in rendered["judge-runaway-watch.service"]
+
+
+# ---------------------------------------------------------------- #40/#41 units: limits, timer, alerts
+def _ship_all_units(env):
+    for sub in ("runner/units", "watch"):
+        (env.judge / sub).mkdir(parents=True, exist_ok=True)
+        for f in sorted((JUDGE / sub).iterdir()):
+            if f.suffix in (".service", ".path", ".timer"):
+                shutil.copy2(f, env.judge / sub / f.name)
+
+
+SHIPPED = ("judge-review.service", "judge-review.path", "judge-review.timer", "judge-alert@.service",
+           "judge-runaway-watch.service")
+
+
+def test_units_have_limits_timer_and_alerts(env):
+    _ship_all_units(env)
+    p = env.run("--apply", "--with-units")
+    assert sorted(x.name for x in env.units.iterdir()) == sorted(SHIPPED)
+    u = {n: (env.units / n).read_text() for n in SHIPPED}
+    for n, text in u.items():
+        body = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+        assert "${" not in body, f"{n} has an unrendered variable"
+    svc = u["judge-review.service"]
+    unit_sec = svc.split("[Service]")[0]
+    assert "StartLimitIntervalSec=0" in unit_sec and "OnFailure=judge-alert@%n.service" in unit_sec
+    path = u["judge-review.path"]
+    assert "TriggerLimitIntervalSec=2s" in path and "TriggerLimitBurst=1000" in path
+    assert "OnFailure=judge-alert@%n.service" in path.split("[Path]")[0]
+    assert f"PathChanged={env.review}/queue\n" in path
+    timer = u["judge-review.timer"]
+    assert "Unit=judge-review.service" in timer and "OnUnitInactiveSec=5min" in timer and "OnActiveSec=" in timer
+    assert "WantedBy=timers.target" in timer
+    alert = u["judge-alert@.service"]
+    assert f"/runner/alert.py %i" in alert and f"Environment=JUDGE_REVIEW_DIR={env.review}" in alert
+    assert "[Install]" not in alert
+    # enabled: path, timer and watcher; never the template, never the triggered service
+    assert ("systemctl --user enable --now judge-review.path judge-review.timer judge-runaway-watch.service"
+            in p.stdout)
+    assert "systemctl --user reset-failed judge-review.service judge-review.path judge-review.timer judge-runaway-watch.service" in p.stdout
+    assert "systemctl --user restart judge-review.path judge-review.timer" in p.stdout
+    assert "judge-alert@" not in "".join(ln for ln in p.stdout.splitlines() if "enable --now" in ln)
+    assert (env.review / "queue" / "deferred").is_dir()
+    p = env.run("--uninstall", "--with-units")
+    assert not any(env.units.iterdir())
+    assert "disable --now judge-review.path judge-review.timer judge-runaway-watch.service" in p.stdout
+
+
+def test_start_runs_reset_failed_enable_and_restart(env, monkeypatch):
+    """--start drives systemctl (a stub here: the live user manager is never touched)."""
+    _ship_all_units(env)
+    stub = env.tmp / "stub"
+    stub.mkdir()
+    log = env.tmp / "systemctl.log"
+    (stub / "systemctl").write_text(f"#!/bin/sh\necho \"$@\" >> {log}\n")
+    (stub / "systemctl").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stub}:{os.environ['PATH']}")
+    env.run("--apply", "--with-units", "--start")
+    calls = log.read_text().splitlines()
+    assert calls[0] == "--user daemon-reload"
+    assert calls[1] == "--user reset-failed judge-review.service judge-review.path judge-review.timer judge-runaway-watch.service"
+    assert calls[2] == "--user enable --now judge-review.path judge-review.timer judge-runaway-watch.service"
+    assert calls[3] == "--user restart judge-review.path judge-review.timer"
+
+
+@pytest.mark.skipif(not shutil.which("systemd-analyze"), reason="systemd-analyze not installed")
+def test_rendered_units_pass_systemd_analyze_verify(env):
+    """The real systemd parser on the rendered files (temp dir only; `verify` loads them into a private
+    manager, it does not touch the running user units). Any warning (unknown key, bad value) fails."""
+    _ship_all_units(env)
+    env.run("--apply", "--with-units", "--python", sys.executable)
+    names = [n for n in SHIPPED if n != "judge-alert@.service"] + ["judge-alert@judge-review.service.service"]
+    p = subprocess.run(["systemd-analyze", "--user", "verify", *names], cwd=env.units, capture_output=True,
+                       text=True, timeout=60)
+    out = (p.stdout + p.stderr).strip()
+    assert p.returncode == 0 and out == "", out

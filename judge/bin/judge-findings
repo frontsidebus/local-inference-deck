@@ -16,10 +16,15 @@ Every item has a status:
   --min-severity LEVEL   low|medium|high (default low)
   --since HOURS          only findings created in the last HOURS (default 168; 0 = all)
   --json                 machine-readable output (each item gets "acked", "status" and "ack")
+Runner health (#41), printed to stderr first: a WARNING when the oldest ready review request has waited longer
+than JUDGE_STALL_MINUTES (default 15) with no runner busy, and when `systemctl --user is-failed` reports a
+judge-review unit failed (skipped when JUDGE_CHECK_UNITS=0 or systemctl is missing). Both print the fix command.
 Colors are used only when stdout is a TTY and NO_COLOR is unset.
 """
 import json
 import os
+import shutil
+import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -97,10 +102,42 @@ def describe_ack(it):
     return f"     ack: {who} {a.get('ts', '')}: {a.get('reason', '')}"
 
 
+UNITS = ("judge-review.service", "judge-review.path", "judge-review.timer")
+
+
+def failed_units():
+    """judge-review units systemd reports as failed ([] when unknown, or JUDGE_CHECK_UNITS=0)."""
+    if os.environ.get("JUDGE_CHECK_UNITS", "1") == "0" or not shutil.which("systemctl"):
+        return []
+    try:
+        p = subprocess.run(["systemctl", "--user", "is-failed", *UNITS], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    states = p.stdout.split()
+    return [u for u, s in zip(UNITS, states) if s.strip() == "failed"]
+
+
+def health_warnings(root):
+    out = []
+    bad = failed_units()
+    if bad:
+        out.append(f"WARNING: judge runner is not running: {' '.join(bad)} failed. Fix: systemctl --user "
+                   "reset-failed judge-review.service judge-review.path && systemctl --user start judge-review.path")
+    try:
+        st = Q.stall_status(root)
+    except Exception:
+        st = None
+    if st:
+        out.append(Q.stall_line(st))
+    return out
+
+
 def main(argv):
     o = parse(argv)
     floor = C.SEVERITY_RANK[o["min"]]
     root = C.review_dir()
+    for w in health_warnings(root):
+        print(paint(w, "31;1"), file=sys.stderr)
     paths = Q.agent_event_paths(root)
     rows = []
     for path, f in C.iter_findings():

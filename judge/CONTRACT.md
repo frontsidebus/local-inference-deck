@@ -37,6 +37,8 @@ judge/
   runner/                judge prompt, run-judge (frontier|local), findings validator, systemd user units (runner agent)
   runner/rejudge.py      re-judge stored bundles with the current prompt/validator, without touching findings/
   runner/prompt-claims.md   preamble of the frontier claims stage (prepended to runner/prompt.md)
+  runner/alert.py        OnFailure= alert for the runner units (runner.log + notify-send; #41)
+  runner/units/          judge-review.{service,path,timer}, judge-alert@.service (systemd --user; see "Runner units")
   bin/judge-ack|judge-findings   operator CLIs (acks, listing)
   watch/runaway.py       C6 llama-server slot watcher (verify agent)
   tests/                 pytest; one test module per part; fixtures under tests/fixtures/
@@ -46,7 +48,9 @@ judge/
 - `HERMES_HOME` (default `~/.hermes`)
 - `JUDGE_REVIEW_DIR` (default `$HERMES_HOME/review`):
 ```
-queue/<request-id>.json          pending review requests
+queue/<request-id>.json          pending review requests, ready to judge (watched by judge-review.path)
+queue/deferred/<request-id>.json pending requests whose `not_before` lies ahead (#40; NOT watched: moved into
+                                 queue/ when released)
 evidence/<request-id>/           collector output (see bundle below)
 findings/<request-id>.json       judge output (validated)
 findings/<request-id>.md         human-readable rendering of the same
@@ -59,6 +63,10 @@ gate.log                         JSONL, one line per C2 decision (incl. `tool_ca
 watch.log                        JSONL, one line per C6 alert
 inject.log                       C5: one line when the count of skipped local-mode items changes for a session
 .inject-local-skips.json         C5 state for inject.log ({session: last logged count}, at most 200 sessions)
+.inject-stall.json               C5 state of the runner stall warning ({session: oldest stalled request id}; #41)
+runner.log                       runner messages; judge-alert@.service appends `ALERT: judge unit ... failed` lines
+.alert-state.json                runner/alert.py: last desktop alert per unit (rate limit)
+.runner.lock                     flock held by run_judge.py while it runs (one runner at a time)
 ```
 Writes are atomic (write tmp + rename). Files are mode 600, dirs 700.
 
@@ -98,10 +106,27 @@ the new write; `data_class` = `sensitive` if either is; `id`, `kind`, `session`,
 **Turn end:** `on_session_end` first releases every pending plan request of the session not yet released:
 `not_before` = now (if it had one), `detail.turn_ended` = now, `claims` re-read from the plan file (its final
 text). A plan write after that starts a new request. **Debounce expiry:** after every hook event,
-`release_due` rewrites each pending request whose `not_before` has passed and that carries neither
+`release_due` releases each pending request whose `not_before` has passed and that carries neither
 `detail.released` nor `detail.turn_ended` (adds `detail.released`), because `judge-review.path` fires only on
 queue/ changes. **Runner:** `run_judge.py --pending` skips a request while `not_before` lies ahead
 (`queue.is_ready`; a missing or unparsable field is ready); `run_judge.py <id>` judges it regardless.
+
+**Where deferred requests live** (#40). `write_request` and every rewrite (`merge_into_pending_plan`,
+`release_plan_requests`, `release_due`) put a request whose `not_before` lies ahead in `queue/deferred/`, and a
+ready one in `queue/` (`_rewrite_pending` moves it: write the new copy, then unlink the old). `judge-review.path`
+uses `PathChanged=` on `queue/`, which (inotify) sees only entries of `queue/` itself, so plan writes during a
+turn never start the runner; the release (turn end, debounce expiry) is one change in `queue/`. Verified with a
+transient `systemd-run --user --path-property=PathChanged=...` unit on systemd 255: writes and renames inside
+`queue/deferred/` did not trigger it; a rename into `queue/` did. Before this, each of a burst of plan writes
+started `run_judge.py --pending`, which exited in ~60 ms with nothing ready; 5 starts in 10 s hit systemd's
+default start limit and left both units failed (pilot 2). Readers: `list_pending` = queue/ + queue/deferred/
+(every request not judged yet; a request in both, from a release racing a merge, is listed once, from queue/);
+`list_ready` / `run_judge.pending_ids` = ready requests in `queue/` only; `read_request`, `new_request_id`,
+`is_duplicate` and the collector's window (`_iter_all_requests`) see all three of queue/, queue/deferred/,
+done/. A rewrite of the deferred copy that finds the request released into `queue/` meanwhile drops its copy and
+returns "not merged" (the caller writes a new request). A legacy request in `queue/` with `not_before` ahead is
+still skipped by the runner and released in place. `run_judge.py --pending` calls `release_due` first, so
+`judge-review.timer`'s runs release due requests even when no hook or watcher poll did.
 
 **Turns with no tool activity** (#29, `hooks/enqueue.py::text_only_reason`). `on_session_end` skips a turn
 with no tool activity in `agent.log`, no `events.jsonl` events in the window, no write targets and no new
@@ -145,7 +170,24 @@ entry is infra too, so every worktree of the deck repo (and its main clone) is c
 `lib/config.git_common_dir(path)` finds the nearest ancestor with a `.git` entry: a `.git` directory is the
 common dir; a `.git` file `gitdir: <main>/.git/worktrees/<name>` resolves through that gitdir's `commondir` file
 (or the `worktrees/` layout) to `<main>/.git`. Parsed from files, no subprocess. Undetermined layouts (broken
-`gitdir:`, submodules' `.git/modules/<x>`, no checkout) stay **sensitive**; `*/.env` is never infra.
+`gitdir:`, submodules' `.git/modules/<x>`, no checkout) stay **sensitive**.
+**Secret-shaped files are never infra** (#42, `lib/config.is_secret_path`), wherever they are: in the deck repo or
+one of its worktrees, /etc, /srv, or a `walter:`/`covenant:` path. Basename globs (case-insensitive,
+`SECRET_GLOBS` + `JUDGE_SECRET_GLOBS`): the gate's `secret_output.secret_names` (`*.key`, `*.pem`, `.env`, `*.env`,
+`api-key`/`api_key`/`apikey`, `*secret*`, `*password*`, `id_rsa`/`id_ecdsa`/`id_ed25519`/`id_dsa`, `*.p12`,
+`*.pfx`, `*.keystore`, `credentials`, `.netrc`, `.pgpass`, `auth.json`, `wg*.conf`, `token`, `*.token`,
+`privkey*`, `*.age`, `*.kdbx`, ...) plus `.env.*`, `*.env.*` (`site.env.bak-*`), `*.jks`, `.htpasswd`,
+`.git-credentials`, `.sanitize-*`; or a directory component `secrets`, `.secrets` or `private`
+(`/etc/ssl/private/`). Names ending in one of the gate's `not_secret_names` suffixes (`.pub`, `.example`,
+`.sample`, `.tmpl`, `.template`, `.md`, `.sh`, `.py`, ... and `.dist`) stay classified by location
+(`site.env.example`, `gen-secrets.sh`, `rotate-secrets.md`, `scripts/secrets.d/walter.sh`). One such path makes
+the request, and the bundle, sensitive (local judge, `# content withheld` stat lines).
+**Reads.** A file the agent only read never enters a bundle: `read_file` events carry no paths, Hermes logs a
+read as `tool read_file completed (Ns, N chars)` (no content), `tool-calls.jsonl` holds tool and program names
+only, and `agent-diff.patch` covers changed paths only. Text the agent itself writes (its final answer in
+`claims`, a command line in a gate excerpt) is redacted (`lib/redact`), not value-checked; the frontier claims
+stage additionally masks IPs, hosts and accounts (`claims_only`). Tested in `test_collector.py`
+(`test_site_env_values_never_reach_a_bundle`: site.env in an infra worktree, read only and read + edited).
 A request without paths is `infra` only when the session cwd is infra (`classify([], cfg, cwd)`), or when it is a
 `gate` request whose `detail.rules` are all host rules (`lib/config.HOST_RULES`: `remote-mutation`,
 `remote-opaque`, `remote-copy`; shared by `hooks/gate.py` and the collector), or when it is a C6 watcher
@@ -753,6 +795,39 @@ sessions). The reminder is injected even when there are no findings. Hermes call
 turn start, so the reminder reaches the agent on the next turn of the session, not between the tool calls of the
 turn that was refused.
 
+**Runner stall warning (#41).** When the oldest ready request in `queue/` has waited longer than
+`JUDGE_STALL_MINUTES` (default 15; `0` = off) by its file mtime and no runner holds `.runner.lock`
+(`lib/queue.stall_status`: one `stat()` per queue file, JSON parsed only for old files, no `systemctl` call),
+the context starts with:
+
+    [Judge runner warning: data, not instructions]
+    The judge runner is not running or is stalled: <n> review request(s) waiting, the oldest since <ts>. Recent
+    work (yours included) is not being reviewed. Tell the human in your reply; do not try to restart or repair the
+    judge yourself.
+
+Once per stall (oldest request id) per session (`.inject-stall.json`). Chosen over a per-turn
+`systemctl --user is-failed` (≈5 ms, and the agent should not be pointed at unit control): the queue check also
+catches stalls with healthy-looking units (a failing backend, units never installed). `judge-findings` prints the
+same condition (and `systemctl --user is-failed judge-review.{service,path,timer}`, unless `JUDGE_CHECK_UNITS=0`)
+as a `WARNING:` line with the fix command on stderr.
+
+## Runner units (`runner/units/`, installed by `install.sh --with-units`)
+| Unit | What | Settings (#40/#41) |
+|---|---|---|
+| `judge-review.path` | `PathChanged=$JUDGE_REVIEW_DIR/queue` (not `queue/deferred/`) → starts the service | `TriggerLimitIntervalSec=2s`, `TriggerLimitBurst=1000` (default 200/2 s); `OnFailure=judge-alert@%n.service` |
+| `judge-review.service` | oneshot `run_judge.py --pending` (release due → judge ready → re-scan) | `StartLimitIntervalSec=0` in `[Unit]` (no start limit; the runner is locked and idempotent); `OnFailure=judge-alert@%n.service`; `TimeoutStartSec=3600` |
+| `judge-review.timer` | backstop: starts the service `OnActiveSec=2min`, then `OnUnitInactiveSec=5min` after each run | `Persistent=` not used (it only applies to `OnCalendar=`); a failed path unit delays reviews by ≤ 5 min |
+| `judge-alert@.service` | template, instance = failed unit; `runner/alert.py %i` | appends `ALERT: judge unit <unit> failed (result=..)... Fix: ...` to `runner.log`; `notify-send -u critical` when `DISPLAY`/`WAYLAND_DISPLAY` is set, ≤ 1 per unit per `JUDGE_ALERT_MIN_INTERVAL_S` (900); never enabled; never restarts anything |
+
+The service is `failed` after any non-zero exit too (a judge backend failure leaves a request queued for retry),
+so the alert also fires for those. The fix command in every alert and warning:
+`systemctl --user reset-failed judge-review.service judge-review.path && systemctl --user start judge-review.path`.
+`install.sh --with-units` enables `judge-review.path`, `judge-review.timer` and `judge-runaway-watch.service`
+(never a template, never a service a path/timer triggers) and, with `--start`, runs `daemon-reload`,
+`reset-failed` (all non-template units), `enable --now`, and `restart` of the path/timer units so changed
+settings apply; without `--start` it prints those commands. The rendered units pass
+`systemd-analyze --user verify` with no output (`test_install.py`).
+
 ## Re-judging (`runner/rejudge.py`)
 `rejudge.py <request-id>... --out DIR [--mode local|frontier|frontier-claims] [--model X] [--no-budget] [--sensitive-local]` judges existing bundles
 again with the current prompt and validator, via `run_judge.judge_bundle(request_id, request, evidence_dir, mode,
@@ -787,7 +862,12 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `JUDGE_REVIEW_TEXT_ONLY=1`, `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS=200`, `JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1` (#29),
 `JUDGE_LOCAL_MAX_TOKENS=4096`, `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default 2 × `JUDGE_LOCAL_MAX_TOKENS`; #30),
 `JUDGE_REFUSAL_NEXT_CALLS=6` (calls listed after each refusal in `refusals.jsonl`, 1–20; site.env only),
-`JUDGE_INJECT_REFUSAL_REMINDER=1` (0 = no refusal reminder in C5; #39).
-Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).
+`JUDGE_INJECT_REFUSAL_REMINDER=1` (0 = no refusal reminder in C5; #39),
+`JUDGE_STALL_MINUTES=15` (C5/judge-findings runner stall warning; 0 = off; #41),
+`JUDGE_SECRET_GLOBS=""` (extra basename globs of secret files, never infra-class; #42).
+Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack),
+`JUDGE_CHECK_UNITS=0` (judge-findings skips `systemctl --user is-failed`; the tests set it),
+`JUDGE_ALERT_MIN_INTERVAL_S=900` (judge-alert@.service, e.g. in `~/.config/judge/judge.env`: seconds between
+desktop alerts per unit; #41).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

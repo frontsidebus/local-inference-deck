@@ -1,14 +1,21 @@
-# systemd USER path unit: run the judge whenever review requests land in queue/.
+# systemd USER path unit: run the judge whenever review requests land in queue/ (not queue/deferred/).
 # ${JUDGE_REVIEW_DIR} is rendered by judge/install.sh --with-units (default %h/.hermes/review).
 #   systemctl --user daemon-reload && systemctl --user enable --now judge-review.path
 [Unit]
 Description=judge: watch the review queue and run the judge on new requests
+# #41: alert when this path unit fails (e.g. trigger limit hit, or the service refused to start).
+OnFailure=judge-alert@%n.service
 
 [Path]
 PathChanged=${JUDGE_REVIEW_DIR}/queue
 MakeDirectory=yes
 DirectoryMode=0700
 Unit=judge-review.service
+# #40: deferred plan requests live in queue/deferred/ (not watched: PathChanged= only sees entries of
+# queue/ itself), so plan writes during a turn do not start the runner. A burst of real queue writes must
+# still never fail this unit: allow 1000 triggers per 2 s (systemd's default is 200 per 2 s for path units).
+TriggerLimitIntervalSec=2s
+TriggerLimitBurst=1000
 
 [Install]
 WantedBy=default.target

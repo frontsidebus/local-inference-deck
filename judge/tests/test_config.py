@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -153,3 +154,54 @@ def test_classify_unknown_gitdir_stays_sensitive(env, tmp_path, monkeypatch):
     plain.mkdir()
     (plain / ".git").write_text("not a gitdir line\n")
     assert config.classify([str(plain / "a.sh")]) == "sensitive"
+
+
+# ---------------------------------------------------------------- #42 secret-shaped files are never infra
+@pytest.mark.parametrize("name", ["site.env", "gateway.env", ".env", ".env.local", "site.env.bak-20261004",
+                                  "edge.pem", "digest.key", "api-key", "api_key", ".htpasswd", ".sanitize-words",
+                                  ".sanitize-extra", "id_ed25519", "creds.p12", "secrets/x.txt", "a/private/b.conf"])
+def test_secret_shaped_files_in_repo_are_sensitive(env, name):
+    repo = Path(os.environ["JUDGE_REPO_DIR"])
+    assert config.classify([str(repo / "README.md")]) == "infra"
+    assert config.is_secret_path(str(repo / name))
+    assert config.classify([str(repo / name)]) == "sensitive"
+    assert config.classify([str(repo / "README.md"), str(repo / name)]) == "sensitive"
+
+
+@pytest.mark.parametrize("path", ["/etc/ssl/private/site.key", "/srv/gateway/keys/digest.key",
+                                  "/etc/llama-swap/api-key", "walter:/etc/llama-swap/api-key",
+                                  "covenant:/srv/telemetry/secrets/token", "/etc/wireguard/site.env"])
+def test_secret_shaped_host_files_are_sensitive(env, path):
+    assert not config.is_infra_path(path) and config.classify([path]) == "sensitive"
+
+
+@pytest.mark.parametrize("name", ["site.env.example", "walter/gateway/.env.example", "gateway.env.example.tmpl",
+                                  "scripts/secrets.d/walter.sh", "scripts/gen-secrets.sh", "docs/runbooks/rotate-secrets.md",
+                                  "walter/deploy.sh", "keys.md"])
+def test_templates_and_secret_tooling_stay_infra(env, name):
+    repo = Path(os.environ["JUDGE_REPO_DIR"])
+    assert not config.is_secret_path(str(repo / name))
+    assert config.classify([str(repo / name)]) == "infra"
+
+
+def test_extra_secret_globs_from_site_env(env, monkeypatch):
+    repo = Path(os.environ["JUDGE_REPO_DIR"])
+    assert config.classify([str(repo / "vault.yml")]) == "infra"
+    monkeypatch.setenv("JUDGE_SECRET_GLOBS", "vault.yml *.age")
+    assert config.classify([str(repo / "vault.yml")]) == "sensitive"
+    assert config.classify([str(repo / "x" / "y.age")]) == "sensitive"
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git not installed")
+def test_site_env_in_worktree_of_infra_repo_is_sensitive(env, tmp_path, monkeypatch):
+    """Pilot 2 note: lid-digest2/site.env (gitignored, real values) classified infra because only */.env was
+    excluded."""
+    main = _main_repo(tmp_path / "deck")
+    wt = tmp_path / "deck-digest"
+    _git("worktree", "add", "-q", "-b", "digest", str(wt), cwd=main)
+    (wt / "site.env").write_text("SPARK_DOMAIN=example.invalid\n")
+    monkeypatch.setenv("JUDGE_REPO_DIR", str(main))
+    assert config.classify([str(wt / "walter" / "deploy.sh")]) == "infra"
+    assert config.classify([str(wt / "site.env")]) == "sensitive"
+    assert config.classify(["site.env"], cwd=str(wt)) == "sensitive"
+    assert config.classify([str(wt / "walter" / "deploy.sh"), str(wt / "site.env")]) == "sensitive"
