@@ -14,9 +14,14 @@
 #   --no-start         install and enable, but do not start units or compose stacks
 #   --with-hermes      also configure Hermes Agent for BACKEND_SSH_USER (needs Hermes installed)
 #
+# Optional components (off unless site.env turns them on):
+#   digest             walter/digest: on when SPARK_DIGEST_HOST is set. Off: no /srv/digest, no 3300
+#                      firewall rules, no stack; deploy prints one "digest: off" line.
+#
 # Order: render -> packages -> users -> /models mount -> llama-swap binary -> files ->
 #        env files -> gen-secrets -> systemd units + firewall -> (offsite backups) -> gateway -> keys -> webui ->
-#        monitoring -> telemetry -> (hermes). Never deletes anything; never overwrites a secret.
+#        monitoring -> telemetry -> (digest: key copy + stack) -> (hermes). Never deletes anything; never
+#        overwrites a secret.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -35,12 +40,14 @@ DRY=0 DESTDIR="" SITE_ENV_FILE="$REPO/site.env" SKIP_PKGS=0 NO_START=0 WITH_HERM
 while [[ $# -gt 0 ]]; do
   case $1 in
     --dry-run) DRY=1 ;;
-    --destdir) DESTDIR=$(realpath -m "${2:?}"); shift ;;
-    --site-env) SITE_ENV_FILE=$(realpath "${2:?}"); shift ;;
+    --destdir) [[ -n ${2:-} && $2 != --* ]] || { echo "deploy: --destdir needs a directory" >&2; exit 2; }
+               DESTDIR=$(realpath -m "$2"); shift ;;
+    --site-env) [[ -n ${2:-} && $2 != --* ]] || { echo "deploy: --site-env needs a file" >&2; exit 2; }
+                SITE_ENV_FILE=$(realpath "$2"); shift ;;
     --skip-packages) SKIP_PKGS=1 ;;
     --no-start) NO_START=1 ;;
     --with-hermes) WITH_HERMES=1 ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "deploy: unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -73,6 +80,19 @@ for v in MODELS_FS_UUID WG_EDGE_PUBLIC_KEY; do
   fi
 done
 
+# Optional digest app (walter/digest): opt-in, on only when SPARK_DIGEST_HOST is set. With it off,
+# nothing digest-related is rendered, installed, opened in the firewall or started.
+DIGEST=0; [[ -n ${SPARK_DIGEST_HOST:-} ]] && DIGEST=1
+if [[ $DIGEST == 1 && ${DIGEST_PORT:-3300} != 3300 ]]; then
+  die "DIGEST_PORT must be 3300 (walter/digest/compose.yaml and the firewall templates use 3300)"
+fi
+if [[ $DIGEST == 1 ]]; then
+  case " ${HARNESS_KEYS:-} " in
+    *" digest "*) ;;
+    *) warn "digest is on but 'digest' is not in HARNESS_KEYS: provision-keys.py will not create its LiteLLM key" ;;
+  esac
+fi
+
 T=$DESTDIR   # target root prefix
 USER_HOME=$(getent passwd "$BACKEND_SSH_USER" | cut -d: -f6 || true)
 USER_HOME=${USER_HOME:-/home/$BACKEND_SSH_USER}
@@ -81,10 +101,18 @@ USER_HOME=${USER_HOME:-/home/$BACKEND_SSH_USER}
 step "render templates"
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/walter-render.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
-for d in base wireguard llama-swap gateway webui monitoring telemetry backup update-check firewall hermes; do
+COMPONENTS=(base wireguard llama-swap gateway webui monitoring telemetry backup update-check firewall hermes)
+[[ $DIGEST == 1 ]] && COMPONENTS+=(digest)
+for d in "${COMPONENTS[@]}"; do
   "$REPO/scripts/render.sh" -e "$SITE_ENV_FILE" "$HERE/$d" "$STAGE/$d"
 done
 find "$STAGE" -name __pycache__ -prune -exec rm -rf {} +
+if [[ $DIGEST == 0 ]]; then
+  # The firewall templates carry the digest rules between "# >>> digest" and "# <<< digest";
+  # drop those blocks so the installed scripts are exactly what they were before the digest app.
+  sed -i '/^# >>> digest/,/^# <<< digest/d' "$STAGE"/firewall/*.sh
+  say "  digest: off (SPARK_DIGEST_HOST is empty in site.env); skipping walter/digest, its firewall rules and its stack"
+fi
 say "  rendered to $STAGE"
 
 # ---- install helpers -----------------------------------------------------------------
@@ -239,6 +267,11 @@ mkdir_p /srv/webui 0750 root root
 mkdir_p /srv/gateway/keys 0700 root root
 mkdir_p /srv/monitoring/secrets 0700 root root
 mkdir_p /srv/telemetry/secrets 0700 root root
+if [[ $DIGEST == 1 ]]; then
+  mkdir_p /srv/digest 0755 root root
+  mkdir_p /srv/digest/secrets 0700 root root
+  mkdir_p /srv/digest/state 0750 10001 10001
+fi
 
 install_file "$S/base/nvidia-persistenced.service.d/override.conf" /etc/systemd/system/nvidia-persistenced.service.d/override.conf 0644 root root units
 # wg0.conf holds the private key once gen-secrets has filled it: compare with the key masked.
@@ -276,6 +309,12 @@ install_tree "$S/monitoring/grafana/provisioning" /srv/monitoring/grafana/provis
 install_file "$S/telemetry/compose.yaml"        /srv/telemetry/compose.yaml               0644 root root telemetry
 install_file "$S/telemetry/README.md"           /srv/telemetry/README.md                  0644 root root
 install_tree "$S/telemetry/build"               /srv/telemetry/build                      0644 root root telemetry
+
+if [[ $DIGEST == 1 ]]; then
+  install_file "$S/digest/compose.yaml"         /srv/digest/compose.yaml                  0644 root root digest
+  install_file "$S/digest/README.md"            /srv/digest/README.md                     0644 root root
+  install_tree "$S/digest/build"                /srv/digest/build                         0644 root root digest
+fi
 
 install_file "$S/backup/spark-backup.sh"        /usr/local/sbin/spark-backup.sh           0750 root root
 install_file "$S/backup/spark-backup-restore-test.sh" /usr/local/sbin/spark-backup-restore-test.sh 0750 root root
@@ -355,6 +394,34 @@ else
   step "webui (Pocket-ID + Open WebUI)"; EXTRA_UP=(--wait); compose_up /srv/webui webui webui-theme
   step "monitoring";                     EXTRA_UP=(); compose_up /srv/monitoring monitoring
   step "telemetry";                      EXTRA_UP=(--build); compose_up /srv/telemetry telemetry
+  if [[ $DIGEST == 1 ]]; then
+    step "digest key"
+    if [[ -f $T/srv/gateway/keys/digest.key ]]; then
+      case " ${HARNESS_KEYS:-} " in
+        *" digest "*) ;;
+        *) warn "digest key present but 'digest' is not in HARNESS_KEYS (site.env)" ;;
+      esac
+      if [[ -e $T/srv/digest/secrets/digest-litellm-key ]]; then
+        say "  keep     /srv/digest/secrets/digest-litellm-key (exists)"
+      elif [[ $DRY == 1 ]]; then
+        say "  would copy /srv/gateway/keys/digest.key -> /srv/digest/secrets/digest-litellm-key (0440 root:10001)"
+      else
+        mkdir_p /srv/digest/secrets 0700 root root
+        install -m 0440 "$T/srv/gateway/keys/digest.key" "$T/srv/digest/secrets/digest-litellm-key"
+        [[ $EUID -eq 0 ]] && chown root:10001 "$T/srv/digest/secrets/digest-litellm-key"
+        say "  create   /srv/digest/secrets/digest-litellm-key (copy of /srv/gateway/keys/digest.key)"
+      fi
+    else
+      warn "digest key missing: /srv/gateway/keys/digest.key (is 'digest' in HARNESS_KEYS?)"
+    fi
+    if [[ -f $T/srv/digest/secrets/digest-litellm-key ]]; then
+      step "digest"; EXTRA_UP=(--build); compose_up /srv/digest digest
+    elif [[ $DRY == 1 && -f $T/srv/gateway/keys/digest.key ]]; then
+      say "  would start digest (key copy pending)"
+    else
+      warn "digest not started: key missing"
+    fi
+  fi
 fi
 
 # ---- 11. Hermes Agent on Walter (optional) ------------------------------------------------

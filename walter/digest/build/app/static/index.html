@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#07070d">
+<title>Walter Digest</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M6 6h20v6H6zM6 16h20v10H6z' fill='none' stroke='%2300f0ff' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="preload" href="/static/fonts/orbitron-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="bg-grid" aria-hidden="true"></div>
+<div class="bg-scan" aria-hidden="true"></div>
+
+<header class="top">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>WALTER<span class="slash">//</span>DIGEST</h1>
+      <div class="brand-sub mono">on-demand intelligence digests</div>
+    </div>
+  </div>
+  <div class="top-right">
+    <div id="status-pill" class="pill pill-wait" role="status" aria-live="polite">
+      <span class="pill-dot" aria-hidden="true"></span><span class="pill-text">CONNECTING</span>
+    </div>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+  <!-- landing: watch cards + history -->
+  <section id="view-landing" class="view" aria-label="watches">
+    <h2 class="view-h mono">WATCHES</h2>
+    <div class="cards" id="cards"></div>
+    <h2 class="view-h mono">HISTORY</h2>
+    <div class="table-wrap">
+      <table class="tbl" id="hist-tbl">
+        <thead><tr><th>watch</th><th>run id</th><th>generated (UTC)</th><th class="r">items</th><th class="r"></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- run view: progress + rendered digest -->
+  <section id="view-run" class="view" hidden aria-label="run">
+    <button class="btn btn-ghost" id="back-btn" type="button">&larr; watches</button>
+    <div class="run-head">
+      <h2 class="run-title" id="run-title"></h2>
+      <span class="tag mono" id="run-id-tag"></span>
+    </div>
+    <ol class="stages" id="stages" aria-live="polite">
+      <li data-stage="collecting" class="stage stage-wait"><span class="stage-dot" aria-hidden="true"></span>collecting</li>
+      <li data-stage="curating" class="stage stage-wait"><span class="stage-dot" aria-hidden="true"></span>curating</li>
+      <li data-stage="done" class="stage stage-wait"><span class="stage-dot" aria-hidden="true"></span>done</li>
+    </ol>
+    <div class="run-body" id="run-body">
+      <div class="digest md" id="digest-md" hidden></div>
+      <pre class="digest raw mono" id="digest-raw" hidden></pre>
+      <button class="btn btn-ghost" id="raw-toggle" type="button" hidden>view raw markdown</button>
+    </div>
+  </section>
+</main>
+
+<footer class="foot mono">
+  <span>walter · digest</span><span>runs: collecting &rarr; curating &rarr; done</span><span>no external CDNs</span>
+</footer>
+</body>
+</html>

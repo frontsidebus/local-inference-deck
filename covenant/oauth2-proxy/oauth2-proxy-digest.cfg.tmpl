@@ -1,0 +1,44 @@
+# oauth2-proxy for ${SPARK_DIGEST_HOST} (nginx auth_request mode)
+# Secrets are NOT in this file: client secret and cookie secret are root-only
+# files under /etc/oauth2-proxy-digest, passed in by systemd LoadCredential= (see unit).
+http_address = "127.0.0.1:4181"
+reverse_proxy = true
+real_client_ip_header = "X-Real-IP"
+trusted_proxy_ips = ["127.0.0.1/32", "::1/128"]
+
+# Provider: Pocket-ID
+provider = "oidc"
+provider_display_name = "Pocket-ID"
+oidc_issuer_url = "https://${SPARK_ID_HOST}"
+client_id = "${OAUTH2_PROXY_DIGEST_CLIENT_ID}"
+redirect_url = "https://${SPARK_DIGEST_HOST}/oauth2/callback"
+scope = "openid email profile groups"
+code_challenge_method = "S256"
+oidc_groups_claim = "groups"
+oidc_email_claim = "email"
+# Pocket-ID reports email_verified=false for users without a verified email;
+# authorization is by group membership, not by email.
+insecure_oidc_allow_unverified_email = true
+
+# Authorization: the group is the gate
+email_domains = ["*"]
+allowed_groups = ["${DIGEST_GROUP}"]
+
+# auth_request mode: no real upstream
+upstreams = ["static://202"]
+set_xauthrequest = true
+skip_provider_button = true
+
+# Session cookie
+cookie_name = "_oauth2_proxy_digest"
+cookie_domains = ["${SPARK_DIGEST_HOST}"]
+cookie_secure = true
+cookie_httponly = true
+cookie_samesite = "lax"
+cookie_expire = "12h"
+cookie_refresh = "0s"
+session_cookie_minimal = true
+
+# Logging
+silence_ping_logging = true
+exclude_logging_paths = ["/oauth2/auth"]
