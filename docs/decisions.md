@@ -133,6 +133,8 @@ Short records of the choices behind gen3. Each says what was decided, why, and w
 
 **Cost.** One more frontier call per sensitive completion, so the daily cap fills about twice as fast. The live cap (20) should probably go to 40.
 
+**Amended after run 3 (bug #26).** The final answer is treated as hostile to the boundary: run 3's S8 answer carried the local username and the digests, length and first character of a key file, and the first self-check let them through. The answer is now masked further (accounts, `user:group`, site hosts, IPv6, hex and base64-like runs, sentences giving a length or prefix of secret material) and the self-check refuses any of those that survive. Spec: `judge/CONTRACT.md`.
+
 **Residual risk.** The final answer can quote what the agent read: host names, config lines, numbers. Redaction masks secrets and paths, not other content. Bare file names (`config.yaml`) and single-segment relative paths stay.
 
 **Revisit when** a final answer carries content that should not leave (then add a content filter or set `JUDGE_SENSITIVE_FRONTIER_CLAIMS=0`), or when a local judge from another family matches the frontier judge on these slips.

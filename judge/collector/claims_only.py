@@ -4,22 +4,38 @@
 A data_class=sensitive bundle never leaves the machine. For the frontier claims stage (run_judge.py,
 JUDGE_SENSITIVE_FRONTIER_CLAIMS=1) this module builds a second, much smaller bundle from it with a POSITIVE
 ALLOWLIST: every field below is constructed here from parsed values; nothing is copied through as text
-except the agent's final answer, which is redacted and path-masked.
+except the agent's final answer. The final answer is treated as HOSTILE to the data boundary (bug #26): it is
+written by an agent that may have read secrets and site data, so it is masked (mask_claims) and the whole
+message must then pass a strict self_check() that refuses (fails closed) on anything that survived.
 
     build(request, evidence_dir, home=None) -> Built
         Built.message       the exact user message for the frontier judge (request + bundle)
         Built.bundle_text   the bundle part (`=== FILE: <name> ===` sections, for the validator)
         Built.request       the sanitized request copy (the validator's view of the "claims" self text)
         Built.problems      self_check(message): empty when it may be sent
-    self_check(text) -> list[str]
-        Problems that make the bundle unsendable: a secret-looking value (lib/redact would change the text),
-        an absolute or home path (`/x`, `~/x`, `$HOME/x`), a user-message marker (`msg=`), a diff hunk or
-        header, a withheld/probe marker, an unknown section header. Never echoes the offending text.
+    self_check(text, ident=None) -> list[str]
+        Problem KINDS that make the bundle unsendable: a secret-looking value (lib/redact would change the
+        text), an absolute or home path (`/x`, `~/x`, `$HOME/x`), an IPv4 or IPv6 address, a hex run of 16+,
+        a base64-like run of 24+, a user:group pattern, a local account name, a site host/domain, a
+        user-message marker (`msg=`), a diff hunk or header, a withheld/probe marker, an unknown section
+        header. Never echoes the offending text or its offset.
+    mask_claims(text, index, ident) -> str
+        redact -> withhold_secret_sentences -> mask_paths -> mask_ips -> mask_identity -> mask_digests.
     mask_paths(text, index) -> str
         Absolute, home and relative multi-segment paths -> opaque `file#N` (shared index with C3 files).
+    withhold_secret_sentences(text) -> (text, n)
+        In a paragraph that mentions a key/token/secret/password/credential, every sentence with a length or
+        prefix/suffix detail ("25 chars", "26 bytes", "starts with s") -> WITHHELD_SENTENCE.
+    mask_ips / mask_identity / mask_digests
+        IPv4/IPv6 -> ip#N; site hosts/domains -> host#N; accounts and user:group -> user#N; hex runs of 16+
+        -> hex#N; base64-like runs of 24+ -> blob#N (ids stable within one text).
+    site_identity(cfg=None) -> Identity
+        Local account names (current user, /etc/passwd uid 1000..65533, getpass, home basename,
+        BACKEND_SSH_USER, EDGE_SSH_USER, SPARK_USERS) and site identifiers (SPARK_DOMAIN and subdomains,
+        SPARK_*_HOST, SPARK_SITE_NAME, JUDGE_SSH_ALIASES, /etc/hostname). Walter/Covenant are kept.
 
 Allowed content (CONTRACT.md "Claims-only bundle"):
-  REVIEW REQUEST     id, kind, data_class, created, since, claims (final answer: redacted, paths -> file#N)
+  REVIEW REQUEST     id, kind, data_class, created, since, claims (final answer, masked by mask_claims)
   manifest.json      bundle_mode, window (since/until/grace_seconds/until_basis), timing (request created,
                      collected, log tz), attribution COUNTS (agent paths, others, withheld, rejected), path_index
                      (file#N -> where seen, and which file#M it lies inside; never a name)
@@ -27,16 +43,20 @@ Allowed content (CONTRACT.md "Claims-only bundle"):
                      rules, decision, decision_meaning (fixed text per decision), outcome
   c3-results.jsonl   check, ok, final, file (file#N)
   tool-activity.jsonl   one summary line (counts per tool, ok/error, total seconds, API calls, tokens, turns)
-                     then one line per session-tagged event: tool calls (name, ok, seconds, output chars),
+                     then one line per session event (tagged, or a parallel tool call lib/hermeslog attributed
+                     to the session: "parallel": true): tool calls (name, ok, seconds, output chars),
                      API calls (number, tokens in/out, latency), turn start (history length), turn end
                      (reason, api_calls, tool_turns, response_len). No message text, no error text, no paths.
 Never: file contents, diffs, paths, host/probe output, slots, user prompts, snapshot data.
 """
 from __future__ import annotations
 
+import getpass
+import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +67,12 @@ if str(JUDGE_DIR) not in sys.path:
     sys.path.insert(0, str(JUDGE_DIR))
 
 from lib.redact import redact  # noqa: E402
+from lib.hermeslog import PARALLEL_MARK  # noqa: E402
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover (non-POSIX)
+    pwd = None  # type: ignore[assignment]
 
 BUNDLE_MODE = "claims-only"
 SECTIONS = ("manifest.json", "gate-decisions.jsonl", "c3-results.jsonl", "tool-activity.jsonl")
@@ -144,6 +170,256 @@ def mask_paths(text: str, index: PathIndex, where: str = "claims") -> str:
     return _REL_PATH_RE.sub(rel_sub, text)
 
 
+# ------------------------------------------------------------------ the final answer is hostile (bug #26)
+# The final answer is free text written by an agent that may have read secrets and site data. Masking is the
+# first line; self_check() is the second and REFUSES (fails closed) on anything that survived it.
+_IPV4_RE = re.compile(r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\w|\.\d)")
+# IPv6 candidates (validated with ipaddress): hex groups and colons, optional embedded IPv4, zone, prefix.
+_IPV6_CAND_RE = re.compile(r"(?<![\w:.])[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?::(?:\d{1,3}\.){3}\d{1,3})?"
+                           r"(?:%[\w.-]+)?(?:/\d{1,3})?(?![\w:])")
+_HEX_RE = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{16,}(?![0-9A-Fa-f])")
+_BLOB_CAND_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{24,}(?![A-Za-z0-9+/=_-])")
+_BLOB_SEG_SPLIT = re.compile(r"[-_+/=]")
+_REQUEST_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{1,6}-[a-z]+$")
+PLACEHOLDER_KINDS = ("file", "ip", "host", "user", "hex", "blob")
+WITHHELD_SENTENCE = "[sentence about secret material withheld]"
+KEEP_HOSTS = frozenset({"walter", "covenant", "localhost", "localhost.localdomain"})  # public codenames
+_NAME_OK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
+
+
+def _is_ipv6(tok: str) -> bool:
+    core = tok.split("/")[0].split("%")[0]
+    if core.count(":") < 2 or not re.search(r"[0-9A-Fa-f]", core):
+        return False
+    try:
+        ipaddress.IPv6Address(core)
+        return True
+    except ValueError:
+        return False
+
+
+def _class_runs_ratio(tok: str) -> float:
+    """Maximal runs of one character class (lower / upper / digit) per alphanumeric char: ~0.6 for random
+    base64, ~0.25 for CamelCase words."""
+    cls = ["l" if c.islower() else "u" if c.isupper() else "d" for c in tok if c.isalnum() and c.isascii()]
+    if not cls:
+        return 0.0
+    return (1 + sum(1 for x, y in zip(cls, cls[1:]) if x != y)) / len(cls)
+
+
+def _is_blob(tok: str) -> bool:
+    """A base64-like run of 24+ chars [A-Za-z0-9+/=_-]: letters and digits, random-looking character classes
+    (class-runs ratio >= 0.3) and one piece between separators (-_+/=) of 9+ chars. Measured on 5000 random
+    tokens each: base64url 24 chars ~1% missed, 32 chars ~0.1%, plain alphanumeric 24 chars ~0.1%. Model names
+    (Qwen3-Coder-30B-A3B-Instruct-Q4_K_M), snake/Camel identifiers and request ids are not blobs."""
+    if len(tok) < 24 or not (re.search(r"\d", tok) and re.search(r"[A-Za-z]", tok)):
+        return False
+    if _REQUEST_ID_RE.match(tok):  # the request id in the bundle header
+        return False
+    if max((len(seg) for seg in _BLOB_SEG_SPLIT.split(tok)), default=0) < 9:
+        return False
+    return _class_runs_ratio(tok) >= 0.3
+
+
+@dataclass
+class Identity:
+    """Local account names and site identifiers that must never leave in a claims-only bundle."""
+    users: List[str] = field(default_factory=list)
+    hosts: List[str] = field(default_factory=list)    # exact names / aliases / phrases
+    domains: List[str] = field(default_factory=list)  # the domain and every subdomain of it
+
+    def user_re(self) -> Optional[re.Pattern]:
+        names = sorted(set(self.users), key=len, reverse=True)
+        if not names:
+            return None
+        return re.compile(r"(?i)(?<![A-Za-z0-9])(?:" + "|".join(re.escape(n) for n in names) + r")(?![A-Za-z0-9#])")
+
+    def host_re(self) -> Optional[re.Pattern]:
+        alts = [r"(?:[A-Za-z0-9-]+\.)*" + re.escape(d) for d in sorted(set(self.domains), key=len, reverse=True)]
+        alts += [r"\s+".join(re.escape(w) for w in h.split())
+                 for h in sorted(set(self.hosts), key=len, reverse=True)]
+        if not alts:
+            return None
+        return re.compile(r"(?i)(?<![A-Za-z0-9-])(?:" + "|".join(alts) + r")(?![A-Za-z0-9-]|#\d)")
+
+
+def site_identity(cfg: Optional[Dict[str, str]] = None) -> Identity:
+    """Identity of this machine and site: the current user, every /etc/passwd account with 1000 <= uid < 65534
+    (`nobody` is public), getpass and home-dir basenames, BACKEND_SSH_USER, EDGE_SSH_USER, SPARK_USERS;
+    SPARK_DOMAIN (and its name without the TLD), every SPARK_*_HOST, SPARK_SITE_NAME, the JUDGE_SSH_ALIASES,
+    /etc/hostname and this host's names. The Walter/Covenant codenames are kept (public lore)."""
+    if cfg is None:
+        try:
+            from lib import config
+            cfg = config.load_config()
+        except Exception:
+            cfg = {}
+    users = set()
+    if pwd is not None:
+        try:
+            users.add(pwd.getpwuid(os.getuid()).pw_name)
+        except (KeyError, OSError):
+            pass
+        try:
+            users.update(e.pw_name for e in pwd.getpwall() if 1000 <= e.pw_uid < 65534)
+        except OSError:
+            pass
+    try:
+        users.add(getpass.getuser())
+    except Exception:
+        pass
+    for h in (os.environ.get("HOME") or "", os.path.expanduser("~")):
+        users.add(os.path.basename(h.rstrip("/")))
+    for k in ("BACKEND_SSH_USER", "EDGE_SSH_USER"):
+        users.add(str(cfg.get(k) or ""))
+    users.update(str(cfg.get("SPARK_USERS") or "").split())
+    hosts, domains = set(), set()
+    dom = str(cfg.get("SPARK_DOMAIN") or "").strip().strip(".").lower()
+    if dom and "." in dom:
+        domains.add(dom)
+        stem = dom.rsplit(".", 1)[0]
+        if len(stem) >= 6:
+            hosts.add(stem)
+    for k, v in cfg.items():
+        if k.startswith("SPARK_") and k.endswith("_HOST") and v:
+            hosts.add(str(v).strip().lower())
+    if str(cfg.get("SPARK_SITE_NAME") or "").strip():
+        hosts.add(" ".join(str(cfg["SPARK_SITE_NAME"]).split()).lower())
+    hosts.update(a.lower() for a in str(cfg.get("JUDGE_SSH_ALIASES") or "").split())
+    hosts.update(h.strip().lower() for h in _local_hostnames())
+    hosts = {h for h in hosts if h and h not in KEEP_HOSTS and len(h) >= 3}
+    users = {u for u in users if u and _NAME_OK_RE.match(u) and u.lower() not in KEEP_HOSTS}
+    return Identity(users=sorted(users), hosts=sorted(hosts), domains=sorted(domains))
+
+
+def _local_hostnames() -> List[str]:
+    """/etc/hostname and this host's names (gethostname, getfqdn)."""
+    out = []
+    try:
+        out.append(Path("/etc/hostname").read_text(encoding="utf-8"))
+    except OSError:
+        pass
+    for fn in (socket.gethostname, socket.getfqdn):
+        try:
+            out.append(fn())
+        except OSError:
+            pass
+    return out
+
+
+class _Ids:
+    """Stable opaque ids per kind within one text: user#1, host#2, hex#1 ..."""
+
+    def __init__(self):
+        self.ids: Dict[Tuple[str, str], str] = {}
+        self.n: Dict[str, int] = {}
+
+    def get(self, kind: str, key: str) -> str:
+        k = (kind, key.lower())
+        if k not in self.ids:
+            self.n[kind] = self.n.get(kind, 0) + 1
+            self.ids[k] = f"{kind}#{self.n[kind]}"
+        return self.ids[k]
+
+
+def mask_ips(text: str, ids: Optional[_Ids] = None) -> str:
+    """IPv4 and IPv6 addresses -> opaque ip#N (stable within one text): an address is site data, not a claim."""
+    ids = ids or _Ids()
+    text = _IPV4_RE.sub(lambda m: ids.get("ip", m.group(0)), text)
+    return _IPV6_CAND_RE.sub(lambda m: ids.get("ip", m.group(0)) if _is_ipv6(m.group(0)) else m.group(0), text)
+
+
+# user:group forms. Masked (and refused) when either side is a known account, when both sides are the same name
+# (alice:alice), or after an ownership word (owner / owned by / chown / user:group).
+_PAIR_RE = re.compile(r"(?<![\w.:/-])([A-Za-z_][\w.-]{0,31}):([A-Za-z_][\w.-]{0,31})(?![\w:/-])")
+_OWNER_PAIR_RE = re.compile(r"(?i)\b(?:owner(?:ship)?|owned\s+by|chown(?:ed)?|user\s*:\s*group|uid|gid)\b[\s:=`'\"(]*"
+                            r"([A-Za-z_][\w.-]{0,31}):([A-Za-z_][\w.-]{0,31})")
+_SAME_PAIR_RE = re.compile(r"(?<![\w.:/-])([A-Za-z_][\w.-]{0,31}):\1(?![\w:/-])", re.I)
+
+
+def _pair_is_account(a: str, b: str, users: set) -> bool:
+    return a.lower() == b.lower() or a.lower() in users or b.lower() in users
+
+
+def mask_identity(text: str, ident: Identity, ids: Optional[_Ids] = None) -> str:
+    """Site hosts/domains -> host#N, user:group pairs and local account names -> user#N."""
+    ids = ids or _Ids()
+    hrx = ident.host_re()
+    if hrx:
+        text = hrx.sub(lambda m: ids.get("host", " ".join(m.group(0).split())), text)
+    users = {u.lower() for u in ident.users}
+    text = _OWNER_PAIR_RE.sub(lambda m: m.group(0)[:m.start(1) - m.start(0)] + ids.get("user", m.group(1) + ":" + m.group(2)), text)
+    text = _PAIR_RE.sub(lambda m: ids.get("user", m.group(0)) if _pair_is_account(m.group(1), m.group(2), users)
+                        else m.group(0), text)
+    urx = ident.user_re()
+    if urx:
+        text = urx.sub(lambda m: ids.get("user", m.group(0)), text)
+    return text
+
+
+def mask_digests(text: str, ids: Optional[_Ids] = None) -> str:
+    """Hex runs of 16+ (digests, hashes, ids, key fragments) -> hex#N; base64-like runs of 24+ -> blob#N."""
+    ids = ids or _Ids()
+    text = _HEX_RE.sub(lambda m: ids.get("hex", m.group(0)), text)
+    return _BLOB_CAND_RE.sub(lambda m: ids.get("blob", m.group(0)) if _is_blob(m.group(0)) else m.group(0), text)
+
+
+# Sentences about secret material: a sentence in a paragraph (or list) that mentions a key/token/secret/
+# password/credential AND gives a length or prefix/suffix detail is replaced as a whole. Digests are not a
+# trigger: their value is a hex/base64 run (hex#N / blob#N, and refused if one survives), and "sha256: hex#1"
+# keeps the fact that a digest of a secret was disclosed visible to the judge.
+_SECRET_WORD_RE = re.compile(
+    r"(?i)\b(?:\w+[_-])?(?:keys?|keyfile|secrets?|passwords?|passwd|passphrases?|credentials?)\b"
+    r"|(?<![\w-])(?<!\d )(?:[A-Za-z]+[_-])?token\b"  # not "32768-token context" / "16784 token"
+    r"|\b(?:api|access|auth|bearer|refresh|session|gateway)[ _-]?tokens\b|\.(?:key|pem)\b")
+_SECRET_DETAIL_RE = re.compile(
+    r"(?i)\b\d+\s*-?\s*(?:chars?|characters|bytes?|bits|digits|letters|symbols)\b"
+    r"|\b(?:starts?|begins?|ends?|starting|beginning|ending)\s+with\b|\b(?:prefix|suffix)(?:ed|es)?\b"
+    r"|\b(?:first|last)\s+(?:\d+\s+)?(?:chars?|characters|bytes?|letters?|digits?)\b|\blength\b")
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_BULLET_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])?\s*)")
+
+
+def withhold_secret_sentences(text: str) -> Tuple[str, int]:
+    """(text, n withheld). In every paragraph that mentions secret material, each sentence that carries a
+    length / prefix / suffix detail becomes WITHHELD_SENTENCE (once per line). Errs on the side of
+    withholding: a byte count next to a key mention goes too."""
+    n = 0
+    out_blocks = []
+    for block in re.split(r"(\n[ \t]*\n)", text):
+        if not block.strip() or not _SECRET_WORD_RE.search(block):
+            out_blocks.append(block)
+            continue
+        lines = []
+        for line in block.split("\n"):
+            lead = _BULLET_RE.match(line).group(1)
+            parts = _SENT_SPLIT_RE.split(line[len(lead):])
+            kept: List[str] = []
+            for part in parts:
+                if _SECRET_DETAIL_RE.search(part):
+                    n += 1
+                    if not kept or kept[-1] != WITHHELD_SENTENCE:
+                        kept.append(WITHHELD_SENTENCE)
+                else:
+                    kept.append(part)
+            lines.append(lead + " ".join(kept))
+        out_blocks.append("\n".join(lines))
+    return "".join(out_blocks), n
+
+
+def mask_claims(text: str, index: "PathIndex", ident: Identity) -> str:
+    """The final answer as it may be sent: redact, withhold secret-detail sentences, then paths -> file#N,
+    IPv4/IPv6 -> ip#N, site hosts/domains -> host#N, accounts and user:group -> user#N, hex/base64 runs ->
+    hex#N/blob#N. self_check() still has the last word."""
+    ids = _Ids()
+    text = redact(text)
+    text, _ = withhold_secret_sentences(text)
+    text = mask_paths(text, index, "claims")
+    text = mask_ips(text, ids)
+    text = mask_identity(text, ident, ids)
+    return mask_digests(text, ids)
+
+
 # ------------------------------------------------------------------ self-check
 _MSG_RE = re.compile(r"\bmsg\s*=\s*['\"]")
 _DIFF_RE = re.compile(r"(?m)^(?:@@ -\d+(?:,\d+)? \+\d+|(?:\+\+\+|---) [ab]/|diff --git )")
@@ -152,38 +428,42 @@ _MARKER_RE = re.compile(r"# content withheld|# WINDOWED|# POINT IN TIME|=== FILE
 _HEADER_RE = re.compile(r"(?m)^=== FILE: (.*?) ===$")
 
 
-_IPV4_RE = re.compile(r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\w|\.\d)")
-
-
-def mask_ips(text: str) -> str:
-    """IPv4 addresses -> opaque ip#N (stable within one text): a host's address is site data, not a claim."""
-    ids: Dict[str, str] = {}
-
-    def sub(m: re.Match) -> str:
-        return ids.setdefault(m.group(0), f"ip#{len(ids) + 1}")
-    return _IPV4_RE.sub(sub, text)
-
-
-def self_check(text: str) -> List[str]:
-    """Why *text* must not be sent (empty = ok). Scans the text as sent and a JSON-unescaped copy of it."""
+def self_check(text: str, ident: Optional[Identity] = None) -> List[str]:
+    """Why *text* must not be sent (empty = ok). Scans the text as sent and a JSON-unescaped copy of it.
+    Problems name the KIND only, never the offending text or where it is. Fails closed: the caller sends
+    nothing when the list is not empty."""
+    ident = ident if ident is not None else site_identity()
+    users = {u.lower() for u in ident.users}
+    urx, hrx = ident.user_re(), ident.host_re()
     problems: List[str] = []
     views = [text, text.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"').replace("\\/", "/")]
     for n, v in enumerate(views):
         tag = "" if n == 0 else " (unescaped)"
         if redact(v) != v:
             problems.append(f"secret-like value{tag}: lib/redact would mask part of the bundle")
-        m = _ABS_PATH_RE.search(v)
-        if m:
-            problems.append(f"path-like token{tag} at offset {m.start()}")
+        if _ABS_PATH_RE.search(v):
+            problems.append(f"path-like token{tag}")
         if _IPV4_RE.search(v):
             problems.append(f"IPv4 address{tag}")
+        if any(_is_ipv6(m.group(0)) for m in _IPV6_CAND_RE.finditer(v)):
+            problems.append(f"IPv6 address{tag}")
+        if _HEX_RE.search(v):
+            problems.append(f"hex run of 16+ chars{tag}")
+        if any(_is_blob(m.group(0)) for m in _BLOB_CAND_RE.finditer(v)):
+            problems.append(f"base64-like run of 24+ chars{tag}")
+        if (_OWNER_PAIR_RE.search(v) or _SAME_PAIR_RE.search(v)
+                or any(_pair_is_account(m.group(1), m.group(2), users) for m in _PAIR_RE.finditer(v))):
+            problems.append(f"user:group pattern{tag}")
+        if urx and urx.search(v):
+            problems.append(f"local account name{tag}")
+        if hrx and hrx.search(v):
+            problems.append(f"site host or domain{tag}")
         if _MSG_RE.search(v):
             problems.append(f"user-message marker (msg=){tag}")
         if _DIFF_RE.search(v):
             problems.append(f"diff hunk or header{tag}")
-        m = _MARKER_RE.search(v)
-        if m:
-            problems.append(f"evidence-bundle marker{tag} at offset {m.start()}")
+        if _MARKER_RE.search(v):
+            problems.append(f"evidence-bundle marker{tag}")
     for h in _HEADER_RE.findall(text):
         if h not in SECTIONS:
             problems.append("unknown section header")
@@ -272,62 +552,102 @@ def c3_lines(evidence_dir: Path, index: PathIndex) -> List[Dict[str, Any]]:
     return out
 
 
-_LOG_RE = re.compile(r"^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})(?:,\d{1,6})? [A-Z]+ \[([^\]\s]+)\] (\S+): (.*)$")
+_LOG_RE = re.compile(r"^\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})(?:,\d{1,6})? [A-Z]+ (?:\[([^\]\s]+)\] )?(\S+): (.*)$")
 _TOOL_OK_RE = re.compile(r"^tool ([a-z][a-z0-9_]{0,39}) completed \(([\d.]+)s, (\d+) chars?\)")
 _TOOL_ERR_RE = re.compile(r"^Tool ([a-z][a-z0-9_]{0,39}) returned error \(([\d.]+)s\)")
+_TOOL_FAIL_RE = re.compile(r"^tool ([a-z][a-z0-9_]{0,39}) (?:failed|cancelled) \(([\d.]+)s\)")
+_ANY_TOOL_RE = re.compile(r"^[Tt]ool [A-Za-z0-9_.-]+ (?:completed|failed|cancelled|abandoned|returned error)\b")
 _API_RE = re.compile(r"^API call #(\d+): model=(\S+).*?\bin=(\d+) out=(\d+)(?: total=(\d+))?(?:.*?\blatency=([\d.]+)s)?")
 _TURN_RE = re.compile(r"^conversation turn: .*?\bhistory=(\d+)")
 _END_RE = re.compile(r"^Turn ended: reason=(\S+)")
 _KV_INT_RE = re.compile(r"\b(api_calls|tool_turns|response_len)=(\d+)")
 _TZ_HDR_RE = re.compile(r"\blog tz ([A-Za-z0-9+:-]{1,10});")
+TOOL_LOGGER = "agent.tool_executor"
+
+
+def _dedupe_parallel_failures(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A failed parallel call is logged twice (untagged worker `tool X failed`, then tagged `Tool X returned
+    error`): drop the attributed copy when the tagged one follows before the next API call / turn end."""
+    out = []
+    for k, ev in enumerate(events):
+        if ev.get("event") == "tool" and ev.get("parallel") and not ev.get("ok"):
+            twin = False
+            for nxt in events[k + 1:]:
+                if nxt.get("event") in ("api_call", "turn_end", "turn_start"):
+                    break
+                if (nxt.get("event") == "tool" and not nxt.get("parallel") and not nxt.get("ok")
+                        and nxt.get("tool") == ev.get("tool") and not nxt.get("_paired")):
+                    nxt["_paired"] = twin = True
+                    break
+            if twin:
+                continue
+        out.append(ev)
+    for ev in out:
+        ev.pop("_paired", None)
+    return out
 
 
 def tool_activity(evidence_dir: Path, session: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Optional[str]]:
-    """(summary, events, log tz) from the session-tagged hermes-log.txt lines. Only values parsed by the
-    patterns above are kept; every other session line is only counted."""
+    """(summary, events, log tz) from hermes-log.txt: lines tagged with the session, plus untagged parallel
+    tool-call lines that lib/hermeslog attributed to it (in a SESSION LINES section, ending with PARALLEL_MARK;
+    bug #28). Only values parsed by the patterns above are kept; every other session line is only counted.
+    Untagged tool lines left in the context sections (not attributable) are counted as untagged_tool_lines."""
     text = _read(evidence_dir / "hermes-log.txt")
     tz = None
     m = _TZ_HDR_RE.search(text[:2000])
     if m and _TZ_RE.match(m.group(1)):
         tz = m.group(1)
     events: List[Dict[str, Any]] = []
-    tools: Dict[str, Dict[str, Any]] = {}
-    api = {"calls": 0, "tokens_in": 0, "tokens_out": 0}
     turns = other = 0
     seen = set()
+    attributed_raw = set()
+    unattributed = []
+    section = None
     for ln in text.splitlines():
+        if ln.startswith("===== "):
+            section = "session" if "SESSION LINES" in ln else ("context" if "UNTAGGED CONTEXT" in ln else None)
+            continue
         m = _LOG_RE.match(ln)
-        if not m or not session or m.group(2) != session:
+        if not m or not session:
+            continue
+        tag, logger, msg = m.group(2), m.group(3), m.group(4)
+        parallel = False
+        if tag is None:
+            if section == "session" and logger == TOOL_LOGGER and ln.endswith(PARALLEL_MARK):
+                parallel = True
+                ln = ln[:-len(PARALLEL_MARK)]
+                msg = msg[:-len(PARALLEL_MARK)]
+                attributed_raw.add(ln)
+            else:
+                if section == "context" and logger == TOOL_LOGGER and _ANY_TOOL_RE.match(msg):
+                    unattributed.append(ln)
+                continue
+        elif tag != session:
             continue
         if ln in seen:  # WARNING+ lines are in both the agent.log and the errors.log section: count once
             continue
         seen.add(ln)
-        t, msg = m.group(1), m.group(4)
+        t = m.group(1)
         ev: Optional[Dict[str, Any]] = None
-        if (mm := _TOOL_OK_RE.match(msg)) or (mm := _TOOL_ERR_RE.match(msg)):
-            ok = msg.startswith("tool ")
-            name, secs = mm.group(1), round(float(mm.group(2)), 2)
-            ev = {"t": t, "event": "tool", "tool": name, "ok": ok, "seconds": secs}
+        if (mm := _TOOL_OK_RE.match(msg)) or (mm := _TOOL_ERR_RE.match(msg)) or (mm := _TOOL_FAIL_RE.match(msg)):
+            ok = " completed (" in msg[:80]
+            ev = {"t": t, "event": "tool", "tool": mm.group(1), "ok": ok, "seconds": round(float(mm.group(2)), 2)}
             if ok:
                 ev["output_chars"] = int(mm.group(3))
-            s = tools.setdefault(name, {"ok": 0, "error": 0, "seconds": 0.0})
-            s["ok" if ok else "error"] += 1
-            s["seconds"] = round(s["seconds"] + secs, 2)
+            if parallel:
+                ev["parallel"] = True
+        elif parallel:
+            continue  # an attributed line we do not parse (e.g. `abandoned`): not counted
         elif mm := _API_RE.match(msg):
             model = mm.group(2) if _MODEL_RE.match(mm.group(2)) else "(other)"
             ev = {"t": t, "event": "api_call", "n": int(mm.group(1)), "model": model,
                   "tokens_in": int(mm.group(3)), "tokens_out": int(mm.group(4))}
             if mm.group(6):
                 ev["latency_s"] = float(mm.group(6))
-            api["calls"] += 1
-            api["tokens_in"] += ev["tokens_in"]
-            api["tokens_out"] += ev["tokens_out"]
         elif mm := _TURN_RE.match(msg):  # the user's message (msg=...) is never read
             ev = {"t": t, "event": "turn_start", "history": int(mm.group(1))}
-            turns += 1
         elif msg.startswith("conversation turn:"):
             ev = {"t": t, "event": "turn_start"}
-            turns += 1
         elif mm := _END_RE.match(msg):
             reason = mm.group(1) if _REASON_RE.match(mm.group(1)) else "(other)"
             ev = {"t": t, "event": "turn_end", "reason": reason}
@@ -336,13 +656,30 @@ def tool_activity(evidence_dir: Path, session: str) -> Tuple[Dict[str, Any], Lis
             other += 1
         if ev is not None:
             events.append(ev)
+    events = _dedupe_parallel_failures(events)
+    tools: Dict[str, Dict[str, Any]] = {}
+    api = {"calls": 0, "tokens_in": 0, "tokens_out": 0}
+    for ev in events:
+        if ev["event"] == "tool":
+            s = tools.setdefault(ev["tool"], {"ok": 0, "error": 0, "seconds": 0.0})
+            s["ok" if ev["ok"] else "error"] += 1
+            s["seconds"] = round(s["seconds"] + ev["seconds"], 2)
+        elif ev["event"] == "api_call":
+            api["calls"] += 1
+            api["tokens_in"] += ev["tokens_in"]
+            api["tokens_out"] += ev["tokens_out"]
+        elif ev["event"] == "turn_start":
+            turns += 1
+    n_parallel = sum(1 for e in events if e.get("parallel"))
     if len(events) > MAX_EVENTS:
         half = MAX_EVENTS // 2
         events = events[:half] + [{"event": "omitted", "count": len(events) - 2 * half}] + events[-half:]
+    untagged = len({ln for ln in unattributed if ln not in attributed_raw})
     summary = {"summary": True, "tools": dict(sorted(tools.items())),
-               "tool_calls": sum(s["ok"] + s["error"] for s in tools.values()), "api_calls": api["calls"],
-               "tokens_in": api["tokens_in"], "tokens_out": api["tokens_out"], "turns": turns,
-               "other_session_lines": other}
+               "tool_calls": sum(s["ok"] + s["error"] for s in tools.values()),
+               "parallel_tool_calls": n_parallel,
+               "api_calls": api["calls"], "tokens_in": api["tokens_in"], "tokens_out": api["tokens_out"],
+               "turns": turns, "other_session_lines": other, "untagged_tool_lines": untagged}
     return summary, events, tz
 
 
@@ -367,7 +704,8 @@ def claims_eligible(request: Dict[str, Any]) -> bool:
     return str(request.get("kind") or "") in CLAIMS_KINDS
 
 
-def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = None) -> Built:
+def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = None,
+          ident: Optional[Identity] = None) -> Built:
     try:
         manifest = json.loads(_read(evidence_dir / "manifest.json") or "{}")
     except ValueError:
@@ -378,7 +716,8 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
     claims = str(request.get("claims") or "")
     if len(claims) > MAX_CLAIMS_CHARS:
         claims = claims[:MAX_CLAIMS_CHARS] + " [... truncated ...]"
-    claims = mask_ips(mask_paths(redact(claims), index, "claims"))
+    ident = ident if ident is not None else site_identity()
+    claims = mask_claims(claims, index, ident)
     gates = gate_lines(evidence_dir)
     c3 = c3_lines(evidence_dir, index)
     session = str(request.get("session") or (manifest.get("request") or {}).get("session") or "")
@@ -387,7 +726,7 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
     att = manifest.get("attribution") if isinstance(manifest.get("attribution"), dict) else {}
     rid = str(request.get("id") or "")
     safe_request = {
-        "id": rid if re.match(r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{1,6}-[a-z]+$", rid) else None,
+        "id": rid if _REQUEST_ID_RE.match(rid) else None,
         "kind": str(request.get("kind") or "") if _RULE_RE.match(str(request.get("kind") or "")) else None,
         "data_class": "sensitive" if str(request.get("data_class") or "sensitive") != "infra" else "infra",
         "created": _ts(request.get("created")),
@@ -428,7 +767,7 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
         + bundle
         + "EVIDENCE BUNDLE ENDS\n\nReturn the finding JSON now."
     )
-    return Built(message=message, bundle_text=bundle, request=safe_request, problems=self_check(message))
+    return Built(message=message, bundle_text=bundle, request=safe_request, problems=self_check(message, ident))
 
 
 def main(argv: List[str]) -> int:
