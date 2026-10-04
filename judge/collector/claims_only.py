@@ -46,6 +46,9 @@ Allowed content (CONTRACT.md "Claims-only bundle"):
   tool-calls.jsonl   per tool call post_tool_call saw (bug #33): ts, tool, command (an allowlisted program
                      NAME, lib/toolcalls, or "(other)"; never arguments), gate (pass | escalated | blocked |
                      not gated), ran, error, after_refused_escalation
+  refusals.jsonl     per refused call (bug #39): t, source, how, rule, tool, command NAME, targets (opaque path
+                     ids p#N + a fixed kind), next_calls (t, tool, command NAME, ran, targets, same_target, route),
+                     summary; every value re-validated by lib/refusals.sanitize
   c3-results.jsonl   check, ok, final, file (file#N)
   tool-activity.jsonl   one summary line (counts per tool, ok/error, total seconds, API calls, tokens, turns)
                      then one line per session event (tagged, or a parallel tool call lib/hermeslog attributed
@@ -73,7 +76,7 @@ if str(JUDGE_DIR) not in sys.path:
 
 from lib.redact import redact  # noqa: E402
 from lib.hermeslog import PARALLEL_MARK  # noqa: E402
-from lib import toolcalls  # noqa: E402
+from lib import refusals as refusal_lib, toolcalls  # noqa: E402
 
 try:
     import pwd
@@ -81,7 +84,8 @@ except ImportError:  # pragma: no cover (non-POSIX)
     pwd = None  # type: ignore[assignment]
 
 BUNDLE_MODE = "claims-only"
-SECTIONS = ("manifest.json", "gate-decisions.jsonl", "tool-calls.jsonl", "c3-results.jsonl", "tool-activity.jsonl")
+SECTIONS = ("manifest.json", "gate-decisions.jsonl", "tool-calls.jsonl", "refusals.jsonl", "c3-results.jsonl",
+            "tool-activity.jsonl")
 CLAIMS_KINDS = ("completion",)  # kinds whose `claims` is the agent's own final answer
 MAX_CLAIMS_CHARS = 8000
 MAX_EVENTS = 300
@@ -657,6 +661,16 @@ def tool_call_lines(evidence_dir: Path) -> Optional[List[Dict[str, Any]]]:
     return out
 
 
+def refusal_records(evidence_dir: Path) -> Optional[List[Dict[str, Any]]]:
+    """The collector's refusals.jsonl (bug #39), every value re-validated against lib/refusals' fixed vocabulary
+    (path ids, target kinds, routes; never paths or arguments). None when the bundle predates it."""
+    p = evidence_dir / "refusals.jsonl"
+    if not p.is_file():
+        return None
+    out = [refusal_lib.sanitize(rec) for rec in _jsonl(p)[:refusal_lib.MAX_REFUSALS]]
+    return [r for r in out if r is not None]
+
+
 def c3_lines(evidence_dir: Path, index: PathIndex) -> List[Dict[str, Any]]:
     out = []
     for rec in _jsonl(evidence_dir / "c3-results.jsonl")[:MAX_C3]:
@@ -839,6 +853,7 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
     claims = mask_claims(claims, index, ident)
     gates = gate_lines(evidence_dir)
     calls = tool_call_lines(evidence_dir)
+    refs = refusal_records(evidence_dir)
     c3 = c3_lines(evidence_dir, index)
     session = str(request.get("session") or (manifest.get("request") or {}).get("session") or "")
     summary, events, tz = tool_activity(evidence_dir, session)
@@ -878,6 +893,9 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
         "tool-calls.jsonl": ("\n".join(json.dumps(c, ensure_ascii=False) for c in calls)
                              or "(no tool calls recorded in window)") if calls is not None
                             else "(not recorded: the bundle predates tool-calls.jsonl)",
+        "refusals.jsonl": ("\n".join(json.dumps(r, ensure_ascii=False) for r in refs)
+                           or "(no refused call in window)") if refs is not None
+                          else "(not recorded: the bundle predates refusals.jsonl)",
         "c3-results.jsonl": "\n".join(json.dumps(c, ensure_ascii=False) for c in c3) or "(no C3 results in window)",
         "tool-activity.jsonl": "\n".join(json.dumps(e, ensure_ascii=False) for e in [summary] + events),
     }
