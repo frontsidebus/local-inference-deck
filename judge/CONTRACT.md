@@ -500,6 +500,40 @@ exit 64, no execution.
   `$HERMES_HOME/config.yaml` passes on purpose (settings, not credentials; see the policy's `_doc_read_file`).
 - **`rule_key`** for a secret read = `judge-gate:secret-output:<sha256(tool \0 resolved-abs-path)[:12]>`: one key
   per file whatever the spelling or page, so a human's "always" covers that one file, never the whole rule.
+- **Shell variables in terminal commands** (#27, local and remote, incl. `bash -c`, `eval`, function bodies,
+  `$(...)`, scripts the gate peeks into): assignments to literal values (`X=v`, prefix `X=v cmd`,
+  `export|local|declare|readonly|typeset X=v`; `~` / `$HOME` / `$HERMES_HOME` / `$JUDGE_REVIEW_DIR` /
+  `$JUDGE_DIR` expanded; earlier known variables substituted) are tracked in order, and `$X` / `${X}` (quoted or
+  not) are substituted into later words and redirect targets before every rule. A value holding a substitution,
+  an unknown variable, `${X:-...}`-style expansion, an array element or `+=` is unknown; so are `for`/`select`
+  loop variables, names set by `read` / `mapfile` / `readarray` / `getopts` / `printf -v`, and positional
+  parameters (`$1`, `$@`; `$0` counts as known). `unset` forgets a name. Over-approximations on purpose: a prefix
+  assignment stays known after its command; single-quoted `$X` is substituted too.
+  Command substitutions are analyzed in order with the command that holds them (substitutions in dropped
+  loop/case headers and `[[ ]]` first).
+- **`secret-output`, terminal** (print commands = policy `print_commands`): a print command, `< file`, `$(<file)`,
+  `openssl rsa|pkey|ec|pkcs12 -in` without `-noout`/`-pubout`, `cp|install|ln|mv <secret> /dev/stdout|-|...`,
+  `python|perl|ruby|node|php -c|-e` code (or code on stdin) that reads (`open(`, `.read*(`, `read_text`, ...) a
+  secret path named in the code or passed as an operand, `perl|ruby -n|-p <secret>`, `echo|printf` of a variable
+  or `$(...)` that read a secret, or `<(cmd)` where cmd read one; each only when stdout is not captured. Captured =
+  inside `$(...)`, stdout redirected (`>`, `>>`, `&>`; `2>` alone is not, fixed with #27), or piped into a
+  `safe_sinks` command. Whole-file digests and counts (`sha256sum`, `md5sum`, `wc`, ...) pass by design; a
+  digest of a byte-limited part (`head -c` / `tail -c` / `cut -c|-b` / `dd count=|skip=` piped to a hash) escalates
+  (brute-forceable). A copy made in the same command (`cp|mv|install|ln <secret> dst`, or a captured secret read
+  redirected to a file) is treated as the secret for the rest of that command.
+- **`secret-output-unknown`** (approve; #27; added to older pre-rendered policies by `load_policy`): a print
+  command (or the commands above) whose operand stays unresolved (`$X` unknown, `$(...)`, loop variable,
+  `xargs` stdin / `-I{}`, `find -exec ... {}`, `sh -c '... "$1"' _ {}`) escalates when the same command line
+  mentions a secret-shaped word anywhere (`Gate.is_secret_file` on every word: assignments, loop lists, globs such
+  as `~/.config/spark/*`), or, for scripts the gate peeks into, a configured `secret_paths` match only (names like
+  `site.env` in long scripts were too noisy); or when the `find` feeding it (`find R ... -exec`, `find R ... | xargs`)
+  has a root R that is or contains a `secret_paths` entry (`~/.config`, `/etc`, `~`) and no `-name` filter that is
+  entirely in `not_secret_names`. Otherwise it passes. The reason names the secret-shaped word, never content.
+- **Not seen by the gate** (known limits): values built at run time (`f=$(printf '%s/%s' ~/.config spark)/k`
+  without any secret-shaped word, base64-decoded names, `$IFS` tricks); copies or symlinks made in an earlier tool
+  call (`cp key /tmp/x`, then `cat /tmp/x` next turn); secrets read by programs that are not print commands and
+  print what they read (`vim`, a compiled tool, `git diff --no-index`); interpreter code that builds the path at
+  run time; `execute_code` (outside the matcher). Each `terminal` call is judged on its own.
 - **hermes CLI** (policy key `oversight_config.hermes_cli`; gate.py carries the same values as a fallback for
   older rendered policies):
   - pass: `-h`/`--help` anywhere before `--` (block flags `--yolo`/`--accept-hooks` are still checked);

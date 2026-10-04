@@ -212,7 +212,31 @@ To keep reviewing but stop frontier spend, set `JUDGE_MODE=local` in `site.env` 
 
 ## Operating it
 
-- **Gate decisions (C2)** appear inline in Hermes as an approval prompt (escalate) or a block message, and as one JSONL line each in `$JUDGE_REVIEW_DIR/gate.log`.
+- **Gate decisions (C2)** appear inline in Hermes as an approval prompt (escalate) or a block message, and as one JSONL line each in `$JUDGE_REVIEW_DIR/gate.log`. The rules are below.
+
+### C2 gate rules
+
+The gate reads only the tool call itself. It parses terminal commands (pipes, `&&`, loops, `if`, `case`, functions, `bash -c`, `eval`, `$(...)`, heredocs, `ssh host '...'`, and local shell scripts it is asked to run) and judges each simple command. Policy: `policy/gate-policy.json.tmpl`. Full matcher list: [CONTRACT.md](CONTRACT.md#gate-c2-coverage).
+
+| Rule | Action | Fires on |
+|---|---|---|
+| `oversight-config`, `oversight-path` | block | Changes to `command_allowlist`, `hooks`, `security`, approval settings, the hook allowlist, or the judge's own files and review data |
+| `hermes-config` | escalate | Other `config.yaml` changes and `hermes` subcommands not known to be read-only |
+| `remote-mutation`, `remote-copy`, `remote-opaque` | escalate | A command on Walter or Covenant that is not on the read-only list, copies to them, or scripts the gate can't see |
+| `sensitive-path` | escalate | Writes under `~/.ssh`, `~/.config/spark`, `$HERMES_HOME/.env`, `/etc` |
+| `public-push` | escalate | `git push`, `gh` mutations (the repo is public) |
+| `secret-output` | escalate | A `read_file` or terminal command that would print a secret-shaped file. Shell variables are resolved first (#27), so `f=~/.config/spark/hermes.key; cat "$f"` is judged like `cat ~/.config/spark/hermes.key`. Also covered: `$(cat …)` echoed, `< "$f"`, `python -c "print(open(…).read())"`, `cp … /dev/stdout`, a copy of the secret reused in the same command, and a digest of a few bytes (`head -c 3 key \| sha256sum`). Capturing the value (`K=$(cat key)`), sending stdout to a file or `/dev/null`, and whole-file `sha256sum`/`md5sum`/`wc` pass. `2>/dev/null` alone hides only stderr, so it no longer counts as captured |
+| `secret-output-unknown` | escalate | A printing command whose file the gate can't resolve (`$(…)`, an unknown or loop variable, `read`, `xargs`, `find -exec {}`) when the same command names a secret-shaped path or name anywhere: `for f in ~/.config/spark/*; do cat "$f"; done`, `echo <key path> \| xargs cat`, `find ~/.config -type f -exec cat {} +`. Without such a mention it passes, so `for f in *.md; do head "$f"; done` doesn't prompt |
+
+**What the gate still can't see.** It is a static check of one tool call, so treat it as a tripwire, not a wall:
+
+- paths built at run time with no secret-shaped word in the command (`printf`-assembled names, base64-decoded names, `$IFS` tricks);
+- copies or symlinks of a secret made in an *earlier* tool call (`cp key /tmp/x`, then `cat /tmp/x` next turn); within one command they are caught;
+- programs that are not on the print list but show file contents (an editor, `git diff --no-index`, a compiled tool), and interpreter code that builds the path itself;
+- whole-file digests and lengths, which pass by design;
+- `execute_code`, which is outside the matcher.
+
+Hermes's output redactor (`sk-…` keys) and the judge's review of the session are the next layers.
 - **Verifier nudges (C3)** appear as the agent continuing with a message naming the failed check.
 - **Findings** land in `$JUDGE_REVIEW_DIR/findings/<request-id>.md` (for reading) and `.json` (for tools). Every item has a rubric code (R1 to R7), a severity, the claim, the **evidence** (a command and its output, or a file and line), a verdict and a recommendation.
 - `judge/bin/judge-findings` lists findings, newest first; the summary line ends `open:N agent-acked:N closed:N`. With `--items` or a request id, items are grouped as `open`, `agent-acked: awaiting a human` and `closed`, each with its ack line (who, when, why). `judge-findings --needs-human` lists the `high` items no human has closed yet, whether unacked or agent-acked: start there. `--unacked` still means no ack at all; `--json` adds `status` and `ack` per item.
@@ -356,6 +380,7 @@ Logs are redacted for secrets before they enter a bundle. The judge never gets a
 | A read-only remote loop (`ssh host 'for p in 3001 3002; do curl ...; done'`) asked for approval as `remote-mutation` | Shell keywords were judged as unknown commands (#22), fixed. The gate parses `for`/`select`, `while`/`until`, `if`/`elif`/`else`, `case`, `{ }`, `( )`, `[[ ]]`, `(( ))` and function definitions, and judges each command inside: a body of read-only commands passes, one mutating command (`systemctl restart`, a `>` redirect after `done`, a substitution in the loop list) still escalates. `[ ]`, `test`, `true`, `false`, `:`, `X=1`, `shift`, `break`, `continue`, `let` and `$(( ))` are read-only. Anything it cannot parse still escalates. |
 | `gate-decisions` says `outcome: unknown` for a gated `read_file` | `read_file` was missing from the `post_tool_call` matcher (#23). Re-run `install.sh --apply` and restart Hermes and the gateway (no new consent). The read's event carries only call markers, never paths: a read is not counted as a change by the agent. |
 | The agent read a key with `read_file` and no approval was asked | `read_file` wasn't in the C2 matcher (#17). Re-run `install.sh --apply` and restart Hermes and the gateway (no new consent). Secret-shaped reads (key-like names, plus the `secret_paths` list in the policy) now ask you; approving "always" covers that one file only. Reads of `$HERMES_HOME/config.yaml` pass on purpose. |
+| The agent read a secret through the terminal with no approval (`f=<key>; cat "$f"`, `head -c1 "$f" \| xxd`) | Variable indirection bypassed `secret-output` (#27, run 3 S8), fixed: variables holding a literal path are resolved, and a printing command on an unresolvable file escalates as `secret-output-unknown` when the command names a secret. No reinstall or restart needed (the gate is read on every call; an older pre-rendered `gate-policy.json` gets the new rule by default). Check a command with `judge/hooks/gate.py --explain` (see [C2 gate rules](#c2-gate-rules) for what it still can't see). |
 | A finding (R5) or the C6 watcher reports `n_predict: -1` / a request without `max_tokens` running to the context limit | Fixed in the stack on 2026-10-03, not in the judge: the gateway gives every request an output limit (default 16384, clamped to the model's maximum) and llama-server runs with `-n` (see the walter README, "Output cap"). Seeing `n_predict: -1` in `/slots` again means the llama-swap config lost its `-n` flags or the call bypassed the gateway; seeing a limit above 32768 means the gateway hook is not loaded (`docker logs gateway-litellm-1 \| grep 'output cap'`). The C6 token trigger fires on `n_decoded >= JUDGE_RUNAWAY_TOKENS` whatever `n_predict` is, and its reason says `NO output cap (n_predict=-1)` in this case. |
 | C6 alerts `n_decoded=... >= 24000 (cap n_predict=32768: .../32768, NN%)` | A request asked for (nearly) the model's maximum output and is still generating; not necessarily a bug. It will stop at the cap. The alert is not cancelled: unload the model with the printed command only if the GPU is needed. The queued `runaway` review is `infra` and goes to the frontier judge; raise `JUDGE_RUNAWAY_TOKENS` if such long generations are routine. |
 | A `runaway` review was judged by `coder-fast` (`data_class=sensitive: local judge enforced`) | The request was not shaped like the watcher's (`source_event=watch`, session `watch-task<N>`, no `changed_paths`, no `detail.cwd`), or it was written before the fix of 2026-10-03 (collector re-classified every path-less runaway as `sensitive`). Check `manifest.json` `request_data_class` vs `data_class`. |
