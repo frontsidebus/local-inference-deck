@@ -236,3 +236,19 @@ def test_with_real_lib_queue(env, monkeypatch, capsys):
     [p] = list((env / "queue").glob("*-runaway.json"))
     from lib import queue as q  # type: ignore
     assert q.validate_request(json.loads(p.read_text())) == []
+
+
+def test_release_deferred_wakes_expired_plan_requests(env, monkeypatch):
+    """#34 backstop: a deferred plan request whose turn never ended (agent crashed or timed out) is released
+    by the watcher's poll, not left waiting for an unrelated queue write."""
+    import sys
+    sys.path.insert(0, str(JUDGE))
+    from lib import queue as q
+    spec = importlib.util.spec_from_file_location("judge_runaway_release", WATCH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    req = q.make_request("plan", "s1", "2026-10-04T00:00:00Z", source_event="post_tool_call",
+                         changed_paths=["/tmp/p.md"], not_before="2026-10-04T00:00:01Z")
+    q.write_request(req)
+    assert mod.release_deferred() == [req["id"]]
+    assert mod.release_deferred() == []  # released once

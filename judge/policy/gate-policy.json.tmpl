@@ -150,7 +150,7 @@
       "id": "secret-output",
       "kind": "secret_output",
       "action": "approve",
-      "description": "Command or read_file that would put a secret into the transcript (reading it into a variable or a pipe to a hash/count is fine)",
+      "description": "Command or read_file that would put a secret, or any part of it, into the transcript. If this is escalated and refused, stop and report it to the human; do not reach the same file another way",
       "_doc_read_file": "read_file escalates when the path is secret-shaped by secret_names (basename) or secret_paths (full path), minus not_secret_names; every other read passes. $HERMES_HOME/config.yaml deliberately passes: it holds settings, not credentials (those live in $HERMES_HOME/.env, which escalates), the agent needs it to reason about its own setup, and Hermes's output redactor still masks key-shaped values.",
       "secret_paths": [
         "~/.config/spark/**", "$HERMES_HOME/.env", "~/.ssh/id_*", "/etc/llama-swap/api-key", "/etc/wireguard/**",
