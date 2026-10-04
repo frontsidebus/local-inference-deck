@@ -27,6 +27,8 @@
 #
 # Optional: the digest site (60-digest, its cert, the oauth2-proxy-digest instance) is opt-in and
 # only deployed when SPARK_DIGEST_HOST is set in site.env (see the Digest section in README.md).
+# Until its cert exists, 60-digest is linked as an ACME-only port-80 stub; the run issues the cert
+# without touching the other sites and links the full site once the cert is there.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -48,7 +50,7 @@ while (($#)); do
     --set-client-secret) SET_SECRET=1 ;;
     --instance) need_value "$@"; INSTANCE=$2; shift ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -75,6 +77,10 @@ COVENANT_VARS=(SPARK_DOMAIN SPARK_CHAT_HOST SPARK_API_HOST SPARK_ID_HOST SPARK_T
 DIGEST_VARS=(SPARK_DIGEST_HOST DIGEST_GROUP OAUTH2_PROXY_DIGEST_CLIENT_ID DIGEST_PORT)
 
 SITES=(00-default 10-apex 20-chat 30-id 40-api 50-telemetry)
+# Optional sites, SITE -> its host name. Their :443 server needs a cert that does not exist
+# when the site is first enabled on a live edge, so until it does, sites-enabled/SITE points at
+# an ACME-only port-80 stub (nginx/bootstrap/SITE-acme.tmpl) and the other sites stay up.
+declare -A OPT_SITE_HOST=()
 
 # ---------------------------------------------------------------- helpers
 log()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
@@ -132,6 +138,22 @@ unlink_if() {   # LINK
 
 service_active() { live && systemctl is-active --quiet "$1"; }
 
+has_cert() { [[ -s $DESTDIR/etc/letsencrypt/live/$1/fullchain.pem ]]; }
+
+# nginx -t, then reload (or start). Live: a failed test restores /etc/nginx from the
+# newest backup and stops the deploy. Otherwise the commands are only printed.
+nginx_apply() {
+  if live; then
+    if ! nginx -t; then
+      local latest; latest=$(ls -1t /var/backups/covenant/nginx-*.tar.gz | head -1)
+      rm -rf /etc/nginx/sites-enabled/*; tar -C / -xzf "$latest"
+      die "nginx -t failed; restored /etc/nginx from $latest (nginx not reloaded)"
+    fi
+    systemctl enable nginx
+    if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi
+  else run nginx -t; run systemctl reload nginx; fi
+}
+
 render() {   # TEMPLATE OUT
   local list; list=$(printf '${%s} ' "${COVENANT_VARS[@]}")
   mkdir -p "$(dirname "$2")"
@@ -150,6 +172,7 @@ if [[ -n ${SPARK_DIGEST_HOST:-} ]]; then
   export DIGEST_PORT DIGEST_GROUP OAUTH2_PROXY_DIGEST_CLIENT_ID
   COVENANT_VARS+=("${DIGEST_VARS[@]}")
   SITES+=(60-digest)
+  OPT_SITE_HOST[60-digest]=$SPARK_DIGEST_HOST
 fi
 for v in "${COVENANT_VARS[@]}"; do [[ -n ${!v:-} ]] || die "$v is empty in $ENV_FILE"; done
 if ((SET_SECRET)) && [[ $INSTANCE == digest && $DIGEST == 0 ]]; then
@@ -263,12 +286,20 @@ for pair in "certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf:options-
   fi
 done
 
+# Core names: a missing cert means the port-80-only bootstrap (443 down, needs the flag on a
+# live edge). Optional sites' names: a missing cert only puts that site on its ACME stub.
 NAMES=("$SPARK_DOMAIN" "$SPARK_CHAT_HOST" "$SPARK_API_HOST" "$SPARK_ID_HOST" "$SPARK_TELEMETRY_HOST")
-((DIGEST)) && NAMES+=("$SPARK_DIGEST_HOST")
-need=()
-for n in "${NAMES[@]}"; do [[ -s $DESTDIR/etc/letsencrypt/live/$n/fullchain.pem ]] || need+=("$n"); done
+need=() need_opt=() opt_stub=()
+for n in "${NAMES[@]}"; do has_cert "$n" || need+=("$n"); done
+for s in "${SITES[@]}"; do
+  n=${OPT_SITE_HOST[$s]:-}
+  [[ -n $n ]] || continue
+  NAMES+=("$n")
+  has_cert "$n" || { need_opt+=("$n"); opt_stub+=("$s"); }
+done
 certs_args=(); ((STAGING)) && certs_args+=(--staging)
 if ((${#need[@]})); then
+  need+=("${need_opt[@]}")
   info "no cert yet for: ${need[*]}"
   if [[ -L $DESTDIR/etc/nginx/sites-enabled/00-default ]] && ((ALLOW_DOWNTIME == 0)) && live; then
     die "full sites are live but certs are missing; re-run with --allow-bootstrap-downtime
@@ -284,6 +315,20 @@ if ((${#need[@]})); then
   if live; then "$HERE/scripts/certs.sh" "${certs_args[@]}" "${need[@]}"
   else "$HERE/scripts/certs.sh" --dry-run "${certs_args[@]}" "${need[@]}" | sed 's/^/    /'; fi
   NGX_CHANGED=1
+elif ((${#need_opt[@]})); then
+  # Only optional sites lack a cert: link each to its ACME-only stub, reload (every other site
+  # stays up), issue. Step 5 links the full site once the cert exists.
+  info "no cert yet for optional site(s): ${opt_stub[*]} (${need_opt[*]}); ACME-only stub, no downtime"
+  for s in "${opt_stub[@]}"; do
+    put "$BUILD/nginx/bootstrap/$s-acme" "/etc/nginx/sites-available/$s-acme" 0644 || true
+    symlink "/etc/nginx/sites-available/$s-acme" "/etc/nginx/sites-enabled/$s" || true
+  done
+  nginx_apply
+  if live; then
+    "$HERE/scripts/certs.sh" "${certs_args[@]}" "${need_opt[@]}" ||
+      warn "certs.sh failed for: ${need_opt[*]} (DNS? port 80?); the site(s) stay on the ACME stub"
+  else "$HERE/scripts/certs.sh" --dry-run "${certs_args[@]}" "${need_opt[@]}" | sed 's/^/    /'; fi
+  NGX_CHANGED=1
 else
   info "certs present for all ${#NAMES[@]} names"
 fi
@@ -292,7 +337,28 @@ fi
 log "5/7 nginx sites"
 for s in "${SITES[@]}"; do
   if put "$BUILD/nginx/sites-available/$s" "/etc/nginx/sites-available/$s" 0644; then NGX_CHANGED=1; fi
+  n=${OPT_SITE_HOST[$s]:-}
+  if [[ -n $n ]] && ! has_cert "$n"; then
+    # Optional site without its cert: never link its :443 server. A dry run shows the live outcome
+    # (step 4 printed the stub + certs.sh); a live or staged run keeps (or puts) it on the stub.
+    if ((DRY_RUN)); then
+      info "link /etc/nginx/sites-enabled/$s -> /etc/nginx/sites-available/$s once step 4 has issued"
+      info "    the cert for $n (if certbot fails, $s stays on its ACME stub; see the warning then)"
+      continue
+    fi
+    if put "$BUILD/nginx/bootstrap/$s-acme" "/etc/nginx/sites-available/$s-acme" 0644; then NGX_CHANGED=1; fi
+    if symlink "/etc/nginx/sites-available/$s-acme" "/etc/nginx/sites-enabled/$s"; then NGX_CHANGED=1; fi
+    if live; then
+      warn "$s: no cert for $n yet, so only its ACME stub is linked. Next: fix DNS/port 80 for $n, then
+    sudo LETSENCRYPT_EMAIL=\"\$LETSENCRYPT_EMAIL\" covenant/scripts/certs.sh $n && sudo covenant/deploy.sh"
+    else
+      info "$s: no cert for $n under DESTDIR, so $s is staged on its ACME stub"
+      info "    (add the cert, e.g. certs.sh $n on the host, then re-run deploy.sh to link the full site)"
+    fi
+    continue
+  fi
   if symlink "/etc/nginx/sites-available/$s" "/etc/nginx/sites-enabled/$s"; then NGX_CHANGED=1; fi
+  if [[ -n $n ]] && unlink_if "/etc/nginx/sites-available/$s-acme"; then NGX_CHANGED=1; fi
 done
 if unlink_if /etc/nginx/sites-enabled/default; then NGX_CHANGED=1; fi
 if ((DIGEST == 0)) && [[ -e $DESTDIR/etc/nginx/sites-enabled/60-digest || -L $DESTDIR/etc/nginx/sites-enabled/60-digest ]]; then
@@ -303,16 +369,7 @@ if ((SETUP_LOCK)); then
   if put "$BUILD/nginx/snippets/pocketid-setup-lock.conf" /etc/nginx/snippets/pocketid-setup-lock.conf 0644; then NGX_CHANGED=1; fi
   warn "Pocket-ID setup lock is ON. Claim the admin at https://$SPARK_ID_HOST/setup, then re-deploy without --setup-lock."
 elif unlink_if /etc/nginx/snippets/pocketid-setup-lock.conf; then NGX_CHANGED=1; fi
-if ((NGX_CHANGED)); then
-  if live; then
-    if ! nginx -t; then
-      latest=$(ls -1t /var/backups/covenant/nginx-*.tar.gz | head -1)
-      rm -rf /etc/nginx/sites-enabled/*; tar -C / -xzf "$latest"
-      die "nginx -t failed; restored /etc/nginx from $latest (nginx not reloaded)"
-    fi
-    systemctl enable nginx
-    if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi
-  else run nginx -t; run systemctl reload nginx; fi
+if ((NGX_CHANGED)); then nginx_apply
 else info "nginx unchanged"; fi
 
 # ================================================================ 6. oauth2-proxy

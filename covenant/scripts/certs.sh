@@ -4,7 +4,10 @@
 #
 # Prerequisite: something on port 80 serves /.well-known/acme-challenge/ from
 # /var/www/letsencrypt for these names - either the bootstrap site
-# (nginx/bootstrap/00-acme-bootstrap) or the full sites (00-default, 50-telemetry).
+# (nginx/bootstrap/00-acme-bootstrap), the full sites (00-default for the apex, chat,
+# api and id names; 50-telemetry; 60-digest), or an optional site's ACME-only stub
+# (nginx/bootstrap/60-digest-acme). 00-default's catch-all returns 444, so a name with
+# none of these (e.g. a new digest name before deploy.sh linked its stub) fails http-01.
 # DNS A records for every name must already point at the Elastic IP.
 #
 # Usage: LETSENCRYPT_EMAIL=you@example.com covenant/scripts/certs.sh [--dry-run] [--staging] NAME...

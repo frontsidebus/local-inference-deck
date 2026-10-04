@@ -291,7 +291,7 @@ grep -n '^PORTS=' /usr/local/sbin/docker-user-rules.sh       # PORTS="3000 1411 
 sudo systemctl restart docker-user-rules.service && sudo iptables -S WALTER-PUBLISHED | grep -c 3300   # 0
 sudo rm -rf /srv/digest            # deletes the run history too; back up state/ first if wanted
 # Covenant
-sudo rm -f /etc/nginx/sites-available/60-digest /etc/systemd/system/oauth2-proxy-digest.service
+sudo rm -f /etc/nginx/sites-available/60-digest /etc/nginx/sites-available/60-digest-acme /etc/systemd/system/oauth2-proxy-digest.service
 sudo rm -rf /etc/oauth2-proxy-digest && sudo systemctl daemon-reload
 sudo certbot delete --cert-name ${SPARK_DIGEST_HOST}
 ```
