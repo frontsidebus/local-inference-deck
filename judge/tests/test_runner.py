@@ -529,3 +529,17 @@ def test_truncation_note_counts_severities():
     raw = ('{"items": [{"severity": "high"}, {"severity":"Medium"}, {"severity": "high"}, {"sev')
     n = RJ.truncation_note(1, raw, 4096, "evidence/x/judge-raw.txt")
     assert "3 item(s)" in n and "2 high, 1 medium" in n
+
+
+def test_split_hermes_log_counts_attributed_parallel_lines_as_session():
+    # #28: an untagged parallel tool line the collector attributed to the session (PARALLEL_MARK suffix)
+    # must survive budget trimming as a session line; an unmarked untagged line stays context.
+    sid = "20261004_034800_abc123"
+    text = "\n".join([
+        f"2026-10-04 03:48:01,000 INFO [{sid}] agent: API call #1",
+        "2026-10-04 03:48:02,000 INFO tools: read_file ok 0.01s" + RJ._PARALLEL_MARK,
+        "2026-10-04 03:48:03,000 INFO tools: read_file ok 0.01s",
+    ])
+    kinds, n = RJ.split_hermes_log(text, sid)
+    assert [k for k, _ in kinds] == ["session", "session", "context"]
+    assert n == 2

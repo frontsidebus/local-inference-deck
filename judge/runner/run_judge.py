@@ -370,6 +370,10 @@ def _middle_cut(lines: List[str], budget: int, what: str) -> List[str]:
     return head + [f"[... runner omitted {cut} {what} line(s) from the middle to fit the bundle budget ...]"] + tail
 
 
+# Suffix lib/hermeslog adds to an untagged parallel tool line it attributed to the session (#28).
+_PARALLEL_MARK = CO.PARALLEL_MARK
+
+
 def split_hermes_log(text: str, session: str) -> Tuple[List[Tuple[str, str]], int]:
     """Classify each line of hermes-log.txt: "session" (tagged with *session*, and its continuation lines),
     "struct" (headers, section titles, placeholders) or "context" (everything else: untagged lines and their
@@ -383,6 +387,8 @@ def split_hermes_log(text: str, session: str) -> Tuple[List[Tuple[str, str]], in
         if m:
             cur = "session" if session and m.group("session") == session else "context"
             kind = cur
+            if ln.endswith(_PARALLEL_MARK):
+                kind = "session"  # untagged parallel tool call the collector attributed to this session (#28)
         elif ln.startswith(("# ", "===== ")) or ln in ("", "(missing)", "(no lines in window)"):
             kind = "struct"
             if ln.startswith("===== "):
