@@ -8,7 +8,8 @@ Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
   on_session_start   snapshot watched paths into snapshots/<session>/ (idempotent)
   post_tool_call     matcher "write_file|patch|terminal|memory|skill_manage|read_file": records each call in
                      snapshots/<session>/events.jsonl with its call markers (call_id/call_hash, matched
-                     against gate.log for gate `outcome`) and touched paths (write_file/patch targets; for
+                     against gate.log for gate `outcome`), the command NAME (terminal: lib/toolcalls
+                     command_word, an allowlisted first word or "(other)"; never arguments) and touched paths (write_file/patch targets; for
                      terminal, the path-like tokens of the command, used only to attribute snapshot changes
                      to the agent; read_file records no paths: a read is not a change by the agent);
                      a successful write_file/patch of */.hermes/plans/*.md enqueues a `plan`
@@ -136,7 +137,7 @@ def on_session_start(payload, cfg, root):
 
 
 def post_tool_call(payload, cfg, root):
-    from lib import config, queue as q, redact, snapshot
+    from lib import config, queue as q, redact, snapshot, toolcalls
     session = payload.get("session_id") or ""
     tool = payload.get("tool_name") or ""
     cwd = payload.get("cwd") or ""
@@ -154,7 +155,9 @@ def post_tool_call(payload, cfg, root):
     cid = extra.get("tool_call_id") if isinstance(extra, dict) else None
     snapshot.record_event(d, tool, paths, _status(extra),
                           call_id=str(cid) if isinstance(cid, (str, int)) and str(cid).strip() else None,
-                          call_hash=redact.call_hash(tool, tinput))
+                          call_hash=redact.call_hash(tool, tinput),
+                          command=toolcalls.command_word(
+                              tool, tinput.get("command") if isinstance(tinput, dict) else None))
     if tool not in WRITE_TOOLS or _status(extra) == "error" or not snapshot.ran({"status": _status(extra)}):
         return None
     for plan in (p for p in paths if is_plan(p)):

@@ -13,6 +13,9 @@ Bundle (judge/CONTRACT.md):
                          untagged context lines (startup/housekeeping noise of all Hermes processes dropped)
     gate-decisions.jsonl gate.log lines of this session in the window (+ a gate request's own decision), redacted,
                          each with `outcome` executed | not_executed | unknown (matched against events.jsonl)
+    tool-calls.jsonl     one line per tool call post_tool_call saw in the window: t, tool, command NAME (an
+                         allowlisted program or "(other)"; never arguments), gate pass|escalated|blocked|not gated,
+                         ran, error, after_refused_escalation (tool_calls; bug #33)
     agent-diff.patch     watched paths vs the session-start snapshot, only paths the agent touched
                          (+ repo changes since the start HEAD for those paths)
     others-changed.txt   snapshot changes NOT attributed to the agent: paths + diffstat, never content
@@ -640,6 +643,73 @@ def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
     return "infra" if req.get("data_class") == "infra" and mine == "infra" else "sensitive"
 
 
+GATED_TOOLS = ("terminal", "write_file", "patch", "read_file")  # hooks/gate.py's pre_tool_call matcher
+TOOL_CALL_MAX_LINES = 200
+
+
+def tool_calls(req: Dict, cfg: Mapping[str, str], root: Path, since: datetime, until: datetime) -> List[str]:
+    """One JSON line per tool call post_tool_call saw for this session with t in [since, until] (bug #33):
+    `t`, `tool`, `command` (lib/toolcalls.command_word: an allowlisted program name, "(other)" or "(none)";
+    never arguments; from the event, else from state.db by tool_call_id, else "(unknown)"), `gate`
+    (`pass`: no gate.log decision for the call; `escalated` / `blocked`: the gate's decision; `not gated`: a
+    tool outside the gate's matcher), `ran` (the call's status is not a NOT_RUN status), `error` (it ran and
+    returned an error), and
+    `after_refused_escalation` (an earlier escalation or block of this session had not run when this call
+    was made)."""
+    from lib import toolcalls
+    session = str(req.get("session") or "")
+    d = q.snapshot_dir(req["session"], root)
+    recs = [r for r in _read_gate_log(root) if str(r.get("session") or "") == session and r.get("_ts") is not None
+            and r.get("decision") in ("approve", "block")]
+    evs = []
+    for ev in snapshot.events(d):
+        try:
+            ev["_t"] = q.parse_utc(str(ev.get("t") or ""))
+        except ValueError:
+            continue
+        evs.append(ev)
+    executed = [ev for ev in evs if snapshot.ran(ev) and ev["_t"] <= until]
+    ran_recs = _match_executions(recs, executed)
+    by_id = {str(r["tool_call_id"]): i for i, r in enumerate(recs) if r.get("tool_call_id")}
+    names: Optional[Dict[str, str]] = None
+    out: List[str] = []
+    for ev in evs:
+        if not since <= ev["_t"] <= until:
+            continue
+        tool = str(ev.get("tool") or "")
+        cid = str(ev.get("call_id") or "")
+        own = by_id.get(cid) if cid else None
+        if own is None and ev.get("call_hash") and (not cid or not by_id):
+            for i, r in enumerate(recs):  # older events/decisions without ids: the latest earlier same call
+                if (r.get("call_hash") == ev["call_hash"] and r.get("tool") == tool and r["_ts"] <= ev["_t"]
+                        and ev["_t"] - r["_ts"] <= timedelta(seconds=GATE_MATCH_SECONDS)):
+                    if own is None or r["_ts"] >= recs[own]["_ts"]:
+                        own = i
+        if tool not in GATED_TOOLS:
+            gate = "not gated"
+        elif own is None:
+            gate = "pass"
+        else:
+            gate = "escalated" if recs[own].get("decision") == "approve" else "blocked"
+        cmd = ev.get("command")
+        if not toolcalls.is_command_word(tool, cmd) or cmd == toolcalls.UNKNOWN:
+            if tool == "terminal":
+                if names is None:
+                    names = toolcalls.commands_from_state_db(cfg.get("HERMES_HOME") or "", session)
+                cmd = names.get(cid, toolcalls.UNKNOWN) if cid else toolcalls.UNKNOWN
+            else:
+                cmd = tool
+        refused_before = any(i != own and i not in ran_recs and r["_ts"] <= ev["_t"] for i, r in enumerate(recs))
+        # No raw Hermes status: it says "blocked" for an escalation nobody approved, which reads as a gate block.
+        out.append(json.dumps({
+            "t": q.utc_now_iso(ev["_t"]), "tool": tool, "command": cmd, "gate": gate, "ran": snapshot.ran(ev),
+            "error": str(ev.get("status") or "").lower() == "error",
+            "after_refused_escalation": refused_before}, ensure_ascii=False))
+        if len(out) >= TOOL_CALL_MAX_LINES:
+            break
+    return out
+
+
 def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=None, root=None,
             now: Optional[datetime] = None) -> Path:
     cfg = cfg or config.load_config()
@@ -669,6 +739,10 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     _write(ev / "gate-decisions.jsonl", "".join(ln + "\n" for ln in gates))
     if not gates:
         notes["gate-decisions.jsonl"] = "no gate decisions in window (empty file)"
+    calls = tool_calls(req, cfg, root, since, until)
+    _write(ev / "tool-calls.jsonl", "".join(ln + "\n" for ln in calls))
+    if not calls:
+        notes["tool-calls.jsonl"] = "no tool calls recorded by post_tool_call in window (empty file)"
     agent_paths = sorted(set(att["agent"]) | set(att["accepted"]))
     _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"]))
     _write(ev / "others-changed.txt", others_changed(req, cfg, root, att, sensitive, until))
@@ -695,7 +769,7 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
         slots = {"error": str(e)}
     _write(ev / "slots.json", redact(json.dumps(slots, indent=2)) + "\n")
     pit = {"observed_at": now_s, "note": POINT_IN_TIME}
-    windowed = ["hermes-log.txt", "gate-decisions.jsonl"] + [f"host-{h}.txt (find)" for h in config.HOSTS]
+    windowed = ["hermes-log.txt", "gate-decisions.jsonl", "tool-calls.jsonl"] + [f"host-{h}.txt (find)" for h in config.HOSTS]
     extra_pit: Dict[str, Dict] = {}
     gate_excerpts = []
     for ln in gates:

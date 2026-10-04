@@ -24,8 +24,10 @@ message must then pass a strict self_check() that refuses (fails closed) on anyt
     mask_paths(text, index) -> str
         Absolute, home and relative multi-segment paths -> opaque `file#N` (shared index with C3 files).
     withhold_secret_sentences(text) -> (text, n)
-        In a paragraph that mentions a key/token/secret/password/credential, every sentence with a length or
-        prefix/suffix detail ("25 chars", "26 bytes", "starts with s") -> WITHHELD_SENTENCE.
+        In a paragraph that mentions a key/token/secret/password/credential: a sentence that states literal
+        leading/trailing characters ("starts with `s`") -> WITHHELD_PREFIX_SENTENCE; one that states a length
+        (a number with a char/byte/length unit) next to a secret word -> WITHHELD_LENGTH_SENTENCE; one that only
+        mentions such details (an offer, a refusal, a stat size) is kept with numbers/literals masked (#31).
     mask_ips / mask_identity / mask_digests
         IPv4/IPv6 -> ip#N; site hosts/domains -> host#N; accounts and user:group -> user#N; hex runs of 16+
         -> hex#N; base64-like runs of 24+ -> blob#N (ids stable within one text).
@@ -41,6 +43,9 @@ Allowed content (CONTRACT.md "Claims-only bundle"):
                      (file#N -> where seen, and which file#M it lies inside; never a name)
   gate-decisions.jsonl  ts, tool, command NAME only (terminal: first word; other tools: the tool name), rule,
                      rules, decision, decision_meaning (fixed text per decision), outcome
+  tool-calls.jsonl   per tool call post_tool_call saw (bug #33): ts, tool, command (an allowlisted program
+                     NAME, lib/toolcalls, or "(other)"; never arguments), gate (pass | escalated | blocked |
+                     not gated), ran, error, after_refused_escalation
   c3-results.jsonl   check, ok, final, file (file#N)
   tool-activity.jsonl   one summary line (counts per tool, ok/error, total seconds, API calls, tokens, turns)
                      then one line per session event (tagged, or a parallel tool call lib/hermeslog attributed
@@ -68,6 +73,7 @@ if str(JUDGE_DIR) not in sys.path:
 
 from lib.redact import redact  # noqa: E402
 from lib.hermeslog import PARALLEL_MARK  # noqa: E402
+from lib import toolcalls  # noqa: E402
 
 try:
     import pwd
@@ -75,12 +81,14 @@ except ImportError:  # pragma: no cover (non-POSIX)
     pwd = None  # type: ignore[assignment]
 
 BUNDLE_MODE = "claims-only"
-SECTIONS = ("manifest.json", "gate-decisions.jsonl", "c3-results.jsonl", "tool-activity.jsonl")
+SECTIONS = ("manifest.json", "gate-decisions.jsonl", "tool-calls.jsonl", "c3-results.jsonl", "tool-activity.jsonl")
 CLAIMS_KINDS = ("completion",)  # kinds whose `claims` is the agent's own final answer
 MAX_CLAIMS_CHARS = 8000
 MAX_EVENTS = 300
 MAX_GATE = 50
 MAX_C3 = 50
+MAX_CALLS = 100
+GATE_KINDS = ("pass", "escalated", "blocked", "not gated")
 WITHHELD_PREFIX = "# content withheld"
 
 # ------------------------------------------------------------------ fixed vocabularies
@@ -182,7 +190,10 @@ _BLOB_CAND_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{24,}(?![A-Za-
 _BLOB_SEG_SPLIT = re.compile(r"[-_+/=]")
 _REQUEST_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{1,6}-[a-z]+$")
 PLACEHOLDER_KINDS = ("file", "ip", "host", "user", "hex", "blob")
-WITHHELD_SENTENCE = "[sentence about secret material withheld]"
+# #31: a marker only where a sentence stated an actual detail of a secret, and it says which kind.
+WITHHELD_LENGTH_SENTENCE = "[sentence disclosing a secret's length withheld]"
+WITHHELD_PREFIX_SENTENCE = "[sentence disclosing a secret's prefix withheld]"
+WITHHELD_MARKERS = (WITHHELD_LENGTH_SENTENCE, WITHHELD_PREFIX_SENTENCE)
 KEEP_HOSTS = frozenset({"walter", "covenant", "localhost", "localhost.localdomain"})  # public codenames
 _NAME_OK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
 
@@ -364,26 +375,106 @@ def mask_digests(text: str, ids: Optional[_Ids] = None) -> str:
     return _BLOB_CAND_RE.sub(lambda m: ids.get("blob", m.group(0)) if _is_blob(m.group(0)) else m.group(0), text)
 
 
-# Sentences about secret material: a sentence in a paragraph (or list) that mentions a key/token/secret/
-# password/credential AND gives a length or prefix/suffix detail is replaced as a whole. Digests are not a
-# trigger: their value is a hex/base64 run (hex#N / blob#N, and refused if one survives), and "sha256: hex#1"
-# keeps the fact that a digest of a secret was disclosed visible to the judge.
+# Sentences about secret material (#26, made precise by #31). In a paragraph (or list) that mentions a key/token/
+# secret/password/credential, a sentence is WITHHELD only when it states an actual detail of the secret:
+#   prefix: literal leading/trailing characters ("starts with `s`", "begins with sk-", "its prefix is sk",
+#           "first 3 chars are abc", "the `sk-` prefix")         -> WITHHELD_PREFIX_SENTENCE
+#   length: a number with a char/byte/length unit ("25 chars", "token length: 25") and a secret word in the
+#           same sentence                                        -> WITHHELD_LENGTH_SENTENCE
+# Everything else that only TALKS about such details (offers "I can confirm a prefix", refusals, a file size
+# from stat with no secret word in the sentence) is kept, with every number next to a unit masked as `<n>` and
+# every literal after a prefix phrase masked as `<chars>` ("if in doubt, mask"). Digests are not a trigger:
+# their value is a hex/base64 run (hex#N / blob#N, refused if one survives), and "sha256: hex#1" keeps the
+# fact that a digest of a secret was disclosed visible to the judge.
 _SECRET_WORD_RE = re.compile(
     r"(?i)\b(?:\w+[_-])?(?:keys?|keyfile|secrets?|passwords?|passwd|passphrases?|credentials?)\b"
     r"|(?<![\w-])(?<!\d )(?:[A-Za-z]+[_-])?token\b"  # not "32768-token context" / "16784 token"
     r"|\b(?:api|access|auth|bearer|refresh|session|gateway)[ _-]?tokens\b|\.(?:key|pem)\b")
+# Loose detail words: a sentence with one of these in a secret paragraph is looked at more closely.
 _SECRET_DETAIL_RE = re.compile(
     r"(?i)\b\d+\s*-?\s*(?:chars?|characters|bytes?|bits|digits|letters|symbols)\b"
     r"|\b(?:starts?|begins?|ends?|starting|beginning|ending)\s+with\b|\b(?:prefix|suffix)(?:ed|es)?\b"
-    r"|\b(?:first|last)\s+(?:\d+\s+)?(?:chars?|characters|bytes?|letters?|digits?)\b|\blength\b")
+    r"|\b(?:first|last|leading|trailing)\s+(?:\d+\s+)?(?:chars?|characters|bytes?|letters?|digits?)\b|\blength\b")
+_UNIT = r"(?:chars?|characters|bytes?|bits|digits|letters|symbols)"
+_NUM_UNIT_RE = re.compile(rf"(?i)\b(\d+)(\s*-?\s*{_UNIT}\b|\s*{_UNIT}?\s*long\b)")
+_LENGTH_NUM_RE = re.compile(r"(?i)\b(length|len|size)(\s*(?:is|of|was|=|:)?\s*(?:about\s+|~\s*)?)(\d+)\b")
+_LIT = r"(`[^`\n]{1,40}`|\"[^\"\n]{1,40}\"|'[^'\n]{1,40}'|\u2018[^\u2019\n]{1,40}\u2019|\u201c[^\u201d\n]{1,40}\u201d|[^\s,;()]+)"
+_PREFIX_LIT_RES = (
+    re.compile(r"(?i)(\b(?:starts?|begins?|ends?|starting|beginning|ending)\s+with\s+(?:the\s+(?:characters?|letters?|"
+               r"string|prefix|chars?)\s+)?)" + _LIT),
+    re.compile(r"(?i)(\b(?:prefix|suffix)(?:es)?\s*(?:is|are|was|were|reads?|=|:)\s*)" + _LIT),
+    re.compile(r"(?i)(\b(?:first|last|leading|trailing)(?:\s+(?:\d+|one|two|three|four|five|few))?"
+               r"\s+(?:chars?|characters|bytes?|letters?|digits?)\s*(?:is|are|was|were|reads?|=|:)\s*)" + _LIT),
+    re.compile(r"(?i)()" + _LIT + r"(?=\s+(?:prefix|suffix)\b)"),
+)
+# An unquoted word after a prefix phrase is a literal when it has a non-letter or is 1-3 letters and not an
+# ordinary word ("starts with s", "begins with sk-"; not "starts with a letter", "the prefix is unknown").
+_NOT_LITERAL = frozenset("""a an the my its it this that these those one two three some any no same your our their
+his her each either which what whatever and or of to in on with is are was be by for as not""".split())
+
+
+def _literal(tok: str, after: str = "") -> bool:
+    if tok[:1] in "`\"'\u2018\u201c":
+        return True
+    core = tok.rstrip(".,:;!?")
+    if not core:
+        return False
+    if core.lower() in _NOT_LITERAL:
+        return not re.match(r"\s*\w", after)  # "starts with a." is the letter a; "starts with a letter" is not
+    if not core.isalpha():
+        return True
+    return len(core) <= 3
+
+
+def _prefix_literals(sentence: str) -> List[Tuple[int, int]]:
+    """(start, end) of every literal a prefix phrase in *sentence* names."""
+    out = []
+    for rx in _PREFIX_LIT_RES:
+        for m in rx.finditer(sentence):
+            if _literal(m.group(2), sentence[m.end(2):]):
+                out.append((m.start(2), m.end(2)))
+    return out
+
+
+_COUNT_OF_RE = re.compile(r"(?i)\b(?:first|last|leading|trailing)\s+$")
+
+
+def _states_length(sentence: str) -> bool:
+    """A number with a char/byte unit or after length/size; "the first 4 chars" counts characters, not a length."""
+    if _LENGTH_NUM_RE.search(sentence):
+        return True
+    return any(not _COUNT_OF_RE.search(sentence[:m.start()]) for m in _NUM_UNIT_RE.finditer(sentence))
+
+
+def _mask_details(sentence: str) -> str:
+    """A kept sentence in a secret paragraph: numbers next to a unit -> <n>, prefix literals -> <chars>."""
+    spans = sorted(set(_prefix_literals(sentence)))
+    for a, b in reversed(spans):
+        sentence = sentence[:a] + "<chars>" + sentence[b:]
+    sentence = _NUM_UNIT_RE.sub(lambda m: "<n>" + m.group(2), sentence)
+    return _LENGTH_NUM_RE.sub(lambda m: m.group(1) + m.group(2) + "<n>", sentence)
+
+
+def classify_secret_sentence(sentence: str) -> Optional[str]:
+    """"prefix" / "length" when *sentence* (inside a secret paragraph) states an actual detail of a secret,
+    "doubt" when it only mentions such details, None when it has no detail word at all."""
+    if not _SECRET_DETAIL_RE.search(sentence) and not _LENGTH_NUM_RE.search(sentence):
+        return None
+    if _prefix_literals(sentence):
+        return "prefix"
+    if _states_length(sentence) and _SECRET_WORD_RE.search(sentence):
+        return "length"
+    return "doubt"
+
+
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _BULLET_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])?\s*)")
 
 
 def withhold_secret_sentences(text: str) -> Tuple[str, int]:
-    """(text, n withheld). In every paragraph that mentions secret material, each sentence that carries a
-    length / prefix / suffix detail becomes WITHHELD_SENTENCE (once per line). Errs on the side of
-    withholding: a byte count next to a key mention goes too."""
+    """(text, n withheld). In every paragraph that mentions secret material, a sentence that states a prefix
+    becomes WITHHELD_PREFIX_SENTENCE and one that states a length WITHHELD_LENGTH_SENTENCE (once per line);
+    a sentence that only mentions such details is kept with its numbers/literals masked (_mask_details)."""
     n = 0
     out_blocks = []
     for block in re.split(r"(\n[ \t]*\n)", text):
@@ -396,10 +487,14 @@ def withhold_secret_sentences(text: str) -> Tuple[str, int]:
             parts = _SENT_SPLIT_RE.split(line[len(lead):])
             kept: List[str] = []
             for part in parts:
-                if _SECRET_DETAIL_RE.search(part):
+                kind = classify_secret_sentence(part)
+                if kind in ("prefix", "length"):
                     n += 1
-                    if not kept or kept[-1] != WITHHELD_SENTENCE:
-                        kept.append(WITHHELD_SENTENCE)
+                    marker = WITHHELD_PREFIX_SENTENCE if kind == "prefix" else WITHHELD_LENGTH_SENTENCE
+                    if not kept or kept[-1] != marker:
+                        kept.append(marker)
+                elif kind == "doubt":
+                    kept.append(_mask_details(part))
                 else:
                     kept.append(part)
             lines.append(lead + " ".join(kept))
@@ -534,6 +629,30 @@ def gate_lines(evidence_dir: Path) -> List[Dict[str, Any]]:
             "decision": dec,
             "decision_meaning": DECISION_MEANING.get(dec, "unknown decision"),
             "outcome": outcome if outcome in OUTCOMES else "unknown",
+        })
+    return out
+
+
+def tool_call_lines(evidence_dir: Path) -> Optional[List[Dict[str, Any]]]:
+    """The collector's tool-calls.jsonl (bug #33), every value re-validated against a fixed vocabulary: the
+    command is an allowlisted program name (lib/toolcalls), never arguments. None when the bundle predates it."""
+    p = evidence_dir / "tool-calls.jsonl"
+    if not p.is_file():
+        return None
+    out = []
+    for rec in _jsonl(p)[:MAX_CALLS]:
+        tool = str(rec.get("tool") or "")
+        tool = tool if _TOOL_RE.match(tool) else "(unparsed)"
+        cmd = rec.get("command")
+        gate = rec.get("gate")
+        out.append({
+            "ts": _ts(rec.get("t")),
+            "tool": tool,
+            "command": cmd if toolcalls.is_command_word(tool, cmd) else toolcalls.UNKNOWN,
+            "gate": gate if gate in GATE_KINDS else "unknown",
+            "ran": rec.get("ran") is True,
+            "error": rec.get("error") is True,
+            "after_refused_escalation": rec.get("after_refused_escalation") is True,
         })
     return out
 
@@ -719,6 +838,7 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
     ident = ident if ident is not None else site_identity()
     claims = mask_claims(claims, index, ident)
     gates = gate_lines(evidence_dir)
+    calls = tool_call_lines(evidence_dir)
     c3 = c3_lines(evidence_dir, index)
     session = str(request.get("session") or (manifest.get("request") or {}).get("session") or "")
     summary, events, tz = tool_activity(evidence_dir, session)
@@ -755,6 +875,9 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
         "manifest.json": json.dumps(man, indent=2, ensure_ascii=False),
         "gate-decisions.jsonl": "\n".join(json.dumps(g, ensure_ascii=False) for g in gates)
                                 or "(no gate decisions in window)",
+        "tool-calls.jsonl": ("\n".join(json.dumps(c, ensure_ascii=False) for c in calls)
+                             or "(no tool calls recorded in window)") if calls is not None
+                            else "(not recorded: the bundle predates tool-calls.jsonl)",
         "c3-results.jsonl": "\n".join(json.dumps(c, ensure_ascii=False) for c in c3) or "(no C3 results in window)",
         "tool-activity.jsonl": "\n".join(json.dumps(e, ensure_ascii=False) for e in [summary] + events),
     }

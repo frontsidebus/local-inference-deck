@@ -284,15 +284,19 @@ def take(session: str, cwd: Optional[str], cfg: Mapping[str, str], root=None, la
 
 
 def record_event(snapdir: Path, tool: str, paths: List[str], status: str = "", now: Optional[datetime] = None,
-                 call_id: Optional[str] = None, call_hash: Optional[str] = None) -> None:
+                 call_id: Optional[str] = None, call_hash: Optional[str] = None,
+                 command: Optional[str] = None) -> None:
     """Append one executed tool call. call_id (Hermes tool_call_id) / call_hash (lib/redact.call_hash) mark
-    the call for matching with gate.log; no command text is stored."""
+    the call for matching with gate.log; *command* is lib/toolcalls.command_word (an allowlisted program
+    name or "(other)", never arguments). No command text is stored."""
     q.ensure_dir(snapdir)
     ev = {"t": _now_iso(now), "tool": tool, "paths": paths, "status": status}
     if call_id:
         ev["call_id"] = str(call_id)[:200]
     if call_hash:
         ev["call_hash"] = call_hash
+    if command:
+        ev["command"] = command
     line = json.dumps(ev) + "\n"
     fd = os.open(str(Path(snapdir) / "events.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:

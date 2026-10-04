@@ -74,8 +74,8 @@ def test_bundle_infra(env):
     man = json.loads((ev / "manifest.json").read_text())
     assert man["data_class"] == "infra" and man["request"]["id"] == r["id"] and man["collector_version"]
     extras = {"c3-results.jsonl"} | {a for a in man["artifacts"] if a.startswith("probes/host-")}
-    assert set(man["artifacts"]) - extras == {"hermes-log.txt", "gate-decisions.jsonl", "agent-diff.patch",
-                                     "others-changed.txt", "host-walter.txt", "host-covenant.txt", "slots.json"}
+    assert set(man["artifacts"]) - extras == {"hermes-log.txt", "gate-decisions.jsonl", "tool-calls.jsonl",
+                                     "agent-diff.patch", "others-changed.txt", "host-walter.txt", "host-covenant.txt", "slots.json"}
     assert man["window"] == {"since": "2026-10-03T03:20:00Z", "until": "2026-10-03T03:30:10Z", "grace_seconds": 10,
                              "until_basis": "grace"}
     assert man["point_in_time"]["slots.json"]["observed_at"] == "2026-10-03T03:30:00Z"
