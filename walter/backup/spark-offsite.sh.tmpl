@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# spark-offsite.sh [--check] -- copy ${MODELS_DIR}/backups offsite with restic (encrypted, S3).
+#
+# Runs from spark-offsite.timer after the nightly local backup (spark-backup.timer):
+#   1. restic backup ${MODELS_DIR}/backups   (--host walter, tags spark-backup, walter; skips .inprogress-*)
+#   2. restic forget --prune --keep-daily 14 --keep-weekly 8 --keep-monthly 6
+#   3. restic check --read-data-subset=25%   (Sundays, or with --check / OFFSITE_CHECK=1)
+# Credentials and repo settings: /etc/spark-restic/{aws.env,restic.env,password} (root 0600).
+# The password is NOT under ${MODELS_DIR}/backups, so it is never inside the repo it protects.
+# Status: /var/lib/spark-offsite/LAST_OK and spark_offsite.prom (Prometheus textfile format).
+# Contains no secrets.
+set -euo pipefail
+umask 077
+
+CONF=/etc/spark-restic
+SRC=${MODELS_DIR}/backups
+STATE=/var/lib/spark-offsite
+LOCAL_LOCK=/run/spark-backup.lock
+RESTIC=/usr/local/bin/restic
+HOST_TAG=walter   # fixed --host: forget groups by host, so a rebuilt VM keeps pruning the same series
+KEEP=(--keep-daily 14 --keep-weekly 8 --keep-monthly 6)
+CHECK_SUBSET=25%
+
+log() {
+  echo "spark-offsite: $*" >&2
+  if [[ -z "${INVOCATION_ID:-}" ]]; then logger -t spark-offsite -- "$*" || true; fi
+}
+die() { log "ERROR: $*"; exit 1; }
+
+DO_CHECK=${OFFSITE_CHECK:-0}
+[[ ${1:-} == --check ]] && DO_CHECK=1
+[[ $(date -u +%u) -eq 7 ]] && DO_CHECK=1
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+for f in aws.env restic.env password; do [[ -s $CONF/$f ]] || die "missing $CONF/$f (see walter/backup/OFFSITE.md)"; done
+set -a; . "$CONF/aws.env"; . "$CONF/restic.env"; set +a
+export RESTIC_CACHE_DIR=${RESTIC_CACHE_DIR:-/var/cache/restic}
+install -d -m 755 "$STATE"; install -d -m 700 "$RESTIC_CACHE_DIR"
+
+START=$(date +%s)
+PROM=$STATE/spark_offsite.prom
+metrics() { # <success 0|1> [extra lines]
+  local ok=$1; shift
+  local last=$START
+  if [[ $ok -ne 1 && -f $PROM ]]; then
+    last=$(awk '/^spark_offsite_last_success_timestamp_seconds /{print $2}' "$PROM"); last=${last:-0}
+  fi
+  {
+    echo "# HELP spark_offsite_last_success_timestamp_seconds Start time of the last successful offsite backup."
+    echo "# TYPE spark_offsite_last_success_timestamp_seconds gauge"
+    echo "spark_offsite_last_success_timestamp_seconds $last"
+    echo "# HELP spark_offsite_last_run_success 1 if the last offsite run succeeded."
+    echo "# TYPE spark_offsite_last_run_success gauge"
+    echo "spark_offsite_last_run_success $ok"
+    echo "spark_offsite_last_run_timestamp_seconds $START"
+    echo "spark_offsite_last_run_duration_seconds $(( $(date +%s) - START ))"
+    printf '%s\n' "$@"
+  } > "$PROM.tmp"
+  chmod 644 "$PROM.tmp"; mv "$PROM.tmp" "$PROM"
+}
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then log "FAILED (rc=$rc)"; metrics 0; fi' EXIT
+
+[[ -s $SRC/LAST_OK ]] || die "no successful local backup yet ($SRC/LAST_OK missing)"
+
+# Do not read the snapshot tree while spark-backup is writing it: wait for its lock, then release.
+# (Snapshots are built in .inprogress-* and renamed; that dir is excluded anyway.)
+if [[ -e $LOCAL_LOCK ]]; then
+  exec 8<"$LOCAL_LOCK"
+  flock -w 7200 8 || die "spark-backup still running after 2h"
+  exec 8<&-
+fi
+
+log "backup $SRC -> $RESTIC_REPOSITORY (local snapshot $(awk '{print $2}' "$SRC/LAST_OK"))"
+summary=$("$RESTIC" backup --json --host "$HOST_TAG" --tag spark-backup --tag walter --exclude '.inprogress-*' "$SRC" \
+          | grep '"message_type":"summary"' | tail -1)
+[[ -n $summary ]] || die "restic backup produced no summary"
+read -r snap added total files < <(python3 -c '
+import json,sys; s=json.loads(sys.argv[1])
+print(s.get("snapshot_id","?")[:8], s.get("data_added",0), s.get("total_bytes_processed",0), s.get("total_files_processed",0))' "$summary")
+log "snapshot $snap: $files files, $total bytes processed, $added bytes added (before compression)"
+
+log "forget --prune ${KEEP[*]}"
+"$RESTIC" forget --prune --tag spark-backup "${KEEP[@]}" >&2 || die "restic forget --prune failed"
+
+if [[ $DO_CHECK -eq 1 ]]; then
+  log "check --read-data-subset=$CHECK_SUBSET"
+  "$RESTIC" check --read-data-subset="$CHECK_SUBSET" >&2 || die "restic check failed"
+fi
+
+nsnap=$("$RESTIC" snapshots --tag spark-backup --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+DUR=$(( $(date +%s) - START ))
+echo "$(date -Is) snapshot=$snap snapshots=$nsnap added=$added duration=${DUR}s checked=$DO_CHECK" > "$STATE/LAST_OK"
+chmod 644 "$STATE/LAST_OK"
+metrics 1 \
+  "spark_offsite_snapshots $nsnap" \
+  "spark_offsite_last_bytes_added $added" \
+  "spark_offsite_last_bytes_processed $total"
+log "OK snapshot=$snap snapshots=$nsnap duration=${DUR}s"

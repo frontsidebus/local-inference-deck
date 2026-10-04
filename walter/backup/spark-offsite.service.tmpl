@@ -1,0 +1,25 @@
+[Unit]
+Description=Spark/Walter offsite backup (restic to S3) of ${MODELS_DIR}/backups
+Documentation=file:${MODELS_DIR}/backups/RESTORE.md
+After=spark-backup.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=${MODELS_DIR}
+ConditionPathExists=/etc/spark-restic/restic.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/spark-offsite.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=4h
+SyslogIdentifier=spark-offsite
+# Read-only view of the system; only the state and cache dirs are writable.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StateDirectory=spark-offsite
+StateDirectoryMode=0755
+CacheDirectory=restic
+CacheDirectoryMode=0700
