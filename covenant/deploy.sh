@@ -4,7 +4,7 @@
 #
 #   sudo covenant/deploy.sh [--env FILE] [--dry-run] [--setup-lock]
 #                           [--allow-bootstrap-downtime] [--staging-certs]
-#   sudo covenant/deploy.sh --set-client-secret [--force]
+#   sudo covenant/deploy.sh --set-client-secret [--instance digest] [--force]
 #   DESTDIR=/tmp/stage covenant/deploy.sh --env FILE   # stage files locally, run nothing
 #
 # Order: packages (+ sshd, unattended-upgrades, secrets) -> wireguard -> ufw ->
@@ -21,7 +21,9 @@
 #                               temporary switch to the port-80-only bootstrap site
 #   --staging-certs             use the Let's Encrypt staging CA (rehearsal)
 #   --set-client-secret         read the oauth2-proxy OIDC client secret from stdin (no echo),
-#                               store it root 0600, restart oauth2-proxy. --force to replace.
+#                               store it root 0600, restart the instance. --force to replace.
+#   --instance telemetry|digest --set-client-secret target: /etc/oauth2-proxy(-digest)
+#                               + the matching unit (default: telemetry)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -29,6 +31,7 @@ REPO=$(cd "$HERE/.." && pwd)
 
 ENV_FILE=$REPO/site.env
 DRY_RUN=0 SETUP_LOCK=0 ALLOW_DOWNTIME=0 STAGING=0 SET_SECRET=0 FORCE=0
+INSTANCE=telemetry
 DESTDIR=${DESTDIR:-}
 while (($#)); do
   case $1 in
@@ -38,12 +41,14 @@ while (($#)); do
     --allow-bootstrap-downtime) ALLOW_DOWNTIME=1 ;;
     --staging-certs) STAGING=1 ;;
     --set-client-secret) SET_SECRET=1 ;;
+    --instance) INSTANCE=$2; shift ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+case $INSTANCE in telemetry|digest) ;; *) echo "unknown --instance: $INSTANCE (telemetry or digest)" >&2; exit 2 ;; esac
 export DESTDIR DRY_RUN
 
 # ---------------------------------------------------------------- versions (pinned, = live)
@@ -57,12 +62,12 @@ PACKAGES=(nginx certbot python3-certbot-nginx fail2ban ufw wireguard wireguard-t
           unattended-upgrades openssl curl ca-certificates)
 
 # site.env variables substituted into *.tmpl (explicit list: nginx's own $vars survive)
-COVENANT_VARS=(SPARK_DOMAIN SPARK_CHAT_HOST SPARK_API_HOST SPARK_ID_HOST SPARK_TELEMETRY_HOST
+COVENANT_VARS=(SPARK_DOMAIN SPARK_CHAT_HOST SPARK_API_HOST SPARK_ID_HOST SPARK_TELEMETRY_HOST SPARK_DIGEST_HOST
                LETSENCRYPT_EMAIL EDGE_WG_IP BACKEND_WG_IP WG_PORT WG_SUBNET WG_BACKEND_PUBLIC_KEY
-               ADMIN_SOURCE_IPS TELEMETRY_GROUP OAUTH2_PROXY_CLIENT_ID
-               WEBUI_PORT POCKETID_PORT LITELLM_PORT TELEMETRY_PORT)
+               ADMIN_SOURCE_IPS TELEMETRY_GROUP DIGEST_GROUP OAUTH2_PROXY_CLIENT_ID OAUTH2_PROXY_DIGEST_CLIENT_ID
+               WEBUI_PORT POCKETID_PORT LITELLM_PORT TELEMETRY_PORT DIGEST_PORT)
 
-SITES=(00-default 10-apex 20-chat 30-id 40-api 50-telemetry)
+SITES=(00-default 10-apex 20-chat 30-id 40-api 50-telemetry 60-digest)
 
 # ---------------------------------------------------------------- helpers
 log()  { printf '\033[1m==> %s\033[0m\n' "$*"; }
@@ -135,19 +140,22 @@ command -v envsubst >/dev/null || die "envsubst missing (apt-get install gettext
 if live; then [[ $EUID -eq 0 ]] || die "run as root (or use --dry-run / DESTDIR=)"; fi
 
 OAUTH2_DIR=/etc/oauth2-proxy
+OAUTH2_DIGEST_DIR=/etc/oauth2-proxy-digest
 
 # ---------------------------------------------------------------- --set-client-secret
 if ((SET_SECRET)); then
   live || die "--set-client-secret only runs on the edge host"
-  f=$OAUTH2_DIR/client-secret
+  if [[ $INSTANCE == digest ]]; then O2P_DIR=$OAUTH2_DIGEST_DIR; O2P_UNIT=oauth2-proxy-digest
+  else O2P_DIR=$OAUTH2_DIR; O2P_UNIT=oauth2-proxy; fi
+  f=$O2P_DIR/client-secret
   [[ -s $f && $FORCE -eq 0 ]] && die "$f exists; pass --force to replace it"
   read -rsp "oauth2-proxy client secret (from Pocket-ID): " s; echo
   [[ -n $s ]] || die "empty secret"
-  install -d -m 0750 -o root -g oauth2-proxy "$OAUTH2_DIR" 2>/dev/null || install -d -m 0750 "$OAUTH2_DIR"
+  install -d -m 0750 -o root -g oauth2-proxy "$O2P_DIR" 2>/dev/null || install -d -m 0750 "$O2P_DIR"
   (umask 077; printf '%s' "$s" >"$f.new"); unset s
   chown root:root "$f.new"; chmod 0600 "$f.new"; mv "$f.new" "$f"
   info "stored $f (root 0600)"
-  systemctl restart oauth2-proxy && systemctl --no-pager --lines=0 status oauth2-proxy
+  systemctl restart "$O2P_UNIT" && systemctl --no-pager --lines=0 status "$O2P_UNIT"
   exit 0
 fi
 
@@ -233,7 +241,7 @@ for pair in "certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf:options-
   fi
 done
 
-NAMES=("$SPARK_DOMAIN" "$SPARK_CHAT_HOST" "$SPARK_API_HOST" "$SPARK_ID_HOST" "$SPARK_TELEMETRY_HOST")
+NAMES=("$SPARK_DOMAIN" "$SPARK_CHAT_HOST" "$SPARK_API_HOST" "$SPARK_ID_HOST" "$SPARK_TELEMETRY_HOST" "$SPARK_DIGEST_HOST")
 need=()
 for n in "${NAMES[@]}"; do [[ -s $DESTDIR/etc/letsencrypt/live/$n/fullchain.pem ]] || need+=("$n"); done
 certs_args=(); ((STAGING)) && certs_args+=(--staging)
@@ -315,6 +323,21 @@ if [[ -s $DESTDIR$OAUTH2_DIR/client-secret ]]; then
   else run systemctl start oauth2-proxy; fi
 else
   warn "oauth2-proxy NOT started: $OAUTH2_DIR/client-secret missing (deploy.sh --set-client-secret)"
+fi
+
+# Second instance: the digest gate (same binary, own config/unit/secret dir)
+O2P_DIGEST_CHANGED=0
+mkdir_p "$OAUTH2_DIGEST_DIR" 0750 root:oauth2-proxy
+if put "$BUILD/oauth2-proxy/oauth2-proxy-digest.cfg" "$OAUTH2_DIGEST_DIR/oauth2-proxy.cfg" 0640 root:oauth2-proxy; then O2P_DIGEST_CHANGED=1; fi
+if put "$BUILD/oauth2-proxy/oauth2-proxy-digest.service" /etc/systemd/system/oauth2-proxy-digest.service 0644; then
+  O2P_DIGEST_CHANGED=1; run systemctl daemon-reload
+fi
+run systemctl enable oauth2-proxy-digest
+if [[ -s $DESTDIR$OAUTH2_DIGEST_DIR/client-secret ]]; then
+  if service_active oauth2-proxy-digest; then ((O2P_DIGEST_CHANGED)) && run systemctl restart oauth2-proxy-digest
+  else run systemctl start oauth2-proxy-digest; fi
+else
+  warn "oauth2-proxy-digest NOT started: $OAUTH2_DIGEST_DIR/client-secret missing (deploy.sh --set-client-secret --instance digest)"
 fi
 
 # ================================================================ 7. fail2ban

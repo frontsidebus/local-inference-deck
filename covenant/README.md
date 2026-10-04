@@ -13,6 +13,7 @@ Internet ──443──> nginx ──wg0 (EDGE_WG_IP -> BACKEND_WG_IP)──> b
   SPARK_ID_HOST         Pocket-ID    :POCKETID_PORT  (auth 10r/m, OIDC 10r/s)
   SPARK_API_HOST        LiteLLM      :LITELLM_PORT   (/v1 allowlist, 401 w/o creds, 10r/s b40, 20 conns)
   SPARK_TELEMETRY_HOST  telemetry    :TELEMETRY_PORT behind oauth2-proxy (127.0.0.1:4180, Pocket-ID, TELEMETRY_GROUP)
+  SPARK_DIGEST_HOST     digest       :DIGEST_PORT    behind oauth2-proxy (127.0.0.1:4181, Pocket-ID, DIGEST_GROUP)
   unknown Host          444
 ```
 
@@ -23,12 +24,14 @@ Internet ──443──> nginx ──wg0 (EDGE_WG_IP -> BACKEND_WG_IP)──> b
 | `nginx/nginx.conf` | `/etc/nginx/nginx.conf` | Ubuntu stock, except `ssl_protocols TLSv1.2 TLSv1.3` |
 | `nginx/conf.d/phase3-http.conf` | `/etc/nginx/conf.d/` | `server_tokens off`, limit zones, websocket + no-credentials maps |
 | `nginx/snippets/{proxy,tls}-common.conf` | `/etc/nginx/snippets/` | proxy headers; certbot TLS params + HSTS etc. |
-| `nginx/sites-available/*.tmpl` | `/etc/nginx/sites-available/{00-default,10-apex,20-chat,30-id,40-api,50-telemetry}` | all six symlinked into `sites-enabled/`; the stock `default` is removed |
+| `nginx/sites-available/*.tmpl` | `/etc/nginx/sites-available/{00-default,10-apex,20-chat,30-id,40-api,50-telemetry,60-digest}` | all seven symlinked into `sites-enabled/`; the stock `default` is removed |
 | `nginx/bootstrap/00-acme-bootstrap.tmpl` | `sites-available/00-acme-bootstrap` | temporary port-80-only site for the first certs |
 | `nginx/snippets/pocketid-setup-lock.conf.in` | `snippets/pocketid-setup-lock.conf` | optional; rendered by `scripts/setup-lock.sh` (one `allow` per admin IP) |
 | `letsencrypt/renewal-hooks/deploy/reload-nginx.sh` | same path under `/etc/letsencrypt` | `nginx -t -q && systemctl reload nginx` |
 | `oauth2-proxy/oauth2-proxy.cfg.tmpl` | `/etc/oauth2-proxy/oauth2-proxy.cfg` (root:oauth2-proxy 0640) | no secrets in it |
 | `oauth2-proxy/oauth2-proxy.service.tmpl` | `/etc/systemd/system/oauth2-proxy.service` | hardened; secrets via `LoadCredential=` |
+| `oauth2-proxy/oauth2-proxy-digest.cfg.tmpl` | `/etc/oauth2-proxy-digest/oauth2-proxy.cfg` (root:oauth2-proxy 0640) | second instance (digest gate, 127.0.0.1:4181); no secrets in it |
+| `oauth2-proxy/oauth2-proxy-digest.service.tmpl` | `/etc/systemd/system/oauth2-proxy-digest.service` | second instance; secrets via `LoadCredential=` |
 | `fail2ban/jail.local.tmpl` | `/etc/fail2ban/jail.local` | sshd, nginx-limit-req, recidive; `banaction = ufw` |
 | `fail2ban/jail.d/sshd-ubuntu.local` | `/etc/fail2ban/jail.d/` | Ubuntu 24.04 unit is `ssh.service`; without this the sshd jail matched nothing |
 | `wireguard/wg0.conf.tmpl` | `/etc/wireguard/wg0.conf` (0600) | private key injected at install from `/etc/wireguard/privatekey` |
@@ -45,12 +48,14 @@ Internet ──443──> nginx ──wg0 (EDGE_WG_IP -> BACKEND_WG_IP)──> b
 ### site.env variables used
 
 Shared: `SPARK_DOMAIN SPARK_CHAT_HOST SPARK_API_HOST SPARK_ID_HOST SPARK_TELEMETRY_HOST
-LETSENCRYPT_EMAIL EDGE_WG_IP BACKEND_WG_IP WG_PORT ADMIN_SOURCE_IPS TELEMETRY_GROUP`
+SPARK_DIGEST_HOST LETSENCRYPT_EMAIL EDGE_WG_IP BACKEND_WG_IP WG_PORT ADMIN_SOURCE_IPS
+TELEMETRY_GROUP DIGEST_GROUP`
 (`EDGE_PUBLIC_IP` is only needed for DNS / the backend's WireGuard `Endpoint`).
 
 Covenant section: `WG_SUBNET` (fail2ban ignoreip), `WG_BACKEND_PUBLIC_KEY` (wg0 peer),
-`WEBUI_PORT POCKETID_PORT LITELLM_PORT TELEMETRY_PORT` (upstreams on `BACKEND_WG_IP`),
-`OAUTH2_PROXY_CLIENT_ID` (Pocket-ID client id for the telemetry gate).
+`WEBUI_PORT POCKETID_PORT LITELLM_PORT TELEMETRY_PORT DIGEST_PORT` (upstreams on `BACKEND_WG_IP`),
+`OAUTH2_PROXY_CLIENT_ID` (Pocket-ID client id for the telemetry gate),
+`OAUTH2_PROXY_DIGEST_CLIENT_ID` (Pocket-ID client id for the digest gate).
 
 ## Secrets
 
@@ -61,6 +66,8 @@ which `deploy.sh` calls. Existing files are never overwritten; values are never 
 |---|---|---|---|
 | oauth2-proxy cookie secret | `/etc/oauth2-proxy/cookie-secret` | root:root 0600 | 32 random bytes, URL-safe base64, no newline |
 | oauth2-proxy client secret | `/etc/oauth2-proxy/client-secret` | root:root 0600 | **from Pocket-ID** when the `OAUTH2_PROXY_CLIENT_ID` client is created; store with `deploy.sh --set-client-secret` |
+| oauth2-proxy digest cookie secret | `/etc/oauth2-proxy-digest/cookie-secret` | root:root 0600 | ditto; the digest instance |
+| oauth2-proxy digest client secret | `/etc/oauth2-proxy-digest/client-secret` | root:root 0600 | **from Pocket-ID** for the `OAUTH2_PROXY_DIGEST_CLIENT_ID` client; store with `deploy.sh --set-client-secret --instance digest` |
 | WireGuard private key | `/etc/wireguard/privatekey` (+ inlined into `wg0.conf`, 0600) | root:root 0600 | `wg genkey` |
 | WireGuard public key | `/etc/wireguard/publickey` | 0644 | `wg pubkey`; not secret - give it to the backend |
 | TLS keys | `/etc/letsencrypt/live/<name>/privkey.pem` | certbot | issued by `scripts/certs.sh` |
@@ -79,7 +86,8 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
 
 - **Instance:** t3.small (2 vCPU / 2 GiB is plenty; oauth2-proxy is capped at 96M), Ubuntu 24.04, default `ubuntu` user with your key pair.
 - **Elastic IP** associated with the instance = `EDGE_PUBLIC_IP`. Point DNS A records for
-  `SPARK_DOMAIN`, `SPARK_CHAT_HOST`, `SPARK_API_HOST`, `SPARK_ID_HOST`, `SPARK_TELEMETRY_HOST` at it.
+  `SPARK_DOMAIN`, `SPARK_CHAT_HOST`, `SPARK_API_HOST`, `SPARK_ID_HOST`, `SPARK_TELEMETRY_HOST`,
+  `SPARK_DIGEST_HOST` at it.
 - **Security group, inbound** (outbound: default allow-all):
 
   | Proto | Port | Source | Why |
@@ -91,7 +99,7 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
 
 ## First deploy (fresh instance)
 
-1. AWS as above; DNS resolving to the Elastic IP for all five names.
+1. AWS as above; DNS resolving to the Elastic IP for all six names.
 2. On the edge: clone the repo, `cp site.env.example site.env`, fill it in.
    `WG_BACKEND_PUBLIC_KEY` comes from the backend (`wg pubkey < /etc/wireguard/privatekey` there).
 3. `sudo covenant/deploy.sh --dry-run`, read it, then
@@ -111,9 +119,10 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
       (`--staging-certs` rehearses against the LE staging CA.) certbot's
       `options-ssl-nginx.conf` / `ssl-dhparams.pem` are seeded from the package because
       `certonly` never writes them and `tls-common.conf` includes them;
-   5. the six full sites (bootstrap link removed, `nginx -t`, reload; on failure `/etc/nginx`
+   5. the seven full sites (bootstrap link removed, `nginx -t`, reload; on failure `/etc/nginx`
       is restored from `/var/backups/covenant/nginx-<ts>.tar.gz`);
-   6. oauth2-proxy: system user, verified binary, config, unit (started only once the client secret exists);
+   6. oauth2-proxy (telemetry) and oauth2-proxy-digest: system user, verified binary, configs,
+      units (each started only once its client secret exists);
    7. fail2ban (`fail2ban-client --test`, restart).
 4. Give the backend the edge public key (`/etc/wireguard/publickey`) and `EDGE_PUBLIC_IP:WG_PORT`
    as its peer endpoint. The backend initiates (it is behind NAT) and keeps the tunnel alive with
@@ -125,15 +134,41 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
 6. In Pocket-ID create the OIDC client for the telemetry gate: client id `OAUTH2_PROXY_CLIENT_ID`,
    callback `https://SPARK_TELEMETRY_HOST/oauth2/callback`, PKCE on, allowed group `TELEMETRY_GROUP`.
    Then `sudo covenant/deploy.sh --set-client-secret` (paste; no echo) - this starts oauth2-proxy.
+   The digest gate's client is created the same way - see the Digest section below.
 
 Adding a new hostname later: add the site + its name to `deploy.sh`; the missing cert makes the
 next run fall back to the bootstrap site, which it refuses to do on a live host unless you pass
 `--allow-bootstrap-downtime` (443 is down for the minute that takes).
 
+## Digest (second oauth2-proxy instance)
+
+`60-digest` gates the digest app on Walter (`BACKEND_WG_IP:DIGEST_PORT`) with a second
+oauth2-proxy instance on `127.0.0.1:4181`: same binary, own config dir
+(`/etc/oauth2-proxy-digest`, root:oauth2-proxy 0750) and unit (`oauth2-proxy-digest`).
+
+1. In Pocket-ID create the OIDC client `digest`: client id `OAUTH2_PROXY_DIGEST_CLIENT_ID`,
+   redirect `https://SPARK_DIGEST_HOST/oauth2/callback`, PKCE on, allowed group `DIGEST_GROUP`.
+2. `sudo covenant/deploy.sh --set-client-secret --instance digest` (paste; no echo) -
+   stores the secret in `/etc/oauth2-proxy-digest/client-secret` and starts the digest instance.
+   Without `--instance` the command still targets the telemetry instance.
+
+Cert order: the full sites are already live, so a deploy that finds the digest cert missing stops
+and asks for `--allow-bootstrap-downtime`. Instead, issue the new cert first - `00-default`
+answers ACME on :80 for any name - and only then run `deploy.sh`:
+
+```
+sudo covenant/scripts/certs.sh SPARK_DIGEST_HOST
+sudo covenant/deploy.sh
+```
+
+Note: the four new site.env variables (`SPARK_DIGEST_HOST DIGEST_GROUP
+OAUTH2_PROXY_DIGEST_CLIENT_ID DIGEST_PORT`) must be set before ANY covenant deploy -
+`COVENANT_VARS` now requires all of them, and deploy dies on the first empty one.
+
 ## Verify
 
 ```
-sudo nginx -t && systemctl is-active nginx wg-quick@wg0 oauth2-proxy fail2ban ufw
+sudo nginx -t && systemctl is-active nginx wg-quick@wg0 oauth2-proxy oauth2-proxy-digest fail2ban ufw
 sudo wg show wg0 latest-handshakes
 sudo ufw status verbose
 sudo fail2ban-client status            # jails: nginx-limit-req, recidive, sshd
@@ -142,6 +177,7 @@ curl -sI https://SPARK_DOMAIN | grep -i location                     # -> https:
 curl -s -o /dev/null -w '%{http_code}\n' https://SPARK_API_HOST/v1/models   # 401 (no key)
 curl -s -o /dev/null -w '%{http_code}\n' https://SPARK_API_HOST/metrics     # 404
 curl -s https://SPARK_TELEMETRY_HOST/api/v1/telemetry                       # {"error":"unauthorized"}
+curl -s https://SPARK_DIGEST_HOST/api/                                       # {"error":"unauthorized"}
 curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: nope' -k https://EDGE_PUBLIC_IP/   # 000 (444)
 sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication'               # no / no
 ```
@@ -152,6 +188,8 @@ sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication'               # 
   `tar -C / -xzf <that>` then `nginx -t && systemctl reload nginx`.
 - oauth2-proxy: `systemctl disable --now oauth2-proxy` takes the telemetry site down to
   500s on auth_request (no data leaks); disable `sites-enabled/50-telemetry` to remove it.
+  The digest instance is the same: `systemctl disable --now oauth2-proxy-digest`,
+  `sites-enabled/60-digest`.
 - WireGuard / fail2ban / ufw: previous files are not kept by deploy.sh; they are small and fully
   described by this directory, so re-render from a known-good commit.
 

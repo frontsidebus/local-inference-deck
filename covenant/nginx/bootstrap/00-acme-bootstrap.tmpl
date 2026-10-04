@@ -4,7 +4,7 @@
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
-    server_name ${SPARK_DOMAIN} ${SPARK_CHAT_HOST} ${SPARK_API_HOST} ${SPARK_ID_HOST} ${SPARK_TELEMETRY_HOST};
+    server_name ${SPARK_DOMAIN} ${SPARK_CHAT_HOST} ${SPARK_API_HOST} ${SPARK_ID_HOST} ${SPARK_TELEMETRY_HOST} ${SPARK_DIGEST_HOST};
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/letsencrypt;
         default_type text/plain;
