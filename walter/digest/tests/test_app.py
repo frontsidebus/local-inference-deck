@@ -48,3 +48,15 @@ def test_post_starts_run_and_get_cannot(client):
 @pytest.mark.parametrize("bad", ["..%2F..%2Fetc%2Fpasswd", "x", "..", "20261004T000000Z.json"])
 def test_run_id_validation(client, bad):
     assert client.get(f"/api/runs/default/{bad}").status_code != 200
+
+
+@pytest.mark.parametrize("site,want", [("cross-site", 403), ("same-site", 403), ("same-origin", 202), ("none", 202)])
+def test_post_refuses_cross_site(client, site, want):
+    r = client.post("/api/runs/ai-research/now", headers={"Sec-Fetch-Site": site})
+    assert r.status_code == want
+    time.sleep(0.2)   # let a started fake run finish before the next case
+
+
+def test_post_without_fetch_metadata_is_allowed(client):
+    # curl on Walter (the CLI trigger) sends no Sec-Fetch-Site
+    assert client.post("/api/runs/ai-security/now").status_code == 202

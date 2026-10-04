@@ -155,16 +155,26 @@ async def watches(request) -> Response:
 
 def _validate(watch: str, run_id: str | None) -> JSONResponse | None:
     if watch not in WATCHES:
-        return JSONResponse({"error": f"unknown watch: {watch}"}, status_code=404)
+        return JSONResponse({"error": "unknown watch"}, status_code=404, headers=SEC_HEADERS)
     if run_id is not None and not RUN_ID_RE.match(run_id):
-        return JSONResponse({"error": "invalid run id"}, status_code=400)
+        return JSONResponse({"error": "invalid run id"}, status_code=400, headers=SEC_HEADERS)
     return None
+
+
+# Browsers label every request with Sec-Fetch-Site. Starting a run is the only state-changing
+# route: refuse it from another site (CSRF, defence in depth behind the SameSite=Lax session
+# cookie at the edge). Clients without the header (curl on Walter, the CLI path) are unaffected.
+ALLOWED_FETCH_SITES = {"same-origin", "none"}
 
 
 async def run_now(request) -> Response:
     watch = request.path_params["watch"]
     if err := _validate(watch, None):
         return err
+    site = request.headers.get("sec-fetch-site")
+    if site is not None and site not in ALLOWED_FETCH_SITES:
+        return JSONResponse({"error": "cross-site request refused"}, status_code=403,
+                            headers={"Cache-Control": "no-store", **SEC_HEADERS})
     if watch in INFLIGHT:
         return JSONResponse(
             {"error": "a run of this watch is already in progress", "run_id": INFLIGHT[watch].run_id},

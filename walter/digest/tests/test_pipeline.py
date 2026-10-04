@@ -108,6 +108,7 @@ def test_llm_call_uses_key_file_and_bounded_output(env, monkeypatch):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             seen["auth"] = self.headers.get("Authorization")
             seen["max_tokens"] = body.get("max_tokens")
+            seen["thinking"] = body.get("chat_template_kwargs", {}).get("enable_thinking")
             content = json.dumps({"tiers": [{"tier": 1, "items": [
                 {"title": "x", "why": "y", "confidence": "HIGH", "evidence": ["https://e.example/a"]}]}],
                 "markdown": "# ok"})
@@ -130,6 +131,7 @@ def test_llm_call_uses_key_file_and_bounded_output(env, monkeypatch):
         srv.shutdown()
     assert seen["auth"] == f"Bearer {KEY}"
     assert isinstance(seen["max_tokens"], int) and 0 < seen["max_tokens"] <= 32768
+    assert seen["thinking"] is False
     out = json.loads((env / "runs" / "default" / "20261004T000000Z.json").read_text())
     assert out["uncurated"] is False
     for p in env.rglob("*"):
@@ -144,3 +146,88 @@ def test_missing_key_file_does_not_leak_path_and_falls_back(env, monkeypatch):
     assert ev[-1][0] == "done"
     out = json.loads((env / "runs" / "default" / "20261004T000000Z.json").read_text())
     assert out["uncurated"] is True
+
+
+# --- per-source cutoffs on a first run with no seeded state ------------------------------------
+# Run 1: BleepingComputer fails. Run 2: it recovers and returns an item dated before run 1.
+# That item is inside its window (the source never delivered it) and must be reported.
+PHASED_COLLECTOR = r'''
+import json, os, sys
+out = sys.argv[-1]
+old = "2020-01-01T00:00:00Z"   # older than any run, i.e. before every cutoff the pipeline writes
+if os.environ["FAKE_PHASE"] == "1":
+    bc = {"ok": False, "error": "HTTP 500", "items": []}
+else:
+    bc = {"ok": True, "items": [{"title": "Late story", "link": "https://e.example/late", "date": old}]}
+json.dump({
+    "SANS_ISC": {"ok": True, "items": [{"title": "Old SANS " + os.environ["FAKE_PHASE"],
+                                        "link": "https://e.example/s", "date": old}]},
+    "BleepingComputer": bc,
+}, open(out, "w"))
+'''
+
+
+@pytest.fixture
+def phased(tmp_path, monkeypatch):
+    col = tmp_path / "phasedcol.py"
+    col.write_text(PHASED_COLLECTOR)
+    monkeypatch.setattr(pipeline, "_collector_cmd", lambda watch, out: [sys.executable, str(col), out])
+    keyf = tmp_path / "key"
+    keyf.write_text(KEY + "\n")
+    monkeypatch.setenv("LITELLM_KEY_FILE", str(keyf))
+    state = tmp_path / "state"
+    state.mkdir()
+    return state
+
+
+def test_first_run_no_seed_failed_source_keeps_its_window(phased, monkeypatch):
+    monkeypatch.setenv("FAKE_PHASE", "1")
+    run(phased, fake_curate, run_id="20261004T000000Z")
+    s = load_state(phased)
+    assert s["cutoff"] is not None                       # the watch advanced (SANS_ISC succeeded)
+    assert s["sources"]["SANS_ISC"]["cutoff"] == s["cutoff"]
+    # the failed source records an explicit "no cutoff yet", not the new watch-level one
+    assert "cutoff" in s["sources"]["BleepingComputer"]
+    assert s["sources"]["BleepingComputer"]["cutoff"] is None
+
+    monkeypatch.setenv("FAKE_PHASE", "2")
+    run(phased, fake_curate, run_id="20261004T000001Z")
+    out = json.loads((phased / "runs" / "default" / "20261004T000001Z.json").read_text())
+    titles = [i["title"] for i in out["items"]]
+    assert "Late story" in titles                        # recovered source: old item kept
+    assert "Old SANS 2" not in titles                    # healthy source: old item cut off
+    s = load_state(phased)
+    assert s["sources"]["BleepingComputer"]["cutoff"] == s["cutoff"]   # now it advances
+
+
+def test_failed_source_twice_keeps_pinned_cutoff(env):
+    seed(env)
+    run(env, fake_curate, run_id="20261004T000000Z")
+    run(env, fake_curate, run_id="20261004T000001Z")    # BleepingComputer fails again
+    s = load_state(env)
+    assert s["sources"]["BleepingComputer"]["cutoff"] == "2026-09-25T00:00:00Z"
+
+
+def test_dedupe_cutoff_resolution():
+    item = {"title": "T", "link": "https://e.example/t", "date": "2026-09-30T00:00:00Z"}
+    sources = {"A": {"ok": True, "items": [dict(item, title="A item")]},
+               "B": {"ok": True, "items": [dict(item, title="B item")]},
+               "C": {"ok": True, "items": [dict(item, title="C item")]},
+               "D": {"ok": True, "items": [dict(item, title="D item")]}}
+    state = {"cutoff": "2026-10-01T00:00:00Z", "seen": {}, "sources": {
+        "A": {"ok": False, "cutoff": None},                     # never succeeded: no cutoff
+        "B": {"ok": True, "cutoff": "2026-09-29T00:00:00Z"},   # own, older cutoff
+        "C": {"ok": True},                                      # seeded entry without one: watch cutoff
+    }}                                                          # D: unknown source: watch cutoff
+    got = {i["title"] for i in pipeline._dedupe("default", sources, state)}
+    assert got == {"A item", "B item"}
+
+
+@pytest.mark.parametrize("val,want", [(None, 4096), ("8192", 8192), ("0", 256), ("-1", 256),
+                                      ("1000000", 16384), ("lots", 4096)])
+def test_max_tokens_always_bounded(monkeypatch, val, want):
+    if val is None:
+        monkeypatch.delenv("DIGEST_MAX_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("DIGEST_MAX_TOKENS", val)
+    assert pipeline._max_tokens() == want

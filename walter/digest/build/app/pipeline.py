@@ -43,9 +43,8 @@ ARXIV_ID_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})(v\d+)?")
 ARXIV_CATS = ("csAI", "csLG", "csCL", "csMA", "csCR")
 ARXIV_SOURCES = {f"arxiv_{c}": c for c in ARXIV_CATS}
 
-# Bounded prompt input: at most this many items per source, and at most this
-# many total items, are sent to the LLM.
-MAX_ITEMS_PER_SOURCE = 12
+# Bounded prompt input: at most this many new items are sent to the LLM (the collectors
+# already cap each feed: 15 per threat-intel feed, 40 per AI feed, 25 recent KEV entries).
 MAX_TOTAL_ITEMS = 150
 
 TIER_DEFS = {
@@ -75,6 +74,20 @@ TOPICS = (
 )
 
 DEFAULT_KEY_FILE = "/run/secrets/digest-litellm-key"
+
+# Output cap of the curation call. Never unbounded: DIGEST_MAX_TOKENS is clamped to this range
+# (the gateway also clamps to the model maximum, 32768 for `coder`).
+DEFAULT_MAX_TOKENS = 4096
+MAX_TOKENS_RANGE = (256, 16384)
+
+
+def _max_tokens() -> int:
+    try:
+        n = int(os.environ.get("DIGEST_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
+    except ValueError:
+        n = DEFAULT_MAX_TOKENS
+    lo, hi = MAX_TOKENS_RANGE
+    return max(lo, min(n, hi))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -222,13 +235,17 @@ def _dedupe(watch: str, sources: dict, state: dict) -> list[dict]:
     seen_cves = seen.get("cves", {})
     seen_events = seen.get("events", {})
     seen_items = seen.get("items", {})
-    # Per-source cutoffs (state["sources"][name]["cutoff"]); a source without one
-    # falls back to the watch-level cutoff, so seeded state files keep working.
+    # Per-source cutoffs (state["sources"][name]["cutoff"]):
+    # - an entry WITH a "cutoff" key is authoritative. null means the source has never
+    #   succeeded (e.g. it failed on the very first run), so it has no cutoff yet: its items
+    #   are only deduped by id, never dropped by date because other sources moved on;
+    # - an entry without the key (seeded state files) or an unknown source falls back to the
+    #   watch-level cutoff.
     global_cutoff = _parse_date(state.get("cutoff") or "")
     source_cutoffs = {
-        name: _parse_date(entry.get("cutoff") or "") or global_cutoff
+        name: _parse_date(entry.get("cutoff") or "")
         for name, entry in state.get("sources", {}).items()
-        if isinstance(entry, dict)
+        if isinstance(entry, dict) and "cutoff" in entry
     }
 
     out: list[dict] = []
@@ -444,11 +461,14 @@ async def curate_with_llm(watch: str, deduped: list[dict], gaps: list[str]) -> d
     """
     url = os.environ.get("LITELLM_URL", "http://127.0.0.1:4000/v1") + "/chat/completions"
     model = os.environ.get("DIGEST_MODEL", "coder")
-    max_tokens = int(os.environ.get("DIGEST_MAX_TOKENS", "4096"))
+    max_tokens = _max_tokens()
     key = _read_key()
     payload = {
         "model": model,
-        "max_tokens": max_tokens,
+        "max_tokens": max_tokens,  # always set and bounded: no unbounded generation
+        # Qwen/Gemma think by default and can spend the whole budget on reasoning; same
+        # setting as the judge's local calls through this gateway.
+        "chat_template_kwargs": {"enable_thinking": False},
         "messages": [
             {"role": "system", "content": "You produce JSON digests. Respond with JSON only."},
             {"role": "user", "content": _prompt(watch, deduped, gaps)},
@@ -458,9 +478,12 @@ async def curate_with_llm(watch: str, deduped: list[dict], gaps: list[str]) -> d
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0)) as client:
             r = await client.post(url, json=payload, headers={"Authorization": f"Bearer {key}"})
             r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
+            choice = r.json()["choices"][0]
+            content = choice["message"].get("content") or ""
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"LLM call failed: {_strip_exc(e)}") from None
+    if choice.get("finish_reason") == "length":
+        raise RuntimeError(f"LLM output hit max_tokens={max_tokens} (raise DIGEST_MAX_TOKENS)")
     try:
         data = _extract_json(content)
     except Exception as e:  # noqa: BLE001
@@ -546,10 +569,10 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
             if s.get("ok"):
                 entry["cutoff"] = now
             else:
-                # First run after seeding: the source has no per-source cutoff
-                # yet. Pin it to the OLD watch-level cutoff before the global
-                # one advances below, so its in-window items are not dropped
-                # next run when it falls back to its own (now stale) value.
+                # The source has no per-source cutoff yet: pin it to the OLD watch-level
+                # cutoff before that one advances below. On a first run with no seeded
+                # state that is null ("no cutoff yet"), which _dedupe honours as such
+                # instead of falling back to the new watch-level cutoff.
                 entry.setdefault("cutoff", old_global)
             if s.get("error"):
                 entry["last_error"] = s["error"]

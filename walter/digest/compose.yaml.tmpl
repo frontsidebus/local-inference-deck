@@ -1,4 +1,4 @@
-# /srv/digest/compose.yaml - Walter digest app (digest.${SPARK_DOMAIN} via Covenant)
+# /srv/digest/compose.yaml - Walter digest app (${SPARK_DIGEST_HOST} via Covenant)
 #
 # Networking: the app uses network_mode: host. There is no digest docker network to join, and a
 # bridged container cannot reach the host's loopback (the LiteLLM gateway on ${BACKEND_WG_IP}:4000
@@ -30,6 +30,7 @@ services:
       BIND: ${BACKEND_WG_IP}:3300
       LITELLM_URL: http://${BACKEND_WG_IP}:4000/v1
       DIGEST_MODEL: coder
+      DIGEST_MAX_TOKENS: "4096"     # output cap of the curation call (clamped to 256..16384 in the app)
       LITELLM_KEY_FILE: /run/secrets/digest-litellm-key
       STATE_DIR: /state
     volumes:
