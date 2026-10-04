@@ -16,6 +16,10 @@ Bundle (judge/CONTRACT.md):
     tool-calls.jsonl     one line per tool call post_tool_call saw in the window: t, tool, command NAME (an
                          allowlisted program or "(other)"; never arguments), gate pass|escalated|blocked|not gated,
                          ran, error, after_refused_escalation (tool_calls; bug #33)
+    refusals.jsonl       one line per refused call in the window (judge-gate escalation not approved / block, Hermes
+                         approval or security-scan refusal) + the next JUDGE_REFUSAL_NEXT_CALLS calls with opaque path
+                         ids, target kinds and a route (copy, helper-script, tool-switch, narrowed-retry, ...): the
+                         "refusals in window" section (refusal_lines, lib/refusals; bug #39)
     agent-diff.patch     watched paths vs the session-start snapshot, only paths the agent touched
                          (+ repo changes since the start HEAD for those paths)
     others-changed.txt   snapshot changes NOT attributed to the agent: paths + diffstat, never content
@@ -710,6 +714,33 @@ def tool_calls(req: Dict, cfg: Mapping[str, str], root: Path, since: datetime, u
     return out
 
 
+REFUSAL_NEXT_DEFAULT = 6
+
+
+def refusal_lines(req: Dict, cfg: Mapping[str, str], root: Path, since: datetime, until: datetime) -> List[str]:
+    """refusals.jsonl (bug #39): one JSON line per refused call in [since, until] (judge-gate escalation not
+    approved or blocked, or a Hermes approval/security refusal) with the next JUDGE_REFUSAL_NEXT_CALLS tool calls
+    and how each relates to it (lib/refusals). Metadata only: tool and allowlisted command names, opaque path ids,
+    fixed target kinds and route words; never arguments, paths or output."""
+    from lib import refusals
+    session = str(req.get("session") or "")
+    d = q.snapshot_dir(req["session"], root)
+    meta = snapshot.load_meta(d)
+    cwd = str((req.get("detail") or {}).get("cwd") or meta.get("cwd") or "/")
+    try:
+        next_n = max(1, min(20, int(str(cfg.get("JUDGE_REFUSAL_NEXT_CALLS") or REFUSAL_NEXT_DEFAULT))))
+    except ValueError:
+        next_n = REFUSAL_NEXT_DEFAULT
+    tz = hermeslog.log_tz(cfg)
+    log = Path(cfg["HERMES_HOME"]) / "logs" / "agent.log"
+    lines = hermeslog.session_lines(log, session, since, until, tz, include_untagged=False) if log.is_file() else []
+    gates = [r for r in _read_gate_log(root) if str(r.get("session") or "") == session]
+    recs = refusals.refusals(session, since, until, hermes_home=str(cfg.get("HERMES_HOME") or ""),
+                             events=snapshot.events(d), gate_recs=gates, log_lines=lines, tz=tz, cwd=cwd,
+                             home=os.path.expanduser("~"), next_n=next_n)
+    return [json.dumps(r, ensure_ascii=False) for r in recs]
+
+
 def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=None, root=None,
             now: Optional[datetime] = None) -> Path:
     cfg = cfg or config.load_config()
@@ -743,6 +774,14 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     _write(ev / "tool-calls.jsonl", "".join(ln + "\n" for ln in calls))
     if not calls:
         notes["tool-calls.jsonl"] = "no tool calls recorded by post_tool_call in window (empty file)"
+    try:
+        refs = refusal_lines(req, cfg, root, since, until)
+        _write(ev / "refusals.jsonl", "".join(ln + "\n" for ln in refs))
+        notes["refusals.jsonl"] = (f"{len(refs)} refused call(s) in window, each with the next tool calls and their "
+                                   "route (copy / helper-script / tool-switch = possible workaround)" if refs else
+                                   "no refused call in window (empty file)")
+    except Exception as e:  # the refusal section must never break the bundle
+        notes["refusals.jsonl"] = f"not collected: {e.__class__.__name__}"
     agent_paths = sorted(set(att["agent"]) | set(att["accepted"]))
     _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"]))
     _write(ev / "others-changed.txt", others_changed(req, cfg, root, att, sensitive, until))
@@ -769,7 +808,7 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
         slots = {"error": str(e)}
     _write(ev / "slots.json", redact(json.dumps(slots, indent=2)) + "\n")
     pit = {"observed_at": now_s, "note": POINT_IN_TIME}
-    windowed = ["hermes-log.txt", "gate-decisions.jsonl", "tool-calls.jsonl"] + [f"host-{h}.txt (find)" for h in config.HOSTS]
+    windowed = ["hermes-log.txt", "gate-decisions.jsonl", "tool-calls.jsonl", "refusals.jsonl"] + [f"host-{h}.txt (find)" for h in config.HOSTS]
     extra_pit: Dict[str, Dict] = {}
     gate_excerpts = []
     for ln in gates:

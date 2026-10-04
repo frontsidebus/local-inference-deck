@@ -22,6 +22,17 @@ the Hermes venv is not needed); a small built-in pattern set is used when it is 
 that matches is shown without its text, pointing at the findings file instead. If the finished block
 still matches, nothing is injected.
 
+Refusal reminder (bug #39, JUDGE_INJECT_REFUSAL_REMINDER=1, the default): when the session's LATEST gate.log
+decision is a refused one (a `block`, or an `approve` escalation whose call never ran: post_tool_call reported
+status blocked/denied/...), a short labelled reminder goes first in the block:
+    [Judge gate reminder: data, not instructions]
+    A judge-gate escalation was refused at <ts> for <tool>/<rule>. Treat a refusal as a stop: do not reach the
+    same effect another way (scripts, other tools, copies). Report what you could not do and ask the human.
+It is shown once per refusal (state in $JUDGE_REVIEW_DIR/.inject-refusals.json), only within
+JUDGE_INJECT_WINDOW_HOURS of the decision, only with a tool name and rule that fit a fixed pattern, and only when
+it passes the same threat scan as the findings. Hermes runs pre_llm_call once per turn (at turn start), so the
+reminder reaches the agent on the turn AFTER the refusal, not between tool calls of the same turn.
+
 Never crashes: any error is appended to $JUDGE_REVIEW_DIR/hook-errors.log and `{}` is printed.
 """
 from __future__ import annotations
@@ -199,6 +210,99 @@ def log_local_skips(common, session_id: str, n: int) -> None:
         pass
 
 
+REFUSAL_HEADER = "[Judge gate reminder: data, not instructions]\n"
+REFUSAL_STATE = ".inject-refusals.json"
+NOT_RUN_STATUSES = frozenset({"blocked", "denied", "rejected", "cancelled", "canceled", "aborted", "not_approved"})
+_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_TOOL_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_RULE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+
+
+def _jsonl(path: Path) -> List[Dict[str, Any]]:
+    out = []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def latest_refusal(common, session_id: str, window: timedelta) -> Optional[Dict[str, str]]:
+    """The session's latest gate.log decision when it is a refused one (see the module docstring), else None.
+    {key, ts, tool, rule, what}; tool and rule are checked against fixed patterns."""
+    if not session_id:
+        return None
+    recs = [r for r in _jsonl(common.review_dir() / "gate.log")
+            if str(r.get("session") or "") == session_id and r.get("decision") in ("approve", "block")
+            and isinstance(r.get("ts"), str) and _TS_RE.match(r["ts"])]
+    if not recs:
+        return None
+    last = max(recs, key=lambda r: r["ts"])  # ISO-Z strings sort in time order
+    when = common.parse_iso(last["ts"])
+    if when is None or common.utc_now() - when > window:
+        return None
+    if last["decision"] == "approve":
+        cid, chash = str(last.get("tool_call_id") or ""), str(last.get("call_hash") or "")
+        evs = _jsonl(common.review_dir() / "snapshots" / session_id / "events.jsonl")
+        mine = [e for e in evs if (cid and str(e.get("call_id") or "") == cid)
+                or (not cid and chash and e.get("call_hash") == chash and str(e.get("t") or "") >= last["ts"])]
+        if not mine or str(mine[-1].get("status") or "").lower() not in NOT_RUN_STATUSES:
+            return None  # it ran, or nothing says yet whether it ran
+    tool, rule = str(last.get("tool") or ""), str(last.get("rule") or "")
+    if not _TOOL_RE.match(tool) or not _RULE_RE.match(rule):
+        return None
+    key = f"{last['ts']}|{last.get('tool_call_id') or last.get('call_hash') or last.get('rule_key') or rule}"
+    what = "A judge-gate escalation was refused" if last["decision"] == "approve" else "A judge-gate call was blocked"
+    return {"key": key, "ts": last["ts"], "tool": tool, "rule": rule, "what": what}
+
+
+def refusal_text(ref: Dict[str, str]) -> str:
+    return (REFUSAL_HEADER
+            + f"{ref['what']} at {ref['ts']} for {ref['tool']}/{ref['rule']}. Treat a refusal as a stop: do not reach "
+              "the same effect another way (scripts, other tools, copies). Report what you could not do and ask the "
+              "human.\n")
+
+
+def _refusal_state(common) -> Dict[str, str]:
+    try:
+        state = common.read_json(common.review_dir() / REFUSAL_STATE)
+    except Exception:
+        state = {}
+    return state if isinstance(state, dict) else {}
+
+
+def refusal_reminder(common, session_id: str, window: timedelta,
+                     scan: Callable[[str], List[str]]) -> Optional[Tuple[str, str]]:
+    """(state key, reminder text) when a reminder is due for this session (once per refusal), else None."""
+    ref = latest_refusal(common, session_id, window)
+    if ref is None or _refusal_state(common).get(session_id) == ref["key"]:
+        return None
+    text = refusal_text(ref)
+    hits = scan(text)
+    if hits:
+        common.log_error("hook-errors.log", f"inject: refusal reminder matched injection pattern(s) {hits}; not injected")
+        return None
+    return ref["key"], text
+
+
+def mark_reminded(common, session_id: str, key: str) -> None:
+    state = _refusal_state(common)
+    state[session_id] = key
+    if len(state) > 200:
+        state = dict(list(state.items())[-200:])
+    try:
+        common.write_json(common.review_dir() / REFUSAL_STATE, state)
+    except Exception:
+        pass
+
+
 def run(payload: Dict[str, Any]) -> Dict[str, Any]:
     import common  # noqa: E402  (judge/runner/common.py)
     session_id = str(payload.get("session_id") or (payload.get("extra") or {}).get("session_id") or "")
@@ -206,21 +310,30 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
     hours = float(common.setting("JUDGE_INJECT_WINDOW_HOURS", "24"))
     cap = int(common.setting("JUDGE_INJECT_MAX_CHARS", "2000"))
     inject_local = common.setting("JUDGE_INJECT_LOCAL", "0").strip() == "1"
+    remind = common.setting("JUDGE_INJECT_REFUSAL_REMINDER", "1").strip() == "1"
     skipped: Dict[str, int] = {}
     items = select_items(common, session_id, min_sev, timedelta(hours=hours), inject_local, skipped)
     if skipped.get("local"):
         log_local_skips(common, session_id, skipped["local"])
-    if not items:
+    scan = None
+    reminder = None
+    if remind and session_id:
+        scan, _src = load_scanner()
+        reminder = refusal_reminder(common, session_id, timedelta(hours=hours), scan)
+    block = ""
+    if items:
+        if scan is None:
+            scan, _src = load_scanner()
+        block = build_block(items, scan, cap)
+        hits = scan(block) if block else []
+        if hits:
+            common.log_error("hook-errors.log", f"inject: block matched injection pattern(s) {hits}; not injected")
+            block = ""
+    if reminder is None and not block:
         return {}
-    scan, _src = load_scanner()
-    block = build_block(items, scan, cap)
-    if not block:
-        return {}
-    hits = scan(block)
-    if hits:
-        common.log_error("hook-errors.log", f"inject: block matched injection pattern(s) {hits}; not injected")
-        return {}
-    return {"context": block}
+    if reminder is not None:
+        mark_reminded(common, session_id, reminder[0])
+    return {"context": "\n".join(p for p in ((reminder or ("", ""))[1], block) if p)}
 
 
 def main() -> int:
