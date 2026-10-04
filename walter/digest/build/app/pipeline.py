@@ -222,7 +222,14 @@ def _dedupe(watch: str, sources: dict, state: dict) -> list[dict]:
     seen_cves = seen.get("cves", {})
     seen_events = seen.get("events", {})
     seen_items = seen.get("items", {})
-    cutoff = _parse_date(state.get("cutoff") or "")
+    # Per-source cutoffs (state["sources"][name]["cutoff"]); a source without one
+    # falls back to the watch-level cutoff, so seeded state files keep working.
+    global_cutoff = _parse_date(state.get("cutoff") or "")
+    source_cutoffs = {
+        name: _parse_date(entry.get("cutoff") or "") or global_cutoff
+        for name, entry in state.get("sources", {}).items()
+        if isinstance(entry, dict)
+    }
 
     out: list[dict] = []
     used_papers: set[str] = set()
@@ -231,6 +238,7 @@ def _dedupe(watch: str, sources: dict, state: dict) -> list[dict]:
     for name, src in sources.items():
         if not src.get("ok"):
             continue
+        cutoff = source_cutoffs.get(name, global_cutoff)
         items = src.get("items")
         if items is None:  # CISA_KEV shape
             items = src.get("recent", [])
@@ -525,11 +533,28 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
         _atomic_write(run_dir / f"{run_id}.md", payload["markdown"])
         _atomic_write(run_dir / f"{run_id}.json", json.dumps(payload, indent=2))
 
-        # 5. update state atomically: cutoff advances only for ok sources
+        # 5. update state atomically: the watch-level cutoff advances when any
+        #    source succeeded; each source ALSO gets its own cutoff that
+        #    advances only when THAT source succeeded, so a failed source keeps
+        #    its old cutoff and its in-window items are not dropped next run.
         now = _utcnow_iso()
+        old_global = state.get("cutoff")
+        src_state = state.setdefault("sources", {})
         for name, s in sources.items():
-            entry = state.setdefault("sources", {}).setdefault(name, {})
+            entry = src_state.setdefault(name, {})
             entry["ok"] = bool(s.get("ok"))
+            if s.get("ok"):
+                entry["cutoff"] = now
+            else:
+                # First run after seeding: the source has no per-source cutoff
+                # yet. Pin it to the OLD watch-level cutoff before the global
+                # one advances below, so its in-window items are not dropped
+                # next run when it falls back to its own (now stale) value.
+                entry.setdefault("cutoff", old_global)
+            if s.get("error"):
+                entry["last_error"] = s["error"]
+            else:
+                entry.pop("last_error", None)
         if any(s.get("ok") for s in sources.values()):
             state["cutoff"] = now
         seen = state.setdefault("seen", {})
