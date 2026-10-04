@@ -21,7 +21,9 @@ ufw allow proto tcp from ${GATEWAY_DOCKER_SUBNET} to ${BACKEND_WG_IP} port 8080 
 # Edge -> telemetry app (host network, so it is gated here and not by DOCKER-USER)
 ufw allow in on wg0 proto tcp from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200 comment 'covenant -> telemetry (host-network)'
 
+# >>> digest (opt-in: walter/deploy.sh drops this block unless SPARK_DIGEST_HOST is set)
 # Edge -> digest app (host network, so it is gated here and not by DOCKER-USER)
 ufw allow in on wg0 proto tcp from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3300 comment 'covenant -> digest (host-network)'
 
+# <<< digest
 ufw --force enable

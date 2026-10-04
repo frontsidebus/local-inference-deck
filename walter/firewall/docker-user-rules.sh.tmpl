@@ -21,7 +21,10 @@ WG_IF=wg0
 LAN_IF=${BACKEND_LAN_IF}
 EDGE=${EDGE_WG_IP}
 SVC_IP=${BACKEND_WG_IP}
-PORTS="3000 1411 4000 3200 3300"   # 3200: telemetry, 3300: digest (host-network; effective gate is the ufw rule, this covers a future published port)
+PORTS="3000 1411 4000 3200"   # 3200: telemetry (host-network; effective gate is the ufw rule, this covers a future published port)
+# >>> digest (opt-in: walter/deploy.sh drops this block unless SPARK_DIGEST_HOST is set)
+PORTS="$PORTS 3300"   # 3300: digest (host-network, like telemetry)
+# <<< digest
 
 $IPT -w -N DOCKER-USER 2>/dev/null || true
 $IPT -w -N "$CHAIN" 2>/dev/null || true
