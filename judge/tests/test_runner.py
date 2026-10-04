@@ -113,8 +113,9 @@ def local(monkeypatch):
                 self.wfile.write(b'{"error": "response_format is not supported"}')
                 return
             i = min(len(state["requests"]), len(state["replies"])) - 1
+            fin = state.get("finish") or []
             out = {"model": "big-served", "choices": [{"message": {"role": "assistant", "content": state["replies"][i]},
-                                                       "finish_reason": "stop"}]}
+                                                       "finish_reason": fin[i] if i < len(fin) else "stop"}]}
             data = json.dumps(out).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -468,3 +469,63 @@ def test_frontier_cost_is_added_to_usage(env, frontier, monkeypatch, tmp_path):
     RJ.frontier_cost_add("not a number")
     RJ.frontier_cost_add(float("nan"))
     assert json.loads((env / "usage.json").read_text())["frontier_usd"] == pytest.approx(0.25)
+
+
+# ------------------------------------------------------------------ #30: truncated local reply
+TRUNCATED = ('{"items": [{"id": "F1", "rubric": "R1", "severity": "high", "claim": "reload was blocked", '
+             '"evidence": "gate-decisions.jsonl: decision approve", "verdict": "false", "recommendation": "say esc')
+
+
+def test_truncated_reply_is_noted_and_kept(env, local, monkeypatch):
+    """Run-3 S1: reply 1 cut off at max_tokens with a HIGH item, the re-ask returned []. The finding's notes
+    must say so, judge-raw.txt keeps both replies, and the re-ask gets the larger retry max_tokens."""
+    monkeypatch.setenv("JUDGE_MODE", "local")
+    monkeypatch.setenv("JUDGE_LOCAL_MAX_TOKENS", "1000")
+    local["replies"] = [TRUNCATED, json.dumps({"items": []})]
+    local["finish"] = ["length", "stop"]
+    r = rid()
+    enqueue(env, r)
+    assert RJ.main([r]) == 0
+    assert [q["body"]["max_tokens"] for q in local["requests"]] == [1000, 2000]
+    assert "cut off at the output token limit" in local["requests"][1]["body"]["messages"][-1]["content"]
+    f = finding(env, r)
+    assert f["items"] == []
+    notes = " | ".join(f["notes"])
+    assert "reply 1 was truncated at max_tokens=1000 (finish_reason=length)" in notes
+    assert "1 item(s) with a parseable severity (1 high" in notes
+    assert f"evidence/{r}/judge-raw.txt" in notes and "comes from reply 2 (max_tokens=2000)" in notes
+    raw = (env / "evidence" / r / "judge-raw.txt").read_text()
+    assert "judge reply 1 (local, big-served, TRUNCATED: finish_reason=length)" in raw
+    assert TRUNCATED in raw and "judge reply 2 (local, big-served) =====" in raw
+    assert "reply 1 was truncated" in (env / "findings" / f"{r}.md").read_text()
+
+
+def test_truncated_reply_without_parseable_items(env, local, monkeypatch):
+    monkeypatch.setenv("JUDGE_MODE", "local")
+    monkeypatch.setenv("JUDGE_LOCAL_MAX_TOKENS", "4096")
+    monkeypatch.setenv("JUDGE_LOCAL_RETRY_MAX_TOKENS", "100")  # never below the first call's cap
+    local["replies"] = ['{"items": [{"id": "F1", "rub', json.dumps(GOOD)]
+    local["finish"] = ["length"]
+    r = rid()
+    enqueue(env, r)
+    assert RJ.main([r]) == 0
+    assert [q["body"]["max_tokens"] for q in local["requests"]] == [4096, 4096]
+    notes = " | ".join(finding(env, r)["notes"])
+    assert "no item could be parsed from the partial reply" in notes
+
+
+def test_untruncated_replies_have_no_truncation_note(env, local, monkeypatch):
+    monkeypatch.setenv("JUDGE_MODE", "local")
+    local["replies"] = ["garbage", json.dumps(GOOD)]
+    r = rid()
+    enqueue(env, r)
+    assert RJ.main([r]) == 0
+    assert local["requests"][1]["body"]["max_tokens"] == local["requests"][0]["body"]["max_tokens"]
+    assert not any("truncated" in n for n in finding(env, r).get("notes") or [])
+    assert "TRUNCATED" not in (env / "evidence" / r / "judge-raw.txt").read_text()
+
+
+def test_truncation_note_counts_severities():
+    raw = ('{"items": [{"severity": "high"}, {"severity":"Medium"}, {"severity": "high"}, {"sev')
+    n = RJ.truncation_note(1, raw, 4096, "evidence/x/judge-raw.txt")
+    assert "3 item(s)" in n and "2 high, 1 medium" in n

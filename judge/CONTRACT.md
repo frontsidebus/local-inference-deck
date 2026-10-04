@@ -85,6 +85,21 @@ undone; a sub-second race remains in which the merged extra paths land in done/ 
 path unit fires on every queue/ change, the merge often finds the pre_verify request already being judged; it
 removes the duplicate whenever the session end arrives first.
 
+**Turns with no tool activity** (#29, `hooks/enqueue.py::text_only_reason`). `on_session_end` skips a turn
+with no tool activity in `agent.log`, no `events.jsonl` events in the window, no write targets and no new
+snapshot changes (`JUDGE_ENQUEUE_ALWAYS=1` overrides), **unless** the turn's final answer is worth reviewing:
+`JUDGE_REVIEW_TEXT_ONLY=1` (default) and the answer (`hermeslog.last_assistant_message`, stripped) is at least
+`JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS` (200) characters and (contains a whole-word `CLAIM_WORDS` match, e.g.
+done/fixed/blocked/ran/verified/changed/deployed/restarted/denied/escalated/approved/gate, case-insensitive, or
+`gate.log` (last 512 KiB) has a decision of the session with `ts` in `[since − 1 s, now + 5 s]`).
+`JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=0` drops the claim-word/gate condition. Never when the answer's hash equals
+`last_claims_sha` in `snapshots/<session>/meta.json` (set whenever a completion request is written, merged or
+deduped), so a turn without a new answer does not re-review the previous one. These keys are read
+environment > site.env > default by enqueue.py itself. The request is an ordinary completion request (empty
+`changed_paths`, so normally `data_class: sensitive`: local judge + frontier claims stage) with
+`detail.text_only = {"chars", "claim_words" (≤ 12), "gate_decisions", "rule": "claims|gate|min_chars"}`; merge
+and dedupe apply unchanged.
+
 ## Request (schema/request.schema.json)
 ```json
 {"id": "...", "kind": "plan|gate|completion|runaway",
@@ -419,6 +434,18 @@ Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a st
   lines (headers, section titles) always stay. A non-priority file that no longer fits is listed as
   `[omitted by runner: bundle size cap]`.
 
+- **Truncated local replies** (#30). Every local call is capped at `JUDGE_LOCAL_MAX_TOKENS` (4096).
+  `call_local(messages, max_tokens=None)` records `finish_reason`/`max_tokens` of its reply in
+  `run_judge.LAST_LOCAL`. When a local reply ends with `finish_reason=length`, `_judge_loop` adds a finding note
+  `local judge reply N was truncated at max_tokens=M (finish_reason=length); the partial reply had K item(s) with a
+  parseable severity (… high, … medium; as written by the judge, before any severity cap) | no item could be parsed
+  …; it is kept in evidence/<id>/judge-raw.txt` (`truncation_note`), plus `the finding below comes from reply N
+  (max_tokens=M); compare …` or `… itself truncated: items may be missing`; the same line goes to `runner.log`.
+  `judge-raw.txt` keeps every reply; a truncated one's header reads `(local, <model>, TRUNCATED:
+  finish_reason=length)`. The next call after a truncated reply (the validation re-ask, which also says the reply
+  was cut off and asks to keep every item with shorter text) uses `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default
+  2 × `JUDGE_LOCAL_MAX_TOKENS`, never less than it). Frontier replies have no finish_reason and get no such note.
+
 ## Probes (`judge/probes/probe.py <name> [args...]`)
 Allowlisted names with per-arg regex validation; each runs read-only with a timeout (default 20s):
 `ssh_alias_test <alias>`, `port_listening <host:walter|covenant> <port>`, `http_status <https-url-on-SPARK_DOMAIN>`,
@@ -549,7 +576,9 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
 `JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
 `JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`,
-`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions).
+`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions),
+`JUDGE_REVIEW_TEXT_ONLY=1`, `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS=200`, `JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1` (#29),
+`JUDGE_LOCAL_MAX_TOKENS=4096`, `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default 2 × `JUDGE_LOCAL_MAX_TOKENS`; #30).
 Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

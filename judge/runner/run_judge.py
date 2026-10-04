@@ -24,7 +24,8 @@ Settings (environment, else site.env via lib/config.py):
   JUDGE_FRONTIER_MAX_USD (per call --max-budget-usd, default 2), JUDGE_FRONTIER_TIMEOUT (900 s),
   JUDGE_FRONTIER_EXTRA_ARGS, JUDGE_LOCAL_MODEL (big; `vision` (Gemma) is recommended: a different model
   family from the Qwen worker, so it does not share the worker's blind spots), JUDGE_LOCAL_KEY_FILE (~/.config/spark/hermes.key),
-  JUDGE_LOCAL_MAX_TOKENS (4096), JUDGE_LOCAL_TIMEOUT (600 s), JUDGE_LOCAL_URL (full base URL override,
+  JUDGE_LOCAL_MAX_TOKENS (4096; a reply cut off there is noted in the finding and re-asked with
+  JUDGE_LOCAL_RETRY_MAX_TOKENS, default 2x), JUDGE_LOCAL_TIMEOUT (600 s), JUDGE_LOCAL_URL (full base URL override,
   e.g. for tests; default https://${SPARK_API_HOST}/v1), JUDGE_BUNDLE_MAX_CHARS (150000 frontier,
   60000 local), JUDGE_PROBES (1 = allow one round of extra allowlisted probes), JUDGE_MAX_ATTEMPTS (3),
   JUDGE_LOCAL_MAX_SEVERITY (medium: items of a mode=local finding are capped at this severity; the cap
@@ -198,13 +199,31 @@ def _local_key() -> str:
     return key
 
 
-def call_local(messages: List[Dict[str, str]]) -> Tuple[str, str]:
+# finish_reason/max_tokens of the last call_local reply (#30): read by _judge_loop to note truncation.
+LAST_LOCAL: Dict[str, Any] = {}
+
+
+def local_max_tokens(retry_after_truncation: bool = False) -> int:
+    """JUDGE_LOCAL_MAX_TOKENS (4096); a re-ask after a reply cut off at max_tokens gets
+    JUDGE_LOCAL_RETRY_MAX_TOKENS (default 2x, never less than the first). Always a finite cap."""
+    base = int(C.setting("JUDGE_LOCAL_MAX_TOKENS", "4096"))
+    if not retry_after_truncation:
+        return base
+    try:
+        retry = int(C.setting("JUDGE_LOCAL_RETRY_MAX_TOKENS", str(base * 2)))
+    except ValueError:
+        retry = base * 2
+    return max(base, retry)
+
+
+def call_local(messages: List[Dict[str, str]], max_tokens: Optional[int] = None) -> Tuple[str, str]:
     url, key = _local_url(), _local_key()
     model = C.setting("JUDGE_LOCAL_MODEL", "big")
+    LAST_LOCAL.clear()
     body: Dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "max_tokens": int(C.setting("JUDGE_LOCAL_MAX_TOKENS", "4096")),  # always capped (runaway guard)
+        "max_tokens": int(max_tokens or local_max_tokens()),  # always capped (runaway guard)
         "temperature": 0,
         "stream": False,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -231,9 +250,27 @@ def call_local(messages: List[Dict[str, str]]) -> Tuple[str, str]:
         text = choice["message"].get("content") or ""
     except (KeyError, IndexError, TypeError, AttributeError):
         raise JudgeError("local judge response has no choices[0].message") from None
+    LAST_LOCAL.update({"finish_reason": choice.get("finish_reason"), "max_tokens": body["max_tokens"]})
     if choice.get("finish_reason") == "length":
         log(f"local judge hit max_tokens={body['max_tokens']}; output may be truncated")
     return text, str(data.get("model") or model)
+
+
+_PARTIAL_SEV_RE = re.compile(r'"severity"\s*:\s*"(high|medium|low)"', re.I)
+
+
+def truncation_note(n: int, raw: str, max_tokens: Any, raw_file: str) -> str:
+    """Finding note for a local reply cut off at max_tokens (#30): the item count and severities that can
+    be read from the partial reply, so a reviewer sees when a high item vanished in the re-ask."""
+    sevs = [m.lower() for m in _PARTIAL_SEV_RE.findall(raw or "")]
+    if sevs:
+        counts = ", ".join(f"{sevs.count(s)} {s}" for s in ("high", "medium", "low") if s in sevs)
+        partial = (f"the partial reply had {len(sevs)} item(s) with a parseable severity ({counts}; as "
+                   f"written by the judge, before any severity cap)")
+    else:
+        partial = "no item could be parsed from the partial reply"
+    return (f"local judge reply {n} was truncated at max_tokens={max_tokens} (finish_reason=length); "
+            f"{partial}; it is kept in {raw_file}")
 
 
 # ------------------------------------------------------------------------------ cost guard
@@ -772,6 +809,10 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
     errs: List[str] = []
     dropped: List[str] = []
     rule_notes: List[str] = []
+    trunc_notes: List[str] = []
+    finish: List[str] = []  # per reply: "length" when a local reply was cut off at max_tokens
+    used_mt: List[Any] = []  # per reply: max_tokens of a local call (None for frontier)
+    raw_file = f"evidence/{request_id}/{'claims-raw.txt' if mode == CLAIMS_MODE else 'judge-raw.txt'}"
     probes_done = retried = False
     try:
         while True:
@@ -782,8 +823,15 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
                     raise ClaimsSkipped(f"frontier daily cap ({cap}) reached")
                 mode, frontier = "local", False
                 notes.append(f"frontier daily cap ({cap}) reached: fell back to local")
-            raw, model = call_frontier(messages, record_cost=use_budget) if frontier else call_local(messages)
+            truncated_before = bool(finish) and finish[-1] == "length"
+            LAST_LOCAL.clear()
+            raw, model = (call_frontier(messages, record_cost=use_budget) if frontier
+                          else call_local(messages, max_tokens=local_max_tokens(truncated_before)))
             raws.append(raw)
+            used_mt.append(None if frontier else LAST_LOCAL.get("max_tokens"))
+            finish.append("length" if not frontier and LAST_LOCAL.get("finish_reason") == "length" else "")
+            if finish[-1]:
+                trunc_notes.append(truncation_note(len(raws), raw, LAST_LOCAL.get("max_tokens"), raw_file))
             parsed: Any = None
             try:
                 parsed = V.extract_json(raw)
@@ -806,14 +854,28 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
             if finding is not None or retried:
                 break
             retried = True
+            cut = ("Your reply was cut off at the output token limit. Reply again with the complete JSON "
+                   "object: keep every item you found, shorten claim/evidence/recommendation instead. "
+                   if finish[-1] else "")
             messages += [{"role": "assistant", "content": raw},
-                         {"role": "user", "content": "Your reply was invalid: " + "; ".join(errs[:5])
+                         {"role": "user", "content": cut + "Your reply was invalid: " + "; ".join(errs[:5])
                           + ". Reply again with ONLY the JSON object described in the system prompt, nothing else."}]
     except JudgeError as exc:
         exc.mode, exc.model = mode, model  # type: ignore[attr-defined]
         raise
 
-    raw_record = "\n\n".join(f"===== judge reply {i} ({mode}, {model}) =====\n{r}" for i, r in enumerate(raws, 1))
+    raw_record = "\n\n".join(
+        f"===== judge reply {i} ({mode}, {model}{', TRUNCATED: finish_reason=length' if f else ''}) =====\n{r}"
+        for i, (r, f) in enumerate(zip(raws, finish), 1))
+    if trunc_notes:
+        # #30: the finding comes from a later reply; say so, with what the cut-off reply contained
+        if finish[-1]:
+            trunc_notes.append(f"the finding below comes from reply {len(raws)}, itself truncated: items may be missing")
+        else:
+            trunc_notes.append(f"the finding below comes from reply {len(raws)} (max_tokens={used_mt[-1]}); "
+                               f"compare it with the truncated reply before trusting an empty or shorter list")
+        log(f"{request_id}: " + "; ".join(trunc_notes)[:500])
+    notes.extend(trunc_notes)
     if finding is None:
         finding = placeholder_finding(
             request_id, mode, model, "Judge output was invalid twice; no review was produced.",
