@@ -434,3 +434,14 @@ def test_single_fragment_numeric_conflict(tmp_path, mode, verdict, frag, kept):
     f, errs, dropped = V.validate_finding({"items": [item]}, request_id=req["id"], judge="j", mode=mode,
                                           created="2026-10-03T00:00:00Z", bundle_text=b.bundle_text, request=b.request)
     assert (len(f["items"]) == 1) is kept, (f, dropped)
+
+
+def test_ips_in_final_answer_are_masked_and_self_checked():
+    """An agent's answer can quote host addresses; they must not leave in the claims-only bundle."""
+    co = CO
+    text = "Grafana answers on 192.0.2.10:3001 and the edge is 203.0.113.10; again 192.0.2.10. v0.19.1 stays."
+    out = co.mask_ips(text)
+    assert "192.0.2.10" not in out and "203.0.113.10" not in out
+    assert out.count("ip#1") == 2 and "ip#2" in out and "v0.19.1" in out and ":3001" in out
+    assert any("IPv4" in p for p in co.self_check('{"claims": "ssh to 198.51.100.7"}'))
+    assert not any("IPv4" in p for p in co.self_check('{"claims": "' + out + '"}'))

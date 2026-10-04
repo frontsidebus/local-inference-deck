@@ -152,6 +152,18 @@ _MARKER_RE = re.compile(r"# content withheld|# WINDOWED|# POINT IN TIME|=== FILE
 _HEADER_RE = re.compile(r"(?m)^=== FILE: (.*?) ===$")
 
 
+_IPV4_RE = re.compile(r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?!\w|\.\d)")
+
+
+def mask_ips(text: str) -> str:
+    """IPv4 addresses -> opaque ip#N (stable within one text): a host's address is site data, not a claim."""
+    ids: Dict[str, str] = {}
+
+    def sub(m: re.Match) -> str:
+        return ids.setdefault(m.group(0), f"ip#{len(ids) + 1}")
+    return _IPV4_RE.sub(sub, text)
+
+
 def self_check(text: str) -> List[str]:
     """Why *text* must not be sent (empty = ok). Scans the text as sent and a JSON-unescaped copy of it."""
     problems: List[str] = []
@@ -163,6 +175,8 @@ def self_check(text: str) -> List[str]:
         m = _ABS_PATH_RE.search(v)
         if m:
             problems.append(f"path-like token{tag} at offset {m.start()}")
+        if _IPV4_RE.search(v):
+            problems.append(f"IPv4 address{tag}")
         if _MSG_RE.search(v):
             problems.append(f"user-message marker (msg=){tag}")
         if _DIFF_RE.search(v):
@@ -364,7 +378,7 @@ def build(request: Dict[str, Any], evidence_dir: Path, home: Optional[str] = Non
     claims = str(request.get("claims") or "")
     if len(claims) > MAX_CLAIMS_CHARS:
         claims = claims[:MAX_CLAIMS_CHARS] + " [... truncated ...]"
-    claims = mask_paths(redact(claims), index, "claims")
+    claims = mask_ips(mask_paths(redact(claims), index, "claims"))
     gates = gate_lines(evidence_dir)
     c3 = c3_lines(evidence_dir, index)
     session = str(request.get("session") or (manifest.get("request") or {}).get("session") or "")
