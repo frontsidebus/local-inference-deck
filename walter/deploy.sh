@@ -16,7 +16,8 @@
 #
 # Order: render -> packages -> users -> /models mount -> llama-swap binary -> files ->
 #        env files -> gen-secrets -> systemd units + firewall -> (offsite backups) -> gateway -> keys -> webui ->
-#        monitoring -> telemetry -> (hermes). Never deletes anything; never overwrites a secret.
+#        monitoring -> telemetry -> digest (key copy + stack) -> (hermes). Never deletes anything; never
+#        overwrites a secret.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -81,7 +82,7 @@ USER_HOME=${USER_HOME:-/home/$BACKEND_SSH_USER}
 step "render templates"
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/walter-render.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
-for d in base wireguard llama-swap gateway webui monitoring telemetry backup update-check firewall hermes; do
+for d in base wireguard llama-swap gateway webui monitoring telemetry digest backup update-check firewall hermes; do
   "$REPO/scripts/render.sh" -e "$SITE_ENV_FILE" "$HERE/$d" "$STAGE/$d"
 done
 find "$STAGE" -name __pycache__ -prune -exec rm -rf {} +
@@ -239,6 +240,8 @@ mkdir_p /srv/webui 0750 root root
 mkdir_p /srv/gateway/keys 0700 root root
 mkdir_p /srv/monitoring/secrets 0700 root root
 mkdir_p /srv/telemetry/secrets 0700 root root
+mkdir_p /srv/digest/secrets 0700 root root
+mkdir_p /srv/digest/state 0750 10001 10001
 
 install_file "$S/base/nvidia-persistenced.service.d/override.conf" /etc/systemd/system/nvidia-persistenced.service.d/override.conf 0644 root root units
 # wg0.conf holds the private key once gen-secrets has filled it: compare with the key masked.
@@ -276,6 +279,10 @@ install_tree "$S/monitoring/grafana/provisioning" /srv/monitoring/grafana/provis
 install_file "$S/telemetry/compose.yaml"        /srv/telemetry/compose.yaml               0644 root root telemetry
 install_file "$S/telemetry/README.md"           /srv/telemetry/README.md                  0644 root root
 install_tree "$S/telemetry/build"               /srv/telemetry/build                      0644 root root telemetry
+
+install_file "$S/digest/compose.yaml"           /srv/digest/compose.yaml                  0644 root root digest
+install_file "$S/digest/README.md"              /srv/digest/README.md                     0644 root root
+install_tree "$S/digest/build"                  /srv/digest/build                         0644 root root digest
 
 install_file "$S/backup/spark-backup.sh"        /usr/local/sbin/spark-backup.sh           0750 root root
 install_file "$S/backup/spark-backup-restore-test.sh" /usr/local/sbin/spark-backup-restore-test.sh 0750 root root
@@ -355,6 +362,32 @@ else
   step "webui (Pocket-ID + Open WebUI)"; EXTRA_UP=(--wait); compose_up /srv/webui webui webui-theme
   step "monitoring";                     EXTRA_UP=(); compose_up /srv/monitoring monitoring
   step "telemetry";                      EXTRA_UP=(--build); compose_up /srv/telemetry telemetry
+  step "digest key"
+  if [[ -f $T/srv/gateway/keys/digest.key ]]; then
+    case " ${HARNESS_KEYS:-} " in
+      *" digest "*) ;;
+      *) warn "digest key present but 'digest' is not in HARNESS_KEYS (site.env)" ;;
+    esac
+    if [[ -e $T/srv/digest/secrets/digest-litellm-key ]]; then
+      say "  keep     /srv/digest/secrets/digest-litellm-key (exists)"
+    elif [[ $DRY == 1 ]]; then
+      say "  would copy /srv/gateway/keys/digest.key -> /srv/digest/secrets/digest-litellm-key (0440 root:10001)"
+    else
+      mkdir_p /srv/digest/secrets 0700 root root
+      install -m 0440 "$T/srv/gateway/keys/digest.key" "$T/srv/digest/secrets/digest-litellm-key"
+      [[ $EUID -eq 0 ]] && chown root:10001 "$T/srv/digest/secrets/digest-litellm-key"
+      say "  create   /srv/digest/secrets/digest-litellm-key (copy of /srv/gateway/keys/digest.key)"
+    fi
+  else
+    warn "digest key missing: /srv/gateway/keys/digest.key (is 'digest' in HARNESS_KEYS?)"
+  fi
+  if [[ -f $T/srv/digest/secrets/digest-litellm-key ]]; then
+    step "digest"; EXTRA_UP=(--build); compose_up /srv/digest digest
+  elif [[ $DRY == 1 && -f $T/srv/gateway/keys/digest.key ]]; then
+    say "  would start digest (key copy pending)"
+  else
+    warn "digest not started: key missing"
+  fi
 fi
 
 # ---- 11. Hermes Agent on Walter (optional) ------------------------------------------------

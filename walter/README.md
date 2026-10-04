@@ -11,6 +11,7 @@ edge (Covenant) ──wg0──► BACKEND_WG_IP
                            :1411  Pocket-ID       (/srv/webui, docker)    │ DOCKER-USER chain
                            :4000  LiteLLM         (/srv/gateway, docker) ─┘ WALTER-PUBLISHED: only EDGE_WG_IP
                            :3200  telemetry app   (/srv/telemetry, host network; ufw: only EDGE_WG_IP on wg0)
+                           :3300  digest app      (/srv/digest, host network; ufw: only EDGE_WG_IP on wg0)
                            :8080  llama-swap      (systemd, user llamaswap; ufw: only GATEWAY_DOCKER_SUBNET)
                                     └─► llama-server containers on 127.0.0.1:<dynamic> (GPU0 / GPU1 / both)
                     127.0.0.1:3001/9090/...  monitoring (/srv/monitoring, host network, SSH tunnel only)
@@ -37,6 +38,7 @@ Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `co
 | `webui/*` | `/srv/webui/` (0750) | Open WebUI + Pocket-ID compose, `.env.example`, `pocket-id.env.example`, `theme/`, `pocketid-bootstrap.py` |
 | `monitoring/*` | `/srv/monitoring/` | Prometheus, Grafana, node-exporter, cAdvisor, dcgm-exporter, blackbox, llama-swap SD sidecar ([README](monitoring/README.md.tmpl)) |
 | `telemetry/*` | `/srv/telemetry/` | Starlette dashboard app + backup-status sidecar ([README](telemetry/README.md.tmpl)) |
+| `digest/*` | `/srv/digest/` | on-demand intelligence digest app (host network, uid 10001), `secrets/` + `state/` ([README](digest/README.md.tmpl)) |
 | `backup/*` | `/usr/local/sbin/spark-backup*.sh`, units, `${MODELS_DIR}/backups/RESTORE.md` | nightly local backup + non-destructive restore test ([RESTORE](backup/RESTORE.md.tmpl)) |
 | `backup/spark-offsite*`, `backup/offsite-setup.sh` | `/usr/local/sbin/spark-offsite.sh`, `spark-offsite.{service,timer}`, `/usr/local/bin/restic`, `/etc/spark-restic/` | optional encrypted offsite copy of the backups (restic to S3, bucket-scoped IAM user), when `RESTIC_BUCKET` is set ([OFFSITE](backup/OFFSITE.md)) |
 | `update-check/*` | `/usr/local/sbin/spark-update-check.py`, units, `/etc/update-motd.d/90-spark-updates`, `/var/lib/spark-update-check/README.md` | weekly report-only update/advisory check ([README](update-check/README.md.tmpl)) |
@@ -92,7 +94,8 @@ overwrites; reports drift) → `scripts/gen-secrets.sh walter` → enable units
 (`nvidia-persistenced`, `wg-quick@wg0`, `docker-user-rules`, `docker`, `llama-swap`,
 `spark-backup.timer`, `spark-update-check.timer`) and run `ufw-rules.sh` → offsite backups
 (`backup/offsite-setup.sh`, only when `RESTIC_BUCKET` is set and `/etc/spark-restic/aws.env` exists) → compose stacks in order:
-gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build`).
+gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build`) →
+digest (key copy, `--build`).
 A stack is force-recreated only when one of its files changed.
 
 Options: `--dry-run`, `--destdir DIR` (install under a prefix and skip every system action — useful
@@ -183,6 +186,23 @@ Live Walter also runs the Hermes CLI for `BACKEND_SSH_USER`, pointed at LiteLLM 
    `~/.hermes/config.yaml`, keeping a timestamped backup.
 3. Use `hermes-spark` (plain `hermes` gets a 401).
 
+## Digest app
+
+On-demand intelligence digests (threat intel / AI security / AI research), published as
+`https://digest.${SPARK_DOMAIN}` (Covenant: nginx + a second oauth2-proxy instance proxy to Walter).
+1. **Deploy.** `digest` must be in `HARNESS_KEYS` in site.env so `provision-keys.py` creates
+   `/srv/gateway/keys/digest.key`. `deploy.sh` then copies it to
+   `/srv/digest/secrets/digest-litellm-key` (0440 root:10001, never printed; kept if present) and
+   starts the stack (`--build`). Without the key the stack is not started and deploy warns.
+2. **Verify (from Walter).** `curl -fsS http://${BACKEND_WG_IP}:3300/healthz` → `{"ok": true}`;
+   `cd /srv/digest && sudo docker compose ps` (healthy).
+3. **Rollback.** `cd /srv/digest && sudo docker compose down && sudo docker image rm walter-digest:local`,
+   delete the ufw 3300 rule and 3300 from `PORTS` in `/usr/local/sbin/docker-user-rules.sh` (restart
+   `docker-user-rules.service`), then remove the digest vhost + oauth2-proxy instance on Covenant.
+   `state/` (run history + watch cutoffs) survives `down`; see `digest/README.md.tmpl`.
+4. **Secrets.** the LiteLLM virtual key copy in `/srv/digest/secrets/` (re-copy by hand after a
+   rotation; the app reads it on every curation call, no restart needed).
+
 ## Secrets
 
 Generated on the host by `scripts/gen-secrets.sh walter` (spec: `scripts/secrets.d/walter.sh`).
@@ -207,6 +227,7 @@ Existing values are never overwritten and never printed.
 | Grafana admin password | `/srv/monitoring/grafana-admin-password` | 0600 root | 32 alnum |
 | container copies | `/srv/monitoring/secrets/grafana-admin-password` (0400 472:472), `/srv/monitoring/secrets/llama-swap-api-key` (0400 65534:65534), `/srv/telemetry/secrets/llama-swap-api-key` (0440 root:10001) | | copies. After a rotation, re-copy by hand (gen-secrets warns on mismatch) |
 | Hermes key (optional) | `~${BACKEND_SSH_USER}/.config/spark/hermes.key` | 0600 user | copy of `keys/hermes.key` |
+| digest LiteLLM key | `/srv/digest/secrets/digest-litellm-key` | 0440 root:10001 | copy of `keys/digest.key`, made by `deploy.sh` after provision-keys (never printed; kept if present) |
 | restic repo password (offsite) | `/etc/spark-restic/password` | 0600 root, dir 0700 | `openssl rand -hex 24` by `offsite-setup.sh`, once. **Owner keeps an offline copy; without it the offsite backups are unrecoverable** |
 | AWS key of IAM user `spark-restic` | `/etc/spark-restic/aws.env` | 0600 root | `aws iam create-access-key`, piped straight to Walter (backup/OFFSITE.md) |
 
@@ -242,7 +263,7 @@ sudo docker logs --since 10m gateway-litellm-1 2>&1 | grep 'output cap'
 systemctl is-active llama-swap docker-user-rules wg-quick@wg0 nvidia-persistenced
 nvidia-smi --query-gpu=name,persistence_mode,pcie.link.width.current --format=csv
 sudo iptables -S WALTER-PUBLISHED; sudo ufw status verbose
-for s in gateway webui monitoring telemetry; do sudo docker compose -f /srv/$s/compose.yaml ps; done   # all (healthy)
+for s in gateway webui monitoring telemetry digest; do sudo docker compose -f /srv/$s/compose.yaml ps; done   # all (healthy)
 K=$(sudo cat /srv/gateway/keys/claude-code.key)
 curl -s http://${BACKEND_WG_IP}:4000/v1/models -H "Authorization: Bearer $K" | jq -r '.data[].id'; unset K
 curl -s http://${BACKEND_WG_IP}:4000/metrics/ | head -3                      # LiteLLM metrics (unauthenticated)
