@@ -16,7 +16,12 @@ Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
                      of duplicated)
   on_session_end     fires once per turn: enqueues a `completion` request for the window since the previous
                      on_session_end of this session (or session start). Turns with no tool activity and no
-                     changed watched paths are skipped (JUDGE_ENQUEUE_ALWAYS=1 to enqueue anyway).
+                     changed watched paths are skipped (JUDGE_ENQUEUE_ALWAYS=1 to enqueue anyway), unless
+                     the turn's final answer is worth reviewing on its own (#29, text_only_reason):
+                     JUDGE_REVIEW_TEXT_ONLY=1 (default), >= JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS (200) chars, and
+                     a claim word (done/fixed/blocked/ran/verified/escalated/...) or a gate.log decision of
+                     the session in the window; never the answer already enqueued for an earlier turn.
+                     Such a request carries detail.text_only {chars, claim_words, gate_decisions, rule}.
                      changed_paths = only what the agent touched: snapshot changes named by the session's
                      tool events (lib/snapshot.agent_touched) plus this turn's write_file/patch targets.
                      Every other snapshot change goes to detail.changed_by_others (paths only) and does not
@@ -218,19 +223,26 @@ def on_session_end(payload, cfg, root):
     changed_paths = sorted(set(touched) | set(mine))
     others = sorted(set(others) - set(changed_paths))
     recent_events = [ev for ev in snapshot.events(d) if ev.get("t", "") >= q.utc_now_iso(since)]
+    claims = hermeslog.last_assistant_message(cfg["HERMES_HOME"], session) or ""
+    text_only = None
     if (activity == 0 and not recent_events and not touched
             and os.environ.get("JUDGE_ENQUEUE_ALWAYS") != "1" and not _new_changes(meta, changed)):
-        meta["last_end"] = q.utc_now_iso(now)
-        snapshot.save_meta(d, meta)
-        return None
+        # No tool activity: review the turn only when its final answer is substantive and makes claims
+        # about actions/state/verification, or the gate decided something in the window (#29).
+        text_only = text_only_reason(claims, cfg, root, session, since, now, meta)
+        if text_only is None:
+            meta["last_end"] = q.utc_now_iso(now)
+            snapshot.save_meta(d, meta)
+            return None
 
-    claims = hermeslog.last_assistant_message(cfg["HERMES_HOME"], session) or ""
     detail = {k: extra.get(k) for k in ("task_id", "turn_id", "completed", "failed", "interrupted",
                                          "turn_exit_reason", "model", "platform", "reason") if k in extra}
     detail.update({"cwd": cwd, "tool_activity": activity, "snapshot_late": bool(meta.get("late")),
                    "changed_by_others": others[:MAX_OTHERS]})
     if len(others) > MAX_OTHERS:
         detail["changed_by_others_total"] = len(others)
+    if text_only is not None:
+        detail["text_only"] = text_only
     plans = [p for p in changed_paths if is_plan(p)]
     req = q.make_request(
         "completion", session, q.utc_now_iso(since), source_event="on_session_end",
@@ -238,6 +250,7 @@ def on_session_end(payload, cfg, root):
         data_class=config.classify(changed_paths, cfg, cwd or None), detail=detail, root=root)
     # The same turn's pre_verify request is still pending: fold this one into it (#12, one review per
     # turn). Already judged or being judged -> a new request as before, subject to is_duplicate.
+    meta["last_claims_sha"] = _claims_sha(claims)
     if q.merge_into_pending_completion(req, since=q.utc_now_iso(since), root=root):
         meta["last_end"] = req["created"]
         meta["last_changed"] = changed
@@ -262,6 +275,93 @@ def _trunc(text: str, limit: int = 4000) -> str:
     marker = "\n[... truncated ...]\n"
     head = (limit - len(marker)) // 3
     return text[:head] + marker + text[-(limit - len(marker) - head):]
+
+
+# ---------------------------------------------------------------- text-only turns (#29)
+# Words that make a final answer a claim about actions, state or verification (whole words, any case).
+# Deliberately cheap and biased towards reviewing: a false positive costs one claims review, a false
+# negative lets a false "it was blocked / it is fixed" go unreviewed.
+CLAIM_WORDS = (
+    "done", "fixed", "repaired", "resolved", "blocked", "denied", "refused", "rejected", "escalated",
+    "approved", "allowed", "prevented", "ran", "executed", "verified", "confirmed", "checked", "tested",
+    "validated", "passed", "failed", "succeeded", "changed", "updated", "modified", "edited", "patched",
+    "wrote", "written", "created", "deleted", "removed", "installed", "uninstalled", "deployed",
+    "restarted", "reloaded", "rebooted", "started", "stopped", "enabled", "disabled", "applied",
+    "reverted", "rolled back", "committed", "pushed", "merged", "migrated", "configured",
+    "gate", "gated", "blocklist", "allowlist", "judge",
+)
+_CLAIM_RE = re.compile(r"(?<![\w-])(?:" + "|".join(re.escape(w).replace(r"\ ", r"\s+") for w in CLAIM_WORDS)
+                       + r")(?![\w-])", re.I)
+GATE_LOG_TAIL = 512 * 1024
+
+
+def _setting(cfg, key: str, default: str) -> str:
+    """Environment > site.env (cfg) > default (these keys are not in lib/config DEFAULTS)."""
+    v = os.environ.get(key)
+    if v in (None, ""):
+        v = (cfg or {}).get(key)
+    return str(v).strip() if v not in (None, "") else default
+
+
+def _claims_sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256((text or "").strip().encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def claim_words(text: str):
+    """Distinct claim words in *text* (lower case, in order of first appearance)."""
+    return list(dict.fromkeys(re.sub(r"\s+", " ", m.group(0).lower()) for m in _CLAIM_RE.finditer(text or "")))
+
+
+def gate_decisions_in_window(root, session: str, since: datetime, until: datetime) -> int:
+    """Number of gate.log decisions of *session* with ts in [since, until] (read-only, tail of the log)."""
+    try:
+        p = Path(root) / "gate.log"
+        with open(p, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - GATE_LOG_TAIL))
+            lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0
+    from lib import queue as q
+    n = 0
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            if (isinstance(rec, dict) and str(rec.get("session") or "") == session and rec.get("decision")
+                    and since - timedelta(seconds=1) <= q.parse_utc(str(rec.get("ts") or "")) <= until):
+                n += 1
+        except ValueError:
+            continue
+    return n
+
+
+def text_only_reason(claims: str, cfg, root, session: str, since: datetime, now: datetime, meta):
+    """Why a turn with no tool activity should still be reviewed (a dict for detail.text_only), or None.
+
+    Rule (JUDGE_REVIEW_TEXT_ONLY=1, default): the final answer is at least JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS
+    (200) characters AND (it contains a claim word (CLAIM_WORDS) OR the gate logged a decision for this
+    session in the window) AND it is not the answer already enqueued for an earlier turn (meta
+    last_claims_sha: a turn that produced no new answer does not re-review the previous one).
+    JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=0 drops the claim-word condition (every substantive answer)."""
+    if _setting(cfg, "JUDGE_REVIEW_TEXT_ONLY", "1") != "1":
+        return None
+    text = (claims or "").strip()
+    try:
+        min_chars = max(0, int(_setting(cfg, "JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS", "200")))
+    except ValueError:
+        min_chars = 200
+    if not text or len(text) < min_chars:
+        return None
+    if meta.get("last_claims_sha") == _claims_sha(text):
+        return None
+    words = claim_words(text)
+    gates = gate_decisions_in_window(root, session, since, now + timedelta(seconds=5))
+    require = _setting(cfg, "JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS", "1") != "0"
+    if require and not words and not gates:
+        return None
+    return {"chars": len(text), "claim_words": words[:12], "gate_decisions": gates,
+            "rule": "claims" if words else ("gate" if gates else "min_chars")}
 
 
 def _new_changes(meta, changed) -> bool:

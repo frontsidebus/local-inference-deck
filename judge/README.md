@@ -182,7 +182,15 @@ JUDGE_SENSITIVE_FRONTIER_CLAIMS=1  # sensitive completions also get a frontier r
 - `coder-fast` is the same model family as the worker (see [Local judge policy](#local-judge-policy)); the cap and the no-injection rule are what make that acceptable for sensitive-only reviews. Read local findings as hints.
 - **Sensitive completions get a second, frontier review of their claims only** (`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1`, the default since 2026-10-03). Every agent slip found in runs 1 and 2 was in a sensitive session, which the local judge alone missed. The frontier judge gets a claims-only bundle: the agent's final answer (redacted and masked: paths `file#N`, addresses `ip#N`, site hosts `host#N`, local accounts `user#N`, digests and token-like runs `hex#N`/`blob#N`, secret length/prefix sentences withheld; a fail-closed self-check refuses anything that survives), gate decisions cut to the command name, C3 pass/fail per `file#N`, tool-call metadata and counts, and the window. It never gets file contents, diffs, paths, command output, probes or your message ([Data boundary](#data-boundary)). Its finding is `findings/<id>.claims.json`, mode `frontier-claims`, items `FC1`, `FC2`, ...; C5 injects it like any frontier finding. The local finding (`findings/<id>.json`) stays capped and out of C5. Gate, plan and runaway requests get no claims stage.
 
-Every local request sets `max_tokens` (`JUDGE_LOCAL_MAX_TOKENS`, default 4096), so the judge itself never sends an unbounded generation.
+Every local request sets `max_tokens` (`JUDGE_LOCAL_MAX_TOKENS`, default 4096), so the judge itself never sends an unbounded generation. A reply cut off at that limit (`finish_reason=length`) is re-asked once with `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default twice the limit). The finding's notes say so, with the item count and severities read from the cut-off reply, and `judge-raw.txt` keeps it marked `TRUNCATED`. So a high item that vanished in the re-ask stays visible (#30).
+
+**Turns with no tool calls.** A turn in which the agent called no tool and changed nothing is still reviewed when its final answer is at least `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS` (200) characters and claims something about actions, state or verification (a word like done, fixed, blocked, ran, verified, restarted, escalated, gate), or the gate decided something for the session in that turn (#29). Short replies and explanations without such words are skipped. The request carries `detail.text_only` (length, claim words found, gate decisions, rule).
+
+```bash
+JUDGE_REVIEW_TEXT_ONLY=1                 # 0 = never review a turn without tool calls
+JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS=200
+JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1  # 0 = every answer of at least MIN_CHARS
+```
 
 ### Cost and caps
 
@@ -366,6 +374,9 @@ Logs are redacted for secrets before they enter a bundle. The judge never gets a
 | Findings come from the local judge although `JUDGE_MODE=frontier` | Expected for `sensitive` requests, or when the daily cap is reached; the finding says which. |
 | The installer says "does not round-trip" | Unusual YAML around `hooks:` (anchors, flow style). Nothing was written; merge the printed block by hand. |
 | A hook changed on disk | Consent is keyed on the command, so it is not re-asked. `hermes hooks doctor` flags mtime drift. |
+| A turn with no tool calls got no review | Expected for short or claim-free answers. Check `JUDGE_REVIEW_TEXT_ONLY` (1), the answer length against `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS`, and whether it contains a claim word (`enqueue.CLAIM_WORDS`). An answer identical to the previous enqueued one is not reviewed again. `JUDGE_ENQUEUE_ALWAYS=1` reviews every turn. |
+| Chit-chat turns are being reviewed | A long answer used a claim word (e.g. "checked", "done"). Raise `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS`, or set `JUDGE_REVIEW_TEXT_ONLY=0`. |
+| A local finding's notes say "reply 1 was truncated" | The local judge hit `JUDGE_LOCAL_MAX_TOKENS`. The finding comes from the re-ask; if the truncated reply listed items (the note gives their severities) and the re-ask did not, read the reply in `evidence/<id>/judge-raw.txt` and re-judge (`rejudge.py`) with a higher `JUDGE_LOCAL_MAX_TOKENS` / `JUDGE_LOCAL_RETRY_MAX_TOKENS`. |
 | The host diff window looks wrong | Host-side `find -newermt` uses UTC; Hermes log time zone is `JUDGE_LOG_TZ`. |
 | Local findings are full of `high` items that turn out false | The local judge treated unverifiable claims as false (run-1 bug #5), worst with a same-family judge. The prompt and validator now turn unquoted `false` verdicts into `n/a` / `low` (see the finding's `notes`), local items are capped at `JUDGE_LOCAL_MAX_SEVERITY` and not injected unless `JUDGE_INJECT_LOCAL=1`. Try `JUDGE_LOCAL_MODEL=vision`, measured with `rejudge.py`. |
 | A finding blames the agent for a path it never touched | Request paths used to be trusted as given (#6). Now a path counts as the agent's only when a tool call that ran in the window names it (or it is under memories/skills after a `memory`/`skill_manage` call). Rejected paths are listed in the manifest's `attribution.rejected_request_paths`, kept out of `agent-diff.patch`, and still make the bundle stricter, never laxer. |
