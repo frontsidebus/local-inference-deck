@@ -152,8 +152,9 @@ def main(argv):
                 shown += 1
             print()
         if o["rid"]:
-            for n in rows[0][1].get("notes") or []:
-                print(f"note: {n}")
+            for _, f, _items in rows:
+                for n in f.get("notes") or []:
+                    print(f"note ({f.get('mode', '?')}): {n}")
         if not shown:
             print("(no items)")
         return 0
@@ -165,7 +166,7 @@ def main(argv):
         by_status = {s: sum(1 for i in items if i["status"] == s) for s, _ in GROUPS}
         parts = " ".join(paint(f"{s[0].upper()}:{counts[s]}", SEV_COLOR[s] if counts[s] else "") for s in counts)
         st = " ".join(paint(f"{s}:{n}", STATUS_COLOR[s] if n and s != "closed" else "") for s, n in by_status.items())
-        print(f"{rid:<44} {f.get('mode', '?'):<8} {parts}  {st}")
+        print(f"{rid:<44} {f.get('mode', '?'):<15} {parts}  {st}")
     return 0
 
 

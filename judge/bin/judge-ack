@@ -96,13 +96,19 @@ def main(argv):
     except ValueError as exc:
         print(f"judge-ack: {exc}", file=sys.stderr)
         return 64
-    path = C.sub("findings") / f"{rid}.json"
-    try:
-        finding = C.read_json(path)
-    except (OSError, ValueError):
+    # findings/<rid>.json, and for a sensitive request also findings/<rid>.claims.json (frontier claims stage,
+    # item ids FC1, FC2, ...); item ids never collide between the two.
+    found = []
+    for path in (C.sub("findings") / f"{rid}.json", C.sub("findings") / f"{rid}.claims.json"):
+        try:
+            found.append(C.read_json(path))
+        except (OSError, ValueError):
+            continue
+    if not found:
         print(f"judge-ack: no finding {rid}", file=sys.stderr)
         return 2
-    item = next((it for it in finding.get("items") or [] if isinstance(it, dict) and str(it.get("id")) == iid), None)
+    item = next((it for finding in found for it in finding.get("items") or []
+                 if isinstance(it, dict) and str(it.get("id")) == iid), None)
     if item is None:
         print(f"judge-ack: finding {rid} has no item {iid}", file=sys.stderr)
         return 2

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Re-run the judge on EXISTING evidence bundles, for comparing prompts/validators/models on identical input.
 
-    rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget] [--sensitive-local]
+    rejudge.py <request-id>... --out DIR [--mode local|frontier|frontier-claims] [--model X] [--no-budget]
+               [--sensitive-local]
 
 Reads the request from queue/ or done/ and the bundle from evidence/<id>/ under $JUDGE_REVIEW_DIR (else the
 usual review dir). It never collects evidence, never runs probes (PROBES ALLOWED: no) and never writes to
@@ -16,8 +17,13 @@ and finally DIR/summary.json + a stdout table comparing each new finding with fi
           `--mode frontier` on a sensitive bundle is REFUSED for that request: no model call, an error in
           summary.json and the table, exit 1. The local model may be a large one that evicts other models,
           so rejudge never falls back to it silently.
+--mode frontier-claims  the frontier CLAIMS stage only (collector/claims_only.py): build the claims-only bundle
+          from the evidence (no file contents, diffs, paths or user messages), self-check it, and judge it with
+          the frontier judge, exactly as run_judge.py's second stage for a sensitive completion does. A bundle
+          the self-check refuses is not sent (error row). <id>.input.txt is then exactly what was sent.
 --sensitive-local  with `--mode frontier`, judge sensitive bundles locally instead (with a note).
 --model   sets JUDGE_LOCAL_MODEL or JUDGE_FRONTIER_MODEL (by --mode; both without --mode), e.g. `--model vision`.
+          The comparison column "old" is findings/<id>.json, or findings/<id>.claims.json for frontier-claims.
 --no-budget  do not count frontier calls against JUDGE_FRONTIER_DAILY_MAX (usage.json is then not touched).
 Exit: 0 all judged, 1 at least one request failed, 64 usage.
 """
@@ -75,6 +81,18 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
         return row
     data_class = RJ.bundle_data_class(request, manifest)
     mode, notes = RJ.choose_mode(data_class)
+    if mode_arg == RJ.CLAIMS_MODE:
+        notes = ["rejudge: frontier claims stage on an existing bundle (no collection, no probes)"]
+        try:
+            res = RJ.judge_claims(rid, request, ev, notes, use_budget=use_budget)
+        except RJ.ClaimsSkipped as exc:
+            row["refused"] = True
+            row["error"] = f"claims stage not run: {exc}"
+            return row
+        except RJ.JudgeError as exc:
+            row["error"] = f"judge backend failed: {exc}"
+            return row
+        return _write_row(row, rid, out, res, RJ.CLAIMS_SUFFIX)
     if mode_arg:
         if data_class != "infra" and mode_arg == "frontier":
             if not sensitive_local:
@@ -94,6 +112,10 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
     except RJ.JudgeError as exc:
         row["error"] = f"judge backend failed: {exc}"
         return row
+    return _write_row(row, rid, out, res, "")
+
+
+def _write_row(row: Dict[str, Any], rid: str, out: Path, res: Dict[str, Any], suffix: str) -> Dict[str, Any]:
     finding = res["finding"]
     finding["notes"] = res["notes"]
     C.write_json(out / f"{rid}.json", finding)
@@ -102,7 +124,7 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
     C.atomic_write(out / f"{rid}.input.txt", res["input"])
     old = None
     try:
-        old = C.read_json(C.sub("findings") / f"{rid}.json")
+        old = C.read_json(C.sub("findings") / f"{rid}{suffix}.json")
     except Exception:
         pass
     row.update({"old": _summ(old), "new": _summ(finding)})
@@ -112,7 +134,7 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(prog="rejudge.py", description=__doc__.split("\n\n")[0])
     ap.add_argument("ids", nargs="+")
-    ap.add_argument("--mode", choices=("local", "frontier"))
+    ap.add_argument("--mode", choices=("local", "frontier", RJ.CLAIMS_MODE))
     ap.add_argument("--model")
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-budget", action="store_true")
@@ -134,7 +156,7 @@ def main(argv: List[str]) -> int:
     if args.model:
         if args.mode != "local":
             os.environ["JUDGE_FRONTIER_MODEL"] = args.model
-        if args.mode != "frontier":  # no --mode: the mode is chosen per request, so set both
+        if args.mode not in ("frontier", RJ.CLAIMS_MODE):  # no --mode: chosen per request, so set both
             os.environ["JUDGE_LOCAL_MODEL"] = args.model
     out.mkdir(parents=True, exist_ok=True)
     rows = [rejudge_one(rid, out, args.mode, not args.no_budget, args.sensitive_local) for rid in args.ids]

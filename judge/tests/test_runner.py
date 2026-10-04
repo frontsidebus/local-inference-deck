@@ -40,7 +40,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("JUDGE_LOCAL_MODEL", "big")
     monkeypatch.setenv("JUDGE_PROBES", "0")
     for k in ("JUDGE_MODE", "JUDGE_FRONTIER_CMD", "JUDGE_FRONTIER_DAILY_MAX", "JUDGE_LOCAL_URL",
-              "JUDGE_FRONTIER_MODEL", "SPARK_API_HOST", "JUDGE_LOCAL_MAX_SEVERITY"):
+              "JUDGE_FRONTIER_MODEL", "SPARK_API_HOST", "JUDGE_LOCAL_MAX_SEVERITY",
+              "JUDGE_SENSITIVE_FRONTIER_CLAIMS"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(RJ, "COLLECTOR", tmp_path / "no-collector.py")
     return review
@@ -221,10 +222,18 @@ def test_sensitive_forces_local(env, frontier, local, monkeypatch):
     r = rid()
     enqueue(env, r, data_class="sensitive")
     assert RJ.main([r]) == 0
-    assert frontier.calls() == []
+    assert only_claims_calls(frontier)  # the full bundle went to the local judge only
     assert len(local["requests"]) == 1
     f = finding(env, r)
     assert f["mode"] == "local" and any("local judge enforced" in n for n in f["notes"])
+
+
+def only_claims_calls(frontier):
+    """Every frontier call was a claims-only call: never the bundle's probe output or the request's paths."""
+    for c in frontier.calls():
+        assert "CLAIMS-ONLY" in c["stdin"] and "Permission denied" not in c["stdin"]
+        assert "ssh/config" not in c["stdin"] and "hermes-log.txt ===" not in c["stdin"]
+    return True
 
 
 def test_missing_data_class_counts_as_sensitive(env, frontier, local, monkeypatch):
@@ -235,7 +244,7 @@ def test_missing_data_class_counts_as_sensitive(env, frontier, local, monkeypatc
     (env / "queue" / f"{r}.json").write_text(json.dumps(req))
     (env / "evidence" / r / "manifest.json").write_text(json.dumps({"request": req}))
     RJ.main([r])
-    assert frontier.calls() == [] and finding(env, r)["mode"] == "local"
+    assert only_claims_calls(frontier) and finding(env, r)["mode"] == "local"
 
 
 def test_manifest_sensitive_wins_over_request(env, frontier, local, monkeypatch):
@@ -244,7 +253,7 @@ def test_manifest_sensitive_wins_over_request(env, frontier, local, monkeypatch)
     enqueue(env, r, data_class="infra")
     (env / "evidence" / r / "manifest.json").write_text(json.dumps({"data_class": "sensitive"}))
     RJ.main([r])
-    assert frontier.calls() == [] and finding(env, r)["mode"] == "local"
+    assert only_claims_calls(frontier) and finding(env, r)["mode"] == "local"
 
 
 def test_invalid_json_retry_then_success(env, local, monkeypatch):

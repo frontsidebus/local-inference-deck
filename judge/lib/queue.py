@@ -508,8 +508,9 @@ def write_finding(finding: Dict[str, Any], root=None) -> Tuple[Path, Path]:
 
 def read_findings(root=None, request_id: Optional[str] = None) -> List[Dict[str, Any]]:
     d = _root(root) / "findings"
-    if request_id is not None:
-        paths = [d / f"{_check_request_id(request_id)}.json"]
+    if request_id is not None:  # the main finding and, for a sensitive request, the frontier claims stage
+        rid = _check_request_id(request_id)
+        paths = [d / f"{rid}.json", d / f"{rid}.claims.json"]
     else:
         paths = sorted(d.glob("*.json")) if d.is_dir() else []
     out = []

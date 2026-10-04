@@ -10,7 +10,11 @@ JUDGE_WINDOW_GRACE_SECONDS + 3 s has passed, then run collector/collect.py) -> a
 findings/<id>.json + .md -> move the request to done/.
 
 Mode selection:
-- data_class != "infra" (missing counts as sensitive) -> local, whatever JUDGE_MODE says.
+- data_class != "infra" (missing counts as sensitive) -> local, whatever JUDGE_MODE says. For a sensitive
+  `completion`, a second stage follows (JUDGE_SENSITIVE_FRONTIER_CLAIMS=1, default, and JUDGE_MODE=frontier): the
+  frontier judge on the CLAIMS-ONLY bundle (collector/claims_only.py: final answer, gate/C3/tool metadata; no
+  contents, diffs, paths or user messages; self-checked, not sent if it fails) -> findings/<id>.claims.json, mode
+  frontier-claims, items FC1.. ; counts against JUDGE_FRONTIER_DAILY_MAX, skipped (never local) at the cap.
 - JUDGE_MODE=frontier (default) -> `${JUDGE_FRONTIER_CMD:-claude} -p`, unless the daily cap
   JUDGE_FRONTIER_DAILY_MAX (default 20 calls per UTC day, counted in usage.json) is reached; then local.
 - JUDGE_MODE=local -> OpenAI-compatible POST to https://${SPARK_API_HOST}/v1/chat/completions.
@@ -49,13 +53,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common as C  # noqa: E402
 import validate as V  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "collector"))
+import claims_only as CO  # noqa: E402
+
 RUNNER_DIR = Path(__file__).resolve().parent
 JUDGE_DIR = RUNNER_DIR.parent
 PROMPT_PATH = RUNNER_DIR / "prompt.md"
+CLAIMS_PREAMBLE_PATH = RUNNER_DIR / "prompt-claims.md"
 COLLECTOR = JUDGE_DIR / "collector" / "collect.py"
 PROBE = JUDGE_DIR / "probes" / "probe.py"
 MAX_PROBES = 4
-OWN_FILES = {"judge-raw.txt", "judge-input.txt"}
+OWN_FILES = {"judge-raw.txt", "judge-input.txt", "claims-input.txt", "claims-raw.txt"}
+CLAIMS_MODE = "frontier-claims"
+CLAIMS_SUFFIX = ".claims"  # findings/<id>.claims.json
 
 # Variables that could point `claude` at a non-Anthropic endpoint (e.g. the local gateway) or swap
 # its credentials/provider. Stripped from the frontier child env. ANTHROPIC_API_KEY is stripped too
@@ -72,6 +82,11 @@ _STRIP_VARS = _ENDPOINT_VARS + (
 
 class JudgeError(Exception):
     """The judge backend failed (not: the judge answered badly)."""
+
+
+class ClaimsSkipped(Exception):
+    """The frontier claims stage did not run: the self-check refused the bundle, or the daily cap is reached.
+    Nothing was sent."""
 
 
 def log(msg: str) -> None:
@@ -484,7 +499,8 @@ def render_md(f: Dict[str, Any], notes: List[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_finding(request_id: str, finding: Dict[str, Any], notes: List[str]) -> Path:
+def write_finding(request_id: str, finding: Dict[str, Any], notes: List[str], suffix: str = "") -> Path:
+    """findings/<id><suffix>.json + .md (suffix "" for the main finding, CLAIMS_SUFFIX for the claims stage)."""
     if notes:
         if V.schema_allows("notes"):
             finding["notes"] = notes
@@ -495,9 +511,9 @@ def write_finding(request_id: str, finding: Dict[str, Any], notes: List[str]) ->
         errs = list(C._queue.validate_finding(finding))  # lib/queue.py's view of the same schema
     if errs:
         raise JudgeError(f"refusing to write a schema-invalid finding: {errs[:3]}")
-    path = C.sub("findings") / f"{request_id}.json"
+    path = C.sub("findings") / f"{request_id}{suffix}.json"
     C.write_json(path, finding)
-    C.atomic_write(path.with_suffix(".md"), render_md(finding, notes))
+    C.atomic_write(C.sub("findings") / f"{request_id}{suffix}.md", render_md(finding, notes))
     return path
 
 
@@ -608,7 +624,8 @@ def judge_request(request_id: str) -> bool:
         manifest = C.read_json(evidence_dir / "manifest.json") if not ev_err else {}
     except Exception:
         manifest = {}
-    mode, notes = choose_mode(bundle_data_class(request, manifest))
+    data_class = bundle_data_class(request, manifest)
+    mode, notes = choose_mode(data_class)
 
     if ev_err:
         f = placeholder_finding(request_id, mode, "none", "No review: the evidence bundle could not be built.",
@@ -631,16 +648,96 @@ def judge_request(request_id: str) -> bool:
                                 f"No review: the judge backend failed {n} times.",
                                 f"run_judge.py {request_id} -> {str(exc)[:400]}",
                                 "Check runner.log and the judge backend, then re-queue the request.")
+        claims_stage(request_id, request, evidence_dir, data_class, notes)
         write_finding(request_id, f, notes)
         move_to_done(request_id)
         return True
 
     C.atomic_write(evidence_dir / "judge-raw.txt", res["raw_record"] + "\n")
     finding = res["finding"]
+    claims_stage(request_id, request, evidence_dir, data_class, res["notes"])
     write_finding(request_id, finding, res["notes"])
     move_to_done(request_id)
     log(f"{request_id}: {len(finding['items'])} item(s), mode={res['mode']}, judge={res['model']}")
     return True
+
+
+# ------------------------------------------------------------------ frontier claims stage (sensitive bundles)
+def claims_stage_enabled(data_class: str, request: Dict[str, Any]) -> Optional[str]:
+    """None when the claims stage should run for this request, else why not (for the notes)."""
+    if data_class == "infra":
+        return "infra bundle (judged by the frontier judge in full)"
+    if C.setting("JUDGE_SENSITIVE_FRONTIER_CLAIMS", "1").strip() == "0":
+        return "JUDGE_SENSITIVE_FRONTIER_CLAIMS=0"
+    if C.setting("JUDGE_MODE", "frontier").strip().lower() != "frontier":
+        return "JUDGE_MODE is not frontier"
+    if not CO.claims_eligible(request):
+        return f"kind={request.get('kind')} has no agent final answer (claims stage: {', '.join(CO.CLAIMS_KINDS)})"
+    return None
+
+
+def claims_ids(finding: Dict[str, Any]) -> None:
+    """Item ids of a claims-stage finding get an FC prefix (F1 -> FC1), so acks/<id>.<item> never collide with
+    the local finding's items of the same request."""
+    for it in finding.get("items") or []:
+        iid = str(it.get("id") or "")
+        it["id"] = ("FC" + iid[1:]) if re.fullmatch(r"F\d+", iid) else ("FC-" + iid)[:32]
+
+
+def judge_claims(request_id: str, request: Dict[str, Any], evidence_dir: Path, notes: List[str], *,
+                 use_budget: bool = True) -> Dict[str, Any]:
+    """Frontier judge on the CLAIMS-ONLY bundle (collector/claims_only.py) of *evidence_dir*. Writes nothing.
+    Raises ClaimsSkipped (self-check refused: nothing sent; or the daily cap is reached) or JudgeError.
+    Returns judge_bundle's dict; its finding has mode frontier-claims and FC item ids."""
+    built = CO.build(request, evidence_dir)
+    if built.problems:
+        raise ClaimsSkipped("self-check refused the claims-only bundle (nothing sent): " + "; ".join(built.problems))
+    system = CLAIMS_PREAMBLE_PATH.read_text(encoding="utf-8") + "\n\n" + PROMPT_PATH.read_text(encoding="utf-8")
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": built.message}]
+    res = _judge_loop(request_id, built.request, messages, built.bundle_text, CLAIMS_MODE, notes, evidence_dir,
+                      probes_allowed=False, use_budget=use_budget, cap_fallback=False)
+    claims_ids(res["finding"])
+    res["notes"].append(f"claims-only bundle ({len(built.message)} chars, self-check passed) judged by the "
+                        f"frontier judge; no file contents, diffs, paths or user messages were sent")
+    return res
+
+
+def claims_stage(request_id: str, request: Dict[str, Any], evidence_dir: Path, data_class: str,
+                 notes: List[str]) -> Optional[Path]:
+    """Run the frontier claims stage for a sensitive request and write findings/<id>.claims.json (+ .md),
+    evidence/<id>/claims-input.txt (exactly what was sent) and claims-raw.txt. Never raises; the outcome is
+    appended to *notes* (the main, local finding's notes) and runner.log."""
+    why = claims_stage_enabled(data_class, request)
+    if why:
+        if data_class != "infra":
+            notes.append(f"{CLAIMS_MODE} stage not run: {why}")
+        return None
+    cnotes: List[str] = []
+    try:
+        res = judge_claims(request_id, request, evidence_dir, cnotes)
+    except ClaimsSkipped as exc:
+        log(f"{request_id}: {CLAIMS_MODE} stage skipped: {exc}")
+        notes.append(f"{CLAIMS_MODE} stage skipped: {exc}"[:500])
+        return None
+    except JudgeError as exc:
+        log(f"{request_id}: {CLAIMS_MODE} stage failed: {exc}")
+        notes.append(f"{CLAIMS_MODE} stage failed (not retried): {exc}"[:500])
+        return None
+    except Exception as exc:  # the local finding must still be written
+        log(f"{request_id}: {CLAIMS_MODE} stage error: {type(exc).__name__}: {exc}")
+        notes.append(f"{CLAIMS_MODE} stage error: {type(exc).__name__}"[:500])
+        return None
+    try:
+        C.atomic_write(evidence_dir / "claims-input.txt", res["input"])
+        C.atomic_write(evidence_dir / "claims-raw.txt", res["raw_record"] + "\n")
+        path = write_finding(request_id, res["finding"], res["notes"], suffix=CLAIMS_SUFFIX)
+    except (JudgeError, OSError) as exc:
+        log(f"{request_id}: {CLAIMS_MODE} finding not written: {exc}")
+        notes.append(f"{CLAIMS_MODE} finding not written: {exc}"[:500])
+        return None
+    notes.append(f"{CLAIMS_MODE} stage: {len(res['finding']['items'])} item(s) in findings/{path.name}")
+    log(f"{request_id}: {CLAIMS_MODE} {len(res['finding']['items'])} item(s), judge={res['model']}")
+    return path
 
 
 def local_max_severity() -> str:
@@ -658,6 +755,15 @@ def judge_bundle(request_id: str, request: Dict[str, Any], evidence_dir: Path, m
     bundle = bundle_text(evidence_dir, max_chars)
     messages = [{"role": "system", "content": PROMPT_PATH.read_text(encoding="utf-8")},
                 {"role": "user", "content": build_user_message(request, bundle, probes_allowed)}]
+    return _judge_loop(request_id, request, messages, bundle, mode, notes, evidence_dir,
+                       probes_allowed=probes_allowed, use_budget=use_budget, cap_fallback=True)
+
+
+def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[str, str]], bundle: str, mode: str,
+                notes: List[str], evidence_dir: Path, *, probes_allowed: bool, use_budget: bool,
+                cap_fallback: bool) -> Dict[str, Any]:
+    """Call the judge (frontier for mode frontier/frontier-claims, else local), one probe round, validate with
+    one retry. cap_fallback: at the daily cap fall back to local (main stage) or raise ClaimsSkipped."""
     user_input = messages[1]["content"]
 
     raws: List[str] = []
@@ -669,10 +775,14 @@ def judge_bundle(request_id: str, request: Dict[str, Any], evidence_dir: Path, m
     probes_done = retried = False
     try:
         while True:
-            if mode == "frontier" and use_budget and not frontier_budget_take():
-                mode = "local"
-                notes.append(f"frontier daily cap ({C.setting('JUDGE_FRONTIER_DAILY_MAX', '20')}) reached: fell back to local")
-            raw, model = call_frontier(messages, record_cost=use_budget) if mode == "frontier" else call_local(messages)
+            frontier = mode in ("frontier", CLAIMS_MODE)
+            if frontier and use_budget and not frontier_budget_take():
+                cap = C.setting('JUDGE_FRONTIER_DAILY_MAX', '20')
+                if not cap_fallback:
+                    raise ClaimsSkipped(f"frontier daily cap ({cap}) reached")
+                mode, frontier = "local", False
+                notes.append(f"frontier daily cap ({cap}) reached: fell back to local")
+            raw, model = call_frontier(messages, record_cost=use_budget) if frontier else call_local(messages)
             raws.append(raw)
             parsed: Any = None
             try:
@@ -707,7 +817,7 @@ def judge_bundle(request_id: str, request: Dict[str, Any], evidence_dir: Path, m
     if finding is None:
         finding = placeholder_finding(
             request_id, mode, model, "Judge output was invalid twice; no review was produced.",
-            f"evidence/{request_id}/judge-raw.txt -> validation errors: {'; '.join(errs[:3])[:400]}",
+            f"evidence/{request_id}/{'claims-raw.txt' if mode == CLAIMS_MODE else 'judge-raw.txt'} -> validation errors: {'; '.join(errs[:3])[:400]}",
             f"A human should read evidence/{request_id}/ directly or re-queue the request.")
         log(f"{request_id}: judge output invalid twice: {errs[:3]}")
     else:

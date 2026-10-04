@@ -71,6 +71,7 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_SNAPSHOT_MAX_BYTES": "1048576", # larger files are hashed, not copied
     "JUDGE_LOCAL_MAX_SEVERITY": "medium",  # cap for findings from the local judge
     "JUDGE_INJECT_LOCAL": "0",             # 1 = C5 also injects local-judge findings
+    "JUDGE_SENSITIVE_FRONTIER_CLAIMS": "1", # 1 = sensitive completions also get a frontier claims-only review
     "BACKEND_SSH_USER": "operator",
     "LLAMA_SWAP_PORT": "8080",
 }
