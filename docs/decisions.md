@@ -115,3 +115,25 @@ Short records of the choices behind gen3. Each says what was decided, why, and w
 **Decision.** When a harness sends something a model's chat template rejects, fix it in a LiteLLM hook, not with client-side flags.
 
 **Why.** The first fix for Claude Code's mid-conversation system messages was an undocumented environment variable found in its binary, which can break on any upgrade and only helped one client. The hook covers every harness and every alias, and fixed a second bug (`coder-fast` dropping environment info) for free.
+
+---
+
+## 10. Frontier review of claims-only bundles for sensitive sessions
+
+**Date:** 2026-10-03 · **Status:** accepted (owner decision after judge runs 1 and 2)
+
+**Context.** Requests are classed `infra` or `sensitive` ([agent-judge.md](agent-judge.md#data-boundary)). Sensitive evidence went only to the local judge (`coder-fast`, the worker's own model family), capped at medium and not shown to the agent. Every agent slip found in runs 1 and 2 was in a sensitive session (work outside the infra paths), and the local judge caught 2 of 4 in run 2, missing both slips in the run-2 disk/GPU report. The frontier judge caught report slips well on infra bundles, with no medium-or-higher false positive.
+
+**Decision.** For a sensitive **completion**, keep the local review of the full bundle and **add** a frontier review of a **claims-only** bundle: the agent's final answer (redacted, paths replaced by opaque `file#N` ids), gate decisions cut to the command name, C3 pass/fail, tool-call metadata and counts, attribution counts, and the window. Never file contents, diffs, paths, command output, host probes, snapshot data or the user's message. The bundle is built from a positive allowlist (`judge/collector/claims_only.py`), self-checked before sending (refused and skipped on any secret-like value, path, user-message marker or diff), and the exact text sent is kept for audit. Its finding (`findings/<id>.claims.json`, mode `frontier-claims`) may be injected through C5; local findings stay out. `JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` by default; each call counts against `JUDGE_FRONTIER_DAILY_MAX`.
+
+**Why.**
+- Most of the slips were in the report itself (internal contradictions, unit labels, "blocked by the gate" for an escalation), which needs the report and the gate/C3/tool metadata, not file contents.
+- Measured before deploying: 3 repeats over the six sensitive run-1/run-2 completions (S2, S6, S7, S8 of run 2; S1, S4 of run 1) caught all 4 ground-truth slips in every repeat (12/12; the local judge alone: 2 of 4), plus one more real slip in the S2 report (VRAM headroom figures that contradict its own numbers, confirmed against the reference `nvidia-smi`), with 0 false positives. Two of the gate-wording catches came out at medium instead of low.
+- An allowlist plus a refusing self-check makes the boundary auditable: what can leave is listed field by field, and anything unexpected stops the call.
+
+**Cost.** One more frontier call per sensitive completion, so the daily cap fills about twice as fast. The live cap (20) should probably go to 40.
+
+**Residual risk.** The final answer can quote what the agent read: host names, config lines, numbers. Redaction masks secrets and paths, not other content. Bare file names (`config.yaml`) and single-segment relative paths stay.
+
+**Revisit when** a final answer carries content that should not leave (then add a content filter or set `JUDGE_SENSITIVE_FRONTIER_CLAIMS=0`), or when a local judge from another family matches the frontier judge on these slips.
+

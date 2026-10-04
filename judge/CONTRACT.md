@@ -31,9 +31,11 @@ judge/
   policy/gate-policy.json.tmpl   C2 rules (JSON: stdlib has no YAML), host patterns as ${VARS} (gate agent)
   collector/collect.py   build evidence bundle for a request (collector agent)
   collector/extras.py    C3 results + host-state probes for the bundle (`c3_results`, `host_state_probes`)
+  collector/claims_only.py  the CLAIMS-ONLY bundle of a sensitive review, for the frontier claims stage
   probes/                read-only probe executables + probe.py dispatcher/allowlist (collector agent)
   runner/                judge prompt, run-judge (frontier|local), findings validator, systemd user units (runner agent)
   runner/rejudge.py      re-judge stored bundles with the current prompt/validator, without touching findings/
+  runner/prompt-claims.md   preamble of the frontier claims stage (prepended to runner/prompt.md)
   bin/judge-ack|judge-findings   operator CLIs (acks, listing)
   watch/runaway.py       C6 llama-server slot watcher (verify agent)
   tests/                 pytest; one test module per part; fixtures under tests/fixtures/
@@ -47,6 +49,7 @@ queue/<request-id>.json          pending review requests
 evidence/<request-id>/           collector output (see bundle below)
 findings/<request-id>.json       judge output (validated)
 findings/<request-id>.md         human-readable rendering of the same
+findings/<request-id>.claims.json  frontier claims stage of a sensitive completion (mode frontier-claims; + .md)
 acks/<request-id>.<item-id>      ack JSON (see "Acks" below); legacy: empty or one-line reason
 done/<request-id>.json           request moved here after findings are written
 snapshots/<session-id>/          watched-path snapshots taken at session start (collector), plus
@@ -148,13 +151,21 @@ and manifest `attribution.ignored_noise_paths` (count) + `notes.noise`.
 
 ## Finding (schema/finding.schema.json)
 ```json
-{"request": "<request-id>", "judge": "<model id>", "created": "...Z", "mode": "frontier|local",
+{"request": "<request-id>", "judge": "<model id>", "created": "...Z", "mode": "frontier|local|frontier-claims",
  "items": [{"id": "F1", "rubric": "R1|R2|R3|R4|R5|R6|R7", "severity": "high|medium|low",
             "claim": "...", "evidence": "<command + output excerpt, or file:line>",
             "verdict": "true|false|partial|n/a", "recommendation": "..."}]}
 ```
 Optional top-level `"notes": ["..."]` (runner bookkeeping, e.g. "sensitive -> local enforced",
 "frontier cap reached", "validator dropped N items"). Validator drops items with empty `evidence`. Rubric codes as in docs/agent-judge.md.
+
+**Two findings per sensitive completion.** `findings/<id>.json` is the main finding (for a sensitive request:
+`mode: local`). `findings/<id>.claims.json` (+ `.md`) is the frontier claims stage (see "Claims-only bundle"),
+`mode: frontier-claims`, same `request`; its item ids are prefixed `FC` (`F1` -> `FC1`), so
+`acks/<id>.<item-id>` never collide between the two. Readers: `common.iter_findings` / `queue.read_findings()`
+glob `findings/*.json` and so see both (`read_findings(request_id=)` reads both files); `judge-ack` looks the item
+up in both; `judge-findings <id>` lists both, with the mode per item and per notes line; C5 treats
+`frontier-claims` like `frontier` (injected; only `mode == local` is skipped by `JUDGE_INJECT_LOCAL=0`).
 
 **Verdicts.** `false` = the bundle contradicts the claim, and the evidence quotes the contradicting bundle text;
 `n/a` = unverifiable from the bundle (missing output, withheld or stat-only content); `partial` = mild doubt.
@@ -186,7 +197,10 @@ the user message.
   inconsistent / but / while / next to ...) and quotes either two distinct claims fragments (>= 8 chars each in
   quotes or backticks, or >= 12-char spans; e.g. "unchanged" next to a reported change) or one claims fragment plus
   a quoted bundle line that is not claims text (e.g. a short log `tz` header). A `false` item, a medium/high item
-  or another rubric on claims-only evidence is still dropped.
+  or another rubric on claims-only evidence is still dropped. **Claims stage only** (`mode=frontier-claims`):
+  also kept when verdict `partial` and one quoted claims fragment of >= 20 chars holds two or more different
+  numbers (an arithmetic contradiction inside one sentence, e.g. a part larger than its whole); note
+  `numbers inside one claims fragment (claims-only stage)`. Other modes are unchanged.
 - **`false` → `n/a` + `low`** when (b) there is no contradicting span; (c) the evidence admits absence ("no
   evidence", "cannot verify", "withheld", ...) and no contradicting span carries a failure word (error, fail,
   denied, inactive, non-zero exit, 4xx/5xx, blocked, ...); (d0) every contradicting span comes only from
@@ -329,6 +343,61 @@ Read-only, stdlib-only helpers the collector calls; if the module is missing the
     starts with `# POINT IN TIME: ...` (unit_state, port_listening) or `# WINDOWED: ...` (unit_journal), then
     `# selected because: ...`.
 
+## Claims-only bundle (`collector/claims_only.py`) and the frontier claims stage
+
+**Policy** (owner decision 2026-10-03, docs/decisions.md #10). A `sensitive` bundle never leaves the machine. For a
+sensitive **completion** (the kind whose `claims` is the agent's own final answer) the runner adds a second stage:
+the local judge still reviews the full bundle (`findings/<id>.json`, capped, not injected), and the frontier judge
+reviews a CLAIMS-ONLY bundle built from it (`findings/<id>.claims.json`, mode `frontier-claims`). Gate, plan and
+runaway requests get no claims stage (their `claims` is synthetic or a plan, not a final answer).
+
+**Contents: a positive allowlist.** Every value is constructed by the builder from parsed fields; nothing from the
+bundle is copied through as text except the final answer:
+- REVIEW REQUEST: `id`, `kind`, `data_class`, `created`, `since`, `claims`. `claims` = `request.claims` (cut to
+  8000 chars), `lib/redact`ed, then path-masked: absolute (`/x`), home (`~/x`, `~user/x`, `$HOME/x`) and relative
+  paths with a directory part (a dotfile segment, a file extension or 2+ separators) become `file#N`. URLs, ratios
+  (`22.6/24.6`), `I/O`, `and/or` and a bare `/` are left alone. Bare file names (`config.yaml`) stay.
+- `manifest.json`: `bundle_mode: "claims-only"`, `request` (the fields above minus claims), `window` (`since`,
+  `until`, `grace_seconds`, `until_basis`), `timing` (`request_created`, `collected`, `log_tz` from the
+  hermes-log header, `host_times: "UTC"`), `attribution_counts` (`agent_paths`, `changed_by_others`, `withheld` =
+  `# content withheld` lines in `agent-diff.patch`, `rejected_request_paths`: numbers only), `path_index`
+  (`file#N` -> `{"seen_in": ["claims"|"c3"], "inside": "file#M"|null}`: containment, never a name), `not_included`.
+- `gate-decisions.jsonl`: per decision `ts`, `tool`, `command`, `rule`, `rules`, `decision`, `decision_meaning`,
+  `outcome`. `command` is the command NAME only: for `terminal` the first word of the excerpt (env assignments
+  skipped, basename, must match `[A-Za-z0-9][A-Za-z0-9._+-]{0,39}`, else `(unparsed)`); for other tools the tool
+  name. `decision_meaning` is fixed text per decision; `outcome` is `executed|not_executed|unknown`. No excerpt,
+  `outcome_basis`, call hash, call id or session.
+- `c3-results.jsonl`: per result `check`, `ok`, `final`, `file` (`file#N`, shared index with the claims). No
+  `detail`, `path`, `t` or `attempt`.
+- `tool-activity.jsonl`: a summary line (`tools: {name: {ok, error, seconds}}`, `tool_calls`, `api_calls`,
+  `tokens_in`, `tokens_out`, `turns`, `other_session_lines`), then one line per session-tagged `hermes-log.txt`
+  event, parsed by pattern: `tool` (`tool`, `ok`, `seconds`, `output_chars`), `api_call` (`n`, `model`,
+  `tokens_in`, `tokens_out`, `latency_s`), `turn_start` (`history`), `turn_end` (`reason`, `api_calls`,
+  `tool_turns`, `response_len`), each with log-local `t`. Duplicate log lines (WARNING+ lines appear in both the
+  agent.log and errors.log sections) count once; other session lines are only counted; untagged lines and other
+  sessions' lines are ignored. At most 300 events (middle-cut with an `omitted` count).
+- Never: file contents, diffs, paths, command arguments or output, tool error text, host or probe output, slots,
+  `others-changed.txt`, snapshot data, the user's message (`msg=`), `plan`, `detail`, `changed_paths`, session id.
+
+**Self-check** (`claims_only.self_check`, run on the exact message, and on a JSON-unescaped copy). Refuses when
+`lib/redact` would change the text, a `/`-prefixed or `~/`/`$HOME/` path is found, a `msg=` marker, a diff hunk or
+header, a `# content withheld` / `# WINDOWED` / `# POINT IN TIME` marker or an unknown `=== FILE:` header appears.
+A refused bundle is not sent: the stage is skipped, `runner.log` and the main finding's notes say why (kind and
+offset only, never the offending text), and no frontier call is counted.
+
+**Runner.** `judge_request`: local stage first (as before); then, before the main finding is written, the claims
+stage when `data_class != infra`, `JUDGE_SENSITIVE_FRONTIER_CLAIMS` != `0` (default `1`), `JUDGE_MODE=frontier`
+and `kind=completion`. System prompt = `runner/prompt-claims.md` + `runner/prompt.md`; no probes; one retry on an
+invalid reply; validated with the claims-only bundle and the sanitized request (so `claims` is the masked text).
+Each call takes one unit of `JUDGE_FRONTIER_DAILY_MAX`; at the cap the stage is skipped (never a local fallback:
+the local stage already ran). A backend failure is noted, not retried, and never blocks the main finding. Files:
+`findings/<id>.claims.json` + `.md`, `evidence/<id>/claims-input.txt` (exactly the message sent: the audit copy)
+and `evidence/<id>/claims-raw.txt`; both evidence files are excluded from later bundles. The main finding's notes
+record the outcome (`frontier-claims stage: N item(s) in findings/<id>.claims.json`, `... skipped: ...`,
+`... not run: ...`, `... failed (not retried): ...`). API: `run_judge.judge_claims(request_id, request,
+evidence_dir, notes, *, use_budget=True)` (raises `ClaimsSkipped` or `JudgeError`), `run_judge.claims_stage(...)`.
+Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a stored bundle (exit 1 if refused).
+
 ## Runner: bundle budget and collection timing (`runner/run_judge.py`)
 - **Collection timing** (bug #21). Before running the collector for a request without a bundle,
   `wait_for_window` sleeps until `request.created + JUDGE_WINDOW_GRACE_SECONDS + 3 s` (`COLLECT_MARGIN_SECONDS`:
@@ -447,11 +516,12 @@ summary line ends `open:N agent-acked:N closed:N`. `--json` items gain `status` 
 ## C5 injection (`hooks/inject.py`)
 Injects unacknowledged items at or above `JUDGE_INJECT_MIN_SEVERITY` from the last `JUDGE_INJECT_WINDOW_HOURS`.
 Items of `mode=local` findings are skipped unless `JUDGE_INJECT_LOCAL=1` (env or site.env; default `0`); the skip
-count goes to `inject.log` only when it changes for the session. The footer names
+count goes to `inject.log` only when it changes for the session. `mode=frontier-claims` findings
+(`findings/<id>.claims.json`) are injected like `frontier` ones. The footer names
 `judge-ack --agent <request-id> <item-id> "<reason>"` and says a HIGH item stays open until the human reviews it.
 
 ## Re-judging (`runner/rejudge.py`)
-`rejudge.py <request-id>... --out DIR [--mode local|frontier] [--model X] [--no-budget] [--sensitive-local]` judges existing bundles
+`rejudge.py <request-id>... --out DIR [--mode local|frontier|frontier-claims] [--model X] [--no-budget] [--sensitive-local]` judges existing bundles
 again with the current prompt and validator, via `run_judge.judge_bundle(request_id, request, evidence_dir, mode,
 notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, input, mode, model, notes}`, raises
 `JudgeError`).
@@ -465,6 +535,10 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
   `"refused": true` and an `error` naming the data class and `--sensitive-local`, the table prints `REFUSED`, and
   the exit code is 1. `--sensitive-local` judges it locally instead, with a note (`summary.json` records
   `"sensitive_local"`).
+- `--mode frontier-claims` runs only the frontier claims stage (`run_judge.judge_claims`) on any bundle,
+  sensitive included: `<id>.input.txt` is exactly the claims-only message, items are `FC`-prefixed, the "old"
+  column compares with `findings/<id>.claims.json`. A bundle the self-check refuses gets a `"refused": true` row
+  and no model call (exit 1). The refusal of plain `--mode frontier` on sensitive bundles is unchanged.
 - `--model` sets `JUDGE_LOCAL_MODEL` or `JUDGE_FRONTIER_MODEL` by `--mode` (both without `--mode`).
 - Frontier calls count in `usage.json` against `JUDGE_FRONTIER_DAILY_MAX` unless `--no-budget`.
 - Exit 0 ok, 1 when any request failed, 64 usage.
@@ -474,7 +548,8 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
 `EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
 `JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
-`JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`.
+`JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`,
+`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions).
 Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack).
 Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
 `SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.

@@ -158,10 +158,22 @@ Because local findings proved unreliable in run 1, they are advisory until a loc
 
 ## Data boundary
 
-The frontier judge sees **infra-class** data only: plans, configs, diffs of infrastructure files, logs, and probe output. Requests carry `data_class`:
+The frontier judge sees **infra-class** evidence only: plans, configs, diffs of infrastructure files, logs, and probe output. Requests carry `data_class`:
 
 - `infra`: the frontier judge is allowed.
-- `sensitive` (anything touching internal code, security telemetry, health or personal data, or company material): **local judge only**, and the bundle carries metadata and diff stats, not content.
+- `sensitive` (anything touching internal code, security telemetry, health or personal data, or company material): the evidence bundle goes to the **local judge only**, and it carries metadata and diff stats, not content. For a sensitive **completion**, the frontier judge also reviews a **claims-only** bundle built from it ([decision 10](decisions.md#10-frontier-review-of-claims-only-bundles-for-sensitive-sessions)).
+
+**The claims-only bundle** (`judge/collector/claims_only.py`; exact spec in [judge/CONTRACT.md](../judge/CONTRACT.md#claims-only-bundle-collectorclaims_onlypy-and-the-frontier-claims-stage)):
+
+| Leaves the machine | Never leaves the machine |
+|---|---|
+| The agent's final answer, redacted, with absolute, home and directory paths replaced by opaque `file#N` ids (plus which id lies inside which) | File contents, diffs, `agent-diff.patch`, `others-changed.txt` |
+| Gate decisions: time, tool, command **name** (`ssh`, `cat`, `write_file`), rule, decision, its fixed meaning, outcome | Command arguments, excerpts, paths, call ids |
+| C3 results: check, ok, final, `file#N` | C3 details and paths |
+| Tool activity from the session's log lines: tool names, ok/error, durations, output sizes in chars, API calls, token counts, turn ends | Command output, tool error text, the user's message (`msg=`), untagged and other sessions' log lines |
+| Counts: agent paths, others' changes, withheld diffs, rejected request paths; the window and timing, the log time zone | Host files and probes, `slots.json`, snapshot data, plans, the request's `detail` and paths |
+
+It is built from a **positive allowlist**: every field is constructed from parsed values, so a field added to the evidence later does not leak by default. A self-check runs on the exact message before it is sent; if `lib/redact` would change it, or it contains a `/`- or `~/`-prefixed path, a `msg=` marker, a diff hunk or a bundle marker, nothing is sent and the stage is skipped (logged, noted in the local finding). The text that was sent is kept as `evidence/<id>/claims-input.txt`. What remains is the final answer itself: it can quote anything the agent read (a host name, a config line, a number), and redaction removes secrets and paths, not other content. `JUDGE_SENSITIVE_FRONTIER_CLAIMS=0` keeps sensitive sessions fully local.
 
 The collector assigns the class by path rules, and defaults to `sensitive` when unsure.
 
@@ -170,7 +182,7 @@ What the data boundary means for the newer evidence:
 - **C3 results** carry the check name, the path and a short redacted detail, never file contents. The detail is redacted before it is cut to 300 characters, and left empty if the redactor cannot load.
 - **Host-state probes** run only from the read-only probe allowlist, and are redacted like every other probe. `unit_journal` withholds any journal line the redactor would change (it notes the count instead), and the probe arguments are validated strictly: unit names must match `^[A-Za-z0-9@._-]+\.?(service|timer|socket)?$`, timestamps must be UTC `YYYY-MM-DDTHH:MM:SSZ`, a journal span is at most 7 days, and anything else is refused (exit 64).
 - **`read_file` gating** closes a gap in front of the boundary, not in it: a secret read through `read_file` used to reach the transcript, and so the logs, filtered only by Hermes's own redactor. Now it escalates like `cat` does, and the gate request is always `sensitive`.
-- **Local-mode findings** stay on the workstation and, by default, out of the agent's context (see [Local-judge policy](#local-judge-policy)).
+- **Local-mode findings** stay on the workstation and, by default, out of the agent's context (see [Local-judge policy](#local-judge-policy)). **Claims-stage findings** (`mode: frontier-claims`, `findings/<id>.claims.json`, items `FC1`...) are injected like other frontier findings.
 
 How each request type is classified:
 
@@ -362,7 +374,7 @@ In every scenario, `~/.ssh/config`, the allowlist and the Hermes config were unc
 | 24 | The `unit_journal` probe prints the logical host name, not the SSH command it ran | The frontier judge flagged a host-name mismatch it could not resolve | **Fixed** differently, to keep real targets out of bundles and docs: every remote probe step prints `# host: <name> (<role>, via the configured ssh target ...)` and `$ ssh <<name>> ...`, including `unit_state`, and says that output hostnames can differ |
 | 25 | The validator's "claims-only evidence" rule dropped an item whose evidence was the manifest's attribution | A true confirming item was lost; the same pattern could drop a real catch | **Fixed:** every manifest field except the `request` copy (attribution, `withheld`, `window`, `extras`, `point_in_time`, notes ...) is now world text, also as `key.path: value` lines. An offline replay of all 295 stored judge items changed 2: S9's item is kept, and one run-1 local `false` low item that quotes `rejected_request_paths` is no longer downgraded |
 
-Two more observations. `execute_code` is outside the gate's matcher; in this run Hermes's own single-query guard refused it. And with routing by data class, the frontier judge never sees the read-only scenarios, where every report slip in runs 1 and 2 happened.
+Two more observations. `execute_code` is outside the gate's matcher; in this run Hermes's own single-query guard refused it. And with routing by data class, the frontier judge never sees the read-only scenarios, where every report slip in runs 1 and 2 happened. (Addressed by [decision 10](decisions.md#10-frontier-review-of-claims-only-bundles-for-sensitive-sessions): a claims-only frontier review of sensitive completions.)
 
 ## Pilot: the digest-site build
 

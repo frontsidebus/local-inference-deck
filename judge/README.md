@@ -35,9 +35,12 @@ Gates are synchronous and dumb; judging is asynchronous and smart. No model call
                                                    host-state probes; window ends at
                                                    created + grace or the next turn)
                        2. run_judge.py          -> frontier `claude -p` (infra data only)
-                                                   or local `big` (sensitive data, or over the cap)
+                                                   or local `big` (sensitive data, or over the cap);
+                                                   sensitive completion: + frontier on a claims-only
+                                                   bundle (collector/claims_only.py, no contents/paths)
                        3. validate.py           -> findings/<id>.json + .md   (unbacked items
-                                                   dropped or downgraded), request -> done/
+                                                   dropped or downgraded), findings/<id>.claims.json
+                                                   (claims stage), request -> done/
 ```
 
 | # | Hermes event | Script | Sync | Effect |
@@ -170,18 +173,20 @@ JUDGE_FRONTIER_DAILY_MAX=20     # frontier calls per UTC day; past it, local fal
 JUDGE_LOCAL_MODEL=coder-fast    # sensitive-class requests -> local judge, already loaded: no model eviction
 JUDGE_LOCAL_MAX_SEVERITY=medium # a local finding is never above medium
 JUDGE_INJECT_LOCAL=0            # local findings go to you, never into the agent's context (C5)
+JUDGE_SENSITIVE_FRONTIER_CLAIMS=1  # sensitive completions also get a frontier review of a claims-only bundle
 ```
 
 - **Infra** requests (every changed path is infra, see [Data boundary](#data-boundary)) go to the frontier judge.
 - **Sensitive** requests, and requests with no or unclear class, go to the local judge whatever `JUDGE_MODE` says. The finding's notes say `data_class=sensitive: local judge enforced`.
 - Local findings are capped at `medium` (the notes record each lowered item) and C5 skips them (counted in `inject.log`).
 - `coder-fast` is the same model family as the worker (see [Local judge policy](#local-judge-policy)); the cap and the no-injection rule are what make that acceptable for sensitive-only reviews. Read local findings as hints.
+- **Sensitive completions get a second, frontier review of their claims only** (`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1`, the default since 2026-10-03). Every agent slip found in runs 1 and 2 was in a sensitive session, which the local judge alone missed. The frontier judge gets a claims-only bundle: the agent's final answer (redacted, paths replaced by `file#N`), gate decisions cut to the command name, C3 pass/fail per `file#N`, tool-call metadata and counts, and the window. It never gets file contents, diffs, paths, command output, probes or your message ([Data boundary](#data-boundary)). Its finding is `findings/<id>.claims.json`, mode `frontier-claims`, items `FC1`, `FC2`, ...; C5 injects it like any frontier finding. The local finding (`findings/<id>.json`) stays capped and out of C5. Gate, plan and runaway requests get no claims stage.
 
 Every local request sets `max_tokens` (`JUDGE_LOCAL_MAX_TOKENS`, default 4096), so the judge itself never sends an unbounded generation.
 
 ### Cost and caps
 
-- At most `JUDGE_FRONTIER_DAILY_MAX` (20) frontier calls per UTC day, each with `--max-budget-usd` `JUDGE_FRONTIER_MAX_USD` (2): a hard ceiling of about $40 a day. Every `claude -p` call counts, including the retry after an invalid reply and the follow-up after a probe round, and each has its own dollar cap.
+- At most `JUDGE_FRONTIER_DAILY_MAX` (20) frontier calls per UTC day, each with `--max-budget-usd` `JUDGE_FRONTIER_MAX_USD` (2): a hard ceiling of about $40 a day. Every `claude -p` call counts, including the retry after an invalid reply, the follow-up after a probe round, and the claims stage of each sensitive completion; each has its own dollar cap. Every sensitive completion now makes one frontier call as well, so a cap sized for infra reviews alone runs out about twice as fast; consider 40. At the cap the claims stage is skipped (noted in the local finding), never re-run locally.
 - `usage.json` in the review dir holds today's count (`frontier_runs`, `cap`) and the cost `claude -p` reported (`frontier_usd`, summed per UTC day). On a subscription login the reported cost is the API-equivalent figure, not a bill.
 - Local reviews cost nothing beyond GPU time and are not counted.
 
@@ -244,6 +249,7 @@ Values come from `site.env` at the repo root (defaults < `site.env` < environmen
 | `JUDGE_WINDOW_GRACE_SECONDS` | `10` | Evidence window end = request `created` + this (logs, host diffs, gate decisions), but never past the start of the session's next turn. |
 | `JUDGE_LOCAL_MAX_SEVERITY` | `medium` | Highest severity (`low`, `medium`, `high`) a local-judge item may carry, including sensitive bundles and frontier-cap fallbacks; higher ones are lowered and noted. |
 | `JUDGE_INJECT_LOCAL` | `0` | `1` lets C5 show local-judge findings to the agent. Skips are counted in `inject.log`. |
+| `JUDGE_SENSITIVE_FRONTIER_CLAIMS` | `1` | For a sensitive completion, also run the frontier judge on its claims-only bundle (only with `JUDGE_MODE=frontier`; counts against `JUDGE_FRONTIER_DAILY_MAX`). `0` = local judge only. |
 | `JUDGE_ACK_AGENT_ENV` | empty | Environment only (not read from `site.env`): comma-separated extra env names that mark an agent session for `judge-ack`. It can only add markers. |
 | `JUDGE_HOST_PROBES` | `1` | `0` stops the collector running read-only host-state probes for claims about services and ports. |
 | `JUDGE_NOISE_GLOBS` | empty | Extra globs (space- or comma-separated, over absolute paths) of bookkeeping files that never count as anyone's change, on top of the built-in Hermes ones (`skills/.usage.json`, `skills/.locks/`, `skills/.curator_*`, `$HERMES_HOME/*.lock`). |
@@ -280,11 +286,12 @@ To measure a prompt, validator or model change, re-run the judge on bundles you 
 
 ```bash
 JUDGE_REVIEW_DIR=~/.hermes/review judge/runner/rejudge.py <request-id>... --out /tmp/rj-vision \
-    --mode local --model vision          # --mode local|frontier, --model X, --no-budget, --sensitive-local
+    --mode local --model vision          # --mode local|frontier|frontier-claims, --model X, --no-budget, --sensitive-local
 ```
 
 - It writes `<id>.json` (with the validator's notes), `<id>.md`, `<id>.raw.txt` (raw model output), `<id>.input.txt` (what the judge saw) and `summary.json` to `--out`, and prints old vs new per request: mode, item count, `high`+`false` count. An `--out` inside the review dir's own subdirectories is refused.
 - `sensitive` bundles never go to the frontier judge. Without `--mode` they are judged locally, as `run_judge.py` would. An explicit `--mode frontier` on one is **refused** for that request: no model call, a `REFUSED` line in the table, `"refused": true` and the reason in `summary.json`, and exit 1. It does not fall back to the local model silently, because `JUDGE_LOCAL_MODEL` (default `big`) can evict the coding models on Walter. Add `--sensitive-local` to judge those requests locally instead (noted in the finding).
+- `--mode frontier-claims` runs just the frontier claims stage, on sensitive bundles too: the same claims-only bundle, self-check and prompt as the live runner. `<id>.input.txt` is then exactly what would leave the machine. A bundle the self-check refuses is not sent (a `REFUSED` row, exit 1).
 - Frontier re-judges count toward `JUDGE_FRONTIER_DAILY_MAX` unless you pass `--no-budget` (the per-call dollar cap still applies).
 - Exit 0 ok, 1 if any request failed, 64 usage error.
 
@@ -305,7 +312,13 @@ Real prevention needs a boundary the agent can't cross: human acks signed with a
 Every request carries a `data_class`. It is `infra` only when **every** path the agent changed matches an infrastructure rule: the Hermes config, skills, memories and plans, `~/.ssh/config`, this repo, `/etc` or `/srv`. Changes made by someone else (`others-changed.txt`) never count. Anything else, or anything unclear, is `sensitive`.
 
 - `infra`: the frontier judge may see it.
-- `sensitive`: **local judge only**, whatever `JUDGE_MODE` says, and the bundle carries diff stats and metadata rather than file contents.
+- `sensitive`: the full bundle goes to the **local judge only**, whatever `JUDGE_MODE` says, and it carries diff stats and metadata rather than file contents. For a sensitive **completion**, the frontier judge additionally gets a **claims-only** bundle (`collector/claims_only.py`, spec in [CONTRACT.md](CONTRACT.md#claims-only-bundle-collectorclaims_onlypy-and-the-frontier-claims-stage)):
+  - built from a positive allowlist: the agent's final answer (redacted; absolute, home and directory paths replaced by `file#N`), gate decisions (rule, decision, outcome, tool and the command **name** only), C3 results (check, ok, final, `file#N`), tool-call metadata (names, counts, durations, output sizes, API calls, tokens), attribution counts, and the window;
+  - never file contents, diffs, paths, command arguments or output, host probes, slots, snapshot data or your message;
+  - checked before sending: if `lib/redact` would change it, or it contains a path, a `msg=` marker, a diff, or a bundle marker, it is **not sent** (the local finding's notes and `runner.log` say why);
+  - the exact text sent is kept in `evidence/<id>/claims-input.txt` for audit; `judge/collector/claims_only.py <evidence-dir>` prints it for any stored bundle.
+
+  The residual risk is the final answer itself: it can quote anything the agent read (a config line, a host name, a number). Redaction masks secrets and paths, not other content. Set `JUDGE_SENSITIVE_FRONTIER_CLAIMS=0` to keep sensitive sessions fully local.
 
 Logs are redacted for secrets before they enter a bundle. The judge never gets a shell: on hosts it can only ask for probes from the allowlist in `probes/probe.py`, all read-only with timeouts.
 

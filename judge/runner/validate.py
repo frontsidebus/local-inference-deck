@@ -358,13 +358,20 @@ class BundleView:
         return None
 
 
-def report_conflict(item: Dict[str, str], view: BundleView) -> Optional[str]:
+_NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
+SINGLE_FRAGMENT_MIN = 20
+
+
+def report_conflict(item: Dict[str, str], view: BundleView, single_fragment: bool = False) -> Optional[str]:
     """Rule 4a carve-out: why a claims-only R1 item is a report-consistency finding, or None.
 
     Only an R1 item with verdict `partial`/`n/a` at severity low qualifies (never `false`, never
     medium/high), and its evidence must name a conflict and quote either two distinct fragments of the
     request claims (an internal contradiction) or one claims fragment plus a short bundle line that is
     not claims text (e.g. a log `tz` header too short for a 12-char span).
+    *single_fragment* (claims-only stage, mode frontier-claims): also one claims fragment of at least
+    SINGLE_FRAGMENT_MIN chars with two or more different numbers, for verdict `partial` (an arithmetic
+    contradiction inside one sentence, e.g. a part larger than its whole).
     """
     if item["rubric"] != "R1" or item["verdict"] not in ("partial", "n/a") or item["severity"] != "low":
         return None
@@ -381,16 +388,20 @@ def report_conflict(item: Dict[str, str], view: BundleView) -> Optional[str]:
     world = [q for q in frags if q in view.world and q not in view.self_text and not view._is_name(q)]
     if distinct and world:
         return "claims fragment vs bundle line"
+    if (single_fragment and item["verdict"] == "partial"
+            and any(len(q) >= SINGLE_FRAGMENT_MIN and len(set(_NUM_RE.findall(q))) >= 2 for q in distinct)):
+        return "numbers inside one claims fragment (claims-only stage)"
     return None
 
 
-def apply_verdict_rules(item: Dict[str, str], view: Optional[BundleView]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+def apply_verdict_rules(item: Dict[str, str], view: Optional[BundleView],
+                        single_fragment: bool = False) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """Return (item or None if dropped, note). Mutates *item* on downgrade."""
     if view is None:
         return item, None
     contra, selfs, grounded = view.analyse(item["claim"], item["evidence"])
     if selfs and not grounded:
-        why = report_conflict(item, view)
+        why = report_conflict(item, view, single_fragment)
         if why:
             return item, f"{item['id'] or '?'}: kept, report-consistency finding (R1 {item['verdict']}/low, {why})"
         return None, (f"{item['id'] or '?'}: dropped, evidence is only the request claims or the user's message "
@@ -586,7 +597,7 @@ BUILTIN_SCHEMA: Dict[str, Any] = {
         "request": {"type": "string", "minLength": 1},
         "judge": {"type": "string", "minLength": 1},
         "created": {"type": "string", "pattern": r"Z$"},
-        "mode": {"enum": ["frontier", "local"]},
+        "mode": {"enum": ["frontier", "local", "frontier-claims"]},
         "items": {"type": "array", "items": {
             "type": "object",
             "required": ["id", "rubric", "severity", "claim", "evidence", "verdict", "recommendation"],
@@ -664,7 +675,7 @@ def validate_finding(raw: Any, *, request_id: Optional[str] = None, judge: Optio
             it["id"] = f"F{n}"
     kept: List[Dict[str, str]] = []
     for norm in items:
-        norm, note = apply_verdict_rules(norm, view)
+        norm, note = apply_verdict_rules(norm, view, single_fragment=eff_mode == "frontier-claims")
         if norm is None:
             dropped.append(note or "item dropped")
             continue
@@ -694,7 +705,7 @@ def _bundle_text(evidence_dir: Path) -> str:
     """Same `=== FILE: <name> ===` layout as run_judge.bundle_text (without its size cap)."""
     parts = []
     for p in sorted(evidence_dir.rglob("*")):
-        if p.is_file() and p.name not in ("judge-raw.txt", "judge-input.txt"):
+        if p.is_file() and p.name not in ("judge-raw.txt", "judge-input.txt", "claims-input.txt", "claims-raw.txt"):
             try:
                 parts.append(f"=== FILE: {p.relative_to(evidence_dir).as_posix()} ===\n"
                              + p.read_text(encoding="utf-8", errors="replace") + "\n")
