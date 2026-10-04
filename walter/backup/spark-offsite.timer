@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Spark/Walter offsite backup at 04:30 UTC (after spark-backup at 03:30)
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

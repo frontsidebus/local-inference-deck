@@ -5,10 +5,11 @@ Backups are made nightly at about 03:30 UTC (plus up to 10 minutes of random del
 `${MODELS_DIR}/backups/<YYYY-mm-dd_HHMM>/`. `${MODELS_DIR}` is a separate XFS disk from the root disk.
 Retention keeps the newest snapshot of each of the last 14 days plus the newest of each of the
 last 8 Sundays. `${MODELS_DIR}/backups/LAST_OK` names the last successful snapshot. Everything is
-root-only (dirs 700, files 600) and is **not encrypted**. Snapshots contain all secrets: .env
+root-only (dirs 700, files 600) and is **not encrypted** locally. Snapshots contain all secrets: .env
 files, keys and DB dumps.
 
 Logs: `journalctl -u spark-backup`. Run a backup now: `sudo systemctl start spark-backup`.
+An encrypted offsite copy (restic on S3) is made daily at 04:30 UTC: see section 7.
 Run the non-destructive restore test (uses throwaway containers only):
 `sudo /usr/local/sbin/spark-backup-restore-test.sh [${MODELS_DIR}/backups/<snapshot>]`
 
@@ -23,7 +24,7 @@ Run the non-destructive restore test (uses throwaway containers only):
 | `pocket-id-export.zip` | `pocket-id export` (official full export; usable with `pocket-id import`) |
 | `vol-open-webui-data.tar.zst` | Volume `webui_open-webui-data` **minus** `./cache` (re-downloadable models) and the live `webui.db*` files |
 | `vol-pocket-id-data.tar.zst` | Volume `webui_pocket-id-data` **minus** the live `pocket-id.db*` files |
-| `config.tar.zst` | `/srv/*/` (compose, .env, keys, litellm.yaml, ...), `/etc/llama-swap`, llama-swap/docker-user-rules units, nvidia-persistenced drop-in, spark-backup units, `/usr/local/sbin/*.sh`, `/etc/ufw/user*.rules`, `/etc/fstab`, `/home/${BACKEND_SSH_USER}/.hermes/config.yaml` (paths relative to `/`) |
+| `config.tar.zst` | `/srv/*/` (compose, .env, keys, litellm.yaml, ...), `/etc/llama-swap`, llama-swap/docker-user-rules units, nvidia-persistenced drop-in, spark-backup and spark-offsite units, `/usr/local/sbin/*.sh`, `/etc/ufw/user*.rules`, `/etc/fstab`, `/home/${BACKEND_SSH_USER}/.hermes/config.yaml` (paths relative to `/`) |
 | `manifest.txt` | Host, Docker/compose/Postgres versions, llama-swap version+sha256, every container's image ref and digest, volumes, file sizes |
 | `SHA256SUMS` | Checksums. Verify with `cd <snap> && sha256sum -c SHA256SUMS` |
 
@@ -164,3 +165,63 @@ with `chown -R root:llamaswap /etc/llama-swap`.
     that Open WebUI login through Pocket-ID works, and that `systemctl list-timers spark-backup*`
     shows the timer. Then run `sudo systemctl start spark-backup` and
     `sudo /usr/local/sbin/spark-backup-restore-test.sh`.
+
+---
+
+## 7. Offsite copy (restic on S3)
+
+`spark-offsite.timer` (04:30 UTC daily) copies all of `${MODELS_DIR}/backups` into the restic repo
+`s3:s3.${RESTIC_REGION}.amazonaws.com/${RESTIC_BUCKET}/walter`. Retention: 14 daily, 8 weekly,
+6 monthly. Each restic snapshot holds every local snapshot that existed at that time, so restoring one
+gives you a `${MODELS_DIR}/backups` tree; then use sections 1-6 on the snapshot dir you pick.
+Setup, key rotation and removal: `walter/backup/OFFSITE.md` in the repo.
+
+To restore you need three things. Keep them together, offline:
+1. **The restic password.** Its only copies are `/etc/spark-restic/password` on Walter and the owner's
+   offline copy. Without it the offsite data is unrecoverable.
+2. **An access key for the IAM user `spark-restic`.** If Walter is gone, create a new one with AWS admin
+   credentials: `aws iam create-access-key --user-name spark-restic`.
+3. **The bucket name and region** (`RESTIC_BUCKET`, `RESTIC_REGION` in site.env).
+
+### 7a. On Walter (it still has /etc/spark-restic)
+
+```bash
+sudo -i
+set -a; . /etc/spark-restic/aws.env; . /etc/spark-restic/restic.env; set +a
+restic snapshots                                   # pick one, or use "latest"
+install -d -m 700 ${MODELS_DIR}/restic-restore
+restic restore latest --target ${MODELS_DIR}/restic-restore      # or: restic restore <id> ... --include /models/backups/<snap>
+cd ${MODELS_DIR}/restic-restore${MODELS_DIR}/backups && for d in 20*/; do (cd "$d" && sha256sum --quiet -c SHA256SUMS && echo "ok $d"); done
+S=${MODELS_DIR}/restic-restore${MODELS_DIR}/backups/<snapshot>   # then follow sections 1-6 with this $S
+# afterwards: rm -rf ${MODELS_DIR}/restic-restore
+```
+
+### 7b. On a fresh machine (only the password and an AWS key)
+
+```bash
+# 1. restic, pinned and verified (same pin as walter/backup/offsite-setup.sh)
+V=0.19.1; SHA=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+curl -fsSLO https://github.com/restic/restic/releases/download/v$V/restic_${V}_linux_amd64.bz2
+echo "$SHA  restic_${V}_linux_amd64.bz2" | sha256sum -c && bunzip2 restic_${V}_linux_amd64.bz2 \
+  && sudo install -m 755 restic_${V}_linux_amd64 /usr/local/bin/restic
+# 2. credentials: typed in, not stored in shell history or on disk
+read -rp 'bucket: ' B; read -rp 'AWS access key id: ' AWS_ACCESS_KEY_ID; read -rsp 'AWS secret: ' AWS_SECRET_ACCESS_KEY; echo
+read -rsp 'restic password: ' RESTIC_PASSWORD; echo
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY RESTIC_PASSWORD AWS_DEFAULT_REGION=${RESTIC_REGION}
+export RESTIC_REPOSITORY=s3:s3.$AWS_DEFAULT_REGION.amazonaws.com/$B/walter
+# 3. restore (as root, into a root-only dir: the data contains every secret)
+restic snapshots
+sudo -E install -d -m 700 /root/restic-restore
+sudo -E restic restore latest --target /root/restic-restore
+sudo bash -c 'cd /root/restic-restore${MODELS_DIR}/backups && for d in 20*/; do (cd "$d" && sha256sum --quiet -c SHA256SUMS && echo "ok $d"); done'
+unset AWS_SECRET_ACCESS_KEY RESTIC_PASSWORD
+```
+
+Then rebuild with section 6, using `S=/root/restic-restore${MODELS_DIR}/backups/<snapshot>`
+(or copy that snapshot dir into `${MODELS_DIR}/backups/` once the disk is mounted). Once the
+new Walter runs, set up offsite again with `walter/backup/offsite-setup.sh`. To keep the same repo,
+put the old password into `/etc/spark-restic/password` (root 0600) **before** running it; the script
+then finds the repo and does not run `init`.
+
+If objects were deleted from the bucket (for example by an attacker with root on Walter), the
+noncurrent versions are kept for 30 days: see OFFSITE.md section 4.
