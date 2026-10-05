@@ -326,7 +326,6 @@ cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsit
 |---|---|---|
 | `backup/RESTORE.md.tmpl` references `${RESTIC_BUCKET}`, and `render.sh` refuses a template with an empty site variable | With `RESTIC_BUCKET=""` (offsite off, the `site.env.example` default) `deploy.sh` stops at "render templates", although the offsite step itself treats an empty bucket as off | Set the real bucket, or `RESTIC_BUCKET=CHANGEME`: `deploy.sh` treats `CHANGEME` as off and the render passes (the installed `RESTORE.md` then names the placeholder) |
 | `deploy.sh` restarts `nvidia-persistenced` and rebuilds the telemetry and digest images on every run | GPU persistence daemon restart, and both app containers recreated | Run deploys with the GPUs idle; use a [narrow redeploy](#narrow-redeploys-one-component) for single-component changes |
-| Telemetry labels x8 links "chipset slot" | Cosmetic; both GPUs are shown that way since the riser | None needed. See [telemetry](telemetry/README.md.tmpl#known-issues) |
 | llama-swap logs `failed to preload ... status 404` at start | Harmless; both preloaded models load and stay healthy | None |
 
 ## Troubleshooting
