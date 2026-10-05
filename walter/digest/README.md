@@ -11,6 +11,7 @@ LiteLLM) to curate the rest, and stores the result as Markdown + JSON on Walter.
 | `ai-research` | AI Research | arXiv cs.AI / cs.LG / cs.CL / cs.MA, frontier-lab and research blogs, newsletters, policy, industry press |
 
 The exact feed list is `SOURCES` / `WATCHES` at the top of the two collectors in `build/app/collectors/`.
+Shared fetching, parsing and windowing live in `build/app/collectors/feedlib.py`.
 
 **Optional and off by default.** Both `walter/deploy.sh` and `covenant/deploy.sh` skip every digest
 part (this directory, port 3300 in the firewall, the `60-digest` site, its certificate, the second
@@ -60,14 +61,34 @@ rule) are fixed and covered by the tests in `tests/`.
 One run of a watch (`pipeline.run_watch`):
 
 1. **Collect.** The watch's collector (`collect_threat_intel.py` or `collect_ai_digest.py`,
-   stdlib only) runs as a subprocess with a 300 s timeout and writes one JSON file to the tmpfs
-   `/tmp`. Each source is fetched independently. A failed source is recorded as
-   `{"ok": false, "error": ...}` and becomes a **coverage gap**, never "no news". Feeds are capped at
-   15 items (threat intel) or 40 (AI), and KEV at its 25 most recent entries.
+   stdlib only, on `feedlib.py`) runs as a subprocess with a 300 s timeout and writes one JSON
+   file to the tmpfs `/tmp`.
+   - **Fetch.** Sources are fetched in parallel (6 at a time), each with a 20 s timeout for the
+     whole download, one retry after 2 s on a network error, timeout, 408/425/429 or 5xx, and an
+     8 MiB cap on the downloaded and on the decoded body. gzip/deflate bodies are decoded even when
+     the server sends them unasked (DeepMind does). A UTF-8 BOM is stripped.
+   - **Parse.** RSS 2.0, Atom and RDF/RSS 1.0, with any namespaces. A well-formed feed with no
+     items is **ok, count 0**, with a `note`: arXiv's listing is empty on weekends and holidays
+     (it announces Sun-Thu evenings US Eastern), and that is not a gap. arXiv replacements
+     (`announce_type` `replace`/`replace-cross`) are skipped; new and cross-listed papers are kept.
+   - **Window.** Dated items older than the window start are dropped. The pipeline passes the
+     oldest cutoff any source of the watch still needs (`DIGEST_SINCE`); the collector subtracts
+     48 h of slack, uses 14 days when there is no cutoff, and never looks back more than 30 days.
+     Then the newest 15 (threat intel) or 40 (AI) items per source are kept; undated items are
+     capped at the first 30 in feed order. KEV keeps its 25 most recent entries.
+   - **Counts.** Per source: `count` = items handed to the pipeline (in window, after the cap),
+     `raw_count` = items in the feed, plus `in_window`, `older`, `undated` and an optional `note`.
+     Full-archive feeds are why `raw_count` can be large (OpenAI ~1250, Hugging Face ~870,
+     Wiz ~700 posts going back years).
+   - **Errors.** A failed source is recorded as `{"ok": false, "error": ...}` and becomes a
+     **coverage gap**, never "no news". The error says what came back: HTTP status, content-type,
+     size and a short printable snippet of the first bytes. No source can fail the run.
 2. **Dedupe** against the watch state file `state/state/<watch>.json`:
    - by id: CVE id (KEV), arXiv id (papers, across all arXiv categories), or a normalised title key
      (news). An id in `seen` is never reported again.
-   - by date: items older than the source's **cutoff** are dropped. Cutoffs are per source:
+   - by date: items older than the source's **cutoff** are dropped (except arXiv papers, which
+     are deduped by id only: arXiv stamps a daily batch with one announcement date that can
+     precede the batch reaching the feed). Cutoffs are per source:
      - a source that succeeded gets cutoff = this run's time;
      - a source that failed keeps its previous cutoff, so its window stays open until it delivers;
      - a source that has never succeeded has cutoff `null` (no date filter, only id dedupe). This
@@ -90,7 +111,8 @@ One run of a watch (`pipeline.run_watch`):
    `"uncurated": true`: key file missing, HTTP error, 120 s timeout, invalid JSON, schema mismatch,
    or output cut at `max_tokens`. A run never fails because of the LLM.
 4. **Persist** atomically (temp file + rename): `state/runs/<watch>/<run_id>.md` and `.json`
-   (window, per-source ok/count, coverage gaps, items, tiers/topics, markdown).
+   (window, per-source ok/count/raw_count/in_window/note, coverage gaps, items, tiers/topics,
+   markdown).
 5. **Advance state** atomically: per-source cutoffs as above, the watch-level cutoff when any
    source succeeded, and every reported id added to `seen`.
 
@@ -123,6 +145,20 @@ App environment (`compose.yaml`; change it there, then `docker compose up -d`):
 | `STATE_DIR` | `/state` | `state` | run history and watch state |
 | `LOG_LEVEL` | (unset) | `INFO` | Python log level |
 
+Collector knobs (optional; the collectors inherit the app environment, so set them in `compose.yaml`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DIGEST_LOOKBACK_DAYS` | `14` | collection window when the watch has no cutoff yet |
+| `DIGEST_MAX_LOOKBACK_DAYS` | `30` | the window never reaches further back |
+| `DIGEST_WINDOW_SLACK_HOURS` | `48` | subtracted from the pipeline's `DIGEST_SINCE` (set per run by the pipeline) |
+| `DIGEST_UNDATED_CAP` | `30` | undated items kept per source (first N in feed order) |
+| `DIGEST_FETCH_TIMEOUT` | `20` | seconds per attempt, whole download |
+| `DIGEST_FETCH_RETRIES` | `1` | retries after the first attempt (0..3) |
+| `DIGEST_RETRY_BACKOFF` | `2` | seconds before the first retry, doubling |
+| `DIGEST_MAX_BODY_BYTES` | `8388608` | cap on the downloaded and the decoded body |
+| `DIGEST_COLLECT_WORKERS` | `6` | sources fetched in parallel |
+
 ## Files and permissions
 
 ```
@@ -134,7 +170,7 @@ App environment (`compose.yaml`; change it there, then `docker compose up -d`):
     requirements.txt                      every dependency pinned (direct + transitive)
     app/main.py                           HTTP, SSE, run scheduling
     app/pipeline.py                       collect -> dedupe -> curate -> persist -> state
-    app/collectors/                       collect_threat_intel.py, collect_ai_digest.py (stdlib only)
+    app/collectors/                       collect_threat_intel.py, collect_ai_digest.py, feedlib.py (stdlib only)
     app/static/                           index.html, app.css, app.js, fonts/ (OFL, licenses included)
   secrets/                                root 0700
     digest-litellm-key                    root:10001 0440   copy of /srv/gateway/keys/digest.key
@@ -200,8 +236,8 @@ sudo install -d -o 10001 -g 10001 -m 0750 /srv/digest/state/state
 sudo install -o 10001 -g 10001 -m 0640 default.json ai-security.json ai-research.json /srv/digest/state/state/
 ```
 
-Without a seed, the first run reports everything the feeds currently carry (still deduped, and
-capped at 150 items for curation). After the first Walter run, Walter is the only source of truth.
+Without a seed, the first run reports what the feeds carry from the last 14 days
+(`DIGEST_LOOKBACK_DAYS`; still deduped, capped per source, and at 150 items for curation). After the first Walter run, Walter is the only source of truth.
 
 **Add a watch.** A watch is code, not configuration:
 1. Write a collector that outputs `{"<source>": {"ok": bool, "items": [{title, link, date, desc}], "error"?}}`,
@@ -220,6 +256,13 @@ sudo install -m 0440 -o root -g 10001 /srv/gateway/keys/digest.key /srv/digest/s
 ```
 
 **Tests** (no network, no real key): `python3 -m pytest walter/digest/tests -q` from the repo root.
+`tests/fixtures/` holds small sanitized samples of every feed format met in the wild (arXiv RSS
+weekday and empty weekend listing, arXiv API Atom, gzip-served RSS, a full-archive unsorted feed,
+Atom, RDF/RSS 1.0, an undated feed, an HTML page).
+
+**Dry-run the collectors** (real network, no LLM, no state change):
+`python3 build/app/collectors/collect_ai_digest.py ai-research /tmp/out.json` (or `ai-security`;
+`collect_threat_intel.py /tmp/out.json` for `default`). It prints one `[OK]`/`[FAIL]` line per source.
 The route tests need `starlette` and `httpx` and are skipped without them.
 
 ## Security model

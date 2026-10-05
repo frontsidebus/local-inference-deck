@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?><rss xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:atom="http://www.w3.org/2005/Atom" version="2.0">
+    <channel>
+        <title><![CDATA[Sample Company News]]></title>
+        <description><![CDATA[A full-archive feed: every post since launch, not quite newest-first]]></description>
+        <link>https://news.example/</link>
+        <lastBuildDate>Mon, 05 Oct 2026 03:27:24 GMT</lastBuildDate>
+        <item>
+            <title><![CDATA[Newest sample post]]></title>
+            <description><![CDATA[<p>Synthetic <em>description</em>.</p>]]></description>
+            <link>https://news.example/index/newest</link>
+            <guid isPermaLink="false">newest</guid>
+            <category><![CDATA[Product]]></category>
+            <pubDate>Fri, 02 Oct 2026 16:15:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[Customer story (date only, midnight)]]></title>
+            <link>https://news.example/index/story</link>
+            <pubDate>Fri, 02 Oct 2026 00:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[Out-of-order post, newer than the one above]]></title>
+            <link>https://news.example/index/out-of-order</link>
+            <pubDate>Fri, 02 Oct 2026 10:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[Security post]]></title>
+            <link>https://news.example/index/security</link>
+            <pubDate>Wed, 30 Sep 2026 10:30:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[Last year's post]]></title>
+            <link>https://news.example/index/last-year</link>
+            <pubDate>Mon, 06 Oct 2025 10:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title><![CDATA[Launch post]]></title>
+            <link>https://news.example/index/launch</link>
+            <pubDate>Fri, 11 Dec 2015 08:00:00 GMT</pubDate>
+        </item>
+    </channel>
+</rss>

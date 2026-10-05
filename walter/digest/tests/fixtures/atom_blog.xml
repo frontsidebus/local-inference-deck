@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en-us">
+  <title>Sample Weblog</title>
+  <link href="https://weblog.example/" rel="alternate"/>
+  <link href="https://weblog.example/atom/everything/" rel="self"/>
+  <id>https://weblog.example/</id>
+  <updated>2026-10-04T21:10:00+00:00</updated>
+  <author><name>Sample Author</name></author>
+  <entry>
+    <title>Notes on prompt injection</title>
+    <link href="https://weblog.example/2026/Oct/4/notes/" rel="alternate"/>
+    <published>2026-10-04T21:10:00+00:00</published>
+    <updated>2026-10-04T21:10:00+00:00</updated>
+    <id>https://weblog.example/2026/Oct/4/notes/</id>
+    <summary type="html">&lt;p&gt;Synthetic &lt;strong&gt;summary&lt;/strong&gt;.&lt;/p&gt;</summary>
+  </entry>
+  <entry>
+    <title>Quote of the day</title>
+    <link href="https://weblog.example/2026/Oct/3/quote/"/>
+    <updated>2026-10-03T08:00:00+00:00</updated>
+    <id>https://weblog.example/2026/Oct/3/quote/</id>
+    <content type="html">&lt;blockquote&gt;Synthetic quote.&lt;/blockquote&gt;</content>
+  </entry>
+</feed>

@@ -186,9 +186,29 @@ def _collector_cmd(watch: str, out_path: str) -> list[str]:
     return [sys.executable, str(here / "collect_ai_digest.py"), watch, out_path]
 
 
-async def _collect(watch: str, progress) -> dict:
+def _collect_since(state: dict) -> str | None:
+    """Collection window start for the collector (env DIGEST_SINCE): the oldest cutoff any
+    source of this watch still needs. None (collector default lookback) when a source has
+    no cutoff yet or the watch has never run. _dedupe still applies the exact per-source
+    cutoffs; this only bounds what the collectors fetch (they also subtract a slack and
+    never look back more than DIGEST_MAX_LOOKBACK_DAYS)."""
+    cutoffs = [state.get("cutoff")]
+    for entry in (state.get("sources") or {}).values():
+        if isinstance(entry, dict) and "cutoff" in entry:
+            cutoffs.append(entry["cutoff"])
+    parsed = [_parse_date(c or "") for c in cutoffs]
+    if any(p is None for p in parsed):
+        return None
+    return min(parsed).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _collect(watch: str, progress, since: str | None = None) -> dict:
     """Run the matching collector; return {"sources": {...}, "gaps": [...]} or raise."""
     await progress("collecting", watch=watch)
+    env = dict(os.environ)
+    env.pop("DIGEST_SINCE", None)
+    if since:
+        env["DIGEST_SINCE"] = since
     cmd = _collector_cmd(watch, "")
     fd, tmp = tempfile.mkstemp(prefix=f"digest-{watch}-", dir="/tmp")
     os.close(fd)
@@ -199,6 +219,7 @@ async def _collect(watch: str, progress) -> dict:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=env,
         )
         try:
             await asyncio.wait_for(proc.communicate(), timeout=300)
@@ -293,14 +314,18 @@ def _dedupe(watch: str, sources: dict, state: dict) -> list[dict]:
             title = (it.get("title") or "").strip()
             if not title:
                 continue
-            date = _parse_date(it.get("date") or "")
-            if cutoff is not None and date is not None and date < cutoff:
-                continue
             link = (it.get("link") or "").strip()
             arxiv_id = (it.get("arxiv_id") or "").strip()
             if not arxiv_id and link:
                 m = ARXIV_ID_RE.search(link)
                 arxiv_id = m.group(1) if m else ""
+            # Papers are deduped by arXiv id only, not by date: arXiv stamps a whole daily
+            # batch with one announcement date that can precede the moment the batch shows up
+            # in the feed, so a run in between would advance the cutoff past it. The collector's
+            # window (DIGEST_SINCE minus slack) bounds how far back papers can come from.
+            date = _parse_date(it.get("date") or "")
+            if not arxiv_id and cutoff is not None and date is not None and date < cutoff:
+                continue
             if arxiv_id:
                 if arxiv_id in seen_papers or arxiv_id in used_papers:
                     continue
@@ -506,12 +531,12 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
     run_id = run_id or _new_run_id()
     curate_fn = curate_fn or curate_with_llm
     try:
-        # 1. collect
-        collected = await _collect(watch, progress)
+        # 1. collect (the state is read first: it sets the collection window)
+        state = _load_state(state_dir, watch)
+        collected = await _collect(watch, progress, since=_collect_since(state))
         sources, gaps = collected["sources"], collected["gaps"]
 
         # 2. dedupe against state
-        state = _load_state(state_dir, watch)
         deduped = _dedupe(watch, sources, state)
 
         # 3. curate (LLM, or deterministic fallback on any failure)
@@ -537,7 +562,10 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
             "generated_at": _utcnow_iso(),
             "window": {"start": window_start, "end": _utcnow_iso()},
             "sources": [
-                {"name": n, "ok": bool(s.get("ok")), "count": s.get("count", len(s.get("items") or s.get("recent") or []))}
+                {"name": n, "ok": bool(s.get("ok")),
+                 "count": s.get("count", len(s.get("items") or s.get("recent") or [])),
+                 # collector stats: count = in window after the per-source cap; raw = in the feed
+                 **{k: s[k] for k in ("raw_count", "in_window", "note") if k in s}}
                 for n, s in sources.items()
             ],
             "coverage_gaps": gaps,
