@@ -299,10 +299,10 @@ Every bug found in the runs and pilots, numbered as found. "PR" is the pull requ
 
 | # | Bug | Effect | Fix | PR |
 |---|---|---|---|---|
-| 1 | Gate requests about host commands carry no local paths, so they were classed `sensitive` | Every review of a host mutation went to the local judge | Gate requests whose rules are all host rules are `infra` | #4 |
-| 2 | The bundle had no time window; it was collected about ten minutes after the request | It held a later turn's log lines; the judge cited them to call a true "the reload did not run" claim false | Evidence window `[since, created + grace]`; point-in-time artifacts labelled | #5 |
-| 3 | No gate decisions in the bundle | The judge could not tell an escalated call from one that ran | `gate-decisions.jsonl` with an `outcome` matched against the calls that ran | #5 |
-| 4 | Every snapshot change was attributed to the agent, even calls that never ran | The judge blamed the agent for the operator's `git pull` | Split into `agent-diff.patch` and `others-changed.txt`; calls that never ran do not count | #5, #6 |
+| 1 | The bundle had no time window; it was collected about ten minutes after the request | It held a later turn's log lines; the judge cited them to call a true "the reload did not run" claim false | Evidence window `[since, created + grace]`; point-in-time artifacts labelled | #5 |
+| 2 | No gate decisions in the bundle | The judge could not tell an escalated call from one that ran | `gate-decisions.jsonl` with an `outcome` matched against the calls that ran | #5 |
+| 3 | Every snapshot change was attributed to the agent, even calls that never ran | The judge blamed the agent for the operator's `git pull` | Split into `agent-diff.patch` and `others-changed.txt`; calls that never ran do not count | #5, #6 |
+| 4 | Gate requests about host commands carry no local paths, so they were classed `sensitive` | Every review of a host mutation went to the local judge | Gate requests whose rules are all host rules are `infra` | #4 |
 | 5 | The local judge treated unverifiable claims as false | About 11 high false positives in run 1 | `false` needs a quoted contradiction; validator rules; local cap and no injection | #8 |
 | 6 | Request paths were trusted without a backing tool event | A forged or stale path could put others' changes in the agent's diff | A path counts only when a tool event that ran backs it; rejected paths still count for `data_class` | #8 |
 | 7 | Two clean turns in one session were deduplicated into one review | Run 1's first S2 attempt was never reviewed | Dedupe by turn id, not by time window | #7 |
@@ -347,7 +347,7 @@ Every bug found in the runs and pilots, numbered as found. "PR" is the pull requ
 | 46 | `secret-output` escalated metadata-only commands next to a secret-shaped word (an `echo` label, a jq field `.key`) | 3 of 3 pilot-2 escalations were FPs; one was routed around | jq filters are programs; labels and metadata output are not mentions. Also closed: `cmp -l`, `jq --rawfile` and `jq -f` on a key passed | #28 |
 | 47 | Hermes's tool-output redaction rewrote a word in a file the agent read ("group" became `***`), and the agent copied it into a template | Harmless in a comment, but it could silently corrupt a copied config value; the judge missed it | **Not fixed** (a Hermes limit, reported to its owner). Not a gate rule: C2 is for safety escalations | — ([follow-up](#9-open-follow-ups)) |
 
-Numbers 1–4 come from the first live judge session, before run 1. The run log that numbered them was not kept, so their rows are reconstructed from the fix PRs (#4–#6). Number 15 was never assigned. Not numbered: the false premise in the digest deploy runbook, caught by Hermes in pilot 2 and fixed in PR #25. Features that were not bug fixes: the units and automatic reviews (PR #10), the output cap (PR #11), the C6 token trigger (PR #12), the report-consistency prompt (PR #13) and the claims stage (PR #19).
+Numbers 1–4 come from the first live judge session, before run 1. Their numbering is taken from that session's record; the fixes landed in PRs #4–#6. Number 15 was never assigned. Not numbered: the false premise in the digest deploy runbook, caught by Hermes in pilot 2 and fixed in PR #25. Features that were not bug fixes: the units and automatic reviews (PR #10), the output cap (PR #11), the C6 token trigger (PR #12), the report-consistency prompt (PR #13) and the claims stage (PR #19).
 
 ## 9. Open follow-ups
 
