@@ -27,5 +27,10 @@ Notes
 - Split modes: `big` uses layer split (`-sm layer -ts 1,1`); `hermes` and `vision` use llama.cpp's experimental
   tensor split (`-sm tensor`, plus `--shm-size 2g` for the container through the `${tp}` macro), which gave them
   +39–67 % decode. Numbers and the fallback are in `llama-swap/BENCHMARKS.md`.
+- Row split (`-sm row`) does not load on the pinned build ("does not support split buffers").
 - The llama.cpp image is pinned by digest in `config.yaml.tmpl` (build 11277). Change model
-  files and the image together and re-run the checks in `BENCHMARKS.md`.
+  files and the image together and re-run the checks in [`llama-swap/BENCHMARKS.md`](llama-swap/BENCHMARKS.md).
+- Load times since the x8/x8 riser: cold loads are disk-bound (about 20 s for `big`, 10–12 s for
+  `vision` and `hermes`, 10–12 s for the coding pair at boot); a swap back to a set whose files are
+  still in the page cache is much faster (`big` 7 s, `hermes` 4 s). About 112 GB of model files
+  share roughly 73 GB of guest page cache, so cycling through every set keeps loads cold.

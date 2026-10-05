@@ -95,6 +95,23 @@ read-only in the UI, so edit the files instead.
 **Upgrade an image:** `docker pull <image>:<newtag>`, take the digest from `docker image inspect -f '{{index .RepoDigests 0}}'`,
 update `compose.yaml`, then run `docker compose up -d`.
 
+## Troubleshooting
+
+| Symptom | Check / fix |
+|---|---|
+| a target is down in `/targets` | `sudo docker compose ps` for that exporter; for `llama-swap`, the key copy in `secrets/` is stale after a rotation (see Key rotation) |
+| no `llama-server` targets | normal while no model is `ready`; check `sudo docker compose logs llamaswap-sd` |
+| `dcgm` target down after a driver upgrade | dcgm-exporter must match the driver; pin a matching image |
+| Grafana login fails | the password in `grafana-admin-password` only applies when the DB is first created: reset it (Key rotation) |
+| `GPUVRAMNearlyFull` firing | expected on full-context split models; see Known limitations |
+
+## Rollback
+
+- A config or alert change: revert the file, then `curl -s -X POST http://127.0.0.1:9090/-/reload` (or `sudo docker compose up -d`).
+- An image upgrade: put the old digest back in `compose.yaml` and `sudo docker compose up -d <svc>`.
+- Remove the stack: `sudo docker compose down` (add `-v` to drop the Prometheus and Grafana data). The telemetry app
+  reads Prometheus, so it goes blank without it.
+
 ## Known limitations
 
 - GeForce GPUs: DCGM has no profiling (DCP) metrics such as tensor activity or DRAM active, and VRAM temperature reads 0 (not

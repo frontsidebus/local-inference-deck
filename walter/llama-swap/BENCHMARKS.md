@@ -23,6 +23,25 @@ Correctness, checked with n-max 2:
 
 Decision: **keep MTP with `--spec-type draft-mtp --spec-draft-n-max 2`**. Decode speed went up 74-83%, with no correctness regression and the full 131072 context kept, at a cost of about 1.3 GB of VRAM (about 1.9 GB headroom left). n-max 3 was within noise on the mean (about 1.5%). It was worse on the low-acceptance cases (prose, and refactor with thinking on) and used more VRAM, so n-max 2 is the better choice.
 
+## 2026-10-05: x8/x8 riser, layer-split baseline
+
+After the bifurcation riser (both 3090s Gen4 x8 on CPU root ports; GPU1 was x1 behind the chipset before), with the production config (all split models still on `-sm layer -ts 1,1`). Same method as the tensor-split section below: raw `/completion`, exact token-id prompts of Python stdlib source, `cache_prompt=false`, temperature 0, `ignore_eos`, 128 generated tokens, one warm-up; tokens/s from llama-server `timings`.
+
+| model | split | pp 512 | pp 8k | pp 32k | tg @512 | tg @8k | tg @32k |
+|---|---|---|---|---|---|---|---|
+| coder (MTP n=2) | none, GPU0 | 1063 | 1215 | 1081 | 81.3 | 79.0 | 63.3 |
+| coder-fast | none, GPU1 | 2880 | 3201 | 2907 | 153.2 | 139.5 | 117.0 |
+| big | layer | 1879 | 2880 | 2829 | 125.5 | 117.4 | 99.9 |
+| vision | layer | 1187 | 1972 | 1789 | 39.3 | 36.0 | 29.7 |
+| hermes | layer | 1162 | 1597 | 1030 | 34.5 | 27.2 | 15.9 |
+
+- **Decode is unchanged** by the wider link under layer split (only 20–60 MB/s cross PCIe per token). coder's 81 t/s reflects MTP acceptance on source code (the code prompt above gave 82.2).
+- **Loads:** weight uploads run at 10–13 GB/s per GPU. The cold boot preload of `coder-fast` on GPU1 went from 18–22 s to 12 s; `coder` on GPU0 is unchanged (8–9 s before, 10 s now). Cold loads are now disk-bound (about 2.8 GB/s from the models disk): `big` 20 s, `vision` 10–11 s, `hermes` 12 s. Warm (files still in page cache): `big` 7 s, `hermes` 4 s, `vision` 6 s.
+- **Long context:** `big` found a needle at 15/50/85 % depth of a 98.9k-token prompt (3/3, pp 2300, tg 66); `hermes` at 59.8k tokens (3/3, pp 728, tg 10.8). VRAM stayed flat (KV preallocated).
+- **Concurrency** (`big`, `-np 1`): 4 simultaneous requests all returned 200, queued in order on the one slot, each at about 124 t/s.
+- **Row split** (`-sm row`) does not load at all on build 11277, for any model or flag set: `device CUDA0 does not support split buffers`.
+- **Errors:** no Xid, AER or PCIe replays on host or guest during the whole run.
+
 ## 2026-10-05: tensor split for `hermes` and `vision` (after the x8/x8 riser)
 
 Setup: llama.cpp b11277 (pinned digest), both 3090s at PCIe Gen4 x8 on CPU root ports, no P2P (GeForce under vfio), so NCCL uses its SHM transport through host memory. Each run used a transient container on `127.0.0.1:18080`, with the production args and image; llama-swap had everything unloaded. Only the split flags differed: `-sm layer -ts 1,1` against `-sm tensor` plus `--shm-size 2g`. Throughput comes from raw `/completion` with exact token-id prompts of Python stdlib source, `cache_prompt=false`, temperature 0, `ignore_eos`, 128 generated tokens and one warm-up request first. The values are llama-server `timings`, in tokens/s.
