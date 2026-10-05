@@ -16,9 +16,10 @@ compose.yaml                 app (host network, uid 10001, read-only, cap_drop A
 build/Dockerfile             python:3.13-alpine pinned by digest; deps pinned in build/requirements.txt
 build/app/main.py            collector + HTTP (fixed server-side PromQL; the client never sends a query)
 build/app/static/            index.html, app.css, app.js, fonts/ (Orbitron, Inter, JetBrains Mono + OFL licenses)
-secrets/llama-swap-api-key   copy of /etc/llama-swap/api-key (root:10001 0440). NOT for backups in plain text
+secrets/llama-swap-api-key   copy of /etc/llama-swap/api-key (root:10001 0440), re-creatable
 ```
-Back up these config files: `compose.yaml`, `build/**`, `README.md`. Do not back up `secrets/`, which is re-creatable.
+The nightly backup's config tarball covers all of `/srv/telemetry` (`secrets/` included, like every `/srv/*/`; see
+`${MODELS_DIR}/backups/RESTORE.md`). The dashboard keeps no state of its own.
 
 ## How it works
 - One collector loop. llama-swap `/running` is polled every 2 s, the fast PromQL set every 4 s (Prometheus scrapes every 15 s),
@@ -31,11 +32,25 @@ Back up these config files: `compose.yaml`, `build/**`, `README.md`. Do not back
 - PCIe link width and speed come from `/sys/bus/pci/devices/<bus>/current_link_*`, because DCGM doesn't export them on GeForce.
 - X-Forwarded-User/Email are only displayed, after being sanitised. They are never used for authorisation.
 
+## Configuration
+Environment of the `app` service in `compose.yaml` (change it there, then `sudo docker compose up -d`):
+
+| Variable | Value in compose | Meaning |
+|---|---|---|
+| `BIND` | `${BACKEND_WG_IP}:3200` | listen address (bound with `IP_FREEBIND`) |
+| `PROM_URL` | `http://127.0.0.1:9090` | Prometheus (host network, loopback only) |
+| `LLAMA_SWAP_URL` | `http://${BACKEND_WG_IP}:8080` | llama-swap, for `/running` |
+| `LLAMA_SWAP_KEY_FILE` | `/run/secrets/llama-swap-api-key` | read on every poll |
+| `BACKUP_STATUS_FILE` | `/state/backup.json` | written by the `backup-status` sidecar |
+| `TZ_DISPLAY` | `UTC` | "today" boundary for the per-key breakdown |
+
+Optional cadence knobs (seconds, app defaults): `PUBLISH_INTERVAL` 2, `PROM_FAST_INTERVAL` 4, `SLOW_INTERVAL` 15, `HISTORY_INTERVAL` 30.
+
 ## Firewall
-- ufw: `ALLOW IN on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200/tcp`. This is the effective gate, because host-network
-  traffic goes through INPUT.
-- `/usr/local/sbin/docker-user-rules.sh`: 3200 was added to `PORTS` (WALTER-PUBLISHED), in case the app is ever
-  switched to a docker-published port. Backup: `docker-user-rules.sh.bak-20261002-221738`.
+- ufw: `ALLOW IN on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200/tcp` (from `ufw-rules.sh`). This is the effective gate, because
+  host-network traffic goes through INPUT.
+- `/usr/local/sbin/docker-user-rules.sh`: 3200 is in `PORTS` (WALTER-PUBLISHED), in case the app is ever switched to a
+  docker-published port.
 
 ## Operations
 ```bash
@@ -43,16 +58,39 @@ cd /srv/telemetry
 sudo docker compose ps                 # both (healthy)
 sudo docker compose up -d --build      # after editing build/
 sudo docker compose logs -f app
+curl -fsS http://${BACKEND_WG_IP}:3200/healthz   # ok
 # llama-swap key rotated:
 sudo install -m 0440 -o root -g 10001 /etc/llama-swap/api-key secrets/llama-swap-api-key   # read on every poll
 ```
 
+`walter/deploy.sh` runs `docker compose up -d --build` here on **every** run. Even when every build layer is cached, the
+rebuilt image gets a new ID, so `telemetry-app` is recreated (a few seconds of dashboard reconnects). The deploy's dry run
+does not show this.
+
+## Known issues
+- **"chipset slot" label on x8 links.** `build/app/static/app.js` labels any GPU link narrower than the card's maximum as
+  `· chipset slot`, with the tooltip "Slot is x1 by design". It dates from when the second GPU sat in a chipset x1 slot.
+  Since the bifurcation riser both GPUs run x8 of a possible x16, so both are mislabelled. Cosmetic: the width and
+  generation shown are correct (`Gen4 x8` under load; Gen1/2 at idle is power saving).
+
+## Troubleshooting
+| Symptom | Check / fix |
+|---|---|
+| dashboard shows no model state, or `llama-swap` errors in the app log | the key copy is stale after a rotation: re-copy it (above) |
+| GPU / request panels empty | Prometheus down or targets missing: see `/srv/monitoring/README.md` |
+| backup tile stale | `sudo docker compose ps backup-status` (healthy?) and `${MODELS_DIR}/backups/LAST_OK` |
+| 502 / 504 at `https://${SPARK_TELEMETRY_HOST}` | the app or the tunnel is down: `curl http://${BACKEND_WG_IP}:3200/healthz` from Covenant, `sudo wg show` on both sides |
+
 ## Rollback
+A config change: revert the file (or the repo revision) and run `sudo docker compose up -d --build`.
+
+Remove the app (telemetry is part of the base Walter deploy, so also drop it from `walter/` and the firewall templates,
+or the next `walter/deploy.sh` run puts it back):
 ```bash
 cd /srv/telemetry && sudo docker compose down -v && sudo docker image rm walter-telemetry:local
-sudo ufw delete allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200 proto tcp
-sudo cp -a /usr/local/sbin/docker-user-rules.sh.bak-20261002-221738 /usr/local/sbin/docker-user-rules.sh
-sudo systemctl restart docker-user-rules.service && sudo iptables -S WALTER-PUBLISHED   # no 3200 lines
+sudo ufw delete allow in on wg0 proto tcp from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200
+sudo sed -i 's/^PORTS="3000 1411 4000 3200"/PORTS="3000 1411 4000"/' /usr/local/sbin/docker-user-rules.sh
+sudo systemctl restart docker-user-rules.service && sudo iptables -S WALTER-PUBLISHED | grep -c 3200   # 0
 sudo rm -rf /srv/telemetry
 ```
-Then remove the telemetry vhost and oauth2-proxy config on Covenant. That is owned by the edge agent.
+Then remove the telemetry vhost and oauth2-proxy config on Covenant (see `covenant/README.md`).

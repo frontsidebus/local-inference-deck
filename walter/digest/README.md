@@ -16,7 +16,9 @@ Shared fetching, parsing and windowing live in `build/app/collectors/feedlib.py`
 **Optional and off by default.** Both `walter/deploy.sh` and `covenant/deploy.sh` skip every digest
 part (this directory, port 3300 in the firewall, the `60-digest` site, its certificate, the second
 oauth2-proxy) and print one `digest: off` line, unless `SPARK_DIGEST_HOST` is set in `site.env`.
-The full deploy checklist is [docs/runbooks/digest-deploy.md](../../docs/runbooks/digest-deploy.md).
+The full deploy checklist is [docs/runbooks/digest-deploy.md](../../docs/runbooks/digest-deploy.md). On the edge,
+the first certificate is issued through an ACME-only port-80 stub with no downtime
+([runbook step 6](../../docs/runbooks/digest-deploy.md#6-covenant-deploy-issues-the-cert-client-secret)).
 
 **Provenance.** The app was built by the local Hermes agent (on the `coder` model) under the agent
 judge, as the judge's pilot build ([docs/agent-judge.md](../../docs/agent-judge.md)). Every Hermes
@@ -148,7 +150,7 @@ Site values (`site.env`, read by the deploy scripts):
 | `SPARK_DIGEST_HOST` | empty (= off) | both deploys | public name, e.g. `digest.example.com`. **The on/off switch** |
 | `DIGEST_PORT` | `3300` | Covenant (nginx upstream) | must stay 3300: Walter's compose and firewall use it, and `walter/deploy.sh` refuses another value |
 | `DIGEST_GROUP` | `digest-viewers` | Covenant (oauth2-proxy `allowed_groups`) | Pocket-ID group allowed in |
-| `OAUTH2_PROXY_DIGEST_CLIENT_ID` | `digest` | Covenant (oauth2-proxy `client_id`) | Pocket-ID OIDC client id |
+| `OAUTH2_PROXY_DIGEST_CLIENT_ID` | `digest` | Covenant (oauth2-proxy `client_id`) | Pocket-ID OIDC client id. Pocket-ID generates a **UUID** unless you set a custom id when creating the client, so this usually has to be set to that UUID ([runbook step 3](../../docs/runbooks/digest-deploy.md#3-pocket-id-client-and-group)) |
 | `HARNESS_KEYS` | (no `digest`) | Walter (`provision-keys.py`) | add `digest` so the LiteLLM key `digest` is created |
 
 `covenant/deploy.sh` applies the three defaults when `SPARK_DIGEST_HOST` is set and a variable is
@@ -212,6 +214,7 @@ Backups: the nightly config tarball (`spark-backup.sh`) already covers all of `/
 | Method and path | Response |
 |---|---|
 | `GET /` | dashboard SPA (vanilla JS, self-hosted fonts, strict CSP) |
+| `GET /static/...` | the SPA's assets (`app.css`, `app.js`, `fonts/`); `index.html` references them under `/static/` |
 | `GET /api/watches` | `{"watches": [{slug, name, running, latest: {run_id, generated_at, items}}]}` |
 | `POST /api/runs/{watch}/now` | 202 `{"run_id": ...}`. 404 unknown watch; 409 a run of this watch is in progress; 403 when the browser marks the request cross-site (`Sec-Fetch-Site`) |
 | `GET /api/runs/{watch}` | `{"runs": [{run_id, generated_at, items}]}`, newest first |
@@ -235,6 +238,32 @@ sudo docker compose down                       # stop (state/ is a bind mount an
 sudo docker compose up -d --build              # start, or rebuild after editing build/
 curl -fsS http://${BACKEND_WG_IP}:3300/healthz # {"ok":true}
 ```
+
+### Redeploy only the digest
+
+`walter/deploy.sh` converges the whole host (see [walter/README.md](../README.md#what-a-run-does-to-a-live-host)). For a
+change to this app alone, install the rendered `build/` and `compose.yaml` the way deploy does and rebuild here. On
+Walter, from a checkout at the wanted revision with the real `site.env`:
+
+```bash
+R=$(mktemp -d)
+scripts/render.sh -e site.env walter/digest "$R/digest" && find "$R" -name __pycache__ -prune -exec rm -rf {} +
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+sudo tar -C /srv/digest -czf /srv/digest/build.bak-$ts.tgz build             # rollback copy
+sudo cp -a /srv/digest/compose.yaml /srv/digest/compose.yaml.bak-$ts
+diff -r "$R/digest/build" /srv/digest/build; diff "$R/digest/compose.yaml" /srv/digest/compose.yaml   # review
+(cd "$R/digest" && find build -type f -print0) | while IFS= read -r -d '' f; do
+  sudo install -D -m 0644 -o root -g root "$R/digest/$f" "/srv/digest/$f"; done
+sudo install -m 0644 -o root -g root "$R/digest/compose.yaml" "$R/digest/README.md" /srv/digest/
+cd /srv/digest && sudo docker compose up -d --build && sudo docker compose ps     # (healthy)
+curl -fsS http://${BACKEND_WG_IP}:3300/healthz; rm -rf "$R"
+```
+
+Like deploy, this never deletes files: remove anything the new revision dropped from `/srv/digest/build` by hand.
+`secrets/` and `state/` are untouched. Rollback: restore `build.bak-$ts.tgz` and `compose.yaml.bak-$ts`, then
+`sudo docker compose up -d --build`.
+
+### Run, seed and maintain
 
 **Trigger a run from the CLI.** The firewall rules gate traffic arriving on `wg0` from the edge;
 host-originated traffic is not filtered, so this path adds no exposure:
@@ -267,7 +296,8 @@ After the first Walter run, Walter is the only source of truth.
 2. `pipeline.py`: add it to `WATCHES` and `_collector_cmd`, give it a curation schema (`TIER_DEFS`
    for a tiered watch), a display name in `WATCH_NAMES` and a focus line in `WATCH_FOCUS`.
 3. `main.py`: add it to `WATCHES` (slug -> display name). `static/app.js`: give it an accent in `ACCENT`.
-4. Add a test in `tests/`, then redeploy with `walter/deploy.sh` (it rebuilds the image).
+4. Add a test in `tests/`, then redeploy: `walter/deploy.sh` (rebuilds the image, but converges the whole host) or
+   [the digest only](#redeploy-only-the-digest).
 
 **Rotate the LiteLLM key.** After the gateway key is rotated
 ([rotate-secrets](../../docs/runbooks/rotate-secrets.md)), copy it again. The app reads it on every
@@ -334,6 +364,8 @@ The route tests need `starlette` and `httpx` and are skipped without them.
 | a source is always in "Coverage gaps" | the feed moved or blocks the user agent. Fix its URL in the collector (a 404 is a gap, not "no news") |
 | progress stalls in the UI | SSE needs the unbuffered `location` in `60-digest`. Check `docker compose logs app` for the run |
 | 409 on RUN NOW | that watch is still running; wait for `done` |
+| the UI loads unstyled, or the browser console shows 404s for `/static/...` | the running image predates the `/static` mount: rebuild ([redeploy](#redeploy-only-the-digest)) |
+| login fails at Pocket-ID with "OIDC client not found" | `OAUTH2_PROXY_DIGEST_CLIENT_ID` is not the client's real id (usually a UUID). Fix it in Covenant's `site.env` and re-run `covenant/deploy.sh` (`--set-client-secret` does not re-render the cfg) |
 
 ## Rollback
 

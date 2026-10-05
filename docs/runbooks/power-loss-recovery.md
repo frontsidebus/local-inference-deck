@@ -4,7 +4,7 @@ What happens when the home power fails (the hypervisor and Walter go down hard; 
 
 ## While the power is out
 
-- Covenant keeps serving TLS. `chat.`, `id.`, `api.` and `telemetry.` return 502/504 because the tunnel peer is gone. Nothing needs doing on the edge.
+- Covenant keeps serving TLS. `chat.`, `id.`, `api.`, `telemetry.` (and `digest.`, if enabled) return 502/504 because the tunnel peer is gone. Nothing needs doing on the edge.
 - Harnesses fail fast with 5xx. No state is lost on the client side.
 
 ## What recovers on its own
@@ -12,16 +12,16 @@ What happens when the home power fails (the hypervisor and Walter go down hard; 
 | Layer | Mechanism |
 |---|---|
 | Hypervisor | Boots, binds both GPUs to `vfio-pci`, starts libvirt. (Needs the BIOS set to power on after AC loss.) |
-| Walter VM | libvirt **autostart** is set on the domain, so it starts with libvirtd. |
+| Walter VM | libvirt **autostart** is set on the domain, so it starts with libvirtd. (It is turned off on purpose during hardware changes; see [hypervisor/README.md](../../hypervisor/README.md#hardware-changes-gpus-risers-slots).) |
 | `/models` | Mounted by UUID with `nofail`; XFS replays its journal on mount. |
 | GPUs in Walter | `nvidia-persistenced` is wanted by `multi-user.target`; GPU-bound units are ordered after it. |
 | WireGuard | `wg-quick@wg0` on Walter dials Covenant; keepalives re-establish the session within seconds. |
 | llama-swap | Enabled systemd service; its startup hook preloads `coder` and `coder-fast` (logs a harmless `status 404`). |
-| Gateway, WebUI, monitoring, telemetry | Docker starts the compose stacks again from their restart policies. |
+| Gateway, WebUI, monitoring, telemetry, digest | Docker starts the compose stacks again from their restart policies (`unless-stopped`). |
 | Postgres | Runs crash recovery from its WAL on start ("database system was not properly shut down; automatic recovery in progress"). No action needed. |
 | SQLite (Open WebUI, Pocket-ID) | WAL is replayed on open. |
 | Firewall | ufw and `docker-user-rules.service` (the `WALTER-PUBLISHED` chain) start at boot. |
-| Backups | `spark-backup.timer` has `Persistent=true`: if the 03:30 UTC run was missed, it runs shortly after boot. |
+| Backups | `spark-backup.timer` has `Persistent=true`: if the 03:30 UTC run was missed, it runs shortly after boot. `spark-offsite.timer` (04:30 UTC, if enabled) is `Persistent=true` too. |
 | Update check | `spark-update-check.timer` is also `Persistent=true`. |
 | Ollama (retired) | Stays off: its drop-in requires `/etc/ollama-enabled`, even if another unit `Wants=` it. |
 
@@ -33,6 +33,7 @@ What happens when the home power fails (the hypervisor and Walter go down hard; 
 virsh -c qemu:///system list --all              # Walter: running
 virsh -c qemu:///system dominfo <walter-domain> | grep Autostart   # enable
 lspci -nnk | grep -A3 NVIDIA                    # Kernel driver in use: vfio-pci
+virsh -c qemu:///system dumpxml <walter-domain> | grep -A3 '<hostdev'   # source addresses = the GPUs' lspci addresses
 systemctl --failed
 journalctl -b -k | grep -iE 'xfs.*(error|corrupt)|nvme.*error'   # expect nothing
 qemu-img check -U <walter-qcow2>                # "No errors were found on the image."
@@ -53,7 +54,7 @@ Always use `/dev/disk/by-id` or `by-uuid` names on the hypervisor: the `nvmeXn1`
 ssh ${BACKEND_SSH_USER}@${BACKEND_LAN_IP}
 systemctl --failed
 findmnt /models
-nvidia-smi --query-gpu=index,name,persistence_mode,memory.used,pcie.link.width.current --format=csv
+nvidia-smi --query-gpu=index,name,persistence_mode,memory.used,pcie.link.gen.max,pcie.link.width.current --format=csv   # width 8 on both
 sudo wg show wg0 latest-handshakes              # recent timestamp
 systemctl status llama-swap --no-pager | head -5
 sudo docker ps --format '{{.Names}}\t{{.Status}}'   # all Up / healthy
@@ -63,7 +64,7 @@ journalctl -u spark-backup -b                   # the catch-up run, if one was d
 cat /models/backups/LAST_OK
 ```
 
-Expect `coder` on GPU0 and `coder-fast` on GPU1, both resident, about a minute after llama-swap starts.
+Expect `coder` on GPU0 and `coder-fast` on GPU1, both resident, about a minute after llama-swap starts (each model itself loads in 10–12 s from a cold disk). The telemetry dashboard labels both GPUs "chipset slot": that is a cosmetic known issue, not a lost link ([telemetry](../../walter/telemetry/README.md.tmpl#known-issues)).
 
 Walter's own boot-time fsck handles its disks: ext4 `/` and `/boot` replay their journals, and the vfat EFI partition has its dirty bit cleared automatically ("Dirty bit is set... Automatically removing dirty bit"). The same fsck notes "differences between boot sector and its backup (offset 65)". Offset 65 is the in-use flag Linux sets while the partition is mounted, so it is harmless. To confirm it clears on a clean unmount:
 
@@ -87,7 +88,8 @@ Then send one chat in Open WebUI and one request through a harness (`claude-spar
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Walter not running | Autostart lost (domain redefined) | `virsh autostart <walter-domain>` then `virsh start <walter-domain>` |
+| Walter not running | Autostart lost (domain redefined), or left off after a hardware change | If the hardware changed, check the hostdev addresses first ([hypervisor](../../hypervisor/README.md#hardware-changes-gpus-risers-slots)). Then `virsh start <walter-domain>` and `virsh autostart <walter-domain>`. |
+| Walter fails to start with a PCI / hostdev error | GPU addresses changed (hardware change) | Fix the `<hostdev>` addresses as in [hypervisor/README.md](../../hypervisor/README.md#hardware-changes-gpus-risers-slots); keep autostart off until it starts. |
 | `/models` not mounted | Disk not attached or UUID changed | Check the domain's disk by serial, `blkid`, then `sudo mount /models`; llama-swap and backups depend on it. |
 | Models load CPU-only or llama-swap fails | Driver raced the service | `sudo systemctl restart nvidia-persistenced llama-swap` |
 | 502 on every host | Tunnel down | `sudo systemctl restart wg-quick@wg0` on Walter; check Covenant's ufw allows `udp/${WG_PORT}`. |

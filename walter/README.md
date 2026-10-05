@@ -39,11 +39,12 @@ Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `co
 | `monitoring/*` | `/srv/monitoring/` | Prometheus, Grafana, node-exporter, cAdvisor, dcgm-exporter, blackbox, llama-swap SD sidecar ([README](monitoring/README.md.tmpl)) |
 | `telemetry/*` | `/srv/telemetry/` | Starlette dashboard app + backup-status sidecar ([README](telemetry/README.md.tmpl)) |
 | `digest/*` | `/srv/digest/` | **optional** (only when `SPARK_DIGEST_HOST` is set): on-demand intelligence digest app (host network, uid 10001), `secrets/` + `state/` ([README](digest/README.md)) |
+| `llama-swap/BENCHMARKS.md`, `models.md` | (repo only) | benchmark log and model sources ([BENCHMARKS](llama-swap/BENCHMARKS.md), [models](models.md)) |
 | `backup/*` | `/usr/local/sbin/spark-backup*.sh`, units, `${MODELS_DIR}/backups/RESTORE.md` | nightly local backup + non-destructive restore test ([RESTORE](backup/RESTORE.md.tmpl)) |
 | `backup/spark-offsite*`, `backup/offsite-setup.sh` | `/usr/local/sbin/spark-offsite.sh`, `spark-offsite.{service,timer}`, `/usr/local/bin/restic`, `/etc/spark-restic/` | optional encrypted offsite copy of the backups (restic to S3, bucket-scoped IAM user), when `RESTIC_BUCKET` is set ([OFFSITE](backup/OFFSITE.md)) |
 | `update-check/*` | `/usr/local/sbin/spark-update-check.py`, units, `/etc/update-motd.d/90-spark-updates`, `/var/lib/spark-update-check/README.md` | weekly report-only update/advisory check ([README](update-check/README.md.tmpl)) |
 | `firewall/docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/`, `/etc/systemd/system/` | `WALTER-PUBLISHED` chain in DOCKER-USER |
-| `firewall/ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` | ufw defaults + the two INPUT allows |
+| `firewall/ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` | ufw defaults (deny in/routed) + INPUT allows: SSH, `GATEWAY_DOCKER_SUBNET` → 8080, `EDGE_WG_IP` on wg0 → 3200 (and 3300 with the digest) |
 | `hermes/*` | `~${BACKEND_SSH_USER}/.local/bin/hermes-spark`, merged into `~/.hermes/config.yaml` | optional, `--with-hermes` |
 
 `*.tmpl` files are rendered by `../scripts/render.sh` (envsubst with an explicit variable list).
@@ -84,7 +85,7 @@ Templates of installed docs (`*.md.tmpl`) render to the host copy of the doc.
 ```bash
 git clone <this repo> && cd <repo> && cp site.env.example site.env && $EDITOR site.env
 sudo walter/deploy.sh --dry-run          # what would change
-sudo walter/deploy.sh                    # do it (re-run any time; idempotent)
+sudo walter/deploy.sh                    # do it (idempotent, but it converges the whole host: read the next sections)
 ```
 
 `deploy.sh` steps: render → apt packages (Docker, WireGuard tools, ufw, NVIDIA driver 580, container
@@ -97,12 +98,48 @@ overwrites; reports drift) → `scripts/gen-secrets.sh walter` → enable units
 (`backup/offsite-setup.sh`, only when `RESTIC_BUCKET` is set and `/etc/spark-restic/aws.env` exists) → compose stacks in order:
 gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build`) →
 digest (key copy, `--build`; only when `SPARK_DIGEST_HOST` is set).
-A stack is force-recreated only when one of its files changed.
+A stack is force-recreated only when one of its files changed (telemetry and digest are also recreated by
+their image rebuild on every run; see below).
 
 Options: `--dry-run`, `--destdir DIR` (install under a prefix and skip every system action — useful
 for review), `--skip-packages`, `--no-start`, `--with-hermes`, `--site-env FILE`.
 
 A new NVIDIA driver needs a reboot. On a fresh VM: deploy, reboot, deploy again.
+
+### What a run does to a live host
+
+`deploy.sh` **converges the whole host** to the repo, not just the part you changed. Run `--dry-run` first and read
+every line, not only the ones you expect:
+
+- `new` in the dry run means missing **or** changed. A changed file in a stack force-recreates that stack, even a
+  comment-only change (for example `gateway/hooks/*` → LiteLLM and Postgres with `--wait`, a short chat/API outage).
+- **Every run**, whatever changed:
+  - `apt-get update` and the pinned package installs (skip with `--skip-packages`);
+  - `ufw-rules.sh` (idempotent; ufw skips existing rules) and a start of `docker-user-rules` (a restart if its script changed);
+  - `systemctl restart nvidia-persistenced`. Only `--no-start` skips it, and that also skips every compose stack;
+  - `docker compose up -d --build` for **telemetry** and **digest**. The rebuilt image gets a new ID even when every
+    layer is cached, so `telemetry-app` and `digest-app-1` are recreated (a few seconds each). The dry run does not show this.
+- A changed `/etc/llama-swap/config.yaml` is reloaded by llama-swap itself (`--watch-config`): the loaded models restart,
+  and the coding pair comes back through the startup preload.
+- It never deletes anything: a file removed from the repo stays on the host until you remove it.
+
+Check the GPUs are idle before a run (`nvidia-smi`), and expect brief reconnects on the telemetry dashboard.
+
+### Narrow redeploys (one component)
+
+When only one component changed and the convergence above is unwanted, install just that component the way
+`deploy.sh` would. Render from a checkout at the wanted revision with the real `site.env`:
+
+```bash
+R=$(mktemp -d); scripts/render.sh -e site.env walter/<component> "$R/<component>"
+find "$R" -name __pycache__ -prune -exec rm -rf {} +
+```
+
+- **llama-swap config:** `sudo install -m 0640 -o root -g llamaswap "$R/llama-swap/config.yaml" /etc/llama-swap/config.yaml`
+  (keep a `.bak-<ts>` copy first). `--watch-config` reloads it.
+- **Digest app:** see [digest/README.md](digest/README.md#redeploy-only-the-digest).
+
+Remove `$R` afterwards. The next full `deploy.sh` run converges everything else.
 
 ### After the first deploy
 
@@ -203,6 +240,10 @@ documentation: [digest/README.md](digest/README.md); deploy checklist:
    `/srv/digest/secrets/digest-litellm-key` (0440 root:10001, never printed; kept if present), adds
    port 3300 to ufw (`wg0`, from `${EDGE_WG_IP}` only) and to `WALTER-PUBLISHED`, and starts the
    stack (`--build`). Without the key the stack is not started and deploy warns.
+   The Pocket-ID client and group are created by hand (`pocketid-bootstrap.py` does not create them). Pocket-ID
+   generates a UUID client id unless you set a custom one, so set `OAUTH2_PROXY_DIGEST_CLIENT_ID` to the real id
+   ([runbook step 3](../docs/runbooks/digest-deploy.md#3-pocket-id-client-and-group)). The edge issues the first
+   certificate through an ACME-only stub ([runbook step 6](../docs/runbooks/digest-deploy.md#6-covenant-deploy-issues-the-cert-client-secret)).
 3. **Verify (from Walter).** `curl -fsS http://${BACKEND_WG_IP}:3300/healthz` → `{"ok":true}`;
    `cd /srv/digest && sudo docker compose ps` (healthy).
 4. **Rollback.** See [digest/README.md#rollback](digest/README.md#rollback). The firewall part
@@ -267,7 +308,7 @@ sudo docker logs --since 10m gateway-litellm-1 2>&1 | grep 'output cap'
 
 ```bash
 systemctl is-active llama-swap docker-user-rules wg-quick@wg0 nvidia-persistenced
-nvidia-smi --query-gpu=name,persistence_mode,pcie.link.width.current --format=csv
+nvidia-smi --query-gpu=name,persistence_mode,pcie.link.gen.max,pcie.link.width.current --format=csv   # Enabled, 4, 8 on both
 sudo iptables -S WALTER-PUBLISHED; sudo ufw status verbose
 for s in gateway webui monitoring telemetry digest; do sudo docker compose -f /srv/$s/compose.yaml ps; done   # all (healthy)
 K=$(sudo cat /srv/gateway/keys/claude-code.key)
@@ -278,6 +319,27 @@ sudo systemctl start spark-backup && sudo /usr/local/sbin/spark-backup-restore-t
 systemctl list-timers 'spark-*'
 cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsite (if enabled)
 ```
+
+## Known issues
+
+| Issue | Effect | Workaround |
+|---|---|---|
+| `backup/RESTORE.md.tmpl` references `${RESTIC_BUCKET}`, and `render.sh` refuses a template with an empty site variable | With `RESTIC_BUCKET=""` (offsite off, the `site.env.example` default) `deploy.sh` stops at "render templates", although the offsite step itself treats an empty bucket as off | Set the real bucket, or `RESTIC_BUCKET=CHANGEME`: `deploy.sh` treats `CHANGEME` as off and the render passes (the installed `RESTORE.md` then names the placeholder) |
+| `deploy.sh` restarts `nvidia-persistenced` and rebuilds the telemetry and digest images on every run | GPU persistence daemon restart, and both app containers recreated | Run deploys with the GPUs idle; use a [narrow redeploy](#narrow-redeploys-one-component) for single-component changes |
+| Telemetry labels x8 links "chipset slot" | Cosmetic; both GPUs are shown that way since the riser | None needed. See [telemetry](telemetry/README.md.tmpl#known-issues) |
+| llama-swap logs `failed to preload ... status 404` at start | Harmless; both preloaded models load and stay healthy | None |
+
+## Troubleshooting
+
+| Symptom | Check / fix |
+|---|---|
+| `render: refusing to render .../RESTORE.md.tmpl with missing values` | `RESTIC_BUCKET` is empty: see Known issues |
+| `<VAR> is empty in site.env` / `set <VAR> in site.env` | fill it in `site.env` (`site.env.example` documents each one) |
+| models load CPU-only, or llama-swap fails right after boot | `sudo systemctl restart nvidia-persistenced llama-swap`; check `nvidia-smi` |
+| a split model (`vision`, `hermes`) crashes at load with `ncclGroupEnd()` / "unhandled system error" | the container lacks `--shm-size 2g`: the `${tp}` macro must be in its `cmd` ([BENCHMARKS](llama-swap/BENCHMARKS.md)) |
+| `nvidia-smi` shows a link narrower than x8 or a GPU is missing | hypervisor side: [hypervisor/README.md](../hypervisor/README.md#troubleshooting) |
+| one stack unhealthy | `sudo docker compose -f /srv/<stack>/compose.yaml ps` and `logs`; the component READMEs have their own tables |
+| no fresh backup / offsite | `journalctl -u spark-backup -u spark-offsite -n 50`, `cat ${MODELS_DIR}/backups/LAST_OK /var/lib/spark-offsite/LAST_OK` |
 
 ## Rollback
 
@@ -312,10 +374,11 @@ cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsit
 
 ## Site assumptions
 
-- **Fixed ports.** Walter publishes 3000/1411/4000/3200/8080 as live. The edge's `WEBUI_PORT`,
+- **Fixed ports.** Walter publishes 3000/1411/4000/3200/8080 (plus 3300 with the digest) as live. The edge's `WEBUI_PORT`,
   `POCKETID_PORT`, `LITELLM_PORT` and `TELEMETRY_PORT` must keep their defaults, or you must edit
   the walter compose files, firewall scripts and probe lists to match.
-- **GPU indices** `device=0` / `device=1` and the matrix in `config.yaml.tmpl` assume two ~24 GB GPUs.
+- **GPU indices** `device=0` / `device=1` and the matrix in `config.yaml.tmpl` assume two ~24 GB GPUs. Tensor split
+  (`hermes`, `vision`) assumes both are on fast links (live: Gen4 x8 each) and needs `--shm-size 2g` on the container.
 - **Docker group IDs.** Grafana runs as uid 472, the llama-swap SD sidecar as 65534, and telemetry
   as 10001. The secret copies are owned accordingly.
 - The interface names `wg0` and `BACKEND_LAN_IF` are used in `docker-user-rules.sh` and in the

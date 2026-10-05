@@ -88,6 +88,14 @@ sudo systemctl start spark-offsite && journalctl -u spark-offsite -n 30
 `walter/deploy.sh` runs the same script when `RESTIC_BUCKET` is set and `/etc/spark-restic/aws.env`
 exists. It never overwrites the password and never runs `init` against a repo it cannot read.
 
+**Known issue (offsite off):** `RESTORE.md.tmpl` uses `${RESTIC_BUCKET}`, and `render.sh` refuses to render
+a template whose site variable is empty. With `RESTIC_BUCKET=""` `walter/deploy.sh` therefore stops at
+"render templates". Until that is fixed, use `RESTIC_BUCKET=CHANGEME` to keep offsite off: deploy treats
+`CHANGEME` as off and the render passes.
+
+**Owner action, once:** keep the restic password offline (password manager or paper) together with the bucket
+name and region. It is the only way to read the offsite repository if Walter is lost; see `RESTORE.md` section 7.
+
 ## 3. Day-to-day
 
 ```bash

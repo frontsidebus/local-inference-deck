@@ -36,7 +36,9 @@ For Covenant, run `spark-edge-check` from the workstation (apt security count, c
 5. Verify through the real path (below), not just the container health.
 6. Keep the old image until the new one has run for a while. **Rollback** = put the old digest back, `docker compose up -d <svc>`, and if a migration ran, restore the DB from the backup taken in step 3.
 
-The component-specific commands are in [walter/README.md](../../walter/README.md) and [covenant/README.md](../../covenant/README.md).
+The component-specific commands are in [walter/update-check/README.md.tmpl](../../walter/update-check/README.md.tmpl) (installed on Walter as `/var/lib/spark-update-check/README.md`) and [covenant/README.md](../../covenant/README.md).
+
+Record every pin change in the repo too. `walter/deploy.sh` installs the repo's version over a hand edit, and it converges the whole host on every run (package installs, an `nvidia-persistenced` restart, telemetry and digest rebuilds): read [What a run does to a live host](../../walter/README.md#what-a-run-does-to-a-live-host) before using it for a one-component upgrade, or use a [narrow redeploy](../../walter/README.md#narrow-redeploys-one-component).
 
 ## 3. Component notes
 
@@ -46,7 +48,7 @@ The component-specific commands are in [walter/README.md](../../walter/README.md
 | Postgres | same | healthcheck healthy | A new digest of `17` is fine. **Never** change the major version by editing the tag; that needs dump and restore. |
 | Open WebUI | `/srv/webui/compose.yaml` | Passkey login, model list, one chat | Theme CSS selectors can break; check dark mode. Model access grants and OIDC settings. |
 | Pocket-ID | same | Login at `https://${SPARK_ID_HOST}`, then Open WebUI and telemetry SSO | Back up before majors. |
-| llama.cpp `server-cuda` | llama-swap config, macro `image` | Each alias loads and answers; `coder` still shows MTP acceptance in the log | CLI flags change (`--fit`, `-fa`, speculative options have changed before). `systemctl restart llama-swap` stops running models. |
+| llama.cpp `server-cuda` | llama-swap config, macro `image` | Each alias loads and answers; `coder` still shows MTP acceptance in the log; `vision` reads a test image | CLI flags change (`--fit`, `-fa`, speculative options have changed before). `systemctl restart llama-swap` stops running models. `hermes` and `vision` run the **experimental** `-sm tensor` (with `--shm-size 2g`): re-run the tensor-split check in [BENCHMARKS](../../walter/llama-swap/BENCHMARKS.md) and fall back to layer split if it regresses. Row split did not load on build 11277; retest only after a bump. |
 | llama-swap | `/usr/local/bin/llama-swap` (version + sha256) | `llama-swap --version`, matrix behaviour | Keep the old binary as `llama-swap.v<old>` for rollback. Config schema changes (matrix, hooks). |
 | Monitoring stack | `/srv/monitoring/compose.yaml` | All Prometheus targets up, dashboards load | dcgm-exporter must match the driver. |
 | oauth2-proxy (Covenant) | `covenant/` (version + sha256) | Telemetry login, `/api/*` still 401 JSON when logged out | Read the changelog for renamed flags. |
@@ -77,6 +79,12 @@ Hermes runs on Walter and on the workstation (where the `hermes-gateway` user se
 - Reboot Walter and Covenant one at a time and run the end-to-end checks from [power-loss-recovery](power-loss-recovery.md#3-end-to-end-from-outside).
 - **NVIDIA driver** upgrades need a maintenance window: DKMS rebuild, reboot, and every GPU container stops. Afterwards: `nvidia-smi`, `docker run --rm --gpus all --runtime nvidia <pinned server-cuda image> --version`, then load one model through llama-swap. Keep the driver, `nvidia-container-toolkit` and dcgm-exporter compatible. Roll back with `apt install nvidia-driver-<series>=<old>`; hold a known-good version with `apt-mark hold`.
 - The hypervisor's NVIDIA packages do not matter while both GPUs belong to `vfio-pci`.
+
+## 5a. Hardware (GPUs, risers, slots)
+
+A hardware change on the hypervisor moves the GPUs' host PCI addresses, and Walter's `<hostdev>` entries name addresses. **Disable Walter's autostart before powering off**, fix the addresses, start Walter by hand, then re-enable autostart. A stale address can make libvirt seize a different host device (after the riser change, GPU1's old address belonged to the PCIe switch in front of the host's root disk). Procedure: [hypervisor/README.md](../../hypervisor/README.md#hardware-changes-gpus-risers-slots).
+
+Afterwards: `nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.width.current --format=csv` in Walter (live: `4, 8` for both GPUs), one load of each split model, and the checks from [power-loss-recovery](power-loss-recovery.md#2-walter).
 
 ## 6. After every upgrade
 

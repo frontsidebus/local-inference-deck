@@ -139,9 +139,16 @@ sudo systemctl restart llama-swap       # stops running model containers; next r
 journalctl -u llama-swap -n 50
 ```
 
-Verify that each alias (coder, coder-fast, big, vision) loads and answers. Watch for
-changed CLI flags in the release notes; `--fit` and `-fa` have changed before. Rollback
-means putting the old digest back and restarting llama-swap.
+Verify that each alias (coder, coder-fast, big, vision, hermes) loads and answers. Watch for
+changed CLI flags in the release notes; `--fit` and `-fa` have changed before. `hermes` and
+`vision` use the **experimental** `-sm tensor`: re-run the tensor-split check in
+`walter/llama-swap/BENCHMARKS.md` (load, `17*23`, an image for `vision`, no Xid in `dmesg`)
+after every image bump, and fall back to layer split if it regresses (the steps are in the
+comments above those models). Rollback means putting the old digest back and restarting
+llama-swap.
+
+Make the same change in the repo (`walter/llama-swap/config.yaml.tmpl`): the next
+`walter/deploy.sh` run installs the repo's version over a hand edit.
 
 The report shows "newer source builds" for llama.cpp when GitHub has newer `bNNNN`
 releases than the image. This is informational: only a changed `server-cuda` digest

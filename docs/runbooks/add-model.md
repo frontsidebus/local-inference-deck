@@ -24,7 +24,7 @@ Use a lowercase, version-specific `<model-id>` (e.g. `qwen3.8-27b`). It becomes 
 
 ## 2. Add the llama-swap entry
 
-Edit the llama-swap config in [walter/](../../walter/README.md) (deployed to `/etc/llama-swap/config.yaml`). Copy the closest existing entry and change:
+Edit `walter/llama-swap/config.yaml.tmpl` (see [walter/](../../walter/README.md); deployed to `/etc/llama-swap/config.yaml`). Copy the closest existing entry and change:
 
 - `name`, `aliases` (only if it takes over an existing alias), the `-m` path and `--mmproj` if any;
 - `--gpus "\"device=N\""` and `-sm none` for one GPU, or `device=0,1` and `-sm layer -ts 1,1` for a split (or `${tp}` before `${image}` plus `-sm tensor`, see above);
@@ -43,6 +43,8 @@ Add a variable under `routing.router.settings.matrix.vars` and put it in a set:
 - add an `evict_costs` entry if it is slow to load (large weights: about 2.8 GB/s from a cold models disk).
 
 ## 4. Reload and test llama-swap
+
+Install the new config with `walter/deploy.sh` (it converges the whole host: read its dry run) or with the narrow llama-swap install in [walter/README.md](../../walter/README.md#narrow-redeploys-one-component). `--watch-config` reloads it.
 
 ```bash
 sudo systemctl restart llama-swap          # safe: the coding pair comes back via preload
@@ -78,7 +80,7 @@ A new model is visible to admins only until it has an access grant. In Admin Pan
 
 ## 8. Record it
 
-Update the model table in the [README](../../README.md#models) and the matrix in [ARCHITECTURE](../../ARCHITECTURE.md#llama-swap-matrix-and-gpu-placement). If you benchmarked it, add the numbers to `walter/BENCHMARKS.md`.
+Update the model table in the [README](../../README.md#models) and the matrix in [ARCHITECTURE](../../ARCHITECTURE.md#llama-swap-matrix-and-gpu-placement). If you benchmarked it, add the numbers to [`walter/llama-swap/BENCHMARKS.md`](../../walter/llama-swap/BENCHMARKS.md), and the file to [`walter/models.md`](../../walter/models.md) and `fetch-models.sh`.
 
 ## Retiring a model
 
