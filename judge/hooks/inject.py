@@ -15,6 +15,12 @@ Selects finding items that are
 and renders them as a block framed as reviewer findings (data, not instructions), capped at
 JUDGE_INJECT_MAX_CHARS (default 2000).
 
+An R8 code-correctness item (verdict `defect`, severity medium unless security/data loss, so the default floor
+lets it through) is rendered under the label "code defect (R8)" with its quoted code lines (the item's
+evidence: file:line and the backticked diff lines, 320 chars), its failure_scenario (300 chars) and the
+recommendation; other items show claim, evidence and recommendation. Every field is flattened to one line and
+truncated with an ellipsis; the threat scan below covers all of them, the scenario included.
+
 Injection safety: every item is checked with Hermes's own threat scanner (tools/threat_patterns.py,
 scope "context", the same scan `_scan_context_content` applies to context files). It is loaded by
 file path from $JUDGE_HERMES_AGENT_DIR or $HERMES_HOME/hermes-agent (that module is stdlib-only, so
@@ -161,13 +167,33 @@ def select_items(common, session_id: str, min_sev: str, window: timedelta,
     return out
 
 
+SCENARIO_CAP = 300  # characters of an R8 failure_scenario shown (the prompt asks for < 400, validate caps at 1000)
+CODE_CAP = 320      # characters of an R8 item's quoted code lines (its evidence)
+
+
+def is_code_defect(it: Dict[str, Any]) -> bool:
+    """An R8 code-correctness item: verdict `defect` (R8 only after validation) or rubric R8."""
+    return (str(it.get("verdict") or "").strip().lower() == "defect"
+            or str(it.get("rubric") or "").strip().upper() == "R8")
+
+
 def render_item(it: Dict[str, Any], scan: Callable[[str], List[str]]) -> str:
     rid, iid = it["_request"], str(it.get("id"))
-    head = (f"- [{clean(it.get('severity'), 10).upper()}] {clean(it.get('rubric'), 4)} "
-            f"finding {rid} {clean(iid, 32)} (verdict: {clean(it.get('verdict'), 10)})")
-    body = (f"\n  Claim: {clean(it.get('claim'), 220)}"
-            f"\n  Evidence: {clean(it.get('evidence'), 260)}"
-            f"\n  Recommendation: {clean(it.get('recommendation'), 220)}")
+    sev = clean(it.get("severity"), 10).upper()
+    if is_code_defect(it):
+        head = (f"- [{sev}] code defect (R8) finding {rid} {clean(iid, 32)} "
+                f"(verdict: {clean(it.get('verdict'), 10)})")
+        body = (f"\n  Defect: {clean(it.get('claim'), 220)}"
+                f"\n  Code: {clean(it.get('evidence'), CODE_CAP)}")
+        if str(it.get("failure_scenario") or "").strip():
+            body += f"\n  Failure scenario: {clean(it.get('failure_scenario'), SCENARIO_CAP)}"
+        body += f"\n  Recommendation: {clean(it.get('recommendation'), 200)}"
+    else:
+        head = (f"- [{sev}] {clean(it.get('rubric'), 4)} "
+                f"finding {rid} {clean(iid, 32)} (verdict: {clean(it.get('verdict'), 10)})")
+        body = (f"\n  Claim: {clean(it.get('claim'), 220)}"
+                f"\n  Evidence: {clean(it.get('evidence'), 260)}"
+                f"\n  Recommendation: {clean(it.get('recommendation'), 220)}")
     hits = scan(head + body)
     if hits:
         body = (f"\n  (text withheld: it matched injection pattern {', '.join(sorted(set(hits)))[:80]}; "

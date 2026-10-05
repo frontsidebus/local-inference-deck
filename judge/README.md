@@ -35,7 +35,7 @@ Contents: [How it works](#how-it-works) · [Components](#components) · [Install
 | C2 | `pre_tool_call`, matcher `terminal\|write_file\|patch\|read_file`, `fail_closed: true` | `hooks/gate.py` | sync, ms | Escalates host-mutating commands, sensitive writes and secret reads to you; blocks changes to its own oversight. |
 | C3 | `pre_verify` | `hooks/verify.py` | sync, < 60 s | Verifies the changed paths, nudges once on a failure, records every result. |
 | C4 | `on_session_end` (+ `on_session_start` for the snapshot) | `hooks/enqueue.py` | async | Snapshot at start; a completion audit per turn. |
-| C5 | `pre_llm_call` | `hooks/inject.py` | sync, fast | Shows open findings to the agent as reviewer data; a one-time reminder after a refused escalation; a runner-stall warning. |
+| C5 | `pre_llm_call` | `hooks/inject.py` | sync, fast | Shows open findings to the agent as reviewer data (an R8 item as a "code defect (R8)" with its quoted code lines and failure scenario); a one-time reminder after a refused escalation; a runner-stall warning. |
 | C6 | none (telemetry) | `watch/runaway.py` | async | Alerts on runaway generations; never cancels. |
 
 ## Components
@@ -221,7 +221,7 @@ JUDGE_SENSITIVE_FRONTIER_CLAIMS=1    # sensitive completions also get a frontier
 |---|---|---|
 | `JUDGE_INJECT_MIN_SEVERITY` | `medium` | Lowest severity injected. |
 | `JUDGE_INJECT_WINDOW_HOURS` | `24` | Only findings (and refusals, for the reminder) this recent. |
-| `JUDGE_INJECT_MAX_CHARS` | `2000` | Size cap of the injected block. |
+| `JUDGE_INJECT_MAX_CHARS` | `2000` | Size cap of the injected block. An R8 item takes up to about 1,200 characters, so the default fits one in full; items that don't fit are counted in a "more not shown" line. |
 | `JUDGE_INJECT_LOCAL` | `0` | `1` also injects local-judge findings. Skips are counted in `inject.log`. |
 | `JUDGE_INJECT_REFUSAL_REMINDER` | `1` | After a refused escalation or a block, remind the agent once, at its next turn, that a refusal is a stop. `0` = off. |
 | `JUDGE_STALL_MINUTES` | `15` | C5 and `judge-findings` warn when the oldest ready request has waited this long and no runner is busy. `0` = off. |
@@ -277,8 +277,8 @@ Stopping only the path unit is not a pause: the timer still runs the queue every
 
 | Command | What it does |
 |---|---|
-| `judge/bin/judge-findings` | One line per finding of the last 7 days, ending `open:N agent-acked:N closed:N`. Options: `<request-id>` (every item of that request, including its claims stage), `--items`, `--needs-human` (high items no human has closed: **start here**), `--unacked`, `--min-severity LEVEL`, `--since HOURS` (`0` = all), `--json`. |
-| `judge/bin/judge-ack <request-id> <item-id> "<reason>"` | Acknowledge an item as you (`actor: human`). The agent uses `--agent`. Inside an agent session (Hermes's environment markers, or a Hermes process among its parents) it records `agent` whatever you pass, and says so. Run it from your own shell. A human ack replaces an agent ack, never the reverse. |
+| `judge/bin/judge-findings` | One line per finding of the last 7 days, ending `open:N agent-acked:N closed:N` (plus `defect:N` when it has R8 code-defect items). The item views print an R8 item as `verdict=DEFECT (code defect)` with `defect:`, `code:` (the quoted lines), `failure scenario:` and `recommendation:` lines. Options: `<request-id>` (every item of that request, including its claims stage), `--items`, `--needs-human` (high items no human has closed: **start here**), `--unacked`, `--min-severity LEVEL`, `--since HOURS` (`0` = all), `--json`. |
+| `judge/bin/judge-ack <request-id> <item-id> "<reason>"` | Acknowledge an item as you (`actor: human`). The agent uses `--agent`. Inside an agent session (Hermes's environment markers, or a Hermes process among its parents) it records `agent` whatever you pass, and says so. Run it from your own shell. A human ack replaces an agent ack, never the reverse. R8 `defect` items are acked like any other item. |
 | `python3 judge/runner/run_judge.py --pending` / `<request-id>` | Judge every ready request, or one request now (its `not_before` is ignored). |
 | `judge/runner/rejudge.py <id>... --out DIR [--mode local\|frontier\|frontier-claims] [--model X] [--no-budget] [--sensitive-local]` | Re-judge stored bundles with the current prompt and validator; writes only to `DIR` (never inside the review dir). A sensitive bundle is never sent to the frontier: `--mode frontier` refuses it (exit 1) unless `--sensitive-local` judges it locally. `--mode frontier-claims` runs the claims stage on any bundle. `--no-budget` keeps the calls out of the daily cap. Procedure: [agent-judge-rejudge.md](../docs/runbooks/agent-judge-rejudge.md). |
 | `judge/hooks/gate.py --explain < payload.json` | The gate's decision and every rule hit for a tool-call payload, with no log line and no request. Example payload: `{"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":{"command":"cat ~/.config/spark/x.key"},"session_id":"explain","cwd":"/tmp"}`. |
@@ -288,7 +288,7 @@ Stopping only the path unit is not a pause: the timer still runs the queue every
 | `judge/runner/validate.py <finding.json> --bundle <evidence-dir> [--local-max-severity LEVEL]` | Re-validate a stored reply without a model call. |
 | `python3 judge/watch/runaway.py --once -v [--slots-file F]` | One watcher pass, printing each slot. |
 
-Findings are in `$JUDGE_REVIEW_DIR/findings/<id>.md` (to read) and `.json`. Every item has a rubric code (R1–R8), a severity, the claim, the **evidence** (bundle text it quotes), a verdict and a recommendation; an R8 code-defect item has verdict `defect` and a `failure_scenario`; the finding's `notes` list every item the validator dropped, downgraded or capped. An item is **closed** when you acked it, or when the agent acked it and it is not `high`; any ack stops C5 from showing it again. The agent runs as your user, so it can still forge a human ack deliberately; look at who acked anything `high` ([why](../docs/agent-judge.md#findings-c5-injection-and-acks)).
+Findings are in `$JUDGE_REVIEW_DIR/findings/<id>.md` (to read) and `.json`. Every item has a rubric code (R1–R8), a severity, the claim, the **evidence** (bundle text it quotes), a verdict and a recommendation; an R8 code-defect item has verdict `defect` and a `failure_scenario` (shown in the `.md`, by `judge-findings` and in C5); the finding's `notes` list every item the validator dropped, downgraded or capped. An item is **closed** when you acked it, or when the agent acked it and it is not `high`; any ack stops C5 from showing it again. The agent runs as your user, so it can still forge a human ack deliberately; look at who acked anything `high` ([why](../docs/agent-judge.md#findings-c5-injection-and-acks)).
 
 ## Review directory
 

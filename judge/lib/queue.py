@@ -793,9 +793,10 @@ def render_finding_md(finding: Dict[str, Any]) -> str:
             str(it.get("evidence", "")).replace("```", "'''"),
             "```",
             "",
-            f"**Recommendation:** {it.get('recommendation', '')}",
-            "",
         ]
+        if str(it.get("failure_scenario") or "").strip():  # R8 code-defect items
+            lines += [f"**Failure scenario:** {it['failure_scenario']}", ""]
+        lines += [f"**Recommendation:** {it.get('recommendation', '')}", ""]
     return "\n".join(lines).rstrip() + "\n"
 
 
