@@ -40,6 +40,11 @@ them; the others are listed in manifest attribution.rejected_request_paths. Herm
 data_class=sensitive (from the request, or from re-classifying the agent-attributed paths: the stricter wins):
 agent diff carries one `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b)` line per
 changed path (no file contents).  Hosts that cannot be reached are recorded, never fatal.
+Per-path withholding in an infra bundle (#43, lib/config.classify_detail): agent scratch/cache paths never decide
+the class and get a metadata-only withheld line; a few genuinely sensitive paths next to infra ones keep the
+bundle infra, but each gets a `# content withheld (sensitive path in an infra bundle; name not shown):
+[sensitive path #N withheld]` line, and that path's name is replaced by its label in every artifact (request
+copy, attribution, C3 results, logs). Every path the diff shows with content is re-checked to be infra-class.
 
 Exit: 0 bundle written, 2 request not found / bad id, 64 bad probe (nothing executed).
 """
@@ -416,9 +421,12 @@ def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) 
 
 
 def agent_diff(req: Dict, cfg: Mapping[str, str], sensitive: bool, root: Path, paths: List[str],
-               until: datetime, rejected=()) -> str:
+               until: datetime, rejected=(), withholding: Optional["Withholding"] = None) -> str:
     d = q.snapshot_dir(req["session"], root)
-    text = snapshot.diff_text(d, cfg, sensitive=sensitive, include=paths, until=until)
+    if not sensitive and withholding is None:
+        withholding = Withholding(cfg, (req.get("detail") or {}).get("cwd") or None)
+    text = snapshot.diff_text(d, cfg, sensitive=sensitive, include=paths, until=until,
+                              withhold=None if sensitive else withholding.hold)
     if snapshot.load_meta(d) and not paths:
         text += "# no changed path is attributed to the agent (other changes, if any: others-changed.txt)\n"
     if rejected:
@@ -624,27 +632,127 @@ def _watch_runaway(req: Dict) -> bool:
             and not req.get("changed_paths") and not detail.get("cwd"))
 
 
-def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
-    """The stricter of the request's own data_class and the collector's independent classification of the
+def class_detail(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> Dict:
+    """effective_class plus lib/config.classify_detail's per-path lists (#43) of the paths considered.
+
+    The stricter of the request's own data_class and the collector's independent classification of the
     agent-attributed paths (request changed_paths + *agent_paths*, Hermes bookkeeping noise excluded).
-    Request paths rejected by attribution still count here: they can only make the bundle stricter.
+    Request paths rejected by attribution still count here: they can only make the bundle stricter (a
+    secret one makes it sensitive; a sensitive one is withheld or makes it sensitive).
 
     With no paths, only a host-rule gate request keeps the hook's answer (its evidence is the redacted
     command), and a C6 watcher runaway request keeps its own (slot telemetry, no agent content: it should
     reach the frontier judge, not `coder-fast`, which may be the very model that is running away). Any
     other path-less request is classified from the session cwd (classify([], cfg, cwd)), so
-    an `infra` label alone never lets a request reach the frontier judge."""
+    an `infra` label alone never lets a request reach the frontier judge. A `gate` request is classified
+    strictly (no withheld sensitive paths: its evidence is the command itself)."""
     cwd = (req.get("detail") or {}).get("cwd") or None
     noise = snapshot.noise_globs(cfg)
     paths = sorted(p for p in set(req.get("changed_paths") or []) | set(agent_paths or [])
                    if isinstance(p, str) and p.strip() and not snapshot.is_noise(p, noise))
-    if paths:
-        mine = config.classify(paths, cfg, cwd)
-    elif _host_rule_gate(req) or _watch_runaway(req):
-        mine = req.get("data_class")
-    else:
-        mine = config.classify([], cfg, cwd)
-    return "infra" if req.get("data_class") == "infra" and mine == "infra" else "sensitive"
+    strict = 0 if req.get("kind") == "gate" else None
+    det = config.classify_detail(paths, cfg, cwd, max_mixed=strict)
+    if not paths and (_host_rule_gate(req) or _watch_runaway(req)):
+        det["class"], det["reason"] = req.get("data_class"), "request class (no paths)"
+    mine = det["class"]
+    det["class"] = "infra" if req.get("data_class") == "infra" and mine == "infra" else "sensitive"
+    if det["class"] != mine:
+        det["reason"] = f"request data_class={req.get('data_class')!r}"
+    return det
+
+
+def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
+    """'infra' | 'sensitive' for the bundle: see class_detail."""
+    return class_detail(req, cfg, agent_paths)["class"]
+
+
+# ---------------------------------------------------------------- per-path withholding in infra bundles (#43)
+SENSITIVE_LABEL = "[sensitive path #{n} withheld]"
+LINE_WITHHELD = "line withheld: it names a sensitive path (#43)"
+NONINFRA_CWD_LABEL = "[non-infra cwd withheld]"
+
+
+class Withholding:
+    """Which paths of an infra bundle are shown only as metadata, and the labels that replace sensitive names.
+
+    hold(path) -> None (infra-class: content may be shown) | (kind, label) for snapshot.diff_text. Every path is
+    re-classified here (lib/config.path_class), so a path the request did not list cannot slip through with
+    content: only `infra` paths are ever shown. scrub(text) replaces each sensitive path name (as given,
+    resolved, and ~-relative) by its label."""
+
+    def __init__(self, cfg: Mapping[str, str], cwd: Optional[str], sensitive_paths=()):
+        self.cfg, self.cwd = cfg, cwd
+        self.labels: Dict[str, str] = {}
+        self.forms: Dict[str, str] = {}
+        self.scratch: List[str] = []
+        self.extra_labels: set = set()
+        for p in sorted(set(sensitive_paths)):
+            self._label(p)
+
+    def _label(self, p: str) -> str:
+        k = snapshot._key(p)
+        if k not in self.labels:
+            self.labels[k] = SENSITIVE_LABEL.format(n=len(self.labels) + 1)
+            home = os.path.expanduser("~").rstrip("/")
+            for form in {p, k, os.path.abspath(os.path.expanduser(p))}:
+                self.forms[form] = self.labels[k]
+                if home and form.startswith(home + "/"):
+                    self.forms["~" + form[len(home):]] = self.labels[k]
+        return self.labels[k]
+
+    def add_form(self, path: str, label: str) -> None:
+        """Also replace *path* (e.g. a non-infra session cwd) by *label* in scrub()."""
+        home = os.path.expanduser("~").rstrip("/")
+        for form in {path, snapshot._key(path)}:
+            self.forms[form] = label
+            if home and form.startswith(home + "/"):
+                self.forms["~" + form[len(home):]] = label
+        self.extra_labels.add(label)
+
+    def kind(self, p: str) -> str:
+        return config.path_class(p, self.cfg, self.cwd)
+
+    def hold(self, p: str):
+        kind = self.kind(p)
+        if kind == "infra":
+            return None
+        if kind == "scratch":
+            if p not in self.scratch:
+                self.scratch.append(p)
+            return ("scratch", p)
+        return (kind if kind == "secret" else "sensitive", self._label(p))
+
+    def name(self, p: str) -> str:
+        """*p* for an infra or scratch path, its label otherwise."""
+        kind = self.kind(p)
+        return p if kind in ("infra", "scratch") else self._label(p)
+
+    def scrub(self, text: str) -> str:
+        if not self.forms or not text:
+            return text
+        for form in sorted(self.forms, key=len, reverse=True):
+            text = text.replace(form, self.forms[form])
+        return text
+
+    @property
+    def count(self) -> int:
+        return len(self.labels)
+
+
+def _scrub_request(req: Dict, wh: "Withholding") -> Dict:
+    """The request copy for an infra bundle: sensitive changed_paths replaced by their labels, others' changes
+    (detail.changed_by_others) reduced to infra-class paths plus a count."""
+    out = json.loads(json.dumps(req))
+    out["changed_paths"] = [wh.name(p) if isinstance(p, str) else p for p in out.get("changed_paths") or []]
+    det = out.get("detail") if isinstance(out.get("detail"), dict) else None
+    if det and isinstance(det.get("changed_by_others"), list):
+        keep = [p for p in det["changed_by_others"] if isinstance(p, str) and wh.kind(p) == "infra"]
+        if len(keep) != len(det["changed_by_others"]):
+            det["changed_by_others_withheld"] = len(det["changed_by_others"]) - len(keep)
+        det["changed_by_others"] = keep
+    if isinstance(out.get("plan"), str) and out["plan"]:
+        out["plan"] = wh.name(out["plan"])
+    return json.loads(wh.scrub(json.dumps(out, ensure_ascii=False)))
 
 
 GATED_TOOLS = ("terminal", "write_file", "patch", "read_file")  # hooks/gate.py's pre_tool_call matcher
@@ -755,8 +863,13 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     since, until = win["since"], win["until"]
     since_s, until_s, now_s = q.utc_now_iso(since), q.utc_now_iso(until), q.utc_now_iso(now)
     att = attribution(req, cfg, root, until)
-    data_class = effective_class(req, cfg, att["agent"])
+    cdet = class_detail(req, cfg, att["agent"])
+    data_class = cdet["class"]
     sensitive = data_class == "sensitive"
+    req_cwd = (req.get("detail") or {}).get("cwd") or None
+    wh = Withholding(cfg, req_cwd, [] if sensitive else cdet.get("sensitive") or [])
+    if wh.count and req_cwd and not config.is_infra_path(os.path.join(req_cwd, ".judge-cwd-probe"), cfg, req_cwd):
+        wh.add_form(req_cwd, NONINFRA_CWD_LABEL)  # a mixed bundle names no non-infra location (#43)
     ev = q.evidence_dir(request_id, root, create=True)
     q.ensure_dir(ev / "probes")
     try:
@@ -783,7 +896,7 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     except Exception as e:  # the refusal section must never break the bundle
         notes["refusals.jsonl"] = f"not collected: {e.__class__.__name__}"
     agent_paths = sorted(set(att["agent"]) | set(att["accepted"]))
-    _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"]))
+    _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"], wh))
     _write(ev / "others-changed.txt", others_changed(req, cfg, root, att, sensitive, until))
     cwd = (req.get("detail") or {}).get("cwd") or None
     withheld: Dict[str, str] = {}
@@ -793,6 +906,16 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
             "line with a line-count stat. Such a line means the file changed; it is not 'no change'.")
     if not sensitive and any(not config.is_infra_path(p, cfg, cwd) for p in att["others"]):
         withheld["others-changed.txt"] = "data_class=infra bundle: non-infra paths changed by others withheld"
+    if not sensitive and wh.count:
+        withheld["sensitive_paths"] = (
+            f"{wh.count} non-infra path(s) next to the infra ones (#43): content withheld and names replaced by "
+            "`[sensitive path #N withheld]` labels everywhere in this bundle; each has a `# content withheld` "
+            "line with a line-count stat in agent-diff.patch when it changed. They are NOT reviewed here.")
+    scratch = sorted(set(wh.scratch) | set(cdet.get("scratch") or []))
+    if scratch:
+        withheld["scratch_paths"] = (
+            f"{len(scratch)} agent scratch/cache path(s) (#43; manifest attribution.scratch_paths): metadata only, "
+            "never content; they do not decide data_class")
     if att["rejected"]:
         notes["attribution"] = (
             f"{len(att['rejected'])} request changed_path(s) rejected: no tool event of this session names them "
@@ -821,6 +944,8 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     ex_info = collect_extras(req, cfg, root, ev, since, until, now_s, notes, windowed, extra_pit,
                              c3_until=turn_end(req, cfg, root, until, now), runner=runner,
                              gate_lines=gate_excerpts)
+    if not sensitive:
+        _mask_c3(ev, wh)
     window_rec = {"since": since_s, "until": until_s, "grace_seconds": config.window_grace(cfg),
                   "until_basis": win["basis"]}
     if win.get("next_turn_start"):
@@ -835,8 +960,14 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     if snap_rec.get("truncated_roots") or snap_rec.get("skipped_roots"):
         notes["snapshot"] = ("some opted-in dirs were truncated or not snapshotted at session start (see "
                              "manifest snapshot); changes there may be missing from agent-diff.patch")
-    _write_manifest(ev, req, data_class, {
+    _write_manifest(ev, req if sensitive else _scrub_request(req, wh), data_class, {
         "collected": now_s,
+        "classification": {"reason": cdet.get("reason"),
+                           "infra_paths": len(cdet.get("infra") or []),
+                           "withheld_sensitive_paths": 0 if sensitive else wh.count,
+                           "secret_paths": len(cdet.get("secret") or []),
+                           "scratch_paths": len(scratch)},
+        "masked_request": bool(not sensitive and (wh.count or req != _scrub_request(req, wh))),
         "window": window_rec,
         "windowed": windowed,
         "snapshot": snap_rec,
@@ -851,7 +982,9 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
                                          "time; a file modified after the window carries a NOTE line"},
             "others-changed.txt": dict(pit),
         },
-        "attribution": {"agent_paths": sorted(att["agent"]),
+        "attribution": {"agent_paths": sorted(att["agent"]) if sensitive else
+                        sorted(wh.name(p) for p in att["agent"]),
+                        "scratch_paths": scratch,
                         "changed_by_others": sorted(att["others"]) if sensitive else
                         sorted(p for p in att["others"]
                                if config.is_infra_path(p, cfg, cwd)),
@@ -862,9 +995,66 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
                         "ignored_noise_paths": len(att["noise"])},
         "notes": notes,
         "request_data_class": req.get("data_class"),
-        "content_policy": "stat summaries only, no file contents" if sensitive else "redacted content diffs",
+        "content_policy": "stat summaries only, no file contents" if sensitive else
+                          ("redacted content diffs of infra paths; sensitive and scratch paths withheld (#43)"
+                           if wh.count or scratch else "redacted content diffs"),
     })
+    if not sensitive and wh.count:
+        _scrub_bundle(ev, wh)
     return ev
+
+
+def _mask_c3(ev: Path, wh: "Withholding") -> None:
+    """Infra bundle: a C3 result about a non-infra path keeps check/ok/final but loses its path name (label)
+    and its detail text (verifier output can quote the file)."""
+    p = ev / C3_ARTIFACT
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    out, changed = [], False
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            out.append(ln)
+            continue
+        path = r.get("path") if isinstance(r, dict) else None
+        if isinstance(path, str) and path and wh.kind(path) not in ("infra", "scratch"):
+            r["path"] = wh.name(path)
+            if "detail" in r:
+                r["detail"] = "[withheld: non-infra path]"
+            changed = True
+            ln = json.dumps(r, ensure_ascii=False, sort_keys=True)
+        out.append(ln)
+    if changed:
+        _write(p, "".join(x + "\n" for x in out))
+
+
+def _scrub_bundle(ev: Path, wh: "Withholding") -> None:
+    """Last pass over an infra bundle with withheld sensitive paths: no artifact may name one of them. Names
+    become labels; in the log and the JSONL artifacts a line that named one is dropped as a whole (a gate
+    excerpt or an error line could quote the file), leaving a marker. agent-diff.patch and manifest.json are
+    built with labels already and are only renamed."""
+    labels = set(wh.labels.values()) | wh.extra_labels
+    for f in sorted(ev.rglob("*")):
+        if not f.is_file() or f.name.startswith("."):
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        new = wh.scrub(text)
+        if new != text and f.name not in ("agent-diff.patch", "manifest.json"):
+            jsonl = f.suffix == ".jsonl"
+            out = []
+            for ln in new.split("\n"):
+                if any(lb in ln for lb in labels):
+                    ln = (json.dumps({"withheld": LINE_WITHHELD}) if jsonl else f"[{LINE_WITHHELD}]")
+                out.append(ln)
+            new = "\n".join(out)
+        if new != text:
+            _write(f, new)
 
 
 def add_probe(request_id: str, name: str, args: List[str], cfg: Optional[Mapping[str, str]] = None, runner=None,
@@ -886,9 +1076,13 @@ def add_probe(request_id: str, name: str, args: List[str], cfg: Optional[Mapping
         man = json.loads((ev / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         man = {}
-    data_class = effective_class(req, cfg, (man.get("attribution") or {}).get("agent_paths") or ())
+    agent = [p for p in (man.get("attribution") or {}).get("agent_paths") or ()
+             if isinstance(p, str) and not p.startswith("[")]  # labels of withheld paths (#43) are not paths
+    data_class = effective_class(req, cfg, agent)
     if man.get("data_class") == "sensitive":  # never relax what collect() decided
         data_class = "sensitive"
+    if man.get("masked_request") and isinstance(man.get("request"), dict):
+        req = man["request"]  # keep the masked copy (#43)
     pit = dict(man.get("point_in_time") or {})
     pit[f"probes/{path.name}"] = {"observed_at": q.utc_now_iso(),
                                   "note": "probe output when it ran, NOT the state during the session"}

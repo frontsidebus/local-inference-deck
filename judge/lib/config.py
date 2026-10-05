@@ -11,7 +11,10 @@ Public API (other judge parts depend on it; keep it stable):
         (path of the file that was read, or "" when none) and every key in DEFAULTS.
     hermes_home(cfg=None) -> Path
     review_dir(cfg=None, create=False) -> Path       create=True makes it (mode 700)
-    classify(paths, cfg=None, cwd=None) -> "infra" | "sensitive"
+    classify(paths, cfg=None, cwd=None, max_mixed=None) -> "infra" | "sensitive"   per-path rules, see below (#43)
+    classify_detail(paths, cfg=None, cwd=None, max_mixed=None) -> dict   the class plus each path's class
+    path_class(path, cfg=None, cwd=None) -> "secret" | "scratch" | "infra" | "sensitive"
+    is_scratch_path(path, cfg=None, cwd=None) -> bool  agent scratch/cache (SCRATCH_GLOBS + JUDGE_SCRATCH_GLOBS)
     is_infra_path(path, cfg=None, cwd=None) -> bool   False for every is_secret_path (#42)
     is_secret_path(path, cfg=None) -> bool            site.env, *.env, keys, secrets/ ... (SECRET_GLOBS + JUDGE_SECRET_GLOBS)
     git_common_dir(path) -> str | None               the repo's shared .git dir (worktrees: the main repo's)
@@ -28,6 +31,7 @@ CLI (used by lib/config.sh):
     config.py --get KEY         print one value
     config.py --review-dir      print the review dir
     config.py --classify PATH.. print infra|sensitive
+    config.py --explain PATH..  print classify_detail() as JSON (per-path classes)
     config.py --ssh HOST        print the ssh argv prefix (shell-quoted)
 """
 from __future__ import annotations
@@ -70,6 +74,8 @@ DEFAULTS: Dict[str, str] = {
     "JUDGE_PLAN_DEBOUNCE_S": "120",        # plan review waits for turn end or this long with no plan write (#34)
     "JUDGE_STALL_MINUTES": "15",           # #41: warn when a ready queue request waited this long (0 = off)
     "JUDGE_SECRET_GLOBS": "",              # #42: extra basename globs of secret files (never infra-class)
+    "JUDGE_SCRATCH_GLOBS": "",             # #43: extra globs of agent scratch/cache paths (never decide the class)
+    "JUDGE_MIXED_MAX_SENSITIVE": "3",      # #43: an infra request may carry up to N withheld sensitive paths (0 = strict)
     # run-1 fixes (one place for every default; site.env and the environment override)
     "JUDGE_HOST_PROBES": "1",              # collector runs read-only host-state probes for host claims
     "JUDGE_NOISE_GLOBS": "",               # extra globs added to snapshot.NOISE_GLOBS
@@ -396,17 +402,109 @@ def is_infra_path(path: str, cfg: Optional[Mapping[str, str]] = None, cwd: Optio
     return bool(common) and common in infra_git_dirs(cfg)
 
 
-def classify(paths: Iterable[str], cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> str:
-    """'infra' only when there is at least one path and EVERY path is infra; otherwise 'sensitive'.
+# ---------------------------------------------------------------- agent scratch / caches (#43)
+# Absolute fnmatch globs (`*` crosses `/`; `~` and $HERMES_HOME expanded) of the agent's own scratch and cache
+# dirs. A changed path there never decides a request's class (it is neither infra nor sensitive), and no bundle
+# shows its content: at most its name and a line count. Secret-shaped files (is_secret_path) are secret wherever
+# they live, scratch dirs included.
+SCRATCH_GLOBS = ("{hh}/cache/*", "{hh}/tmp/*", "~/.cache/*", "*/__pycache__/*", "*/.pytest_cache/*",
+                 "*/.mypy_cache/*", "*/.ruff_cache/*")
 
-    With no paths at all the session's *cwd* decides (infra only if cwd itself is inside an infra location,
-    e.g. the deck repo); no paths and no cwd -> 'sensitive'."""
-    plist = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
-    if not plist:
-        if cwd and is_infra_path(os.path.join(cwd, ".judge-cwd-probe"), cfg, cwd):
-            return "infra"
+
+def scratch_globs(cfg: Optional[Mapping[str, str]] = None) -> List[str]:
+    """SCRATCH_GLOBS (with $HERMES_HOME and ~ expanded, symlinks resolved) plus JUDGE_SCRATCH_GLOBS."""
+    c = _cfg(cfg)
+    hh = _real(c.get("HERMES_HOME") or "~/.hermes")
+    out: List[str] = []
+    for g in list(SCRATCH_GLOBS) + re.split(r"[\s,]+", c.get("JUDGE_SCRATCH_GLOBS") or ""):
+        if not g:
+            continue
+        g = g.replace("{hh}", hh)
+        if g.startswith("~"):
+            g = os.path.expanduser(g)
+        if g.startswith("/"):
+            head, star, tail = g.partition("*")
+            # resolve the literal leading directory (e.g. ~/.cache -> its real location), keep the pattern part
+            d = os.path.dirname(head) if not head.endswith("/") else head.rstrip("/")
+            if d and os.path.isabs(d):
+                g = _real(d).rstrip("/") + head[len(d):] + star + tail
+        out.append(g)
+    return list(dict.fromkeys(out))
+
+
+def is_scratch_path(path: str, cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> bool:
+    """True when *path* (resolved) is under an agent scratch/cache glob (scratch_globs). Host paths never are."""
+    if not isinstance(path, str) or not path.strip() or _REMOTE_RE.match(path.strip()):
+        return False
+    p = _normalize(path.strip(), cwd)
+    return any(fnmatch.fnmatchcase(p, g) for g in scratch_globs(cfg))
+
+
+def path_class(path: str, cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> str:
+    """One path's class: "secret" (is_secret_path, of the path as given or resolved), else "scratch"
+    (is_scratch_path), else "infra" (is_infra_path), else "sensitive"."""
+    if not isinstance(path, str) or not path.strip():
         return "sensitive"
-    return "infra" if all(is_infra_path(p, cfg, cwd) for p in plist) else "sensitive"
+    raw = path.strip()
+    if is_secret_path(raw, cfg):
+        return "secret"
+    if not _REMOTE_RE.match(raw):
+        p = _normalize(raw, cwd)
+        if p.endswith("/.env") or is_secret_path(p, cfg):
+            return "secret"
+    if is_scratch_path(raw, cfg, cwd):
+        return "scratch"
+    return "infra" if is_infra_path(raw, cfg, cwd) else "sensitive"
+
+
+def mixed_max(cfg: Optional[Mapping[str, str]] = None) -> int:
+    """JUDGE_MIXED_MAX_SENSITIVE (default 3; 0 = strict, any sensitive path makes the request sensitive)."""
+    try:
+        return max(0, int(float(_cfg(cfg).get("JUDGE_MIXED_MAX_SENSITIVE") or 3)))
+    except ValueError:
+        return 3
+
+
+def classify_detail(paths: Iterable[str], cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None,
+                    max_mixed: Optional[int] = None) -> Dict:
+    """Per-path classification (#43). Returns {"class", "reason", "infra", "sensitive", "secret", "scratch"}
+    (the four lists hold the given path strings).
+
+    1. any secret path -> sensitive (#42: a secret file keeps the whole bundle away from the frontier);
+    2. scratch paths are left out; with no other path the session *cwd* decides, as with no paths at all;
+    3. every remaining path infra -> infra;
+    4. infra plus a few sensitive paths (at most *max_mixed*, default JUDGE_MIXED_MAX_SENSITIVE, and no more
+       than the infra paths) -> infra with those paths WITHHELD: the collector shows no content and no name
+       for them (reason "mixed");
+    5. otherwise -> sensitive."""
+    plist = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
+    out: Dict = {"infra": [], "sensitive": [], "secret": [], "scratch": []}
+    for p in plist:
+        out[path_class(p, cfg, cwd)].append(p)
+    limit = mixed_max(cfg) if max_mixed is None else max(0, int(max_mixed))
+    if out["secret"]:
+        out.update({"class": "sensitive", "reason": "secret path"})
+    elif not out["infra"] and not out["sensitive"]:
+        infra_cwd = bool(cwd) and is_infra_path(os.path.join(cwd, ".judge-cwd-probe"), cfg, cwd)
+        out.update({"class": "infra" if infra_cwd else "sensitive",
+                    "reason": ("only scratch paths: " if plist else "no paths: ")
+                              + ("cwd is infra" if infra_cwd else "cwd is not infra")})
+    elif not out["sensitive"]:
+        out.update({"class": "infra", "reason": "all paths infra"})
+    elif out["infra"] and len(out["sensitive"]) <= min(limit, len(out["infra"])):
+        out.update({"class": "infra", "reason": "mixed"})
+    else:
+        out.update({"class": "sensitive", "reason": "sensitive path"})
+    return out
+
+
+def classify(paths: Iterable[str], cfg: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None,
+             max_mixed: Optional[int] = None) -> str:
+    """'infra' | 'sensitive' by classify_detail(): secret paths make it sensitive, scratch paths do not count,
+    a few sensitive paths next to infra ones are withheld (JUDGE_MIXED_MAX_SENSITIVE), any other sensitive path
+    makes it sensitive. With no deciding path the session's *cwd* decides (infra only if cwd itself is inside an
+    infra location, e.g. the deck repo); no paths and no cwd -> 'sensitive'."""
+    return classify_detail(paths, cfg, cwd, max_mixed)["class"]
 
 
 # ---------------------------------------------------------------- ssh
@@ -462,6 +560,10 @@ def _main(argv: List[str]) -> int:
         return 0
     if cmd == "--classify":
         print(classify(rest, cfg))
+        return 0
+    if cmd == "--explain":
+        import json
+        print(json.dumps(classify_detail(rest, cfg, os.getcwd()), indent=2))
         return 0
     if cmd == "--ssh" and len(rest) == 1:
         try:

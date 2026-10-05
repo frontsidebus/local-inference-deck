@@ -330,7 +330,7 @@ def frontier_cost_add(usd: Any) -> None:
 
 # ------------------------------------------------------------------------------ input assembly
 # Priority content (bug #19): session-tagged Hermes log lines and gate decisions must never be truncated away
-# by the per-file budget. They get first call on the budget (up to these shares of max_chars; beyond that
+# by the shared budget (#44: water-filled, see bundle_text). They get first call on the budget (up to these shares of max_chars; beyond that
 # they are cut in the middle with a marker, keeping their first and last lines), and hermes-log.txt's
 # untagged context lines share the rest like any other file but are cut in the MIDDLE, never by a head cut
 # that drops whatever comes after them.
@@ -435,11 +435,127 @@ def _fit_hermes_log(text: str, session: str, session_budget: int, context_budget
     return "\n".join(out)
 
 
+def water_fill(needs: Dict[str, int], budget: int) -> Dict[str, int]:
+    """#44: split *budget* over *needs*: smallest first, each gets min(need, equal share of what is left), so
+    what small items do not use goes to the large ones. sum(result) <= max(0, budget)."""
+    out: Dict[str, int] = {}
+    left = max(0, budget)
+    items = sorted(needs.items(), key=lambda kv: (kv[1], kv[0]))
+    for i, (k, need) in enumerate(items):
+        give = min(max(0, need), left // (len(items) - i))
+        out[k] = give
+        left -= give
+    return out
+
+
+# Static assets are cut before code when a diff does not fit (#44): every asset file gets a small share first,
+# the code files are water-filled with the rest, and the assets get what the code leaves.
+ASSET_SUFFIXES = (".css", ".scss", ".less", ".svg", ".html", ".htm", ".min.js", ".map", ".lock", ".woff", ".woff2",
+                  ".ttf", ".otf", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".txt")
+ASSET_MIN = 1500
+_DIFF_PATH_RE = re.compile(r"^(?:diff --git a/\S+ b/(?P<g>.+)|\+\+\+ b?(?P<u>/\S.*))$")
+
+
+def _diff_sections(text: str) -> List[Tuple[str, List[str]]]:
+    """[(path or "", lines)]: a preamble/comment section, then one per file of a unified/git diff."""
+    lines = text.split("\n")
+    secs: List[Tuple[str, List[str]]] = [("", [])]
+    for i, ln in enumerate(lines):
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        cur_lines = secs[-1][1]
+        start = ln.startswith("diff --git ") or (
+            ln.startswith("--- ") and nxt.startswith("+++ ")
+            and not (cur_lines and cur_lines[0].startswith("diff --git ") and not any(x.startswith("@@") for x in cur_lines)))
+        if start:
+            secs.append(("", [ln]))
+        elif ln.startswith("# ") and not any(x.startswith("@@") for x in cur_lines) and secs[-1][0] == "":
+            cur_lines.append(ln)
+        elif ln.startswith("# ") and len(secs) > 1:
+            secs.append(("", [ln]))  # a comment between files (repo header, withheld line): its own section
+        else:
+            cur_lines.append(ln)
+    out = []
+    for _, ls in secs:
+        path = ""
+        for x in ls[:6]:
+            m = _DIFF_PATH_RE.match(x)
+            if m:
+                path = (m.group("g") or m.group("u") or "").strip()
+                break
+        out.append((path, ls))
+    return [s for s in out if s[1]]
+
+
+def _cut_section(lines: List[str], budget: int) -> List[str]:
+    """One file's diff within *budget* chars: its header, then whole hunks while they fit, then a marker."""
+    total = sum(len(x) + 1 for x in lines)
+    if total <= budget:
+        return lines
+    head: List[str] = []
+    hunks: List[List[str]] = []
+    for x in lines:
+        if x.startswith("@@"):
+            hunks.append([x])
+        elif hunks:
+            hunks[-1].append(x)
+        else:
+            head.append(x)
+    kept = list(head)
+    used = sum(len(x) + 1 for x in head) + 120
+    n = 0
+    for h in hunks:
+        size = sum(len(x) + 1 for x in h)
+        if used + size > budget:
+            break
+        kept += h
+        used += size
+        n += 1
+    if n == 0 and hunks:  # not even one whole hunk fits: the first one, cut at a line boundary
+        for x in hunks[0]:
+            if used + len(x) + 1 > budget:
+                break
+            kept.append(x)
+            used += len(x) + 1
+    omitted = total - sum(len(x) + 1 for x in kept)
+    kept.append(f"[... runner omitted {len(hunks) - n} of {len(hunks)} hunk(s) of this file ({omitted} chars) to "
+                f"fit the bundle budget ...]")
+    return kept
+
+
+def fit_diff(text: str, budget: int) -> str:
+    """agent-diff.patch within *budget* chars (#44): comment lines (headers, `# content withheld`, `# NOTE`) are
+    kept; file sections share the rest (assets get ASSET_MIN first, code is water-filled, assets get what
+    code leaves), each cut at hunk boundaries with a marker."""
+    if len(text) <= budget:
+        return text
+    secs = _diff_sections(text)
+    fixed = [i for i, (p, ls) in enumerate(secs) if not p and all(x.startswith("#") or not x for x in ls)]
+    left = budget - sum(sum(len(x) + 1 for x in secs[i][1]) for i in fixed)
+    files = [i for i in range(len(secs)) if i not in fixed]
+    sizes = {str(i): sum(len(x) + 1 for x in secs[i][1]) for i in files}
+    assets = {str(i) for i in files if secs[i][0].lower().endswith(ASSET_SUFFIXES)}
+    alloc = {k: min(sizes[k], ASSET_MIN) for k in assets}
+    left -= sum(alloc.values())
+    code = water_fill({k: v for k, v in sizes.items() if k not in assets}, left)
+    left -= sum(code.values())
+    alloc.update(code)
+    more = water_fill({k: sizes[k] - alloc[k] for k in assets}, left)
+    for k, v in more.items():
+        alloc[k] += v
+    out: List[str] = []
+    for i, (_, ls) in enumerate(secs):
+        out += ls if i in fixed else _cut_section(ls, alloc.get(str(i), 0))
+    return "\n".join(out)
+
+
 def bundle_text(evidence_dir: Path, max_chars: int) -> str:
     """The evidence bundle as one text, at most about *max_chars*. manifest.json comes first. hermes-log.txt's
-    session-tagged lines and gate-decisions.jsonl are priority content (see SESSION_LOG_SHARE); every other
-    file (and hermes-log.txt's untagged context) gets an equal share of what is left, at least MIN_PER_FILE,
-    head-truncated (context: middle-cut). Files that no longer fit at all are listed as omitted."""
+    session-tagged lines and gate-decisions.jsonl are priority content (see SESSION_LOG_SHARE), reserved up front.
+    Every other file (and hermes-log.txt's untagged context) shares what is left by water-filling (#44): small
+    files are included whole and what they leave goes to the large ones, up to the total cap; at least
+    MIN_PER_FILE each when the cap allows. agent-diff.patch is cut by fit_diff (whole hunks, code before static
+    assets), the context lines in the middle, any other file at its end. Files that no longer fit at all are
+    listed as omitted."""
     files = [p for p in sorted(evidence_dir.rglob("*")) if p.is_file() and p.name not in OWN_FILES]
     files.sort(key=lambda p: (p.name != "manifest.json", str(p)))
     if not files:
@@ -472,9 +588,14 @@ def bundle_text(evidence_dir: Path, max_chars: int) -> str:
         sess_budget = min(sess_len, int(max_chars * SESSION_LOG_SHARE))
     used_priority = sum(len(t) for t in priority.values()) + (sess_budget if sess_text else 0)
     others = [r for r in texts if r not in priority]  # hermes-log.txt counts here for its context share
-    per_file = max(MIN_PER_FILE, (max_chars - used_priority) // max(1, len(others)))
+    overhead = sum(len(f"=== FILE: {r} ===\n\n") + 100 for r in texts)  # headers + truncation markers
+    needs = {r: (log_ctx_len if r == "hermes-log.txt" else len(texts[r])) for r in others}
+    alloc = water_fill(needs, max_chars - used_priority - overhead)
+    for r in others:  # the old floor: a share of at least MIN_PER_FILE (the size cap below still applies)
+        alloc[r] = max(alloc.get(r, 0), min(needs[r], MIN_PER_FILE))
     if sess_text:
-        priority["hermes-log.txt"] = _fit_hermes_log(sess_text, session, sess_budget, min(log_ctx_len, per_file))
+        priority["hermes-log.txt"] = _fit_hermes_log(sess_text, session, sess_budget,
+                                                     min(log_ctx_len, alloc.get("hermes-log.txt", 0)))
 
     chunks = {rel: f"=== FILE: {rel} ===\n{priority[rel]}\n" for rel in priority}
     parts, used = [], sum(len(c) for c in chunks.values())  # priority content is reserved up front
@@ -482,8 +603,12 @@ def bundle_text(evidence_dir: Path, max_chars: int) -> str:
         if rel in chunks:
             parts.append(chunks[rel])
             continue
-        if len(text) > per_file:
-            text = text[:per_file] + f"\n[... truncated by runner: {len(text) - per_file} more chars ...]"
+        share = alloc.get(rel, MIN_PER_FILE)
+        if len(text) > share:
+            if rel == "agent-diff.patch":
+                text = fit_diff(text, share)
+            else:
+                text = text[:share] + f"\n[... truncated by runner: {len(text) - share} more chars ...]"
         chunk = f"=== FILE: {rel} ===\n{text}\n"
         if rel != "manifest.json" and used + len(chunk) > max_chars:
             parts.append(f"=== FILE: {rel} ===\n[omitted by runner: bundle size cap]\n")
@@ -491,6 +616,19 @@ def bundle_text(evidence_dir: Path, max_chars: int) -> str:
         parts.append(chunk)
         used += len(chunk)
     return "".join(parts)
+
+
+def bundle_request(request: Dict[str, Any], evidence_dir: Path) -> Dict[str, Any]:
+    """The request as the judge sees it: the bundle's masked copy (manifest `request`, #43: sensitive path names
+    replaced by `[sensitive path #N withheld]` labels) when the collector masked it, else *request*."""
+    try:
+        man = C.read_json(evidence_dir / "manifest.json")
+    except Exception:
+        return request
+    if (isinstance(man, dict) and man.get("masked_request") and isinstance(man.get("request"), dict)
+            and man["request"].get("id") == request.get("id")):
+        return man["request"]
+    return request
 
 
 def build_user_message(request: Dict[str, Any], bundle: str, probes_allowed: bool) -> str:
@@ -797,6 +935,7 @@ def judge_bundle(request_id: str, request: Dict[str, Any], evidence_dir: Path, m
     JudgeError (with .mode/.model) when the backend fails. *notes* is extended in place."""
     max_chars = int(C.setting("JUDGE_BUNDLE_MAX_CHARS", "150000" if mode == "frontier" else "60000"))
     bundle = bundle_text(evidence_dir, max_chars)
+    request = bundle_request(request, evidence_dir)
     messages = [{"role": "system", "content": PROMPT_PATH.read_text(encoding="utf-8")},
                 {"role": "user", "content": build_user_message(request, bundle, probes_allowed)}]
     return _judge_loop(request_id, request, messages, bundle, mode, notes, evidence_dir,
