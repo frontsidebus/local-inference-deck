@@ -24,7 +24,7 @@ Internet ──443──> nginx ──wg0 (EDGE_WG_IP -> BACKEND_WG_IP)──> b
 | `nginx/nginx.conf` | `/etc/nginx/nginx.conf` | Ubuntu stock, except `ssl_protocols TLSv1.2 TLSv1.3` |
 | `nginx/conf.d/phase3-http.conf` | `/etc/nginx/conf.d/` | `server_tokens off`, limit zones, websocket + no-credentials maps |
 | `nginx/snippets/{proxy,tls}-common.conf` | `/etc/nginx/snippets/` | proxy headers; certbot TLS params + HSTS etc. |
-| `nginx/sites-available/*.tmpl` | `/etc/nginx/sites-available/{00-default,10-apex,20-chat,30-id,40-api,50-telemetry}` (+ `60-digest` when `SPARK_DIGEST_HOST` is set) | all symlinked into `sites-enabled/`; the stock `default` is removed |
+| `nginx/sites-available/*.tmpl` | `/etc/nginx/sites-available/{00-default,10-apex,20-chat,30-id,40-api,50-telemetry}` (+ `60-digest` when `SPARK_DIGEST_HOST` is set) | all symlinked into `sites-enabled/`; the stock `sites-enabled/default` link is removed (the package's `sites-available/default` file stays, unused) |
 | `nginx/bootstrap/00-acme-bootstrap.tmpl` | `sites-available/00-acme-bootstrap` | temporary port-80-only site for the first certs |
 | `nginx/bootstrap/60-digest-acme.tmpl` | `sites-available/60-digest-acme` | digest only: ACME-only port-80 stub that `sites-enabled/60-digest` points at until the digest cert exists (removed once the full site is linked) |
 | `nginx/snippets/pocketid-setup-lock.conf.in` | `snippets/pocketid-setup-lock.conf` | optional; rendered by `scripts/setup-lock.sh` (one `allow` per admin IP) |
@@ -61,6 +61,9 @@ Optional digest site: `SPARK_DIGEST_HOST` switches it on. Then `DIGEST_PORT` (de
 are added to `COVENANT_VARS`. With `SPARK_DIGEST_HOST` empty none of them is needed and the deploy
 is exactly the six-site one, plus a single `digest: off` line.
 
+Both client ids must be the ids Pocket-ID really has, which are not always the client names (see
+[Pocket-ID clients and groups](#pocket-id-clients-and-groups)). They are not secrets.
+
 ## Secrets
 
 Generated on the host by `scripts/gen-secrets.sh covenant` (`scripts/secrets.d/covenant.sh`),
@@ -78,6 +81,45 @@ which `deploy.sh` calls. Existing files are never overwritten; values are never 
 
 oauth2-proxy never reads the secret files directly: systemd's `LoadCredential=` hands the
 unprivileged `oauth2-proxy` user a private copy under `%d`.
+
+`--set-client-secret` (with `--instance digest` for the second instance) reads the secret from
+stdin with no echo, writes it root 0600 without a trailing newline, and restarts the instance. It
+checks `site.env` like a full run, so run it from the checkout that holds the edge's `site.env`. It
+refuses to replace an existing secret unless `--force` is given. Piped input needs a trailing
+newline: without one, `read` fails at the end of the input and the script exits without storing
+anything. Rotation of every secret here: [docs/runbooks/rotate-secrets.md](../docs/runbooks/rotate-secrets.md).
+
+## Pocket-ID clients and groups
+
+Pocket-ID (on Walter) is the only identity provider. Every web app has **its own OIDC client and its
+own group**, so access to one site never implies another:
+
+| Site | Client id (`site.env`) | Group | Gate |
+|---|---|---|---|
+| `SPARK_CHAT_HOST` | `open-webui` | `CHAT_GROUP` (`chat-users`) | Open WebUI's own OIDC login (client secret on Walter) |
+| `SPARK_TELEMETRY_HOST` | `OAUTH2_PROXY_CLIENT_ID` (`telemetry`) | `TELEMETRY_GROUP` (`telemetry-viewers`) | `oauth2-proxy` on 127.0.0.1:4180 |
+| `SPARK_DIGEST_HOST` (optional) | `OAUTH2_PROXY_DIGEST_CLIENT_ID` (`digest`, or a UUID) | `DIGEST_GROUP` (`digest-viewers`) | `oauth2-proxy-digest` on 127.0.0.1:4181 |
+
+Every client is set up the same way: confidential (it has a client secret), PKCE on (oauth2-proxy
+sends `code_challenge_method=S256`), callback `https://<site>/oauth2/callback` (Open WebUI:
+`/oauth/oidc/callback`), launch URL `https://<site>`, and **allowed user groups** set to the one
+group. The oauth2-proxy instances check the group a second time (`allowed_groups`), so a user
+outside it is refused even if the client restriction is ever lost. Giving someone a site means
+adding them to its group: [docs/runbooks/add-user.md](../docs/runbooks/add-user.md).
+
+**Client id vs name.** Pocket-ID shows a client's name, but oauth2-proxy sends its **id**. When you
+create a client in the UI, Pocket-ID generates a random id (a UUID) unless you set a custom one. The
+telemetry and open-webui clients were created with custom ids; a client created without one needs
+its real id in `site.env`. Check an id with Pocket-ID's public metadata endpoint (no login):
+
+```
+curl -s -w ' %{http_code}\n' https://SPARK_ID_HOST/api/oidc/clients/<client id>/meta
+# 200 {"id":"<client id>","name":...,"launchURL":...}   or   404 "OIDC client not found"
+```
+
+`walter/webui/pocketid-bootstrap.py` creates the chat and telemetry groups and clients; the digest
+group and client are created in the UI (or with the API method in walter/README.md), as described in
+[docs/runbooks/digest-deploy.md](../docs/runbooks/digest-deploy.md#3-pocket-id-group-and-client).
 
 ## Pinned versions
 
@@ -106,6 +148,8 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
 1. AWS as above; DNS resolving to the Elastic IP for all five names (six with the digest).
 2. On the edge: clone the repo, `cp site.env.example site.env`, fill it in.
    `WG_BACKEND_PUBLIC_KEY` comes from the backend (`wg pubkey < /etc/wireguard/privatekey` there).
+   It must be the real key: with `CHANGEME` the dry run only warns, and the live run stops at step
+   2/7.
 3. `sudo covenant/deploy.sh --dry-run`, read it, then
    `sudo covenant/deploy.sh --setup-lock` (the lock is only for step 5's window). It runs, in order:
    1. packages, sshd hardening (`sshd -t` then reload), unattended-upgrades, secrets;
@@ -136,9 +180,18 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
    (everyone else gets 403 while the lock is on), then `sudo covenant/deploy.sh` without
    `--setup-lock` (or `covenant/scripts/setup-lock.sh disable`).
 6. In Pocket-ID create the OIDC client for the telemetry gate: client id `OAUTH2_PROXY_CLIENT_ID`,
-   callback `https://SPARK_TELEMETRY_HOST/oauth2/callback`, PKCE on, allowed group `TELEMETRY_GROUP`.
-   Then `sudo covenant/deploy.sh --set-client-secret` (paste; no echo) - this starts oauth2-proxy.
+   callback `https://SPARK_TELEMETRY_HOST/oauth2/callback`, confidential, PKCE on, allowed group
+   `TELEMETRY_GROUP` (`walter/webui/pocketid-bootstrap.py` does this). Check the id with the `/meta`
+   probe ([Pocket-ID clients and groups](#pocket-id-clients-and-groups)), then
+   `sudo covenant/deploy.sh --set-client-secret` (paste; no echo) - this starts oauth2-proxy.
    The digest gate (optional) is set up the same way - see the Digest section below.
+
+**Re-running on a live edge.** `deploy.sh` converges the whole edge, not just what you changed, so
+read every dry run for unexpected lines. `install /etc/wireguard/wg0.conf` appears whenever the live
+file differs from the render, even only in a comment, and without a diff (the file holds the private
+key); compare the two with the key masked before the live run, which applies it with
+`wg syncconf`. A few lines are printed by every dry run and are not changes: the `ufw` rule list, and
+`+ systemctl start oauth2-proxy` (the dry run cannot see unit state).
 
 Adding a new hostname later: add the site + its name to `deploy.sh`. A core name (in `NAMES`)
 with a missing cert makes the next run fall back to the bootstrap site, which it refuses to do on
@@ -164,7 +217,9 @@ is otherwise identical to a deploy without the feature. If the digest is off but
 Enabling it on a live edge:
 
 1. `site.env`: set `SPARK_DIGEST_HOST` (and `DIGEST_GROUP` / `OAUTH2_PROXY_DIGEST_CLIENT_ID` if
-   the defaults do not suit). The DNS A record must already resolve to `EDGE_PUBLIC_IP`.
+   the defaults do not suit). The DNS A record must already resolve to `EDGE_PUBLIC_IP`. Create the
+   Pocket-ID group and client (step 4) **before** the deploy, so that the client id in `site.env` is
+   the real one (`/meta` probe) and the client secret is at hand for step 5.
 2. **Do not issue the cert by hand first.** `00-default` does not answer ACME for the digest
    name: its `:80 default_server` returns 444 and its ACME block lists only the apex, chat, api
    and id names. The digest's own `:80` ACME block lives in `60-digest`, next to a `:443` server
@@ -180,15 +235,23 @@ Enabling it on a live edge:
    the instance is not started (no client secret yet). In the dry run, step 5/7 says the full site
    is linked once step 4 has issued the cert.
 
+   **From here until step 5 the full site is public and answers 500**: nginx's auth subrequest
+   cannot reach 127.0.0.1:4181 yet. That is fail-closed (nothing reaches the backend), but run
+   step 5 right away.
+
    If certbot fails (DNS not resolving yet, port 80 blocked), the deploy does not stop: the digest
    stays on the stub (the name answers ACME and nothing else) and deploy prints the next step,
    `certs.sh <digest host>` and then `deploy.sh` again. The re-run finds the cert and links the
    full site. Check the cert with
    `sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST"` (`Key Type: ECDSA`).
-4. In Pocket-ID create the OIDC client: client id `OAUTH2_PROXY_DIGEST_CLIENT_ID`, callback
-   `https://SPARK_DIGEST_HOST/oauth2/callback`, PKCE on, allowed group `DIGEST_GROUP`.
+4. The Pocket-ID group `DIGEST_GROUP` and OIDC client (do this before step 3, see step 1): callback
+   `https://SPARK_DIGEST_HOST/oauth2/callback`, confidential, PKCE on, allowed group `DIGEST_GROUP`.
+   If Pocket-ID gave it a UUID id, that UUID is `OAUTH2_PROXY_DIGEST_CLIENT_ID`. A wrong id is only
+   fixed by correcting `site.env` and re-running `deploy.sh`: `--set-client-secret` does not
+   re-render the config.
 5. `sudo covenant/deploy.sh --set-client-secret --instance digest` (paste; no echo). It stores
-   `/etc/oauth2-proxy-digest/client-secret` (root 0600) and restarts `oauth2-proxy-digest`.
+   `/etc/oauth2-proxy-digest/client-secret` (root 0600) and restarts `oauth2-proxy-digest`, which
+   ends the 500 window.
 
 `--instance` takes `telemetry` (the default) or `digest` and only matters with
 `--set-client-secret`. It needs a value (`--instance` alone exits 2 with a message), and
@@ -199,18 +262,26 @@ Enabling it on a live edge:
 ```
 sudo nginx -t && systemctl is-active nginx wg-quick@wg0 oauth2-proxy fail2ban ufw
 systemctl is-active oauth2-proxy-digest   # only with the digest on
+ss -ltn | grep -E ':418[01] '             # 127.0.0.1:4180 (and 127.0.0.1:4181 with the digest)
+ls -l /etc/nginx/sites-enabled/           # 00-default ... 50-telemetry (+ 60-digest), all -> sites-available
 sudo wg show wg0 latest-handshakes
-sudo ufw status verbose
+sudo ufw status verbose                   # 22, 80, 443/tcp + WG_PORT/udp; plus any fail2ban REJECT lines
 sudo fail2ban-client status            # jails: nginx-limit-req, recidive, sshd
-sudo certbot certificates; sudo certbot renew --dry-run
+sudo certbot certificates; sudo certbot renew --dry-run   # every cert Key Type: ECDSA
 curl -sI https://SPARK_DOMAIN | grep -i location                     # -> https://SPARK_CHAT_HOST/...
 curl -s -o /dev/null -w '%{http_code}\n' https://SPARK_API_HOST/v1/models   # 401 (no key)
 curl -s -o /dev/null -w '%{http_code}\n' https://SPARK_API_HOST/metrics     # 404
 curl -s https://SPARK_TELEMETRY_HOST/api/v1/telemetry                       # {"error":"unauthorized"}
 curl -s https://SPARK_DIGEST_HOST/api/watches                                # {"error":"unauthorized"} (digest on)
+curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' https://SPARK_DIGEST_HOST/  # 302 -> SPARK_ID_HOST/authorize?client_id=...
 curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: nope' -k https://EDGE_PUBLIC_IP/   # 000 (444)
 sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication'               # no / no
 ```
+
+Every renewal config in `/etc/letsencrypt/renewal/` should say `authenticator = webroot`,
+`key_type = ecdsa`, the ACME v2 production `server`, and the `reload-nginx.sh` hook. A cert issued
+outside `certs.sh` may also carry `installer = nginx`; that is harmless (renewal still uses the
+webroot, and the installer only reloads nginx afterwards).
 
 ## Rollback
 

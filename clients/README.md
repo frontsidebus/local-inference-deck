@@ -89,7 +89,10 @@ key). See `walter/` for how they are generated; they live in
   save it once per harness file, or point every wrapper at one file with
   `SPARK_KEY_DIR` / the `*_KEY_FILE` variables. Cline should get its own key.
 - Never paste a key into a config file, a shell rc or a chat. Rotate by replacing the
-  file contents; nothing else needs to change.
+  file contents; no config changes. The wrappers read the key once, at process start, so
+  restart running sessions (and `hermes-gateway`) after the swap, before the old key is
+  deleted. The full procedure, with every other copy of a key:
+  [docs/runbooks/rotate-secrets.md](../docs/runbooks/rotate-secrets.md#rotate-a-litellm-virtual-key).
 
 ## Install
 
@@ -247,7 +250,9 @@ API server runs.
 - The unit starts Hermes through `hermes-spark`, so it reads the gateway key from
   `~/.config/spark/hermes.key`. The original setup instead kept a copy of that key in
   `~/.hermes/.env` as `SPARK_HERMES_API_KEY` and ran the venv python directly;
-  both work, but the key-file way leaves one copy of the secret.
+  both work, but the key-file way leaves one copy of the secret. A machine still on the
+  old layout has two copies of the `hermes` key (`hermes.key` and that `.env` line), and a
+  rotation must swap both.
 
 Install: `clients/install.sh --with-hermes-gateway [--force]`, then
 ```
@@ -287,7 +292,10 @@ remove the `hermes-agent` connection from Open WebUI.
 | Hermes harness key | `~/.config/spark/hermes.key` | 600 | LiteLLM virtual key `hermes` |
 | OpenCode harness key | `~/.config/spark/opencode.key` | 600 | LiteLLM virtual key `opencode` |
 | `API_SERVER_KEY` (optional gateway) | `~/.hermes/.env` | 600 | `openssl rand -hex 32`; also in Open WebUI's `OPENAI_API_KEYS` |
-| `SPARK_HERMES_API_KEY` (legacy layout only) | `~/.hermes/.env` | 600 | copy of `hermes.key`; not needed with this unit |
+| `SPARK_HERMES_API_KEY` (legacy layout only) | `~/.hermes/.env` | 600 | copy of `hermes.key`; not needed with this unit, but must be rotated with it while it exists |
+
+Rotation (new key, swap every copy, restart, delete the old key, restore the alias):
+[docs/runbooks/rotate-secrets.md](../docs/runbooks/rotate-secrets.md).
 
 ## Verify / rollback
 
