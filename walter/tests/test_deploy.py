@@ -226,3 +226,93 @@ def test_persistenced_dropin_change_restarts(tmp_path):
     out = deploy(root, env, repo=repo)
     assert "systemctl restart nvidia-persistenced.service" in out
     assert all("--build" not in compose_lines(out, s)[0] for s in ("telemetry", "digest"))
+
+
+# ---- deploy.sh --destdir: docs never recreate or rebuild ---------------------------------------
+
+def append(path, text="\n<!-- test change -->\n"):
+    with open(path, "a") as f:
+        f.write(text)
+
+
+def test_monitoring_readme_only_change_no_recreate(tmp_path):
+    repo, root, env = repo_copy(tmp_path), seeded_root(tmp_path), env_on(tmp_path)
+    deploy(root, env, repo=repo)
+    append(repo / "walter/monitoring/README.md.tmpl")
+    out = deploy(root, env, repo=repo)
+    assert changed_lines(out) == ["  new      /srv/monitoring/README.md"]
+    assert "<!-- test change -->" in (root / "srv/monitoring/README.md").read_text()   # still installed
+    assert "--force-recreate" not in compose_lines(out, "monitoring")[0]
+    assert "  force-recreate: no (only docs changed: /srv/monitoring/README.md)" in out
+    assert "--force-recreate" not in out
+
+
+def test_monitoring_config_change_recreates(tmp_path):
+    repo, root, env = repo_copy(tmp_path), seeded_root(tmp_path), env_on(tmp_path)
+    deploy(root, env, repo=repo)
+    append(repo / "walter/monitoring/blackbox/blackbox.yml", "# test change\n")
+    append(repo / "walter/monitoring/README.md.tmpl")
+    out = deploy(root, env, repo=repo)
+    assert "--force-recreate" in compose_lines(out, "monitoring")[0]
+    assert "  force-recreate: yes (changed in this run: /srv/monitoring/blackbox/blackbox.yml)" in out
+    for stack in ("gateway", "webui", "telemetry", "digest"):
+        assert "--force-recreate" not in compose_lines(out, stack)[0]
+
+
+def test_dashboard_generator_change_no_recreate(tmp_path):
+    # grafana/build_spark_overview.py is not mounted; only its output under grafana/provisioning is.
+    repo, root, env = repo_copy(tmp_path), seeded_root(tmp_path), env_on(tmp_path)
+    deploy(root, env, repo=repo)
+    append(repo / "walter/monitoring/grafana/build_spark_overview.py.tmpl", "# test change\n")
+    out = deploy(root, env, repo=repo)
+    assert changed_lines(out) == ["  new      /srv/monitoring/grafana/build_spark_overview.py"]
+    assert "--force-recreate" not in compose_lines(out, "monitoring")[0]
+
+
+@pytest.mark.parametrize("stack,readme", [("telemetry", "README.md.tmpl"), ("digest", "README.md")])
+def test_build_stack_readme_change_no_rebuild(tmp_path, stack, readme):
+    repo, root, env = repo_copy(tmp_path), seeded_root(tmp_path), env_on(tmp_path)
+    deploy(root, env, repo=repo)
+    hash_before = (root / f"srv/{stack}/.build-hash").read_text()
+    append(repo / f"walter/{stack}/{readme}")
+    out = deploy(root, env, repo=repo)
+    assert changed_lines(out) == [f"  new      /srv/{stack}/README.md"]
+    assert out.count("rebuild: no (build inputs unchanged") == 2
+    assert f"docs changed: /srv/{stack}/README.md" in out
+    line = compose_lines(out, stack)[0]
+    assert "--build" not in line and "--force-recreate" not in line
+    assert (root / f"srv/{stack}/.build-hash").read_text() == hash_before
+
+
+def test_doc_under_build_tree_no_rebuild_code_change_rebuilds(tmp_path):
+    repo, root, env = repo_copy(tmp_path), seeded_root(tmp_path), env_on(tmp_path)
+    deploy(root, env, repo=repo)
+    (repo / "walter/digest/build/app/NOTES.md").write_text("notes\n")
+    out = deploy(root, env, repo=repo)
+    assert changed_lines(out) == ["  new      /srv/digest/build/app/NOTES.md"]
+    assert "--build" not in compose_lines(out, "digest")[0]
+    append(repo / "walter/digest/build/app/main.py", "# test change\n")
+    out = deploy(root, env, repo=repo)
+    assert "rebuild: yes (compose.yaml or build/ changed in this run: /srv/digest/build/app/main.py)" in out
+    assert "--build" in compose_lines(out, "digest")[0]
+    assert "--build" not in compose_lines(out, "telemetry")[0]
+
+
+def test_build_hash_unchanged_for_trees_without_docs(tmp_path):
+    # The doc exclusion must not invalidate markers written before it: same hash as the old definition
+    # (compose.yaml + every file under build/) when build/ holds no docs, so no one-time rebuild.
+    root, env = seeded_root(tmp_path), env_on(tmp_path)
+    deploy(root, env)
+    for stack in ("telemetry", "digest"):
+        d = root / "srv" / stack
+        old = subprocess.run("find compose.yaml build -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum"
+                             " | sha256sum | cut -c1-64", shell=True, cwd=d, capture_output=True,
+                             text=True, check=True).stdout.strip()
+        assert (d / ".build-hash").read_text().strip() == old
+
+
+def test_no_stack_bind_mounts_a_doc_file():
+    # is_doc() in deploy.sh relies on this: a mounted single doc file would need a recreate on change.
+    for tmpl in sorted((REPO / "walter").glob("*/compose.yaml.tmpl")):
+        for m in re.finditer(r"^\s*-\s*(\./[^:\s]+):", tmpl.read_text(), flags=re.M):
+            assert not re.search(r"\.(md|example)$", m.group(1)), f"{tmpl}: {m.group(1)}"
