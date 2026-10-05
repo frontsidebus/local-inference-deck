@@ -80,9 +80,9 @@ curl -fsS http://${BACKEND_WG_IP}:3200/healthz   # ok
 sudo install -m 0440 -o root -g 10001 /etc/llama-swap/api-key secrets/llama-swap-api-key   # read on every poll
 ```
 
-`walter/deploy.sh` runs `docker compose up -d --build` here on **every** run. Even when every build layer is cached, the
-rebuilt image gets a new ID, so `telemetry-app` is recreated (a few seconds of dashboard reconnects). The deploy's dry run
-does not show this.
+`walter/deploy.sh` rebuilds this stack (`docker compose up -d --build`, which recreates `telemetry-app`: a few seconds of
+dashboard reconnects) only when `compose.yaml` or `build/` changed, when the `.build-hash` marker here is missing or stale,
+or with `--rebuild`; otherwise it runs a plain `up -d`. Each run prints `rebuild: yes (<why>)` or `rebuild: no`.
 
 ## Troubleshooting
 | Symptom | Check / fix |

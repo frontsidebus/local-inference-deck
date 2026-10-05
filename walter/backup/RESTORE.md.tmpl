@@ -9,7 +9,11 @@ root-only (dirs 700, files 600) and is **not encrypted** locally. Snapshots cont
 files, keys and DB dumps.
 
 Logs: `journalctl -u spark-backup`. Run a backup now: `sudo systemctl start spark-backup`.
+<!-- @@if RESTIC_BUCKET@@ -->
 An encrypted offsite copy (restic on S3) is made daily at 04:30 UTC: see section 7.
+<!-- @@else@@ -->
+There is **no offsite copy**: offsite backups were not configured when this file was rendered (see section 7).
+<!-- @@endif@@ -->
 Run the non-destructive restore test (uses throwaway containers only):
 `sudo /usr/local/sbin/spark-backup-restore-test.sh [${MODELS_DIR}/backups/<snapshot>]`
 
@@ -168,6 +172,7 @@ with `chown -R root:llamaswap /etc/llama-swap`.
 
 ---
 
+<!-- @@if RESTIC_BUCKET@@ -->
 ## 7. Offsite copy (restic on S3)
 
 `spark-offsite.timer` (04:30 UTC daily) copies all of `${MODELS_DIR}/backups` into the restic repo
@@ -225,3 +230,11 @@ then finds the repo and does not run `init`.
 
 If objects were deleted from the bucket (for example by an attacker with root on Walter), the
 noncurrent versions are kept for 30 days: see OFFSITE.md section 4.
+<!-- @@else@@ -->
+## 7. Offsite copy (not configured)
+
+Offsite backups were off when this file was rendered (`RESTIC_BUCKET` empty or CHANGEME in site.env), so the
+snapshots above exist only on the `${MODELS_DIR}` disk: losing that disk loses every backup. To add an
+encrypted offsite copy (restic on S3), follow `walter/backup/OFFSITE.md` in the repo. Its setup
+re-renders this file with the offsite restore steps.
+<!-- @@endif@@ -->
