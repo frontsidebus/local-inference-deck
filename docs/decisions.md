@@ -20,6 +20,8 @@ Short records of the choices behind gen3. Each says what was decided, why, and w
 
 **Revisit when** a bifurcation riser gives both GPUs x8: a vLLM entry inside llama-swap becomes possible, preferring pipeline parallel or single-GPU over tensor parallel.
 
+**Update 2026-10-05.** The riser is in: both GPUs are Gen4 x8 on CPU root ports. llama.cpp's own experimental tensor split (`-sm tensor`, NCCL over host shared memory, since there is still no P2P) now works and is used for the dense split models `hermes` and `vision` (see [walter/llama-swap/BENCHMARKS.md](../walter/llama-swap/BENCHMARKS.md)). That removed the main reason to look at vLLM; llama.cpp stays.
+
 ---
 
 ## 2. nginx instead of Caddy on the edge
