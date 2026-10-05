@@ -1,0 +1,2 @@
+URL	Description	Prompt	GT
+https://nvd.nist.gov/vuln/detail/CVE-2099-0001	An invented web app reflects the q parameter without encoding.	Map this invented CVE to a CWE. Last line: CWE ID only.  CVE Description: An invented web app reflects the q parameter without encoding. 	CWE-79

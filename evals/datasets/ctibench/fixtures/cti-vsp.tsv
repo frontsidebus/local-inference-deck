@@ -1,0 +1,2 @@
+URL	Description	Prompt	GT
+https://nvd.nist.gov/vuln/detail/CVE-2099-0002	An invented daemon crashes on a malformed packet.	Give the CVSS v3.1 vector for: An invented daemon crashes on a malformed packet.	CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H

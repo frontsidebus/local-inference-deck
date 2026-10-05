@@ -1,0 +1,239 @@
+{
+ "resultsPerPage": 6,
+ "startIndex": 0,
+ "totalResults": 6,
+ "vulnerabilities": [
+  {
+   "cve": {
+    "id": "CVE-2099-0003",
+    "sourceIdentifier": "cna@example.org",
+    "published": "2099-08-02T10:00:00.000",
+    "vulnStatus": "Analyzed",
+    "descriptions": [
+     {
+      "lang": "en",
+      "value": "An invented CMS lets remote users run SQL through the id parameter of a listing page."
+     }
+    ],
+    "weaknesses": [
+     {
+      "source": "nvd@nist.gov",
+      "type": "Primary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "CWE-89"
+       }
+      ]
+     },
+     {
+      "source": "cna@example.org",
+      "type": "Secondary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "CWE-20"
+       }
+      ]
+     }
+    ],
+    "metrics": {
+     "cvssMetricV31": [
+      {
+       "source": "nvd@nist.gov",
+       "type": "Primary",
+       "cvssData": {
+        "version": "3.1",
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+       }
+      },
+      {
+       "source": "cna@example.org",
+       "type": "Secondary",
+       "cvssData": {
+        "version": "3.1",
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "cve": {
+    "id": "CVE-2099-0001",
+    "sourceIdentifier": "cna@example.org",
+    "published": "2099-08-02T10:00:00.000",
+    "vulnStatus": "Deferred",
+    "descriptions": [
+     {
+      "lang": "en",
+      "value": "An invented plugin reflects a search term into the page without output encoding."
+     }
+    ],
+    "weaknesses": [
+     {
+      "source": "cna@example.org",
+      "type": "Secondary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "CWE-79"
+       }
+      ]
+     }
+    ],
+    "metrics": {
+     "cvssMetricV31": [
+      {
+       "source": "cna@example.org",
+       "type": "Secondary",
+       "cvssData": {
+        "version": "3.1",
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "cve": {
+    "id": "CVE-2099-0002",
+    "sourceIdentifier": "cna@example.org",
+    "published": "2099-08-02T10:00:00.000",
+    "vulnStatus": "Rejected",
+    "descriptions": [
+     {
+      "lang": "en",
+      "value": "** REJECT ** This candidate was withdrawn by its CNA. Do not use it."
+     }
+    ],
+    "weaknesses": [
+     {
+      "source": "cna@example.org",
+      "type": "Secondary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "CWE-79"
+       }
+      ]
+     }
+    ],
+    "metrics": {
+     "cvssMetricV31": []
+    }
+   }
+  },
+  {
+   "cve": {
+    "id": "CVE-2099-0004",
+    "sourceIdentifier": "cna@example.org",
+    "published": "2099-08-02T10:00:00.000",
+    "vulnStatus": "Received",
+    "descriptions": [
+     {
+      "lang": "en",
+      "value": "An invented router has a path traversal flaw (CWE-22) in its file download handler."
+     }
+    ],
+    "weaknesses": [
+     {
+      "source": "cna@example.org",
+      "type": "Secondary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "CWE-22"
+       }
+      ]
+     }
+    ],
+    "metrics": {
+     "cvssMetricV31": [
+      {
+       "source": "cna@example.org",
+       "type": "Secondary",
+       "cvssData": {
+        "version": "3.1",
+        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "cve": {
+    "id": "CVE-2099-0005",
+    "sourceIdentifier": "cna@example.org",
+    "published": "2099-08-02T10:00:00.000",
+    "vulnStatus": "Received",
+    "descriptions": [
+     {
+      "lang": "en",
+      "value": "An invented service has two weaknesses and only a CVSS v4 score in this record."
+     }
+    ],
+    "weaknesses": [
+     {
+      "source": "cna@example.org",
+      "type": "Secondary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "CWE-787"
+       },
+       {
+        "lang": "en",
+        "value": "CWE-125"
+       }
+      ]
+     }
+    ],
+    "metrics": {
+     "cvssMetricV31": []
+    }
+   }
+  },
+  {
+   "cve": {
+    "id": "CVE-2099-0006",
+    "sourceIdentifier": "cna@example.org",
+    "published": "2099-08-02T10:00:00.000",
+    "vulnStatus": "Analyzed",
+    "descriptions": [
+     {
+      "lang": "en",
+      "value": "An invented agent with NVD-CWE-noinfo only, and a CNA vector string."
+     }
+    ],
+    "weaknesses": [
+     {
+      "source": "nvd@nist.gov",
+      "type": "Primary",
+      "description": [
+       {
+        "lang": "en",
+        "value": "NVD-CWE-noinfo"
+       }
+      ]
+     }
+    ],
+    "metrics": {
+     "cvssMetricV31": [
+      {
+       "source": "cna@example.org",
+       "type": "Secondary",
+       "cvssData": {
+        "version": "3.1",
+        "vectorString": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+       }
+      }
+     ]
+    }
+   }
+  }
+ ]
+}
