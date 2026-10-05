@@ -104,6 +104,7 @@ def test_bundle_infra(env):
 def test_bundle_sensitive_has_no_content(env, monkeypatch):
     monkeypatch.setenv("JUDGE_MIXED_MAX_SENSITIVE", "0")  # strict: no withheld paths in an infra bundle (#43)
     _snapshot_and_change(env)
+    _agent_wrote("/home/x/company/app.py")                       # confirmed: it decides the class
     r = _request(env, data_class="infra", paths=[str(env["hermes"] / "config.yaml"), "/home/x/company/app.py"])
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
     man = json.loads((ev / "manifest.json").read_text())
@@ -112,14 +113,14 @@ def test_bundle_sensitive_has_no_content(env, monkeypatch):
     assert "mode: off" not in diff
     assert (f"# content withheld (data_class=sensitive): {env['hermes'] / 'config.yaml'} \u2014 3 lines changed "
             "(+2/-1) [modified]") in diff
-    # the unbacked request path is not the agent's, but still makes the bundle sensitive
-    assert man["attribution"]["rejected_request_paths"] == ["/home/x/company/app.py"]
+    assert man["attribution"]["unconfirmed_paths"] == [] and man["attribution"]["rejected_request_paths"] == []
 
 
 def test_bundle_mixed_withholds_the_sensitive_path(env):
     """#43 default: one sensitive request path next to an infra one keeps the bundle infra; the sensitive path is
     named nowhere (a label instead), the infra content is shown."""
     _snapshot_and_change(env)
+    _agent_wrote("/home/x/company/app.py")
     r = _request(env, data_class="infra", paths=[str(env["hermes"] / "config.yaml"), "/home/x/company/app.py"])
     ev = collect.collect(r["id"], runner=runner(), now=NOW)
     man = json.loads((ev / "manifest.json").read_text())

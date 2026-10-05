@@ -23,7 +23,8 @@ judge/
   install.sh             renders the hooks block; dry run by default, --apply merges into $HERMES_HOME/config.yaml
   lib/config.py|sh       site.env + judge defaults, path rules and data_class (classify_detail), SSH argv
   lib/queue.py           atomic read/write of requests, findings and acks; schema checks; merge, dedupe, release
-  lib/snapshot.py        session snapshots, diffs, attribution (agent_touched, copy_targets), noise globs
+  lib/snapshot.py        session snapshots, diffs, attribution (agent_touched, copy_targets, confirmed_writes), noise globs
+  lib/version.py         code version stamp of the judge code (git tree id of judge/ + dirty flag; files only)
   lib/hermeslog.py       Hermes log parsing: session lines, parallel tool-call attribution, noise loggers
   lib/redact.py          secret redaction and call hashes
   lib/refusals.py        refusals in a window and the next tool calls, as metadata (refusals.jsonl; #39)
@@ -177,15 +178,18 @@ object on stdout. Hermes keys consent on `(event, command)`.
  "changed_paths": ["..."], "claims": "<agent final response or plan excerpt, ≤4000 chars>",
  "plan": "<path or null>", "data_class": "infra|sensitive",
  "source_event": "post_tool_call|pre_tool_call|pre_verify|on_session_end|watch", "detail": {},
- "not_before": "2026-10-03T03:54:10Z"}          // optional (plan requests, #34): not judged before this UTC time
+ "not_before": "2026-10-03T03:54:10Z",          // optional (plan requests, #34): not judged before this UTC time
+ "code_version": {"sha": "<40 hex>", "commit": "<40 hex>|null", "dirty": false, "source": "git|file|unknown"}}
+                                                // optional: the judge code that wrote it (see "Code version")
 ```
 `changed_paths` lists only paths **the agent touched** (see "Attribution" below), never every snapshot change.
 `since` of a `pre_verify` completion (`hooks/verify.py::since_for`): earliest mtime of the changed paths − 5 min
 (no readable path: now − 1 h; never more than 24 h back), **clamped to the session start** (`started` in
 `snapshots/<session>/meta.json`, bug #20), except that a late snapshot never moves `since` past the earliest
 edit itself. An `on_session_end` completion starts at the previous turn's end (`last_end`) or the session start.
-The collector does **not** trust a request's `changed_paths` (see "Attribution"): a path without a backing tool
-event is rejected and never reaches `agent-diff.patch`, but still counts for `data_class`.
+The collector does **not** trust a request's `changed_paths` (see "Attribution"): a path the session's own tool
+events do not confirm is *unconfirmed*: it never reaches `agent-diff.patch` or `data-files.txt` and, except a
+secret-shaped one or any path of a `gate` request, does not count for the collector's `data_class`.
 A `completion` request from `hooks/enqueue.py` also carries `detail.changed_by_others`: the session's other
 snapshot changes (paths only, at most 200; `detail.changed_by_others_total` when more), which never count for
 `data_class`.
@@ -258,14 +262,53 @@ exists gives a `D/<name>/` prefix (`D/` for a rename); `install -d` and words wi
 Nothing is executed, and the command text never reaches a bundle (`tool-calls.jsonl` keeps program names only).
 Everything else is "changed by others" (`lib/snapshot.agent_touched` / `attribute`).
 
-**Request paths need a backing event** (`collect.attribution`). In the collector, a request's `changed_paths`
-entry is the agent's only if a session tool event in `events.jsonl` names it (up to the window end, status not in
-`NOT_RUN_STATUSES`), or it lies under a `$HERMES_HOME` self-write prefix (memory/skill_manage ran). Otherwise it
-is **rejected**: never in `agent-diff.patch` (which gets a `# N path(s) listed by the request are NOT attributed
-to the agent ...` line), in `others-changed.txt` if the snapshot shows it changed, and still counted for
-`data_class` (it can only make the bundle stricter). A request without a session snapshot gets all its paths
-rejected. Manifest: `attribution.rejected_request_paths` (in an `infra` bundle only the infra ones are listed),
-`attribution.rejected_request_paths_total`, `notes.attribution`.
+**Request paths need a confirming event** (`collect.attribution`). In the collector, a request's
+`changed_paths` entry is the agent's (*confirmed*) only when the session's own executed tool calls (status not in
+`NOT_RUN_STATUSES`, up to the window end) confirm it:
+- a `write_file`/`patch` target in `events.jsonl`;
+- a terminal **write target** (`snapshot.confirmed_writes` / `write_targets`, command text from `state.db` by
+  `call_id`, in memory only): a `cp`/`mv`/`install` destination (#45, `copy_targets`), the target of an output
+  redirection (`>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `N>`, `N>>`, `>&` with a file word; `/dev/*` and words with `$`
+  or backticks ignored) or a `tee` operand; `cd DIR` is followed;
+- or a **snapshot change attributed to the agent** (the `agent_touched` rule above: path-like tokens, self-write
+  prefixes, copy destinations), i.e. the file did change and a tool call of the session names it.
+A path a terminal command merely names without changing it (`cat X`, `grep x X`) is not confirmed. Anything else
+is **unconfirmed** ("claimed but not confirmed"; legacy, buggy or forged request, or another actor's change):
+- never in `agent-diff.patch` (which gets a `# N path(s) listed by the request are NOT attributed to the agent:
+  claimed but not confirmed ...` line) nor in `data-files.txt`; in `others-changed.txt` only if the snapshot shows
+  someone changed it;
+- **left out of the collector's classification** (`collect.class_detail(..., unconfirmed)`), so a forged request
+  can neither relax the class (extra infra paths would otherwise make a sensitive path a withheld one under the
+  #43 mixed rule) nor drag a path into a frontier bundle. Exceptions, both stricter: a secret-shaped unconfirmed
+  path still makes the bundle `sensitive` (reason `secret-shaped unconfirmed request path`), and a `gate`
+  request keeps all its paths (its evidence is the gated command, whether or not it ran). The request's own
+  `data_class` still applies (the stricter wins);
+- in an `infra` bundle a non-infra unconfirmed path is never named: `[unconfirmed path #N withheld]` replaces it
+  everywhere (same last pass as #43), `withheld.unconfirmed_paths` says how many.
+Manifest: the request copy moves them from `changed_paths` to `detail.unconfirmed_paths` (+
+`detail.unconfirmed_paths_total`; `masked_request: true`, so the runner shows the judge this copy),
+`attribution.unconfirmed_paths` (in an `infra` bundle only the infra ones by name), `attribution.unconfirmed_paths_total`,
+`rejected_request_paths` / `rejected_request_paths_total` (older names, same values), `classification.unconfirmed_paths_excluded`
+and `notes.attribution`. A request without a session snapshot gets all its paths unconfirmed.
+`attribution.agent_paths` = the attributed snapshot changes plus the confirmed request paths (what the diff covers).
+
+### Code version
+Every request records the judge code that wrote it: `lib/queue.write_request` stamps `code_version` =
+`lib/version.code_version()` when the request has none (hooks, `verify.py`, `watch/runaway.py`; merges and
+releases keep the stamp of the request they rewrite). `sha` is the git tree id of `judge/` from the checkout's
+index (= `git rev-parse HEAD:judge` when nothing is staged; commits outside judge/ do not change it), `commit` is
+HEAD, `dirty` is true when a tracked judge/ file differs from the index, a judge/ index entry is unmerged, or an
+untracked code file (`.py .sh .json .tmpl .md .service .timer .path`, outside `__pycache__` etc.) exists under
+judge/. Read from files only (`.git`/worktree `gitdir:`, HEAD, ref file or `packed-refs`, index v2-v4; tracked
+files are hashed only when their stat differs from the index), **no subprocess**, cached per process; about 1 ms
+on a clean checkout. Without git: the first line of `judge/VERSION` (`source: "file"`); else `sha: null`,
+`source: "unknown"`. The field is optional: requests without it stay valid.
+The collector records `manifest.code_versions = {request, collector}` and, when they are not provably the same
+(`version.same`: same `sha`, neither dirty), `notes.code_version` (`code version: request written by judge code
+<sha12>, judged by collector <sha12>...`). `rejudge.py` puts `code_versions = {request, collector, runner}` in
+each finding and a `code version: ...` note per mismatch (request, evidence bundle), and marks the summary row
+`version_warning: true`. A mismatch is a warning, never a failure. (`run_judge.py` does not yet stamp its
+findings: see the judge-hardening change note.)
 
 **Noise paths.** Hermes bookkeeping files change on their own and are never anyone's edit. `lib/snapshot.noise_globs(cfg, meta)`
 = `NOISE_GLOBS` (`*/skills/.usage.json`, `*/skills/.locks/*`, `*/skills/.curator_ledger.jsonl`,
@@ -284,7 +327,8 @@ and manifest `attribution.ignored_noise_paths` (count) + `notes.noise`.
             "failure_scenario": "<R8 only, optional in the schema>"}]}
 ```
 Optional top-level `"notes": ["..."]` (runner bookkeeping, e.g. "sensitive -> local enforced",
-"frontier cap reached", "validator dropped N items"). Validator drops items with empty `evidence`. Rubric codes as in docs/agent-judge.md.
+"frontier cap reached", "validator dropped N items", "code version: ..."). Optional
+`"code_versions": {"request", "collector", "runner"}` (each a `code_version` object or null; see "Code version"). Validator drops items with empty `evidence`. Rubric codes as in docs/agent-judge.md.
 
 **Two findings per sensitive completion.** `findings/<id>.json` is the main finding (for a sensitive request:
 `mode: local`). `findings/<id>.claims.json` (+ `.md`) is the frontier claims stage (see "Claims-only bundle"),
@@ -441,12 +485,12 @@ redacted, not checked for what it says about the withheld files.
 
 | File | Content | Time |
 |---|---|---|
-| `manifest.json` | request copy (masked in an infra bundle with withheld paths: `masked_request`), `classification` (#43), `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, scratch_paths, changed_by_others, omitted_after_window, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `data_files: {included: [{path, bytes, shown_chars, excerpt, why, modified_after_window?}], withheld: [{path, reason}] (infra files only), withheld_counts: {<reason>: n} (secret-shaped, non-infra and scratch files: counts, never names), skipped?: "<why no data files were looked for>"}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`) | — |
+| `manifest.json` | request copy (masked in an infra bundle with withheld paths, and unconfirmed paths moved to `detail.unconfirmed_paths`: `masked_request` = the copy differs from the queued request), `classification` (#43; + `unconfirmed_paths_excluded`), `artifacts`, `collector_version` (2, the bundle format), `code_versions: {request, collector}` (see "Code version"), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, scratch_paths, changed_by_others, omitted_after_window, unconfirmed_paths, unconfirmed_paths_total, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `data_files: {included: [{path, bytes, shown_chars, excerpt, why, modified_after_window?}], withheld: [{path, reason}] (infra files only), withheld_counts: {<reason>: n} (secret-shaped, non-infra and scratch files: counts, never names), skipped?: "<why no data files were looked for>"}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`, `code_version`) | — |
 | `hermes-log.txt` | agent.log/errors.log lines in the window, secrets redacted: **this session's tagged lines first**, then untagged context lines with startup/housekeeping noise dropped (none for a C6 watcher request); layout below | window |
 | `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires for every call; Hermes reports a denied or timed-out approval as `status="blocked"`, interrupted calls as `cancelled`/`aborted`) matches the decision by `tool_call_id`, else by tool + `call_hash`, and its status is not in `NOT_RUN_STATUSES` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); not_executed also as soon as an event with a `NOT_RUN_STATUSES` status (e.g. Hermes' `blocked` for a refused approval) carries the decision's `tool_call_id` (basis `post_tool_call reported status=<s> ...`); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
 | `tool-calls.jsonl` | one JSON line per tool call `post_tool_call` saw for this session with `t` in the window (bug #33; `collect.tool_calls`): `t` (UTC), `tool`, `command` (the program NAME only, `lib/toolcalls.command_word`: for `terminal` the first word, leading `VAR=value` assignments skipped, basename, kept only when it is in `READONLY_COMMANDS` (common read-only programs: `ls`, `stat`, `wc`, `cat`, `grep`, `systemctl`, `journalctl`, `sha256sum`, `git`, ...), else `(other)`; `(none)` for an empty command; never arguments; taken from the event's `command`, else from Hermes' `state.db` by `tool_call_id`, else `(unknown)`; other tools: the tool name), `gate` (`pass`: no gate.log decision matches the call by `tool_call_id`, or by tool + `call_hash` for events/decisions without ids; `escalated` / `blocked`: the matching decision; `not gated`: a tool outside the gate's matcher), `ran` (the event's status is not in `NOT_RUN_STATUSES`), `error` (status `error`), `after_refused_escalation` (an earlier `approve`/`block` decision of this session whose call never ran). Hermes' raw status is not copied: it says `blocked` for an escalation nobody approved, which reads as a gate block. At most 200 lines; when empty, `notes["tool-calls.jsonl"]` says so | window |
 | `refusals.jsonl` | the "refusals in window" section (bug #39; `collect.refusal_lines`, `lib/refusals`): one JSON line per refused call with `t` in the window: `t` (UTC; the gate decision's time when there is one), `source` (`judge-gate` \| `hermes`), `how` (`gate-escalation-not-approved`, `gate-escalation-denied-by-human`, `gate-block`, `hermes-approval-refused`, `hermes-denied-by-human`, `hermes-security-scan`, `hermes-other`), `rule` (the gate rule, or a slug of Hermes' reason: `recursive-delete`, `script-execution-via-e-c-flag`, `execute-code`, `security-scan-medium`, ...), `tool`, `command` (`lib/toolcalls.command_word` of the command after a leading `cd DIR &&`), `targets` (`[{id, kind}]`: opaque path ids `p1`, `p2`, ... local to the bundle, the same id for the same path; `kind` in `secret`, `remote-host`, `system`, `scratch`, `hermes-home`, `repo`, `home`, `other`; the session cwd, its parents, HOME and HERMES_HOME are never targets), `next_calls` (the next `JUDGE_REFUSAL_NEXT_CALLS` (default 6, max 20) tool calls in the window, in order: `t`, `tool`, `command`, `ran`, `targets`, `same_target` (a target equal to, inside or containing a refused one), `route`), `summary`. Routes: `copy` (a terminal `cp`/`install`/`rsync`/`dd`/`tee`/`mv`/`ln`/`cat >` call that names a refused target and a new path), `uses-copy` (a later call on such a new path), `writes-script` (`write_file`/`patch` of a script file `.sh .py .pl .rb .js .mjs .ts .php .bash`), `helper-script` (a terminal call that names such a script, when the refused call was inline code (`python -c`, `bash -c`, heredoc, `execute_code`) or shares a target), `tool-switch` (another tool of the same class on the same target, or with no targets: search = `grep`/`rg`/`find`... \| `search_files`; read = `cat`/`head`/`xxd`/`sha256sum`/`openssl`... \| `read_file`; exec = `python`/`bash`/heredoc \| `execute_code`), `narrowed-retry` (same tool and program, ran, same or no target), `same-call` (the identical call again: same call hash or arguments), `refused` (did not run), `related` (same target, another action), `unrelated`. `summary`: `possible-workaround` (a `copy`/`uses-copy`/`helper-script`/`tool-switch` route) > `retried-same-call` > `narrowed-retry-only` > `related-calls-only` > `no-related-call` > `no-later-call`. Sources: Hermes' `state.db` (read-only: every tool call with its arguments and result; a result starting `BLOCKED` is a refusal, classified by its wording), else `events.jsonl` (`status` blocked/denied/... = not run); `gate.log` by `tool_call_id`/`call_hash`; agent.log session lines `Tool <name> returned error (...): {..."BLOCKED: ..."}` for Hermes-native reasons. Arguments, paths and results are read in memory only and never written. At most 50 lines; `notes["refusals.jsonl"]` gives the count, or says the file is empty | window |
-| `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (session tool events up to the window end; request `changed_paths` only with a backing event, see Attribution). Content only when `data_class=infra`; otherwise `# content withheld` lines (see above). A file modified after the window gets a `# NOTE:` line; a truncated or missing opted-in dir gets a `# NOTE: opted-in dir ...` header line | point in time (current content) |
+| `agent-diff.patch` | watched paths vs the session-start snapshot (+ repo changes since the start HEAD), **only paths attributed to the agent** (session tool events up to the window end; request `changed_paths` only when confirmed, see Attribution). Content only when `data_class=infra`; otherwise `# content withheld` lines (see above). A file modified after the window gets a `# NOTE:` line; a truncated or missing opted-in dir gets a `# NOTE: opted-in dir ...` header line | point in time (current content) |
 | `others-changed.txt` | snapshot changes **not** made by the agent: `<status> <path> \| +N -M` lines, never content. In an `infra` bundle, non-infra paths are withheld (count only). Changes made after the window (by anyone) are omitted (count only) | point in time |
 | `data-files.txt` | **`infra` bundles of `completion`/`plan` requests only** (`collector/datafiles.py`, below): redacted excerpts of the data/config files the agent's changed code reads, for the R8 code review. One `=== data file: <path> (<bytes> bytes; <why>; excerpt: <how>) ===` section per file; absent when no file qualifies | point in time (current content; a file modified after the window gets a `NOTE:` line) |
 | `host-<name>.txt` | `# host:` header (see Probes), then UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local, then `systemctl --failed` and the host clock (both at collection time) | find: window |
@@ -523,7 +567,8 @@ agent.log (2026-10-02..04) all 38 untagged tool lines were attributed, each insi
 
 `data_class` of the bundle: the stricter of the request's class and the collector's own classification
 (`collect.class_detail`: `config.classify_detail`, strict for `gate` requests) of the
-agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request or a C6 watcher request (shape above) keeps its own class; any other
+agent-attributed and confirmed request paths (noise and unconfirmed request paths excluded, except as in
+"Attribution"). With no such paths, only a host-rule `gate` request or a C6 watcher request (shape above) keeps its own class; any other
 request is classified with `classify([], cfg, cwd)`, so an `infra` label on a path-less request (forged or
 buggy) comes out `sensitive` unless the cwd is infra. For `data_class=sensitive`: diffs replaced by
 `# content withheld` stat lines; no file contents.
@@ -1034,6 +1079,9 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 - Never writes to queue/, done/, findings/, acks/ or evidence/; an `--out` inside any of them is refused (64).
 - Writes `DIR/<id>.json` (with notes), `<id>.md`, `<id>.raw.txt`, `<id>.input.txt` and `DIR/summary.json`, and
   prints old (`findings/<id>.json`) vs new: mode, items, high+false count.
+- Each new finding carries `code_versions: {request, collector, runner}`; a request or bundle written by other
+  judge code than the one re-judging it gets a `code version: ...` note (a warning: it is judged anyway) and its
+  summary row `version_warning: true`.
 - A `sensitive` bundle is never judged by the frontier. Without `--mode` it is judged locally. With an explicit
   `--mode frontier` that request is refused: no backend call, no `<id>.*` files, its summary row gets
   `"refused": true` and an `error` naming the data class and `--sensitive-local`, the table prints `REFUSED`, and

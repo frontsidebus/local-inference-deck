@@ -17,6 +17,7 @@
     "data_class": {"type": "string", "enum": ["infra", "sensitive"]},
     "source_event": {"type": "string", "enum": ["post_tool_call", "pre_tool_call", "pre_verify", "on_session_end", "watch"]},
     "not_before": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", "description": "optional: run_judge.py --pending leaves the request queued until this UTC time (plan debounce, #34)"},
-    "detail": {"type": "object"}
+    "detail": {"type": "object", "description": "free-form hook detail; in the bundle manifest's request copy the collector adds unconfirmed_paths (changed_paths no tool event of the session confirms) and unconfirmed_paths_total"},
+    "code_version": {"type": "object", "properties": {"sha": {"type": ["string", "null"], "maxLength": 80, "description": "git tree id of judge/ (index), or the first line of judge/VERSION"}, "commit": {"type": ["string", "null"], "maxLength": 80}, "dirty": {"type": "boolean"}, "source": {"type": "string", "enum": ["git", "file", "unknown"]}}, "description": "optional: the judge code that wrote this request (lib/version.code_version, stamped by lib/queue.write_request); requests without it stay valid"}
   }
 }

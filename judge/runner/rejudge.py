@@ -12,6 +12,9 @@ queue/, done/, findings/, acks/ or the evidence bundle. Per request it writes to
   <id>.raw.txt     the judge's raw replies
   <id>.input.txt   the exact user message sent to the judge
 and finally DIR/summary.json + a stdout table comparing each new finding with findings/<id>.json (read only).
+Each new finding carries code_versions {request, collector, runner} (lib/version); when the request or the bundle
+was written by other judge code than this one, a `code version: ...` note says so (a warning, never a failure)
+and the summary row gets "version_warning": true.
 
 --mode    default: what run_judge.py would choose (a sensitive bundle is judged locally). An explicit
           `--mode frontier` on a sensitive bundle is REFUSED for that request: no model call, an error in
@@ -40,6 +43,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common as C  # noqa: E402
 import run_judge as RJ  # noqa: E402
+from lib import version as V  # noqa: E402  (common.py put judge/ on sys.path)
 
 PROTECTED = ("queue", "done", "findings", "acks", "evidence")
 
@@ -79,10 +83,13 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
     except Exception as exc:
         row["error"] = f"no usable evidence bundle at {ev} ({exc}); rejudge never collects"
         return row
+    versions = code_versions(request, manifest)
+    vnotes = version_notes(versions)
     data_class = RJ.bundle_data_class(request, manifest)
     mode, notes = RJ.choose_mode(data_class)
+    notes += vnotes
     if mode_arg == RJ.CLAIMS_MODE:
-        notes = ["rejudge: frontier claims stage on an existing bundle (no collection, no probes)"]
+        notes = ["rejudge: frontier claims stage on an existing bundle (no collection, no probes)"] + vnotes
         try:
             res = RJ.judge_claims(rid, request, ev, notes, use_budget=use_budget)
         except RJ.ClaimsSkipped as exc:
@@ -92,7 +99,7 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
         except RJ.JudgeError as exc:
             row["error"] = f"judge backend failed: {exc}"
             return row
-        return _write_row(row, rid, out, res, RJ.CLAIMS_SUFFIX)
+        return _write_row(row, rid, out, res, RJ.CLAIMS_SUFFIX, versions)
     if mode_arg:
         if data_class != "infra" and mode_arg == "frontier":
             if not sensitive_local:
@@ -112,12 +119,35 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
     except RJ.JudgeError as exc:
         row["error"] = f"judge backend failed: {exc}"
         return row
-    return _write_row(row, rid, out, res, "")
+    return _write_row(row, rid, out, res, "", versions)
 
 
-def _write_row(row: Dict[str, Any], rid: str, out: Path, res: Dict[str, Any], suffix: str) -> Dict[str, Any]:
+def code_versions(request: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """{request, collector, runner}: the request's code_version stamp, the collector's (manifest
+    code_versions.collector; null for a bundle collected before stamps) and this code's (lib/version)."""
+    mv = manifest.get("code_versions") if isinstance(manifest.get("code_versions"), dict) else {}
+    return {"request": request.get("code_version") if isinstance(request.get("code_version"), dict) else None,
+            "collector": mv.get("collector") if isinstance(mv.get("collector"), dict) else None,
+            "runner": V.code_version()}
+
+
+def version_notes(versions: Dict[str, Any]) -> List[str]:
+    """Finding notes for a request or bundle written by other judge code than the one re-judging it (a
+    warning only: the request is judged anyway)."""
+    out = []
+    for what, key in (("request", "request"), ("evidence bundle", "collector")):
+        n = V.mismatch_note(versions.get(key), versions["runner"], what, "rejudge")
+        if n:
+            out.append(n)
+    return out
+
+
+def _write_row(row: Dict[str, Any], rid: str, out: Path, res: Dict[str, Any], suffix: str,
+               versions: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     finding = res["finding"]
     finding["notes"] = res["notes"]
+    if versions is not None:
+        finding["code_versions"] = versions
     C.write_json(out / f"{rid}.json", finding)
     C.atomic_write(out / f"{rid}.md", RJ.render_md(finding, res["notes"]))
     C.atomic_write(out / f"{rid}.raw.txt", res["raw_record"] + "\n")
@@ -128,6 +158,8 @@ def _write_row(row: Dict[str, Any], rid: str, out: Path, res: Dict[str, Any], su
     except Exception:
         pass
     row.update({"old": _summ(old), "new": _summ(finding)})
+    if versions is not None and version_notes(versions):
+        row["version_warning"] = True
     return row
 
 

@@ -133,7 +133,7 @@ All of it is files in `$JUDGE_REVIEW_DIR` (default `$HERMES_HOME/review`), so bo
 
 ### Queue
 
-Requests have four kinds: `plan` (C1), `gate` (C2), `completion` (C3 and C4) and `runaway` (C6). Hooks merge what belongs together: one completion request per turn (#12), one plan request per plan file and turn (#34). A plan request waits in `queue/deferred/`, which the runner's path unit does not watch, until its turn ends or the debounce expires (#40). Request paths are not trusted on their own: the collector accepts a path as the agent's only when a tool event that ran backs it (#6).
+Requests have four kinds: `plan` (C1), `gate` (C2), `completion` (C3 and C4) and `runaway` (C6). Hooks merge what belongs together: one completion request per turn (#12), one plan request per plan file and turn (#34). A plan request waits in `queue/deferred/`, which the runner's path unit does not watch, until its turn ends or the debounce expires (#40). Request paths are not trusted on their own: the collector accepts a path as the agent's only when the session's own tool calls confirm it, as a `write_file`/`patch` target, a terminal `cp`/`mv`/`install`/redirect/`tee` target, or a snapshot change attributed to the agent (#6). Anything else is "claimed but not confirmed": no content, no say in the classification (a forged request cannot pull files into a frontier bundle or relax the class), and listed in the manifest. Every request records the judge code version that wrote it (`code_version`: the git tree id of `judge/` and a dirty flag); the collector and `rejudge.py` note a mismatch with their own version.
 
 ### Collector
 

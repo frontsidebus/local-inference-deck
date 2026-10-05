@@ -32,6 +32,11 @@ indexed, diffed or attributed: they change on read-only turns too.
                                                           what the agent's tool calls touched (incl. cp/mv/install
                                                           destinations of its terminal commands, #45)
     copy_targets(command, cwd) -> (paths, prefixes)       files a cp/mv/install in *command* created
+    write_targets(command, cwd) -> (paths, prefixes)      copy_targets + output redirection and tee targets
+    confirmed_writes(snapdir, cfg, until=None, commands=None) -> (paths, prefixes)
+                                                          what the session's calls wrote AS A TARGET
+                                                          (write_file/patch, write_targets): confirms request
+                                                          changed_paths in the collector
     terminal_commands(hermes_home, session) -> {call_id: (command, workdir)}   from state.db, attribution only
     attribute(changed, paths, prefixes=()) -> (agent, others)                split changed paths by who touched them
     diff_text(snapdir, cfg, sensitive, include=None, until=None) -> str
@@ -394,6 +399,54 @@ def agent_touched(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until:
     return paths, prefixes
 
 
+WRITE_TOOLS = ("write_file", "patch")
+
+
+def confirmed_writes(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until: Optional[datetime] = None,
+                     commands=None) -> Tuple[set, List[str]]:
+    """(paths, prefixes) the session's executed tool calls (t <= *until*) WROTE as a target: write_file/patch
+    paths, and write_targets (cp/mv/install destinations, output redirections, `tee` operands) of its terminal
+    calls (*commands*: tool_call_id -> (command, workdir), default read from Hermes' state.db, in memory only).
+    Unlike agent_touched, a path a terminal command merely names (an argument, a file it reads) is NOT here:
+    this is what confirms a request's changed_paths in the collector (together with the snapshot changes
+    agent_touched attributes). Realpath-normalised; noise excluded; best effort, never raises on a command."""
+    meta = load_meta(snapdir)
+    noise = noise_globs(cfg, meta)
+    hh = (cfg or {}).get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    paths: set = set()
+    prefixes: List[str] = []
+    term_ids: List[Tuple[str, str]] = []
+    for ev in events(snapdir):
+        if not ran(ev):
+            continue
+        if until is not None:
+            try:
+                if q.parse_utc(str(ev.get("t") or "")) > until:
+                    continue
+            except ValueError:
+                continue
+        if ev.get("tool") in WRITE_TOOLS:
+            paths |= {_key(p) for p in ev.get("paths") or [] if isinstance(p, str) and p.strip()
+                      and not is_noise(p, noise)}
+        elif ev.get("tool") == "terminal" and ev.get("call_id"):
+            term_ids.append((str(ev["call_id"]), str(ev.get("cwd") or "")))
+    if term_ids:
+        if commands is None:
+            commands = terminal_commands(hh, str(meta.get("session") or ""))
+        for cid, ev_cwd in term_ids:
+            got = (commands or {}).get(cid)
+            if not got:
+                continue
+            command, workdir = got if isinstance(got, tuple) else (got, "")
+            try:
+                wp, wpre = write_targets(command, workdir or ev_cwd or str(meta.get("cwd") or "") or "/")
+            except Exception:
+                continue
+            paths |= {p for p in wp if not is_noise(p, noise)}
+            prefixes += [x for x in wpre if x not in prefixes]
+    return paths, prefixes
+
+
 # ---------------------------------------------------------------- cp/mv/install destinations (#45)
 COPY_PROGRAMS = ("cp", "mv", "install")
 COPY_WALK_MAX = 5000            # files walked per recursive source
@@ -409,7 +462,17 @@ _ARG_OPTS = {"cp": {"-S", "--suffix", "-t", "--target-directory"},
 def _simple_commands(command: str) -> List[List[str]]:
     """Shell words of each simple command in *command* (best effort: no expansion; a line that does not
     tokenize is skipped). Redirections and their targets are dropped."""
-    out: List[List[str]] = []
+    return [w for w, _ in _parsed_commands(command) if w]
+
+
+_OUT_REDIRECTS = {">", ">>", "&>", "&>>", ">|", "<>", ">&"}
+
+
+def _parsed_commands(command: str) -> List[Tuple[List[str], List[str]]]:
+    """(words, output redirection targets) of each simple command in *command*. A target is the word after
+    `>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `N>`, `N>>` (and `>&` / `N>&` when it is not an fd number or `-`);
+    input redirections (`<`, `<<`, `<<<`) are dropped like before."""
+    out: List[Tuple[List[str], List[str]]] = []
     for line in str(command or "").splitlines():
         try:
             lex = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -419,23 +482,29 @@ def _simple_commands(command: str) -> List[List[str]]:
         except ValueError:
             continue
         cur: List[str] = []
-        skip = False
+        redirs: List[str] = []
+        skip = None
         for t in toks:
-            if skip:
-                skip = False
+            if skip is not None:
+                if skip and not (re.fullmatch(r"\d+|-", t) and skip == "dup"):
+                    redirs.append(t)
+                skip = None
                 continue
             if t in _SEPARATORS:
-                if cur:
-                    out.append(cur)
-                cur = []
+                if cur or redirs:
+                    out.append((cur, redirs))
+                cur, redirs = [], []
             elif t in _REDIRECTS or re.fullmatch(r"\d+>>?|\d+<|\d*>&\d*", t):
+                fd_dup = t.endswith(">&")
                 if cur and cur[-1].isdigit():  # `2>/dev/null` tokenizes as `2`, `>`, `/dev/null`
                     cur.pop()
-                skip = True
+                if re.fullmatch(r"\d*>&\d+", t):  # `2>&1` in one token: no target word follows
+                    continue
+                skip = ("dup" if fd_dup else "file") if (t in _OUT_REDIRECTS or ">" in t) else ""
             else:
                 cur.append(t)
-        if cur:
-            out.append(cur)
+        if cur or redirs:
+            out.append((cur, redirs))
     return out
 
 
@@ -529,10 +598,28 @@ def copy_targets(command: str, cwd: str) -> Tuple[set, List[str]]:
     (`D/rel` and `D/<src name>/rel`), a glob source is matched against the destination dir, and a moved
     directory (source gone) gives a `D/<src name>/` prefix (`D/` when it was a rename). Words with `$` or
     backticks are not resolved. Nothing is executed; the command text is never stored."""
+    return _targets(command, cwd, writes=False)
+
+
+def write_targets(command: str, cwd: str) -> Tuple[set, List[str]]:
+    """(paths, prefixes) *command* writes as a destination: copy_targets (cp/mv/install, #45) plus the targets
+    of output redirections (`>`, `>>`, `&>`, `N>`, ...) and `tee` operands. Words with `$` or backticks are
+    not resolved; `/dev/*` targets are ignored. Used to CONFIRM a request's changed_paths (collector); nothing
+    is executed and the command text is never stored."""
+    return _targets(command, cwd, writes=True)
+
+
+def _targets(command: str, cwd: str, writes: bool) -> Tuple[set, List[str]]:
     paths: set = set()
     prefixes: List[str] = []
     cur = cwd or "/"
-    for words in _simple_commands(command):
+    for words, redirs in _parsed_commands(command):
+        if writes:
+            for t in redirs:
+                if t and "$" not in t and "`" not in t:
+                    a = _abs_from(t, cur)
+                    if not a.startswith("/dev/"):
+                        paths.add(_key(a))
         while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
             words = words[1:]
         while words and os.path.basename(words[0]) in _WRAPPERS:
@@ -547,6 +634,11 @@ def copy_targets(command: str, cwd: str) -> Tuple[set, List[str]]:
         if prog in ("cd", "pushd"):
             if len(words) > 1 and "$" not in words[1] and words[1] != "-":
                 cur = _abs_from(words[1], cur)
+            continue
+        if writes and prog == "tee":
+            paths |= {_key(_abs_from(a, cur)) for a in words[1:]
+                      if not a.startswith("-") and "$" not in a and "`" not in a
+                      and not _abs_from(a, cur).startswith("/dev/")}
             continue
         if prog not in COPY_PROGRAMS:
             continue
