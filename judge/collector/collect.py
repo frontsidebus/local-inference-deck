@@ -23,6 +23,10 @@ Bundle (judge/CONTRACT.md):
     agent-diff.patch     watched paths vs the session-start snapshot, only paths the agent touched
                          (+ repo changes since the start HEAD for those paths)
     others-changed.txt   snapshot changes NOT attributed to the agent: paths + diffstat, never content
+    data-files.txt       infra bundles of completion/plan requests only: redacted excerpts of at most
+                         JUDGE_DATA_FILES_MAX (3) data/config files (.json/.yaml/.toml/.csv/...) the agent read in
+                         the window or agent-diff.patch names, in infra locations, not secret-shaped, not scratch
+                         (collector/datafiles.py; manifest data_files lists what was included and withheld)
     host-<name>.txt      walter/covenant: UTC `find -newermt <since> ! -newermt <until>` over /etc /srv /usr/local
                          + `systemctl --failed` (at collection time)
     slots.json           llama-server slot summary (probe `slots`; at collection time)
@@ -67,6 +71,10 @@ if str(JUDGE_DIR) not in sys.path:
 from lib import config, hermeslog, snapshot  # noqa: E402
 from lib import queue as q  # noqa: E402
 from lib.redact import redact  # noqa: E402
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import datafiles  # noqa: E402  (collector/datafiles.py: data files the changed code reads, for R8)
 
 sys.path.insert(0, str(JUDGE_DIR / "probes"))
 import probe  # noqa: E402
@@ -898,6 +906,20 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     agent_paths = sorted(set(att["agent"]) | set(att["accepted"]))
     _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"], wh))
     _write(ev / "others-changed.txt", others_changed(req, cfg, root, att, sensitive, until))
+    df_text, df_rec = None, {"included": [], "withheld": [], "withheld_counts": {}}
+    try:
+        (ev / datafiles.ARTIFACT).unlink()  # a re-collection must not keep an older excerpt
+    except OSError:
+        pass
+    try:
+        df_text, df_rec = datafiles.collect_data_files(
+            req, cfg, root, since, until, (ev / "agent-diff.patch").read_text(encoding="utf-8", errors="replace"),
+            agent_paths, data_class, now=now)
+    except Exception as e:  # the data-files section must never break the bundle
+        df_rec = {"included": [], "withheld": [], "withheld_counts": {},
+                  "skipped": f"not collected: {e.__class__.__name__}"}
+    if df_text:
+        _write(ev / datafiles.ARTIFACT, df_text)
     cwd = (req.get("detail") or {}).get("cwd") or None
     withheld: Dict[str, str] = {}
     if sensitive:
@@ -906,6 +928,12 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
             "line with a line-count stat. Such a line means the file changed; it is not 'no change'.")
     if not sensitive and any(not config.is_infra_path(p, cfg, cwd) for p in att["others"]):
         withheld["others-changed.txt"] = "data_class=infra bundle: non-infra paths changed by others withheld"
+    if df_rec.get("withheld") or df_rec.get("withheld_counts"):
+        withheld[datafiles.ARTIFACT] = (
+            f"{len(df_rec.get('withheld') or []) + sum((df_rec.get('withheld_counts') or {}).values())} data "
+            "file(s) the agent read or the diff names were not included (manifest data_files.withheld: infra "
+            "files by name and reason; data_files.withheld_counts: secret-shaped, non-infra and scratch files, "
+            "counts only)")
     if not sensitive and wh.count:
         withheld["sensitive_paths"] = (
             f"{wh.count} non-infra path(s) next to the infra ones (#43): content withheld and names replaced by "
@@ -981,7 +1009,11 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
                                  "note": "the agent's paths vs the session-start snapshot, read at collection "
                                          "time; a file modified after the window carries a NOTE line"},
             "others-changed.txt": dict(pit),
+            **({datafiles.ARTIFACT: {"observed_at": now_s,
+                                     "note": "data file content read at collection time; a file modified after "
+                                             "the window end carries a NOTE line"}} if df_text else {}),
         },
+        "data_files": df_rec,
         "attribution": {"agent_paths": sorted(att["agent"]) if sensitive else
                         sorted(wh.name(p) for p in att["agent"]),
                         "scratch_paths": scratch,

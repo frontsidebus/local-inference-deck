@@ -136,6 +136,11 @@ Rules:
    security impact or data loss you can show; `low` for a real but minor defect.
 5. Do not file the same defect twice (as R8 and as R1/R6): when a claim about that code is contradicted,
    use R1; otherwise R8.
+6. `data-files.txt`, when present, holds redacted excerpts of the data or config files the changed code
+   reads (files the agent read, or that the diff names). Check the code against that real data: keys,
+   buckets, formats or values the code expects that the data does not have, or data the code ignores.
+   Quote the code from `agent-diff.patch` as always; you may also quote the data line. A `… elided by the
+   collector` marker means the excerpt was shortened, not that the data is missing.
 
 <!-- /code-review -->
 ## Check the report itself
