@@ -99,7 +99,8 @@ overwrites; reports drift) → `scripts/gen-secrets.sh walter` → enable units
 (`backup/offsite-setup.sh`, only when `RESTIC_BUCKET` is set and `/etc/spark-restic/aws.env` exists) → compose stacks in order:
 gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build` only when
 its build inputs changed) → digest (key copy, `--build` likewise; only when `SPARK_DIGEST_HOST` is set).
-A stack is force-recreated only when one of its files changed.
+A stack is force-recreated only when one of its runtime files changed; docs (`*.md`, `*.example`) are
+installed but never recreate or rebuild anything.
 
 Optional parts are off unless `site.env` turns them on, and each prints one "off" line in the render step:
 the digest app (`SPARK_DIGEST_HOST`) and offsite backups (`RESTIC_BUCKET`; empty or `CHANGEME` = off). With
@@ -119,8 +120,16 @@ A new NVIDIA driver needs a reboot. On a fresh VM: deploy, reboot, deploy again.
 `deploy.sh` **converges the whole host** to the repo, not just the part you changed. Run `--dry-run` first and read
 every line, not only the ones you expect:
 
-- `new` in the dry run means missing **or** changed. A changed file in a stack force-recreates that stack, even a
-  comment-only change (for example `gateway/hooks/*` → LiteLLM and Postgres with `--wait`, a short chat/API outage).
+- `new` in the dry run means missing **or** changed. A changed runtime file in a stack force-recreates that stack,
+  even a comment-only change (for example `gateway/hooks/*` → LiteLLM and Postgres with `--wait`, a short chat/API
+  outage). Each stack prints `force-recreate: yes (changed in this run: <files>)` or `force-recreate: no (<why>)`.
+- **Docs never recreate or rebuild.** Files named `*.md` (`README.md`, `RESTORE.md`, ...) or `*.example`
+  (`.env.example`; the stacks read the real `.env`) are still installed, but a change to one only prints
+  `force-recreate: no (only docs changed: <files>)` and is left out of the build hash below (a doc under `build/`
+  reaches the image at the next real rebuild). The same holds for
+  `monitoring/grafana/build_spark_overview.py`, which no container mounts (its output under
+  `grafana/provisioning/` does count). This is safe because no `compose.yaml` bind-mounts a single doc file (a
+  test checks it); a change inside a bind-mounted directory reaches the container without a recreate.
 - **Every run**, whatever changed:
   - `apt-get update` and the pinned package installs (skip with `--skip-packages`);
   - `ufw-rules.sh` (idempotent; ufw skips existing rules) and a start of `docker-user-rules` (a restart if its script changed);
@@ -130,10 +139,11 @@ every line, not only the ones you expect:
 - **Telemetry and digest images** are rebuilt (`up -d --build`, which recreates the app container: a few seconds
   each) only when the stack's `compose.yaml` or `build/` tree changed in this run, differs from the last
   successful build, or `--rebuild` is given. Each run prints `rebuild: yes (<why>)` or `rebuild: no` per stack,
-  in the dry run too. The last build's content hash (compose.yaml plus every file under `build/`, as installed)
+  in the dry run too. The last build's content hash (compose.yaml plus every non-doc file under `build/`, as installed)
   is kept in `/srv/<stack>/.build-hash`, written after a successful `up`. A change installed with `--no-start`
   is therefore still rebuilt on the next run. **The first run after this was added rebuilds both images once**
-  (no `.build-hash` yet); later runs with no change do not.
+  (no `.build-hash` yet); later runs with no change do not. Leaving docs out of the hash did not cause another
+  one-time rebuild: no `build/` tree held a doc, so the hash of an existing marker is unchanged.
 - A changed `/etc/llama-swap/config.yaml` is reloaded by llama-swap itself (`--watch-config`): the loaded models restart,
   and the coding pair comes back through the startup preload.
 - It never deletes anything: a file removed from the repo stays on the host until you remove it.

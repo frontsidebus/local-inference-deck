@@ -25,6 +25,7 @@
 # Restarts and rebuilds happen only when needed: nvidia-persistenced is restarted only when its drop-in
 # changed; the telemetry and digest images are rebuilt (docker compose up -d --build) only when their
 # compose.yaml or build/ tree differs from the last build (content hash in /srv/<stack>/.build-hash).
+# Docs (*.md, *.example) are installed but never force-recreate a stack or count toward a build hash.
 #
 # Order: render -> packages -> users -> /models mount -> llama-swap binary -> files ->
 #        env files -> gen-secrets -> systemd units + firewall -> (offsite backups) -> gateway -> keys -> webui ->
@@ -56,7 +57,7 @@ while [[ $# -gt 0 ]]; do
     --no-start) NO_START=1 ;;
     --with-hermes) WITH_HERMES=1 ;;
     --rebuild) REBUILD=1 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "deploy: unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -134,7 +135,18 @@ fi
 say "  rendered to $STAGE"
 
 # ---- install helpers -----------------------------------------------------------------
-declare -A CHANGED=()   # tag -> 1 when a file in that group changed
+declare -A CHANGED=()   # tag -> non-empty when a runtime file in that group changed (restart/recreate trigger)
+declare -A DOCS=()      # tag -> installed paths of docs that changed in that group (reported, no trigger)
+
+# is_doc PATH: docs-only files. They are installed like any other file, but a change to one never restarts,
+# recreates or rebuilds anything (CHANGED is not set, build_hash skips them). Safe because no stack
+# bind-mounts a single doc file (walter/tests/test_deploy.py checks every compose.yaml), and a change inside
+# a bind-mounted directory is visible to the container without a recreate. *.example: the stacks read the
+# real .env, which env_from_example creates only when absent.
+is_doc() {
+  case ${1##*/} in *.md|*.example) return 0 ;; esac
+  return 1
+}
 
 # install_file SRC DEST MODE OWNER GROUP [TAG]
 install_file() {
@@ -148,7 +160,9 @@ install_file() {
     same) return 0 ;;
     *) say "  $(printf '%-8s' "$state") $2" ;;
   esac
-  [[ -n $tag ]] && CHANGED[$tag]=1
+  if [[ -n $tag ]]; then
+    if is_doc "$2"; then DOCS[$tag]+=" $2"; else CHANGED[$tag]+=" $2"; fi
+  fi
   [[ $DRY == 1 ]] && return 0
   install -d -m 0755 "$(dirname "$dest")"
   if [[ $EUID -eq 0 ]]; then install -m "$mode" -o "$owner" -g "$group" "$src" "$dest"
@@ -317,20 +331,21 @@ install_file "$S/webui/pocket-id.env.example"   /srv/webui/pocket-id.env.example
 install_tree "$S/webui/theme"                   /srv/webui/theme                          0644 root root webui-theme
 install_file "$S/webui/pocketid-bootstrap.py"   /srv/webui/pocketid-bootstrap.py          0700 root root
 
-for f in compose.yaml README.md blackbox/blackbox.yml prometheus/prometheus.yml llamaswap-sd/llamaswap_sd.py \
-         grafana/build_spark_overview.py; do
+for f in compose.yaml README.md blackbox/blackbox.yml prometheus/prometheus.yml llamaswap-sd/llamaswap_sd.py; do
   install_file "$S/monitoring/$f" "/srv/monitoring/$f" 0644 root root monitoring
 done
+# The dashboard generator is not mounted into any container (its output is under grafana/provisioning): no tag.
+install_file "$S/monitoring/grafana/build_spark_overview.py" /srv/monitoring/grafana/build_spark_overview.py 0644 root root
 install_tree "$S/monitoring/prometheus/rules" /srv/monitoring/prometheus/rules 0644 root root monitoring
 install_tree "$S/monitoring/grafana/provisioning" /srv/monitoring/grafana/provisioning 0644 root root monitoring
 
 install_file "$S/telemetry/compose.yaml"        /srv/telemetry/compose.yaml               0644 root root telemetry
-install_file "$S/telemetry/README.md"           /srv/telemetry/README.md                  0644 root root
+install_file "$S/telemetry/README.md"           /srv/telemetry/README.md                  0644 root root telemetry
 install_tree "$S/telemetry/build"               /srv/telemetry/build                      0644 root root telemetry
 
 if [[ $DIGEST == 1 ]]; then
   install_file "$S/digest/compose.yaml"         /srv/digest/compose.yaml                  0644 root root digest
-  install_file "$S/digest/README.md"            /srv/digest/README.md                     0644 root root
+  install_file "$S/digest/README.md"            /srv/digest/README.md                     0644 root root digest
   install_tree "$S/digest/build"                /srv/digest/build                         0644 root root digest
 fi
 
@@ -398,19 +413,25 @@ else
 fi
 
 # ---- 10. compose stacks, in dependency order ---------------------------------------------
-# compose_up DIR TAG...: recreate when any file of the stack changed (bind-mounted configs are
-# not noticed by `up -d` alone), otherwise a no-op `up -d`.
+# compose_up DIR TAG...: --force-recreate when a runtime file of the stack changed in this run (bind-mounted
+# configs are not noticed by `up -d` alone), otherwise a no-op `up -d`. Docs (is_doc) never recreate.
+# Prints `force-recreate: yes|no (<why>)`.
 compose_up() {
-  local dir=$1 recreate=(); shift
-  local t; for t in "$@"; do [[ -n ${CHANGED[$t]:-} ]] && recreate=(--force-recreate); done
+  local dir=$1 recreate=() files="" docs="" t; shift
+  for t in "$@"; do files+=${CHANGED[$t]:-}; docs+=${DOCS[$t]:-}; done
+  if [[ -n $files ]]; then
+    recreate=(--force-recreate); say "  force-recreate: yes (changed in this run:$files)"
+  elif [[ -n $docs ]]; then say "  force-recreate: no (only docs changed:$docs)"
+  else say "  force-recreate: no (no stack file changed in this run)"; fi
   run docker compose -f "$dir/compose.yaml" up -d "${recreate[@]}" "${EXTRA_UP[@]}"
 }
-# build_hash DIR: sha256 over the stack's build inputs as installed (compose.yaml + every file under build/,
-# path and content), i.e. what `docker compose build` sees.
+# build_hash DIR: sha256 over the stack's build inputs as installed (compose.yaml + every non-doc file under
+# build/, path and content), i.e. what `docker compose build` sees. Docs are skipped so a README change does
+# not rebuild; no build/ tree has ever held one, so existing .build-hash markers stay valid.
 build_hash() {
   [[ -d $T$1/build && -f $T$1/compose.yaml ]] || { echo none; return 0; }
-  (cd "$T$1" && find compose.yaml build -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
-    | sha256sum | cut -c1-64
+  (cd "$T$1" && find compose.yaml build -type f ! -name '*.md' ! -name '*.example' -print0 | LC_ALL=C sort -z \
+     | xargs -0 sha256sum) | sha256sum | cut -c1-64
 }
 # compose_build_up DIR TAG: compose_up with --build only when the build inputs changed in this run, differ
 # from the last successful build (DIR/.build-hash), have no marker yet, or --rebuild was given. A plain
@@ -420,12 +441,12 @@ compose_build_up() {
   want=$(build_hash "$dir")
   [[ -r $T$dir/.build-hash ]] && have=$(<"$T$dir/.build-hash")
   if [[ $REBUILD == 1 ]]; then why="--rebuild"
-  elif [[ -n ${CHANGED[$tag]:-} ]]; then why="compose.yaml or build/ changed in this run"
+  elif [[ -n ${CHANGED[$tag]:-} ]]; then why="compose.yaml or build/ changed in this run:${CHANGED[$tag]}"
   elif [[ -z $have ]]; then why="no $dir/.build-hash yet (first run with build tracking)"
   elif [[ $have != "$want" ]]; then why="build inputs differ from the last build ($dir/.build-hash)"
   fi
   if [[ -n $why ]]; then say "  rebuild: yes ($why)"; EXTRA_UP+=(--build)
-  else say "  rebuild: no (build inputs unchanged since the last build)"; fi
+  else say "  rebuild: no (build inputs unchanged since the last build${DOCS[$tag]:+; docs changed:${DOCS[$tag]}})"; fi
   compose_up "$dir" "$tag"
   if [[ -n $why && $DRY == 0 && $want != none ]]; then   # only after a successful up (set -e)
     printf '%s\n' "$want" >"$T$dir/.build-hash"; chmod 0644 "$T$dir/.build-hash"
