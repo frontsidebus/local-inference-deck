@@ -63,7 +63,7 @@ SWAPPING_ALIASES = {"big", "vision", "hermes"}   # these take both GPUs and evic
 
 DEFAULT_SYSTEM = {
     "mcq": ("You are a security expert answering a multiple-choice question. Choose the single best option. "
-            "End your reply with a line of the form 'Answer: X', where X is the option letter."),
+            "Keep any reasoning brief. End your reply with a line of the form 'Answer: X', where X is the option letter."),
     "extract": ("You extract information from security text. Follow the requested output format exactly and do "
                 "not add commentary. When a single value is asked for, end with a line 'Answer: <value>'."),
     "classify": "You classify security data. End your reply with a line of the form 'Answer: <label>'.",
@@ -72,7 +72,7 @@ DEFAULT_SYSTEM = {
              "output format."),
 }
 # Output caps per task type with thinking off. Thinking on adds --think-budget (reasoning counts against max_tokens).
-MAX_TOKENS = {"mcq": 512, "classify": 512, "extract": 2048, "freeform": 2048, "code": 3072}
+MAX_TOKENS = {"mcq": 1024, "classify": 1024, "extract": 2048, "freeform": 2048, "code": 3072}
 DEFAULT_THINK_BUDGET = 8192
 HARD_MAX_TOKENS = 32768   # the gateway/llama-server cap for the coding models
 
