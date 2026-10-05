@@ -1,0 +1,66 @@
+{
+ "document": {
+  "category": "csaf_security_advisory",
+  "csaf_version": "2.0",
+  "distribution": {
+   "text": "Disclosure is not limited",
+   "tlp": {
+    "label": "WHITE"
+   }
+  },
+  "lang": "en-US",
+  "publisher": {
+   "category": "coordinator",
+   "name": "CISA",
+   "namespace": "https://www.cisa.gov/"
+  },
+  "notes": [
+   {
+    "category": "legal_disclaimer",
+    "title": "Legal Notice",
+    "text": "Synthetic notice."
+   },
+   {
+    "category": "summary",
+    "title": "Advisory Summary",
+    "text": "Synthetic medical device advisory summary."
+   },
+   {
+    "category": "other",
+    "title": "Critical infrastructure sectors",
+    "text": "Energy"
+   }
+  ],
+  "references": [
+   {
+    "category": "self",
+    "summary": "ICS Advisory ICSMA-26-999-01 JSON",
+    "url": "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/OT/white/2026/icsma-26-999-01.json"
+   },
+   {
+    "category": "external",
+    "summary": "Recommended Practices",
+    "url": "https://www.cisa.gov/resources-tools/resources/ics-recommended-practices"
+   }
+  ],
+  "title": "Example Medical InfusionHub",
+  "tracking": {
+   "current_release_date": "2026-10-02T06:00:00.000000Z",
+   "initial_release_date": "2026-10-02T06:00:00.000000Z",
+   "id": "ICSMA-26-999-01",
+   "revision_history": [
+    {
+     "date": "2026-10-02T06:00:00.000000Z",
+     "number": "1",
+     "summary": "Initial Publication"
+    }
+   ],
+   "status": "final",
+   "version": "1"
+  }
+ },
+ "product_tree": {
+  "branches": []
+ },
+ "vulnerabilities": []
+}

@@ -82,8 +82,10 @@ def main():
     out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
         os.environ.get("BH_AGENT_WORKSPACE", "."), f"ai_digest_{slug}_raw.json")
     since = feedlib.window_start()
+    cache = feedlib.FeedCache.from_env()   # $STATE_DIR/feedcache: conditional GET, backoff
+    fetcher = cache.fetch if cache else feedlib.fetch
     results = feedlib.collect(
-        WATCHES[slug], lambda n, spec, cfg: collect_source(n, spec, cfg, since))
+        WATCHES[slug], lambda n, spec, cfg: collect_source(n, spec, cfg, since, fetcher=fetcher))
     d = os.path.dirname(os.path.abspath(out))
     os.makedirs(d, exist_ok=True)
     with open(out, "w") as f:

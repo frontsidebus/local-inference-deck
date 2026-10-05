@@ -160,11 +160,13 @@ class Srv:
     def __init__(self, routes):
         self.routes = routes
         self.hits = {}
+        self.req_headers = {}
         outer = self
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 outer.hits[self.path] = outer.hits.get(self.path, 0) + 1
+                outer.req_headers.setdefault(self.path, []).append(dict(self.headers))
                 seq = outer.routes[self.path]
                 resp = seq[min(outer.hits[self.path] - 1, len(seq) - 1)]
                 if resp[0] == "sleep":
