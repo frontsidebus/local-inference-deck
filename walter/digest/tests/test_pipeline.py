@@ -230,3 +230,34 @@ def test_max_tokens_always_bounded(monkeypatch, val, want):
     else:
         monkeypatch.setenv("DIGEST_MAX_TOKENS", val)
     assert pipeline._max_tokens() == want
+
+
+FALLBACK_COLLECTOR = r'''
+import json, sys
+out = sys.argv[1]
+json.dump({
+    "SANS_ISC": {"ok": True, "items": [{"title": "Story A", "link": "https://e.example/a", "date": "2026-10-03"}]},
+    "CISA_Advisories": {"ok": True, "via": "fallback", "fallback": "csaf",
+                        "note": "HTTP 403; served via fallback csaf",
+                        "items": [{"title": "ICSA-26-999-01 Example", "link": "https://e.example/icsa",
+                                   "date": "2026-10-03"}]},
+}, open(out, "w"))
+'''
+
+
+def test_fallback_served_source_is_a_gap_and_keeps_its_cutoff(env, tmp_path, monkeypatch):
+    """A source served only by its fallback (partial coverage, e.g. CSAF = ICS advisories only) is
+    reported as a coverage gap and does not advance its own cutoff, so items the primary carries
+    from the blocked window are still reported once it recovers."""
+    col = tmp_path / "fallbackcol.py"
+    col.write_text(FALLBACK_COLLECTOR)
+    monkeypatch.setattr(pipeline, "_collector_cmd", lambda watch, out: [sys.executable, str(col), out])
+    seed(env)
+    ev = run(env, fake_curate)
+    assert ev[-1][0] == "done"
+    out = json.loads((env / "runs" / "default" / "20261004T000000Z.json").read_text())
+    assert any(g.startswith("CISA_Advisories:") and "fallback" in g for g in out["coverage_gaps"])
+    assert any("ICSA-26-999-01" in (i.get("title") or "") for i in out["items"])
+    s = load_state(env)
+    assert s["sources"]["SANS_ISC"]["cutoff"] == s["cutoff"] != "2026-09-25T00:00:00Z"
+    assert s["sources"]["CISA_Advisories"]["cutoff"] == "2026-09-25T00:00:00Z"

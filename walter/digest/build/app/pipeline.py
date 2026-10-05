@@ -257,6 +257,10 @@ async def _collect(watch: str, progress, since: str | None = None) -> dict:
         sources = data.get("sources", data)
         sources = {k: v for k, v in sources.items() if isinstance(v, dict) and "ok" in v}
         gaps = [f"{name}: {v.get('error', 'unknown error')}" for name, v in sources.items() if not v.get("ok")]
+        # A source served by its fallback is partial coverage (e.g. CSAF carries only ICS advisories):
+        # report it as a gap, and run_watch keeps its cutoff so the primary's items are not skipped later.
+        gaps += [f"{name}: {v.get('note') or 'served via fallback'}" for name, v in sources.items()
+                 if v.get("ok") and v.get("via") == "fallback"]
         return {"sources": sources, "gaps": gaps}
     finally:
         try:
@@ -1147,9 +1151,10 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
         for name, s in sources.items():
             entry = src_state.setdefault(name, {})
             entry["ok"] = bool(s.get("ok"))
-            if s.get("ok"):
+            if s.get("ok") and s.get("via") != "fallback":
                 entry["cutoff"] = now
             else:
+                # Failed, or served only by a fallback with partial coverage: keep the old cutoff.
                 # The source has no per-source cutoff yet: pin it to the OLD watch-level
                 # cutoff before that one advances below. On a first run with no seeded
                 # state that is null ("no cutoff yet"), which _dedupe honours as such
