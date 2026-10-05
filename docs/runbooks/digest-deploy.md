@@ -72,13 +72,26 @@ In the Pocket-ID admin UI at `https://${SPARK_ID_HOST}`:
 3. Keep the **client secret** window open, or regenerate the secret later; step 6 needs it. Do not
    save it in a file or a chat.
 
+The **name** is only a label. The **client id** is what oauth2-proxy-digest sends, and Pocket-ID
+generates a random one (a UUID) unless you set a custom client id when you create the client. If
+the id is not `digest`, put the real one in every `site.env` as `OAUTH2_PROXY_DIGEST_CLIENT_ID`
+(it is not a secret). Before step 6, check the id with Pocket-ID's public metadata endpoint, which
+needs no login:
+
+```bash
+curl -s -w ' %{http_code}\n' "https://${SPARK_ID_HOST}/api/oidc/clients/${OAUTH2_PROXY_DIGEST_CLIENT_ID:-digest}/meta"
+#   expected: {"id":"<that id>","name":...} 200
+#   404 "OIDC client not found": the id is wrong; do not run step 6 until it returns 200
+```
+
 `/srv/webui/pocketid-bootstrap.py` does **not** create this client or group: it only knows
 `open-webui` and the telemetry client. Without the UI, use the API method in
 [walter/README.md](../../walter/README.md#pocket-id--oidc-bootstrap) (step 3, temporary
 `STATIC_API_KEY`). That method recreates the `pocket-id` container twice, so logins to every site
 pause for a few seconds each time. Check in the admin UI (User groups) that `${DIGEST_GROUP}` exists
 and has its members **before** using the API method, so the two recreates are not spent on a run
-that stops at a missing group.
+that stops at a missing group. Walter has no `sqlite3` CLI; a read-only look at the Pocket-ID
+database uses `python3`'s `sqlite3` module with a `file:...?mode=ro` URI.
 
 ## 4. LiteLLM key `digest`
 
@@ -167,7 +180,9 @@ sudo covenant/deploy.sh
 #   expected warning: oauth2-proxy-digest NOT started: /etc/oauth2-proxy-digest/client-secret missing
 readlink /etc/nginx/sites-enabled/60-digest                                     # expected: /etc/nginx/sites-available/60-digest
 sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST" | grep 'Key Type'   # expected: Key Type: ECDSA
-# 6c. client secret from step 3 (read without echo, stored root 0600, instance restarted)
+# 6c. re-check the client id first (step 3: the /meta probe must answer 200). A wrong id is
+#     only fixed in site.env + a full deploy.sh run: --set-client-secret does not re-render the cfg.
+#     Then the client secret from step 3 (read without echo, stored root 0600, instance restarted)
 sudo covenant/deploy.sh --set-client-secret --instance digest
 ```
 
