@@ -756,9 +756,48 @@ def _fragments(text):
     return [f.lstrip("-+?!@") for f in _FRAG_SPLIT.split(text)]
 
 
-def _pattern_args(text, depth=0):
+def jq_operands(args):
+    """#46: (filter or None, files) of a jq command line. --arg/--argjson/--slurpfile/--rawfile take two
+    values (the --slurpfile/--rawfile file is read); --indent and -L take one. With -f/--from-file the program
+    comes from a file and every positional is a file (the program file first: compile errors quote it)."""
+    files, pos, from_file, i, n = [], [], False, 0, len(args)
+    while i < n:
+        a = args[i]
+        if a == "--":
+            pos += args[i + 1:]
+            break
+        if a.startswith("--") and len(a) > 2:
+            nm = a[2:]
+            if nm in ("arg", "argjson", "slurpfile", "rawfile"):
+                if nm in ("slurpfile", "rawfile") and i + 2 < n:
+                    files.append(args[i + 2])
+                i += 3
+                continue
+            if nm == "indent":
+                i += 1
+            elif nm == "from-file":
+                from_file = True
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:]):
+                if ch == "f":
+                    from_file = True
+                elif ch == "L":
+                    if k == len(a) - 2:
+                        i += 1
+                    break
+        else:
+            pos.append(a)
+        i += 1
+    if from_file:
+        return None, files + pos
+    return (pos[0] if pos else None), files + pos[1:]
+
+
+def _pattern_args(text, depth=0, skip_jq=None):
     """#36: the pattern/program arguments of grep/egrep/fgrep/zgrep/rg, sed and awk anywhere in `text`
-    (including $(...) and bash -c code). They are text to match or a program, never a file the command reads."""
+    (including $(...) and bash -c code). They are text to match or a program, never a file the command reads.
+    #46: also a jq filter (`"\\(.key)"` is a field, not a *.key file), unless it matches `skip_jq` (a filter
+    that pulls a secret-looking field such as `.client_secret` still counts as naming a secret)."""
     out = []
     if depth > 3 or not text or not text.strip():
         return out
@@ -769,7 +808,7 @@ def _pattern_args(text, depth=0):
     except Exception:  # the real analysis reports parse problems; this scan is best effort
         return out
     for sub in substs:
-        out += _pattern_args(sub if isinstance(sub, str) else str(sub), depth + 1)
+        out += _pattern_args(sub if isinstance(sub, str) else str(sub), depth + 1, skip_jq)
     for sc in cmds:
         argv, _, _ = unwrap(sc.argv)
         if not argv:
@@ -781,9 +820,68 @@ def _pattern_args(text, depth=0):
             out += opt_values(args, "e", ("expression",)) or positional(args, "ef", ("expression", "file"))[:1]
         elif name in ("awk", "gawk", "mawk") and not opt_values(args, "f"):
             out += positional(args, "fvF")[:1]
+        elif name == "jq":
+            filt = jq_operands(args)[0]
+            if filt is not None and not (skip_jq and skip_jq.search(filt)):
+                out.append(filt)
         elif name in ("bash", "sh", "zsh", "dash", "ksh", "ash"):
             for code in opt_values(args, "c"):
-                out += _pattern_args(code, depth + 1)
+                out += _pattern_args(code, depth + 1, skip_jq)
+    return out
+
+
+# #46: commands that print only metadata (size, mode, type, counts, a yes/no) or a label, never file content
+_METADATA_CMDS = ("stat", "ls", "wc", "test", "[", "file", "du", "true", ":")
+_FD_TARGET_RE = re.compile(r"&?\d+|&-")
+
+
+def _display_only(name, args):
+    if name in _METADATA_CMDS or name == "echo":
+        return True
+    if name == "printf":
+        return "-v" not in args  # printf -v VAR stores its output in a variable
+    if name == "cmp":  # -l/-b print the differing bytes
+        return not has_flag(args, "lb", ("verbose", "print-bytes"))
+    if name == "diff":  # -q/--brief: "Files A and B differ"
+        return has_flag(args, "q", ("brief",))
+    return False
+
+
+def _display_only_args(text):
+    """#46: words that only label or locate something in output that goes straight to the transcript: the
+    arguments (and `<` stdin redirect) of top-level echo/printf and metadata-only commands (stat, ls, wc,
+    test/[ ], [[ ]], file, du, cmp -s, diff -q) whose stdout is not piped, redirected to a file or captured by
+    $(...). Such a word can't become the value of an unresolved variable or an xargs/loop argument in this
+    command, so it is not a "secret mention" for secret-output-unknown (`echo "== secrets"; scripts/check-
+    sanitized.sh --all`); Gate._line_mentions_secret still counts it when it is a configured secret path.
+    The same word anywhere else (an assignment, a loop header, a substitution, a pipe) still counts."""
+    out = []
+    if not text or not text.strip():
+        return out
+    try:
+        body, _, heredocs = preprocess(text)
+        raw = tokenize(body)
+        toks, _ = shell_structure(raw)
+        cmds = simple_commands(toks, heredocs)
+    except Exception:  # best effort, like _pattern_args: on a parse problem nothing is exempt
+        return out
+    # [[ ... ]] is dropped by shell_structure (it runs nothing); its operands are a test, like `test`
+    cmdpos = True
+    for k, (kind, val) in enumerate(raw):
+        if kind == "w" and val == "[[" and cmdpos:
+            j = k + 1
+            while j < len(raw) and raw[j] != ("w", "]]"):
+                if raw[j][0] == "w" and not SUB_RE.search(raw[j][1]):
+                    out.append(raw[j][1])
+                j += 1
+        cmdpos = kind == "op" and val in SEPS or (kind == "w" and val in ("if", "then", "else", "elif", "do",
+                                                                           "while", "until", "!", "{"))
+    for sc in cmds:
+        if sc.pipe_out or any(not _FD_TARGET_RE.fullmatch(t) for t in sc.out_targets()):
+            continue
+        argv, _, _ = unwrap(sc.argv)
+        if argv and _display_only(base(argv[0]), argv[1:]):
+            out += argv[1:] + [t for op, t in sc.redirects if op == "<"]  # `wc -c < key`
     return out
 
 
@@ -1220,10 +1318,15 @@ class Gate:
             self._mention = ""
             seen = set()
             seed = self._seed_vars()
-            # #36: a word that only occurs inside grep/sed/awk patterns is text to match, not a path
-            pat_only = Counter()
-            for p in _pattern_args(self.full_text):
+            # #36: a word that only occurs inside grep/sed/awk (#46: jq) patterns is text to match, not a path
+            pat_only, shown_only = Counter(), Counter()
+            for p in _pattern_args(self.full_text, skip_jq=self.secret_grep):
                 pat_only.update(_fragments(self.subst(p, seed)))
+            # #46: nor is a word that only labels or locates metadata-only output (echo "== secrets", stat/wc -c/
+            # test on a staged cookie-secret), unless it is a configured secret path: `ls ~/.config/spark/;
+            # cat "$KEY_FILE"` still escalates (#27), since the unresolved file may be the one just listed
+            for p in _display_only_args(self.full_text):
+                shown_only.update(_fragments(self.subst(p, seed)))
             line_count = Counter(_fragments(self.subst(self.full_text, seed)))
             # the command line itself: any secret-shaped word; script files it runs (often long, with comments
             # and site.env plumbing): configured secret paths only, to avoid approval fatigue
@@ -1232,6 +1335,9 @@ class Gate:
                     if not frag or (frag, names) in seen or len(frag) > 512 or UNRES_RE.search(frag):
                         continue
                     if names and pat_only[frag] >= line_count[frag]:
+                        continue
+                    if names and pat_only[frag] + shown_only[frag] >= line_count[frag] and \
+                            not self.is_secret_file(frag, None, names=False):
                         continue
                     seen.add((frag, names))
                     if self.is_secret_file(frag, None, names=names):
@@ -1591,8 +1697,9 @@ class Gate:
         elif name == "dd":
             files = [a[3:] for a in args if a.startswith("if=")]
         elif name == "jq":
-            pos = positional(args, "", ("arg", "argjson", "slurpfile", "rawfile", "indent"))
-            files = pos[1:]
+            files = jq_operands(args)[1]
+        elif name == "diff" and has_flag(args, "q", ("brief",)):
+            return []  # #46: "Files A and B differ", no content
         else:
             files = positional(args, "nNcwsk" if name in ("head", "tail", "base64", "cut", "fold") else "")
         return files + [t for op, t in sc.redirects if op == "<"]
@@ -1687,6 +1794,11 @@ class Gate:
             return False
         if name in self.print_cmds:
             reads = self._secret_or_unknown(name, self._print_files(name, args, sc, ctx), ctx)
+        elif name == "cmp":
+            # #46: plain cmp / cmp -s print an offset or nothing; -l / -b print the differing bytes
+            if has_flag(args, "lb", ("verbose", "print-bytes")):
+                reads = self._secret_or_unknown(name, positional(args, "in", ("ignore-initial", "bytes")), ctx,
+                                                verb="(-l/-b) prints bytes of")
         elif name in ("echo", "printf") and not ctx["captured"]:
             if self._mentions_secret_var(args, ctx, sub_secret):
                 self.hit("secret_output", f"{name} of a value read from a secret file", name)
