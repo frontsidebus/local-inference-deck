@@ -37,9 +37,19 @@ SPARK_DIGEST_HOST=digest.example.com          # your real name; this switches th
 # OAUTH2_PROXY_DIGEST_CLIENT_ID=digest
 ```
 
-`site.env.example` documents each variable. Check that the host's `site.env` is otherwise complete:
-on Walter, `scripts/render.sh` refuses to render any template whose variables are empty (for
-example `RESTIC_BUCKET` / `RESTIC_REGION` for `walter/backup`).
+`site.env.example` documents each variable. Check that the host's `site.env` is otherwise complete
+and matches what is live:
+- on Walter, `scripts/render.sh` refuses to render any template whose variables are empty (for
+  example `RESTIC_BUCKET` / `RESTIC_REGION` for `walter/backup`), so the deploy stops at "render";
+- on Covenant, `WG_BACKEND_PUBLIC_KEY` must be Walter's real WireGuard public key
+  (`sudo cat /etc/wireguard/publickey` on Walter; it is not a secret). With `CHANGEME` the live
+  deploy stops at step 2/7, and with a wrong key it would rewrite the edge's `wg0` peer and cut the
+  tunnel. The dry run only warns `WG_BACKEND_PUBLIC_KEY is CHANGEME`.
+
+The deploy scripts read `site.env` from the root of the checkout they run from (`../site.env` next
+to `walter/` or `covenant/`). If a host has no checkout, copy one there first (for example
+`git archive <commit> | ssh <host> tar -x -C ~/<dir>`) and put the same `site.env` next to it, with
+mode 0600. Compare `sha256sum site.env` across the copies.
 
 ## 2. DNS
 
@@ -62,6 +72,27 @@ In the Pocket-ID admin UI at `https://${SPARK_ID_HOST}`:
 3. Keep the **client secret** window open, or regenerate the secret later; step 6 needs it. Do not
    save it in a file or a chat.
 
+The **name** is only a label. The **client id** is what oauth2-proxy-digest sends, and Pocket-ID
+generates a random one (a UUID) unless you set a custom client id when you create the client. If
+the id is not `digest`, put the real one in every `site.env` as `OAUTH2_PROXY_DIGEST_CLIENT_ID`
+(it is not a secret). Before step 6, check the id with Pocket-ID's public metadata endpoint, which
+needs no login:
+
+```bash
+curl -s -w ' %{http_code}\n' "https://${SPARK_ID_HOST}/api/oidc/clients/${OAUTH2_PROXY_DIGEST_CLIENT_ID:-digest}/meta"
+#   expected: {"id":"<that id>","name":...} 200
+#   404 "OIDC client not found": the id is wrong; do not run step 6 until it returns 200
+```
+
+`/srv/webui/pocketid-bootstrap.py` does **not** create this client or group: it only knows
+`open-webui` and the telemetry client. Without the UI, use the API method in
+[walter/README.md](../../walter/README.md#pocket-id--oidc-bootstrap) (step 3, temporary
+`STATIC_API_KEY`). That method recreates the `pocket-id` container twice, so logins to every site
+pause for a few seconds each time. Check in the admin UI (User groups) that `${DIGEST_GROUP}` exists
+and has its members **before** using the API method, so the two recreates are not spent on a run
+that stops at a missing group. Walter has no `sqlite3` CLI; a read-only look at the Pocket-ID
+database uses `python3`'s `sqlite3` module with a `file:...?mode=ro` URI.
+
 ## 4. LiteLLM key `digest`
 
 Append `digest` to `HARNESS_KEYS` in `site.env` (same three copies as step 1):
@@ -81,7 +112,29 @@ sudo walter/deploy.sh --dry-run               # read it: /srv/digest files, ufw 
 sudo walter/deploy.sh
 ```
 
-Expected in the output:
+Expected in the dry run:
+- `provision-keys: would create harness key digest`;
+- `WARN: digest key missing` and `WARN: digest not started: key missing`. On the first deploy these
+  are expected in the **dry run** only: the key is created by the live run's `provision-keys.py`.
+
+Read the dry run for **non-digest** changes before the live run. `walter/deploy.sh` converges the
+whole host, not only the digest:
+- every file whose live copy differs from the repo is installed. The `files` list labels a file
+  `new` both when it is missing and when it differs; even a comment-only difference counts;
+- a changed file in a stack force-recreates that stack, for example `/srv/gateway/hooks/*` →
+  LiteLLM and Postgres (`--force-recreate --wait`), or `/srv/monitoring/prometheus/*` → monitoring;
+- every run also runs `apt-get install` (skip it with `--skip-packages`), `ufw-rules.sh` and
+  `systemctl restart nvidia-persistenced`. `--no-start` skips that restart, but also every compose
+  stack, the digest included;
+- every run rebuilds the telemetry image (`up -d --build`). Even with every build layer cached, the
+  new image gets a new ID, so `telemetry-app` is recreated (a few seconds). The dry run does not
+  show this.
+
+On a host that was set up by hand or has drifted from the repo, the first run can therefore restart
+LiteLLM and other stacks. Reconcile those files, or schedule the run when a short gateway restart is
+acceptable. The digest part on its own restarts nothing that already exists.
+
+Expected in the live output:
 - `create   /srv/digest/secrets/digest-litellm-key (copy of /srv/gateway/keys/digest.key)`;
 - `== digest` followed by `docker compose ... up -d ... --build`;
 - no `digest: off`, no `WARN: digest ...`.
@@ -119,17 +172,38 @@ sudo covenant/deploy.sh --dry-run
 #        + nginx -t, + systemctl reload nginx, + certbot certonly ... -d <digest host> --key-type ecdsa ...
 #   5/7: link sites-enabled/60-digest -> sites-available/60-digest once step 4 has issued the cert
 #   6/7: oauth2-proxy-digest config + unit staged
+#   The dry run shows a diff only for files that already exist, so it never shows the new digest
+#   cfg. Check its client_id by rendering the template yourself (render.sh refuses it while
+#   DIGEST_GROUP is unset, because that default lives in deploy.sh):
+#     ( export DIGEST_GROUP=${DIGEST_GROUP:-digest-viewers}
+#       envsubst '${DIGEST_GROUP} ${OAUTH2_PROXY_DIGEST_CLIENT_ID} ${SPARK_DIGEST_HOST} ${SPARK_ID_HOST}' \
+#         <covenant/oauth2-proxy/oauth2-proxy-digest.cfg.tmpl | grep '^client_id' )
+#     expected: client_id = "<the id that the step 3 /meta probe answers 200 for>"
 # 6b. deploy: stub -> cert -> full site in one run
 sudo covenant/deploy.sh
 #   4/7: the same lines, then certbot's "Successfully received certificate"
 #   5/7: link /etc/nginx/sites-enabled/60-digest -> /etc/nginx/sites-available/60-digest
 #        remove /etc/nginx/sites-available/60-digest-acme
 #   expected warning: oauth2-proxy-digest NOT started: /etc/oauth2-proxy-digest/client-secret missing
+#   From here until 6c the full site is public and answers 500 (its auth subrequest cannot reach
+#   :4181; fail-closed). Run 6c right away.
 readlink /etc/nginx/sites-enabled/60-digest                                     # expected: /etc/nginx/sites-available/60-digest
 sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST" | grep 'Key Type'   # expected: Key Type: ECDSA
-# 6c. client secret from step 3 (read without echo, stored root 0600, instance restarted)
+# 6c. re-check the client id first (step 3: the /meta probe must answer 200). A wrong id is
+#     only fixed in site.env + a full deploy.sh run: --set-client-secret does not re-render the cfg.
+#     Then the client secret from step 3 (read without echo, stored root 0600, instance restarted)
 sudo covenant/deploy.sh --set-client-secret --instance digest
 ```
+
+As on Walter, `covenant/deploy.sh` converges the whole edge, so read 6a for non-digest lines:
+- `install /etc/wireguard/wg0.conf` means the live file differs from the rendered one. Its diff is
+  not shown, because the file holds the private key. The live run applies it with `wg syncconf`.
+  Compare it with the private key masked before the live run, and check `WG_BACKEND_PUBLIC_KEY`
+  (step 1);
+- any other `install ...` with a diff under it is a non-digest file that the live run replaces;
+- some lines appear in every dry run and are not changes. The dry run cannot see unit state, so it
+  prints `+ systemctl start oauth2-proxy` even when the unit is running, along with the `ufw` rule
+  list.
 
 If certbot fails in 6b (the DNS record from step 2 not resolving yet, port 80 blocked), the deploy
 does not stop and does not take anything down: the digest stays on the stub, and deploy warns
