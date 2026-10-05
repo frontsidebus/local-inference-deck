@@ -10,7 +10,7 @@ Gen2 is the setup that ran until the end of September 2026:
 - **Edge:** nginx on a small EC2 instance (Covenant), with TLS from Let's Encrypt and HTTP **basic auth** in front of everything.
 - **UI:** a single static HTML page (`server/index.html`), a terminal-style chat that streamed from Ollama's OpenAI-compatible endpoint.
 - **Link:** one WireGuard tunnel between the edge and the VM. This part survives into gen3 unchanged.
-- **vLLM:** a parked launcher, unit and nginx block for tensor-parallel serving. It never ran in production because the second GPU sits on a PCIe x1 link.
+- **vLLM:** a parked launcher, unit and nginx block for tensor-parallel serving. It never ran in production because the second GPU sat on a PCIe x1 link at the time (both GPUs have been Gen4 x8 since the October 2026 bifurcation riser).
 
 ## Why it was replaced
 
