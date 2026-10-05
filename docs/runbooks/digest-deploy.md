@@ -20,7 +20,7 @@ a secret into a command line or a chat.
 | 3 | Pocket-ID admin UI | OIDC client `digest` and group `${DIGEST_GROUP}` |
 | 4 | `site.env` | `digest` in `HARNESS_KEYS` (its LiteLLM key) |
 | 5 | Walter | app running, key copied, state seeded |
-| 6 | Covenant | cert, site, second oauth2-proxy with its client secret |
+| 6 | Covenant | site + cert (one deploy run), second oauth2-proxy with its client secret |
 | 7 | both | firewall rules checked |
 | 8 | anywhere | verification probes pass |
 | 9 | both | rollback, if needed |
@@ -101,25 +101,43 @@ ssh ${BACKEND_SSH_USER}@${BACKEND_LAN_IP} 'sudo install -d -o 10001 -g 10001 -m 
 The path really is `state/state/`: the volume is `/srv/digest/state` and the pipeline reads
 `STATE_DIR/state/<watch>.json`.
 
-## 6. Covenant: cert, deploy, client secret
+## 6. Covenant: deploy (issues the cert), client secret
+
+Do **not** run `certs.sh` for the digest name before the deploy: `00-default` does not answer ACME
+for it (its `:80 default_server` returns 444 and its ACME block lists only the apex, chat, api and
+id names), so the http-01 challenge would fail. `deploy.sh` links an ACME-only port-80 stub for the
+digest first, issues the cert, then links the full site, with no downtime for the other sites.
 
 On the edge, from the repo checkout:
 
 ```bash
 set -a; . ./site.env; set +a
-# 6a. cert first: 00-default answers ACME on :80 for any name, so no bootstrap downtime is needed
-sudo LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL" covenant/scripts/certs.sh "$SPARK_DIGEST_HOST"
-sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST" | grep 'Key Type'   # expected: Key Type: ECDSA
-# 6b. deploy
-sudo covenant/deploy.sh --dry-run             # read it: 60-digest installed + linked, oauth2-proxy-digest staged
+# 6a. dry run: read it
+sudo covenant/deploy.sh --dry-run
+#   4/7: no cert yet for optional site(s): 60-digest (<digest host>); ACME-only stub, no downtime
+#        install .../sites-available/60-digest-acme, link sites-enabled/60-digest -> 60-digest-acme,
+#        + nginx -t, + systemctl reload nginx, + certbot certonly ... -d <digest host> --key-type ecdsa ...
+#   5/7: link sites-enabled/60-digest -> sites-available/60-digest once step 4 has issued the cert
+#   6/7: oauth2-proxy-digest config + unit staged
+# 6b. deploy: stub -> cert -> full site in one run
 sudo covenant/deploy.sh
-# expected warning: oauth2-proxy-digest NOT started: /etc/oauth2-proxy-digest/client-secret missing
+#   4/7: the same lines, then certbot's "Successfully received certificate"
+#   5/7: link /etc/nginx/sites-enabled/60-digest -> /etc/nginx/sites-available/60-digest
+#        remove /etc/nginx/sites-available/60-digest-acme
+#   expected warning: oauth2-proxy-digest NOT started: /etc/oauth2-proxy-digest/client-secret missing
+readlink /etc/nginx/sites-enabled/60-digest                                     # expected: /etc/nginx/sites-available/60-digest
+sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST" | grep 'Key Type'   # expected: Key Type: ECDSA
 # 6c. client secret from step 3 (read without echo, stored root 0600, instance restarted)
 sudo covenant/deploy.sh --set-client-secret --instance digest
 ```
 
-If 6a is skipped, 6b stops with "full sites are live but certs are missing" instead of taking 443
-down. Run 6a, then 6b again.
+If certbot fails in 6b (the DNS record from step 2 not resolving yet, port 80 blocked), the deploy
+does not stop and does not take anything down: the digest stays on the stub, and deploy warns
+`60-digest: no cert for <digest host> yet, so only its ACME stub is linked` with the next step.
+Fix the cause, then run
+`sudo LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL" covenant/scripts/certs.sh "$SPARK_DIGEST_HOST"` (the stub
+now answers the challenge) and `sudo covenant/deploy.sh` again; that run prints
+`certs present for all 6 names` and links the full site.
 
 ## 7. Firewall
 
@@ -171,7 +189,7 @@ Quick disable (minutes, nothing deleted):
 ```bash
 # Covenant
 sudo systemctl disable --now oauth2-proxy-digest
-sudo rm /etc/nginx/sites-enabled/60-digest && sudo nginx -t && sudo systemctl reload nginx
+sudo rm /etc/nginx/sites-enabled/60-digest && sudo nginx -t && sudo systemctl reload nginx   # full site or stub
 # Walter
 cd /srv/digest && sudo docker compose down
 ```

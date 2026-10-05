@@ -26,6 +26,7 @@ Internet ──443──> nginx ──wg0 (EDGE_WG_IP -> BACKEND_WG_IP)──> b
 | `nginx/snippets/{proxy,tls}-common.conf` | `/etc/nginx/snippets/` | proxy headers; certbot TLS params + HSTS etc. |
 | `nginx/sites-available/*.tmpl` | `/etc/nginx/sites-available/{00-default,10-apex,20-chat,30-id,40-api,50-telemetry}` (+ `60-digest` when `SPARK_DIGEST_HOST` is set) | all symlinked into `sites-enabled/`; the stock `default` is removed |
 | `nginx/bootstrap/00-acme-bootstrap.tmpl` | `sites-available/00-acme-bootstrap` | temporary port-80-only site for the first certs |
+| `nginx/bootstrap/60-digest-acme.tmpl` | `sites-available/60-digest-acme` | digest only: ACME-only port-80 stub that `sites-enabled/60-digest` points at until the digest cert exists (removed once the full site is linked) |
 | `nginx/snippets/pocketid-setup-lock.conf.in` | `snippets/pocketid-setup-lock.conf` | optional; rendered by `scripts/setup-lock.sh` (one `allow` per admin IP) |
 | `letsencrypt/renewal-hooks/deploy/reload-nginx.sh` | same path under `/etc/letsencrypt` | `nginx -t -q && systemctl reload nginx` |
 | `oauth2-proxy/oauth2-proxy.cfg.tmpl` | `/etc/oauth2-proxy/oauth2-proxy.cfg` (root:oauth2-proxy 0640) | no secrets in it |
@@ -139,9 +140,11 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
    Then `sudo covenant/deploy.sh --set-client-secret` (paste; no echo) - this starts oauth2-proxy.
    The digest gate (optional) is set up the same way - see the Digest section below.
 
-Adding a new hostname later: add the site + its name to `deploy.sh`; the missing cert makes the
-next run fall back to the bootstrap site, which it refuses to do on a live host unless you pass
-`--allow-bootstrap-downtime` (443 is down for the minute that takes).
+Adding a new hostname later: add the site + its name to `deploy.sh`. A core name (in `NAMES`)
+with a missing cert makes the next run fall back to the bootstrap site, which it refuses to do on
+a live host unless you pass `--allow-bootstrap-downtime` (443 is down for the minute that takes).
+An optional site instead goes in `OPT_SITE_HOST` with an ACME-only stub
+`nginx/bootstrap/<site>-acme.tmpl`; like the digest, it is enabled without downtime (see below).
 
 ## Digest (optional; second oauth2-proxy instance)
 
@@ -162,18 +165,26 @@ Enabling it on a live edge:
 
 1. `site.env`: set `SPARK_DIGEST_HOST` (and `DIGEST_GROUP` / `OAUTH2_PROXY_DIGEST_CLIENT_ID` if
    the defaults do not suit). The DNS A record must already resolve to `EDGE_PUBLIC_IP`.
-2. **Cert first.** The full sites are already live, so a deploy that finds the digest cert missing
-   stops and asks for `--allow-bootstrap-downtime`. Avoid that: `00-default` answers ACME
-   http-01 on :80 for any name, so issue the cert (one ECDSA cert, like every other name) before
-   deploying:
-   ```
-   set -a; . ./site.env; set +a
-   sudo LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL" covenant/scripts/certs.sh "$SPARK_DIGEST_HOST"
-   sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST"   # Key Type: ECDSA
-   ```
-3. `sudo covenant/deploy.sh --dry-run`, read it, then `sudo covenant/deploy.sh`. It installs and
-   links `60-digest`, generates `/etc/oauth2-proxy-digest/cookie-secret`, installs the config and
-   unit, and warns that the instance is not started (no client secret yet).
+2. **Do not issue the cert by hand first.** `00-default` does not answer ACME for the digest
+   name: its `:80 default_server` returns 444 and its ACME block lists only the apex, chat, api
+   and id names. The digest's own `:80` ACME block lives in `60-digest`, next to a `:443` server
+   that needs the cert, so linking the full site before the cert exists fails `nginx -t`.
+   `deploy.sh` resolves this itself, with no downtime and no manual nginx edit (step 3).
+3. `sudo covenant/deploy.sh --dry-run`, read it, then `sudo covenant/deploy.sh`. With the core
+   certs present and only the digest cert missing, step 4/7 prints
+   `no cert yet for optional site(s): 60-digest (...); ACME-only stub, no downtime`, links
+   `sites-enabled/60-digest` to the port-80-only stub `60-digest-acme`, runs `nginx -t` and a
+   reload (all other sites stay up), then issues the cert with `scripts/certs.sh` (one ECDSA cert,
+   like every other name). Step 5/7 then links the full `60-digest` and removes the stub. It also
+   generates `/etc/oauth2-proxy-digest/cookie-secret`, installs the config and unit, and warns that
+   the instance is not started (no client secret yet). In the dry run, step 5/7 says the full site
+   is linked once step 4 has issued the cert.
+
+   If certbot fails (DNS not resolving yet, port 80 blocked), the deploy does not stop: the digest
+   stays on the stub (the name answers ACME and nothing else) and deploy prints the next step,
+   `certs.sh <digest host>` and then `deploy.sh` again. The re-run finds the cert and links the
+   full site. Check the cert with
+   `sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST"` (`Key Type: ECDSA`).
 4. In Pocket-ID create the OIDC client: client id `OAUTH2_PROXY_DIGEST_CLIENT_ID`, callback
    `https://SPARK_DIGEST_HOST/oauth2/callback`, PKCE on, allowed group `DIGEST_GROUP`.
 5. `sudo covenant/deploy.sh --set-client-secret --instance digest` (paste; no echo). It stores
@@ -208,7 +219,7 @@ sudo sshd -T | grep -E 'permitrootlogin|passwordauthentication'               # 
 - oauth2-proxy: `systemctl disable --now oauth2-proxy` takes the telemetry site down to
   500s on auth_request (no data leaks); disable `sites-enabled/50-telemetry` to remove it.
   The digest instance is the same: `systemctl disable --now oauth2-proxy-digest` and remove
-  `sites-enabled/60-digest`, then clear `SPARK_DIGEST_HOST` so later deploys skip it. Full removal
+  `sites-enabled/60-digest` (whether it points at the full site or the `60-digest-acme` stub), then clear `SPARK_DIGEST_HOST` so later deploys skip it. Full removal
   (files, secrets dir, cert): [walter/digest/README.md#rollback](../walter/digest/README.md#rollback).
 - WireGuard / fail2ban / ufw: previous files are not kept by deploy.sh; they are small and fully
   described by this directory, so re-render from a known-good commit.

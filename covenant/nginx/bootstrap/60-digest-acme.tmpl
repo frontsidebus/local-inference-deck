@@ -1,0 +1,19 @@
+# ACME-only stub for the optional digest site (port 80 only, no 443 server).
+# 60-digest's :443 server needs its cert, so until that cert exists deploy.sh links
+# sites-enabled/60-digest to this stub instead: it answers http-01 for the digest name
+# while every other site stays live, certs.sh issues the cert, and the same (or the
+# next) deploy.sh run swaps the link to the full 60-digest. Same :80 block as 60-digest,
+# except that nothing is redirected to an https server that does not exist yet.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${SPARK_DIGEST_HOST};
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+        try_files $uri =404;
+    }
+    location / {
+        return 444;
+    }
+}
