@@ -1,0 +1,92 @@
+{
+  "watch_slug": "default",
+  "audience": "Sample audience. Every value in this file is invented.",
+  "notes": "Sanitized sample of a digest state file (structure only). See README.md.",
+  "created": "2026-01-01T00:00:00Z",
+  "last_run": "2026-01-05T12:00:00Z",
+  "cutoff": "2026-01-05T12:00:00Z",
+  "window_days": 7,
+  "sources": {
+    "CISA_KEV": {
+      "url": "https://example.com/feeds/kev.json",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "CISA_Advisories": {
+      "url": "https://example.com/feeds/advisories.xml",
+      "ok": false,
+      "cutoff": "2026-01-03T12:00:00Z",
+      "last_error": "HTTP 403 (sample error text)"
+    },
+    "SANS_ISC": {
+      "url": "https://example.com/feeds/isc.xml",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "BleepingComputer": {
+      "url": "https://example.org/feed/",
+      "ok": true
+    },
+    "TheHackerNews": {
+      "url": "https://example.org/feeds/news",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    }
+  },
+  "seen": {
+    "cves": {
+      "CVE-2099-0001": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "date_added": "2026-01-02",
+        "due_date": "2026-01-23",
+        "product": "Sample Product 1",
+        "ransomware": "Unknown"
+      },
+      "CVE-2099-0002": {
+        "first_seen": "2026-01-03T12:00:00Z",
+        "date_added": "2026-01-03",
+        "due_date": "2026-01-24",
+        "product": "Sample Product 2",
+        "ransomware": "Known"
+      },
+      "CVE-2099-0003": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "date_added": "2026-01-04",
+        "due_date": "2026-01-25",
+        "product": "Sample Product 3",
+        "ransomware": "Unknown"
+      }
+    },
+    "events": {
+      "sample-advisory-1": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "title": "Sample advisory 1",
+        "url": "https://example.com/news/sample-advisory-1",
+        "date": "Fri, 02 Jan 2026 09:00:00 +0000",
+        "source": "SANS_ISC"
+      },
+      "icsa-99-999-01-sample-industrial-advisory": {
+        "first_seen": "2026-01-03T12:00:00Z",
+        "title": "ICSA-99-999-01 Sample industrial advisory",
+        "url": "https://example.com/advisories/icsa-99-999-01",
+        "date": "Sat, 03 Jan 2026 08:00:00 +0000",
+        "source": "CISA_Advisories"
+      },
+      "sample-news-story-2": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample news story 2",
+        "url": "https://example.org/news/sample-news-story-2",
+        "date": "Mon, 05 Jan 26 10:00:00 +0000",
+        "source": "BleepingComputer"
+      },
+      "sample-news-story-3": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample news story 3",
+        "url": "https://example.org/news/sample-news-story-3",
+        "date": "2026-01-05T07:30:00Z",
+        "source": "TheHackerNews"
+      }
+    }
+  },
+  "failures": {}
+}

@@ -1,0 +1,90 @@
+{
+  "watch_slug": "ai-research",
+  "notes": "Sanitized sample of a digest state file (structure only). Every value is invented. See README.md.",
+  "created": "2026-01-01T00:00:00Z",
+  "last_run": "2026-01-05T12:00:00Z",
+  "cutoff": "2026-01-05T12:00:00Z",
+  "window_days": 7,
+  "sources": {
+    "arxiv_csAI": {
+      "url": "https://example.com/rss/cs.AI",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "arxiv_csLG": {
+      "url": "https://example.com/rss/cs.LG",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "OpenAINews": {
+      "url": "https://example.com/news/rss.xml",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "HuggingFaceBlog": {
+      "url": "https://example.org/blog/feed.xml",
+      "ok": false,
+      "cutoff": "2026-01-03T12:00:00Z",
+      "last_error": "HTTP 500 (sample error text)"
+    },
+    "ImportAI": {
+      "url": "https://example.org/importai/feed",
+      "ok": true
+    }
+  },
+  "seen": {
+    "papers": {
+      "9999.00011": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "title": "Sample research paper 1",
+        "link": "https://example.com/abs/9999.00011"
+      },
+      "9999.00012": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "title": "Sample research paper 2",
+        "link": "https://example.com/abs/9999.00012"
+      },
+      "9999.00013": {
+        "first_seen": "2026-01-03T12:00:00Z",
+        "title": "Sample research paper 3",
+        "link": "https://example.com/abs/9999.00013"
+      },
+      "9999.00014": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample research paper 4",
+        "link": "https://example.com/abs/9999.00014"
+      }
+    },
+    "items": {
+      "sample-research-post-1": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "title": "Sample research post 1",
+        "url": "https://example.com/news/sample-research-post-1",
+        "date": "Fri, 02 Jan 2026 17:00:00 GMT",
+        "source": "OpenAINews"
+      },
+      "sample-research-post-2": {
+        "first_seen": "2026-01-03T12:00:00Z",
+        "title": "Sample research post 2",
+        "url": "https://example.org/blog/sample-research-post-2",
+        "date": "2026-01-03T00:00:00+00:00",
+        "source": "HuggingFaceBlog"
+      },
+      "sample-research-post-3": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample research post 3",
+        "url": "https://example.org/importai/sample-research-post-3",
+        "date": "Mon, 05 Jan 2026 08:00:00 +0000",
+        "source": "ImportAI"
+      },
+      "sample-research-post-4": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample research post 4",
+        "url": "https://example.com/news/sample-research-post-4",
+        "date": "2026-01-05T11:00:00Z",
+        "source": "OpenAINews"
+      }
+    }
+  },
+  "failures": {}
+}
