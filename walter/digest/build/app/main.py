@@ -300,6 +300,8 @@ app = Starlette(
         Route("/api/runs/{watch}/now", run_now, methods=["POST"]),
         Route("/api/runs/{watch}/{run_id}", run_get),
         Route("/api/runs/{watch}/{run_id}/stream", run_stream),
+        # index.html and app.css reference assets as /static/...; "/" serves index.html for the SPA.
+        Mount("/static", StaticWithHeaders(directory=STATIC), name="assets"),
         Mount("/", StaticWithHeaders(directory=STATIC, html=True), name="static"),
     ],
     lifespan=lifespan,
