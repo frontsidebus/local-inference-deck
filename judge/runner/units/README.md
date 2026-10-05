@@ -1,11 +1,14 @@
 # judge runner units (systemd --user)
 
+Operator view (settings, pause and resume, troubleshooting): [judge/README.md](../../README.md#units). Exact settings: [CONTRACT.md](../../CONTRACT.md#runner-units-runnerunits-installed-by-installsh---with-units).
+
 | Unit | Enabled | What |
 |---|---|---|
 | `judge-review.path` | yes | `PathChanged=$JUDGE_REVIEW_DIR/queue` starts `judge-review.service`. Only entries of `queue/` itself count: deferred plan requests in `queue/deferred/` do not start the runner (#40). `TriggerLimitIntervalSec=2s`, `TriggerLimitBurst=1000`. `OnFailure=judge-alert@%n.service`. |
 | `judge-review.service` | no (triggered) | Oneshot `runner/run_judge.py --pending`: release due deferred requests into `queue/`, judge every ready request, re-scan. `StartLimitIntervalSec=0` in `[Unit]`: no start limit (#40). `OnFailure=judge-alert@%n.service`. |
 | `judge-review.timer` | yes | Backstop (#40): starts the service `OnActiveSec=2min` after the timer starts, then `OnUnitInactiveSec=5min` after each run. A failed or stopped path unit delays reviews by minutes, never for good. (`Persistent=` only applies to `OnCalendar=` timers, so it is not set.) |
 | `judge-alert@.service` | never (template) | Started by `OnFailure=` with the failed unit as the instance: `runner/alert.py %i` appends `ALERT: judge unit <unit> failed (result=…) … Fix: …` to `$JUDGE_REVIEW_DIR/runner.log` and runs `notify-send` when `DISPLAY`/`WAYLAND_DISPLAY` is set (≤ 1 per unit per `JUDGE_ALERT_MIN_INTERVAL_S`, default 900). It never restarts anything (#41). |
+| `judge-runaway-watch.service` (in `watch/`) | yes | C6 watcher: `watch/runaway.py --interval 30`, `Restart=on-failure`. Read-only: polls the slots probe, alerts to `watch.log`, the journal and the desktop, and queues a `runaway` review; never cancels or unloads. Long-running, so restart it after a change under `watch/`. |
 
 - Installed by `judge/install.sh --with-units [--start]`, which renders `${JUDGE_DIR}`, `${JUDGE_PYTHON}`,
   `${HERMES_HOME}` and `${JUDGE_REVIEW_DIR}` and copies the units to `~/.config/systemd/user/`. It enables the
