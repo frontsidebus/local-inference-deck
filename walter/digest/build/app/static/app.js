@@ -213,8 +213,17 @@
     if (li) li.className = "stage " + cls;
   }
 
+  // Shown when the run record says LLM curation failed (the digest below is the uncurated
+  // listing). textContent only: the reason is never parsed as HTML.
+  function setCurationBanner(err) {
+    const b = $("#curation-banner");
+    b.textContent = err ? "curation failed: " + String(err) : "";
+    b.hidden = !err;
+  }
+
   function resetStages() {
     for (const s of STAGE_ORDER) setStage(s, "stage-wait");
+    setCurationBanner(null);
     $("#digest-md").hidden = true;
     $("#digest-raw").hidden = true;
     $("#raw-toggle").hidden = true;
@@ -253,9 +262,12 @@
       });
       if (!r.ok) throw new Error(String(r.status));
       const d = await r.json();
+      const rec = d.json || {};
+      setCurationBanner(rec.uncurated ? rec.curation_error || "unknown reason" : null);
       showDigest(d.markdown);
     } catch {
       if (state.failed) return; // pipeline error already shown; don't clobber it
+      setCurationBanner(null);
       $("#digest-md").hidden = true;
       $("#digest-md").innerHTML = "";
       $("#digest-raw").textContent = "failed to load run artifact";
