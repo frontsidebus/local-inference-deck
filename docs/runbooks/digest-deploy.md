@@ -76,7 +76,9 @@ In the Pocket-ID admin UI at `https://${SPARK_ID_HOST}`:
 `open-webui` and the telemetry client. Without the UI, use the API method in
 [walter/README.md](../../walter/README.md#pocket-id--oidc-bootstrap) (step 3, temporary
 `STATIC_API_KEY`). That method recreates the `pocket-id` container twice, so logins to every site
-pause for a few seconds each time.
+pause for a few seconds each time. Check in the admin UI (User groups) that `${DIGEST_GROUP}` exists
+and has its members **before** using the API method, so the two recreates are not spent on a run
+that stops at a missing group.
 
 ## 4. LiteLLM key `digest`
 
@@ -109,7 +111,11 @@ whole host, not only the digest:
 - a changed file in a stack force-recreates that stack, for example `/srv/gateway/hooks/*` →
   LiteLLM and Postgres (`--force-recreate --wait`), or `/srv/monitoring/prometheus/*` → monitoring;
 - every run also runs `apt-get install` (skip it with `--skip-packages`), `ufw-rules.sh` and
-  `systemctl restart nvidia-persistenced`.
+  `systemctl restart nvidia-persistenced`. `--no-start` skips that restart, but also every compose
+  stack, the digest included;
+- every run rebuilds the telemetry image (`up -d --build`). Even with every build layer cached, the
+  new image gets a new ID, so `telemetry-app` is recreated (a few seconds). The dry run does not
+  show this.
 
 On a host that was set up by hand or has drifted from the repo, the first run can therefore restart
 LiteLLM and other stacks. Reconcile those files, or schedule the run when a short gateway restart is
