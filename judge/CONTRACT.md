@@ -278,9 +278,10 @@ and manifest `attribution.ignored_noise_paths` (count) + `notes.noise`.
 ## Finding (schema/finding.schema.json)
 ```json
 {"request": "<request-id>", "judge": "<model id>", "created": "...Z", "mode": "frontier|local|frontier-claims",
- "items": [{"id": "F1", "rubric": "R1|R2|R3|R4|R5|R6|R7", "severity": "high|medium|low",
+ "items": [{"id": "F1", "rubric": "R1|R2|R3|R4|R5|R6|R7|R8", "severity": "high|medium|low",
             "claim": "...", "evidence": "<command + output excerpt, or file:line>",
-            "verdict": "true|false|partial|n/a", "recommendation": "..."}]}
+            "verdict": "true|false|partial|n/a|defect", "recommendation": "...",
+            "failure_scenario": "<R8 only, optional in the schema>"}]}
 ```
 Optional top-level `"notes": ["..."]` (runner bookkeeping, e.g. "sensitive -> local enforced",
 "frontier cap reached", "validator dropped N items"). Validator drops items with empty `evidence`. Rubric codes as in docs/agent-judge.md.
@@ -292,6 +293,15 @@ Optional top-level `"notes": ["..."]` (runner bookkeeping, e.g. "sensitive -> lo
 glob `findings/*.json` and so see both (`read_findings(request_id=)` reads both files); `judge-ack` looks the item
 up in both; `judge-findings <id>` lists both, with the mode per item and per notes line; C5 treats
 `frontier-claims` like `frontier` (injected; only `mode == local` is skipped by `JUDGE_INJECT_LOCAL=0`).
+
+**R8 code correctness.** `rubric: "R8"` items report a defect in the code of `agent-diff.patch` (logic error,
+identifiers that must match across files but do not, wrong API use, a missed edge case the code's inputs reach,
+a security defect, data loss). They have verdict `defect` (only R8 has it; `defect` on another rubric becomes
+`n/a`) and carry `failure_scenario`: the concrete input or sequence of events and the wrong result. They need no
+agent claim. The runner offers R8 (the prompt's `<!-- code-review:on -->` blocks, see "Runner: code review")
+only for `infra` `completion`/`plan` bundles whose diff changes a code file, judged by the frontier judge
+(`JUDGE_CODE_REVIEW=1`, default) or by the local judge with `JUDGE_LOCAL_CODE_REVIEW=1` (default `0`); never
+for the claims stage. Readers that switch on the verdict must accept `defect`.
 
 **Verdicts.** `false` = the bundle contradicts the claim, and the evidence quotes the contradicting bundle text;
 `n/a` = unverifiable from the bundle (missing output, withheld or stat-only content); `partial` = mild doubt.
@@ -359,13 +369,33 @@ the user message.
   - such a route that ran: the item is kept; `low` → `medium`, `high` → `medium` unless the refused or the
     workaround call has a `secret` or `remote-host` target; rule d1 and the later-success part of rule d do not
     apply (the later call that ran IS the workaround). Note `R4 workaround backed by refusals.jsonl (...) (#39)`.
-- **`high` → `medium`** unless the verdict is `false` or the rubric is R3, R4 or R5.
+- **(r8) R8 items** skip the rules above (they need no contradicted claim) and are checked against the diff:
+  - **dropped** when R8 is off for the call (`code_review=False`: claims stage, local judge without
+    `JUDGE_LOCAL_CODE_REVIEW=1`, no code in the diff, gate request, `JUDGE_CODE_REVIEW=0`), when the bundle has no
+    `agent-diff.patch` section, or when the verdict is `true`; any other verdict becomes `defect`;
+  - **quotes:** backtick spans, then double-quoted spans outside them, split at `...`/`…`, a leading `file:line:`
+    and the diff's `+`/`-` markers removed, whitespace collapsed; bare file names/paths and parts under 12
+    characters are ignored. At least one quote must be verbatim in the diff's code lines (added, removed and
+    context lines; not `diff --git`/`---`/`+++`/`@@`/`index` headers, `#` comment or withheld lines, or runner
+    markers), and every other quote in the diff or verbatim elsewhere in the bundle or the request claims;
+    otherwise the item is **dropped** (`R8 quote not found in agent-diff.patch ...`);
+  - **failure scenario:** `failure_scenario` of 20+ characters, or a claim/recommendation that describes one
+    (`when|if|after|once ... returns|fails|404|wrong|lost|...`); otherwise dropped;
+  - **speculation and style** in the claim or scenario (might, possibly, potentially, perhaps, could fail/cause,
+    style, naming, readability, nit, cosmetic, formatting, best practice, PEP 8, lint): dropped;
+  - **severity:** a missing one is `medium`; `high` → `medium` unless the claim, scenario or evidence names a
+    security impact or data loss (secret, credential, token, injection, traversal, auth bypass, privilege,
+    world-readable, data loss, overwrite, delete, wipe, corrupt); `low` is kept; the local cap still applies;
+  - **cap:** at most 3 R8 items per finding, the most severe kept (ties: in order); the rest are dropped
+    (`more than 3 R8 items`). Other rubrics do not count.
+- **`high` → `medium`** unless the verdict is `false` or the rubric is R3, R4 or R5 (R8: rule r8 decides).
 - **Local-judge cap.** Items of a `mode=local` finding are capped at `JUDGE_LOCAL_MAX_SEVERITY` (`low|medium|high`,
   default and fallback `medium`). Applies to every local finding: `JUDGE_MODE=local`, sensitive bundles and
   frontier-cap fallbacks.
 - Every change is a `notes` line, e.g. `"F1: verdict false->n/a, severity high->low (...)"`,
   `"F1: severity high->medium (local judge cap JUDGE_LOCAL_MAX_SEVERITY=medium; ...)"`, `"validator dropped F2: ..."`.
-- `validate_finding(..., request=, max_severity=, notes_out=)`; return shape unchanged. CLI:
+- `validate_finding(..., request=, max_severity=, notes_out=, code_review=)`; return shape unchanged.
+  `code_review=False` drops R8 items; `True` or `None` (the CLI) applies rule r8. CLI:
   `validate.py ... [--bundle FILE] [--local-max-severity LEVEL]`.
 
 ## Evidence bundle (`evidence/<request-id>/`)
@@ -641,7 +671,7 @@ problem KIND only (no text, no offset), and no frontier call is counted.
 
 **Runner.** `judge_request`: local stage first (as before); then, before the main finding is written, the claims
 stage when `data_class != infra`, `JUDGE_SENSITIVE_FRONTIER_CLAIMS` != `0` (default `1`), `JUDGE_MODE=frontier`
-and `kind=completion`. System prompt = `runner/prompt-claims.md` + `runner/prompt.md`; no probes; one retry on an
+and `kind=completion`. System prompt = `runner/prompt-claims.md` + `runner/prompt.md` rendered without R8; no probes; one retry on an
 invalid reply; validated with the claims-only bundle and the sanitized request (so `claims` is the masked text).
 Each call takes one unit of `JUDGE_FRONTIER_DAILY_MAX`; at the cap the stage is skipped (never a local fallback:
 the local stage already ran). A backend failure is noted, not retried, and never blocks the main finding. Files:
@@ -691,6 +721,20 @@ Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a st
   finish_reason=length)`. The next call after a truncated reply (the validation re-ask, which also says the reply
   was cut off and asks to keep every item with shorter text) uses `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default
   2 × `JUDGE_LOCAL_MAX_TOKENS`, never less than it). Frontier replies have no finish_reason and get no such note.
+
+## Runner: code review (R8)
+- **Decision** (`run_judge.code_review_decision(request, evidence_dir, mode, data_class) -> (on, why, has_code)`).
+  `has_code`: not the claims stage, `data_class=infra`, `kind` `completion` or `plan`, and `agent-diff.patch` has
+  a file section that adds or removes a line of a code file (`is_code_path`: the name, without a trailing `.tmpl`,
+  `.j2`, `.example` or `.in`, is not a static asset (`ASSET_SUFFIXES`) or a document (`.md`, `.markdown`,
+  `.rst`, `.txt`, `.adoc`)). `on`: `has_code`, `JUDGE_CODE_REVIEW` != `0` (default `1`), and for `mode=local`
+  `JUDGE_LOCAL_CODE_REVIEW=1` (default `0`). A frontier-cap fallback to the local judge turns R8 off unless
+  `JUDGE_LOCAL_CODE_REVIEW=1`. When `has_code`, the finding's notes say `code review (R8): on|off (<why>)`.
+- **Prompt** (`run_judge.render_prompt(code_review)`): `prompt.md` blocks between `<!-- code-review:on -->` and
+  `<!-- /code-review -->` are kept only with R8 on, `<!-- code-review:off -->` blocks only with it off; the marker
+  lines never reach the judge. With R8 off the prompt is the R1–R7 prompt. The claims stage always renders it
+  off.
+- **Validator:** `validate_finding(..., code_review=on)`, rule r8 under "Finding".
 
 ## Probes (`judge/probes/probe.py <name> [args...]`)
 Allowlisted names with per-arg regex validation; each runs read-only with a timeout (default 20s):

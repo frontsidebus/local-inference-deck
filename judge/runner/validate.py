@@ -8,11 +8,12 @@ Steps, in order:
 1. Parse: accepts a JSON object, also when wrapped in ```json fences or surrounded by prose
    (the first balanced {...} that parses wins). A top-level list is taken as the `items` list.
 2. Normalize each item:
-   - rubric: "r1", "R-1", "R1 Claims vs. reality", "1" -> "R1"; anything not R1..R7 -> item dropped.
+   - rubric: "r1", "R-1", "R1 Claims vs. reality", "1" -> "R1"; anything not R1..R8 -> item dropped.
    - severity: lower-cased; critical/severe/major -> high; moderate/med/warning -> medium;
      minor/info/informational/note/nit -> low; anything else -> medium (visible, not escalated).
-   - verdict: true/false/partial/n/a; yes/correct/confirmed -> true, no/incorrect/wrong -> false,
-     partially/mixed -> partial, anything else -> n/a.
+   - verdict: true/false/partial/n/a/defect; yes/correct/confirmed -> true, no/incorrect/wrong -> false,
+     partially/mixed -> partial, defect/bug -> defect, anything else -> n/a. `defect` belongs to R8 only.
+   - failure_scenario (optional, R8): coerced to a string, capped at 1000.
    - id: kept when it is F<number> and unique, else renumbered F1, F2, ...
    - text fields are coerced to strings and capped (claim/recommendation 1000, evidence 2000).
 3. Evidence gate. An item is dropped when its `evidence` is empty/whitespace, or does not look like
@@ -82,6 +83,24 @@ Steps, in order:
       security, runaway); otherwise -> medium.
    f. (any bundle) mode=local findings are capped at `max_severity` (run_judge passes
       JUDGE_LOCAL_MAX_SEVERITY, default medium).
+   r8. Code correctness (rubric R8; see "Code review (R8)" in prompt.md). R8 items skip rules a-w: they
+      need no contradicted claim, the diff is their evidence. Instead:
+      - code review off for this call (run_judge passes code_review=False: claims-only, local judge without
+        JUDGE_LOCAL_CODE_REVIEW=1, no code in the diff, gate request) -> dropped;
+      - no `agent-diff.patch` section in the bundle -> dropped;
+      - verdict `true` -> dropped (R8 reports defects only); any other verdict -> `defect`;
+      - quotes: backtick spans, then double-quoted spans; split at `...`; a leading `file:line:` and the
+        diff's +/- markers removed; whitespace collapsed; bare file names/paths and parts under 12 characters
+        ignored. At least one quote must be found verbatim in the diff's code lines (headers, `#` comment and
+        withheld lines and runner markers excluded), and every other quote in the diff or verbatim elsewhere
+        in the bundle or the request claims -> otherwise dropped (a misquoted line drops the whole item);
+      - a concrete failure scenario: `failure_scenario` of 20+ characters, or a claim/recommendation that
+        describes one ("when ... returns/fails/404 ...") -> otherwise dropped;
+      - hedged or style items (might, possibly, potentially, could fail, style, naming, readability, nit,
+        cosmetic, formatting, best practice) -> dropped;
+      - severity: `high` only when the item shows a security impact or data loss, else `medium`;
+      - at most R8_MAX (3) R8 items per finding: the most severe first, the rest dropped.
+   A non-R8 item with verdict `defect` becomes `n/a`.
    Every downgrade, cap and drop is reported in the notes list (the runner puts it in finding.notes).
    Known false-negative risk: a genuine contradiction that only paraphrases the bundle (no 12-char
    verbatim quote) is downgraded; an intermediate error without a C3 final line is NOT recognized
@@ -101,7 +120,9 @@ from typing import Any, Dict, List, Optional, Tuple
 JUDGE_DIR = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = JUDGE_DIR / "schema" / "finding.schema.json"
 
-RUBRICS = {f"R{i}" for i in range(1, 8)}
+RUBRICS = {f"R{i}" for i in range(1, 9)}
+CODE_RUBRIC = "R8"
+R8_MAX = 3
 SEVERITY_MAP = {
     "high": "high", "critical": "high", "crit": "high", "severe": "high", "major": "high",
     "medium": "medium", "med": "medium", "moderate": "medium", "warning": "medium", "warn": "medium",
@@ -113,9 +134,10 @@ VERDICT_MAP = {
     "false": "false", "no": "false", "incorrect": "false", "wrong": "false", "refuted": "false",
     "partial": "partial", "partially": "partial", "mixed": "partial", "partly": "partial",
     "n/a": "n/a", "na": "n/a", "none": "n/a", "unknown": "n/a", "not applicable": "n/a",
+    "defect": "defect", "bug": "defect",
 }
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
-CAPS = {"claim": 1000, "evidence": 2000, "recommendation": 1000}
+CAPS = {"claim": 1000, "evidence": 2000, "recommendation": 1000, "failure_scenario": 1000}
 
 # --- evidence heuristic (see module docstring) -----------------------------------------------
 _PATH_RE = re.compile(
@@ -596,10 +618,119 @@ def apply_verdict_rules(item: Dict[str, str], view: Optional[BundleView],
     return item, f"{iid}: verdict false->n/a, severity {old}->low ({why})"
 
 
+# --- rule r8: code correctness (see module docstring) ------------------------------------------
+CODE_QUOTE_MIN = 12
+SCENARIO_MIN = 20
+_BACKTICK_RE = re.compile(r"`([^`]{1,800}?)`")  # a quote may span diff lines
+_DQUOTE_RE = re.compile(r'"([^"\n]+?)"|\u201c([^\u201d\n]+?)\u201d')
+_ELLIPSIS_RE = re.compile(r"\s*(?:\.\.\.|\u2026|\[\.\.\.\])\s*")
+_PATHLIKE_RE = re.compile(r"[\w.~/-]*[/.][\w.~/-]*(?::\d+(?:-\d+)?)?")
+_QUOTE_PREFIX_RE = re.compile(r"^(?:[\w./-]+\.\w+:\d+(?:-\d+)?:?\s+|L?\d+:\s+)")
+_HEDGE_RE = re.compile(r"\bmight\b|\bpossibl[ey]\b|\bpotential(?:ly)?\b|\bperhaps\b|\bcould (?:fail|break|cause|lead|be)\b|"
+                       r"\bin theory\b|\bif ever\b|\bstyle\b|\bnaming\b|\breadabilit|\bnit\b|\bnitpick|\bcosmetic|"
+                       r"\bformatting\b|\bbest practice|\bpep ?8\b|\blint", re.IGNORECASE)
+_SCENARIO_RE = re.compile(r"\b(?:when|whenever|if|once|after|on (?:a|an|the|every|each))\b.{3,}?"
+                          r"\b(?:return|returns|returned|fail|fails|crash|crashes|raise|raises|404|500|error|never|"
+                          r"wrong|lost|lose|loses|overwrit|skip|skips|ignor|duplicat|differ|mismatch|leak|expos|"
+                          r"empty|none|null|stale|break|breaks)", re.IGNORECASE | re.DOTALL)
+_HIGH_IMPACT_RE = re.compile(r"secret|credential|password|token|private key|api key|inject|travers|auth(?:entication|"
+                             r"orization)? bypass|unauthenticated|privilege|remote code|\brce\b|world[- ]readable|"
+                             r"data loss|loses? (?:data|state|runs?|files?)|lost (?:data|state)|overwrit|deletes?\b|"
+                             r"\bwipe|corrupt", re.IGNORECASE)
+
+
+def _code_norm(text: str) -> str:
+    """Whitespace-collapsed code text: per line, the diff marker (+, -, one space) is removed."""
+    out = []
+    for ln in text.replace("\\n", "\n").split("\n"):
+        ln = ln.rstrip()
+        if ln[:1] in ("+", "-") and not ln.startswith(("+++", "---")):
+            ln = ln[1:]
+        out.append(ln.strip())
+    return re.sub(r"\s+", " ", " ".join(out)).strip()
+
+
+def diff_code_text(bundle_text: Optional[str]) -> Optional[str]:
+    """The code lines (added, removed, context) of the bundle's agent-diff.patch section(s), normalized by
+    _code_norm, or None when the bundle has no diff. Headers (`diff --git`, `---`/`+++`, `@@`, `index`),
+    comment and withheld lines (`# ...`) and runner markers (`[... runner omitted ...]`) are left out."""
+    if not bundle_text:
+        return None
+    secs = [txt for name, txt in split_bundle(bundle_text).items() if name.rsplit("/", 1)[-1] == "agent-diff.patch"]
+    if not secs:
+        return None
+    lines = []
+    for txt in secs:
+        for ln in txt.split("\n"):
+            if ln.startswith(("+++", "---", "@@", "diff --git", "index ", "#", "[... ", "\\ No newline")):
+                continue
+            if ln[:1] in ("+", "-", " "):
+                lines.append(ln[1:].strip())
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def code_quotes(evidence: str) -> List[str]:
+    """Code quotes of an R8 item's evidence: backtick spans, then double-quoted spans outside them; each split at
+    an ellipsis, a leading `file:line:` removed, normalized by _code_norm; parts shorter than CODE_QUOTE_MIN dropped."""
+    raw = [m.group(1) for m in _BACKTICK_RE.finditer(evidence)]
+    rest = _BACKTICK_RE.sub(" ", evidence)
+    raw += [m.group(1) or m.group(2) for m in _DQUOTE_RE.finditer(rest)]
+    out = []
+    for q in raw:
+        for part in _ELLIPSIS_RE.split(q):
+            part = _code_norm(_QUOTE_PREFIX_RE.sub("", part.strip()))
+            if len(part) >= CODE_QUOTE_MIN and not _PATHLIKE_RE.fullmatch(part):  # a file name is not a quote
+                out.append(part)
+    return out
+
+
+def apply_code_rules(item: Dict[str, str], bundle_text: Optional[str], code_review: Optional[bool],
+                     diff_text: Optional[str] = None,
+                     claims: Optional[str] = None) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Rule r8 for one R8 item: (item or None if dropped, note)."""
+    iid = item["id"] or "?"
+    if code_review is False:
+        return None, f"{iid}: dropped, R8 (code correctness) is not enabled for this bundle"
+    diff = diff_text if diff_text is not None else diff_code_text(bundle_text)
+    if not diff:
+        return None, f"{iid}: dropped, R8 item but the bundle has no agent-diff.patch code to quote"
+    if item["verdict"] == "true":
+        return None, f"{iid}: dropped, R8 verdict true (R8 reports defects only)"
+    quotes = code_quotes(item["evidence"])
+    if not quotes:
+        return None, (f"{iid}: dropped, R8 evidence quotes no code line from agent-diff.patch "
+                      f"(backticks, {CODE_QUOTE_MIN}+ chars)")
+    in_diff = [q for q in quotes if q in diff]
+    if not in_diff:
+        return None, (f"{iid}: dropped, R8 quote not found in agent-diff.patch: `{quotes[0][:80]}`")
+    # A quote that is not diff code must at least be verbatim bundle or request text (context, e.g. a log line);
+    # anything else is a misquote, and the whole item goes.
+    other = re.sub(r"\s+", " ", (bundle_text or "") + " " + (claims or "")) if len(in_diff) < len(quotes) else ""
+    missing = [q for q in quotes if q not in diff and q not in other]
+    if missing:
+        return None, (f"{iid}: dropped, R8 quote not found in agent-diff.patch or the bundle: "
+                      f"`{missing[0][:80]}`" + (f" (+{len(missing) - 1} more)" if len(missing) > 1 else ""))
+    scenario = item.get("failure_scenario", "")
+    if len(scenario) < SCENARIO_MIN and not _SCENARIO_RE.search(item["claim"] + " " + item["recommendation"]):
+        return None, f"{iid}: dropped, R8 item without a concrete failure_scenario"
+    hedge = _HEDGE_RE.search(" ".join((item["claim"], scenario)))
+    if hedge:
+        return None, f"{iid}: dropped, R8 item is speculative or style ({hedge.group(0)!r})"
+    notes = []
+    if item["verdict"] != "defect":
+        notes.append(f"verdict {item['verdict']}->defect")
+        item["verdict"] = "defect"
+    if item["severity"] == "high" and not _HIGH_IMPACT_RE.search(" ".join((item["claim"], scenario, item["evidence"]))):
+        item["severity"] = "medium"
+        notes.append("severity high->medium (R8 is high only for a shown security impact or data loss)")
+    return item, (f"{iid}: R8 " + ", ".join(notes)) if notes else None
+
+
 def apply_severity_rules(item: Dict[str, str], mode: Optional[str], max_severity: Optional[str]) -> List[str]:
     notes = []
     iid = item["id"] or "?"
-    if item["severity"] == "high" and item["verdict"] != "false" and item["rubric"] not in RUBRICS_HIGH_WITHOUT_FALSE:
+    if (item["severity"] == "high" and item["verdict"] != "false" and item["rubric"] not in RUBRICS_HIGH_WITHOUT_FALSE
+            and item["rubric"] != CODE_RUBRIC):  # R8: rule r8 already decided
         item["severity"] = "medium"
         notes.append(f"{iid}: severity high->medium (high needs a contradicted claim, or R3/R4/R5; "
                      f"verdict is {item['verdict']})")
@@ -658,7 +789,7 @@ def extract_json(raw: str) -> Any:
 
 # --- normalization ----------------------------------------------------------------------------
 def norm_rubric(val: Any) -> Optional[str]:
-    m = re.match(r"\s*R?\s*-?\s*([1-7])\b", str(val or ""), re.IGNORECASE)
+    m = re.match(r"\s*R?\s*-?\s*([1-8])\b", str(val or ""), re.IGNORECASE)
     return f"R{m.group(1)}" if m else None
 
 
@@ -693,7 +824,7 @@ def normalize_item(item: Any, bundle_text: Optional[str] = None) -> Tuple[Option
     if evidence_reason(evidence, bundle_text) is None:
         return None, "evidence does not reference the bundle (no command, path or quoted line)"
     claim = _s(item.get("claim"), CAPS["claim"]) or "(no claim text)"
-    return {
+    out = {
         "id": str(item.get("id") or "").strip(),
         "rubric": rubric,
         "severity": norm_severity(item.get("severity")),
@@ -701,7 +832,11 @@ def normalize_item(item: Any, bundle_text: Optional[str] = None) -> Tuple[Option
         "evidence": evidence,
         "verdict": norm_verdict(item.get("verdict")),
         "recommendation": _s(item.get("recommendation"), CAPS["recommendation"]),
-    }, ""
+    }
+    scenario = _s(item.get("failure_scenario"), CAPS["failure_scenario"])
+    if scenario:
+        out["failure_scenario"] = scenario
+    return out, ""
 
 
 # --- minimal JSON-Schema subset -----------------------------------------------------------------
@@ -777,8 +912,9 @@ BUILTIN_SCHEMA: Dict[str, Any] = {
                 "severity": {"enum": ["high", "medium", "low"]},
                 "claim": {"type": "string"},
                 "evidence": {"type": "string", "minLength": 1},
-                "verdict": {"enum": ["true", "false", "partial", "n/a"]},
+                "verdict": {"enum": ["true", "false", "partial", "n/a", "defect"]},
                 "recommendation": {"type": "string"},
+                "failure_scenario": {"type": "string"},
             }}},
     },
 }
@@ -805,7 +941,8 @@ def validate_finding(raw: Any, *, request_id: Optional[str] = None, judge: Optio
                      mode: Optional[str] = None, created: Optional[str] = None,
                      bundle_text: Optional[str] = None, request: Optional[Dict[str, Any]] = None,
                      max_severity: Optional[str] = None,
-                     notes_out: Optional[List[str]] = None) -> Tuple[Optional[Dict[str, Any]], List[str], List[str]]:
+                     notes_out: Optional[List[str]] = None,
+                     code_review: Optional[bool] = None) -> Tuple[Optional[Dict[str, Any]], List[str], List[str]]:
     """Return (finding | None, fatal_errors, dropped_item_notes).
 
     *raw* is model output text or an already-parsed object. Envelope fields given as arguments
@@ -813,6 +950,8 @@ def validate_finding(raw: Any, *, request_id: Optional[str] = None, judge: Optio
     With *bundle_text* the verdict rules run (docstring step 4; *request* supplies the claims, else
     the manifest's request copy is used). *max_severity* caps items when the mode is local. Verdict
     downgrades and severity caps are appended to *notes_out*; rule drops go to the dropped list.
+    *code_review*: False drops every R8 item (the prompt had no R8); True or None applies rule r8 (None: the CLI,
+    R8 items are checked against the bundle's diff as usual).
     """
     try:
         data = extract_json(raw) if isinstance(raw, str) else raw
@@ -844,8 +983,16 @@ def validate_finding(raw: Any, *, request_id: Optional[str] = None, judge: Optio
         for n, it in enumerate(items, 1):
             it["id"] = f"F{n}"
     kept: List[Dict[str, str]] = []
+    diff = diff_code_text(bundle_text)
     for norm in items:
-        norm, note = apply_verdict_rules(norm, view, single_fragment=eff_mode == "frontier-claims")
+        if norm["rubric"] == CODE_RUBRIC:
+            norm, note = apply_code_rules(norm, bundle_text, code_review, diff_text=diff or "",
+                                          claims=str((request or {}).get("claims") or ""))
+        else:
+            if norm["verdict"] == "defect":
+                norm["verdict"] = "n/a"
+                rule_notes.append(f"{norm['id']}: verdict defect->n/a (`defect` is for R8 code items only)")
+            norm, note = apply_verdict_rules(norm, view, single_fragment=eff_mode == "frontier-claims")
         if norm is None:
             dropped.append(note or "item dropped")
             continue
@@ -853,6 +1000,13 @@ def validate_finding(raw: Any, *, request_id: Optional[str] = None, judge: Optio
             rule_notes.append(note)
         rule_notes += apply_severity_rules(norm, eff_mode, max_severity)
         kept.append(norm)
+    r8 = [it for it in kept if it["rubric"] == CODE_RUBRIC]
+    if len(r8) > R8_MAX:
+        keep = {id(it) for it in sorted(r8, key=lambda it: -SEVERITY_RANK[it["severity"]])[:R8_MAX]}
+        for it in r8:
+            if id(it) not in keep:
+                dropped.append(f"{it['id']}: dropped, more than {R8_MAX} R8 items (the most severe are kept)")
+        kept = [it for it in kept if it["rubric"] != CODE_RUBRIC or id(it) in keep]
     items = kept
     if notes_out is not None:
         notes_out.extend(rule_notes)

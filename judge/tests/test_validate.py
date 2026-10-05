@@ -40,7 +40,7 @@ def test_severity_normalized(raw, expected):
 
 @pytest.mark.parametrize("raw,expected", [
     ("R1", "R1"), ("r3", "R3"), ("R-5", "R5"), ("R7 Knowledge integrity", "R7"), ("2", "R2"),
-    ("R8", None), ("X1", None), ("", None)])
+    ("R8", "R8"), ("R9", None), ("X1", None), ("", None)])
 def test_rubric_normalized(raw, expected):
     assert V.norm_rubric(raw) == expected
 
