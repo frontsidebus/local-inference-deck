@@ -70,3 +70,69 @@ Correctness and stability:
 - The container logs had no error lines. Walter's `dmesg` had no new Xid, NVRM or AER lines, only docker veth messages.
 
 Decision: **`hermes` and `vision` use `-sm tensor`**. `vision` traffic is mostly short prompts with an image and a long, thinking-heavy answer, so decode dominates. The prompt-processing loss shows only on prompts of 8k tokens and above. `big` stays on layer split: tensor gave −7 to +8 % decode and −15 % prompt processing on its 3B-active MoE (riser test). Row split (`-sm row`) does not load on b11277 ("does not support split buffers"). Tensor split is experimental upstream, so re-run this check after every image bump. The fallback is in the comments above each model in `config.yaml.tmpl`.
+
+## 2026-10-05: `presence_penalty` for the Qwen models
+
+Question: does a presence penalty (Qwen's model cards suggest up to 1.5) cut repetition loops on `coder` and `coder-fast`, and what does it cost on code and JSON? `big` was not measured: it would have swapped out the coding pair, and its model card lists no presence penalty.
+
+Setup: build 11277, production config, requests to llama-swap `$BACKEND_WG_IP:8080` with a per-request `presence_penalty` of 0 / 0.5 / 1.0 / 1.5, a fixed seed and the server's sampling (temp 0.6, top-p 0.95, top-k 20) unless noted. One request at a time per model.
+
+How llama-server applies it: `presence_penalty` is the `penalties` sampler, first in the chain (before top-k and temperature). It subtracts the value from the logit of every token seen in the **last `repeat_last_n` tokens (default 64)**, prompt included, not the whole output as in vLLM. `--repeat-penalty` (1.0 = off) and `--frequency-penalty` (0) share that window and stay off. A CLI `--presence-penalty X` is only a default: a request's `presence_penalty` overrides it (checked through `generation_settings`). Clients that cannot send the field (for example over the Anthropic `/v1/messages` API) get the default.
+
+Loop probes (thinking off unless noted, `max_tokens` 4096, 2 seeds):
+- `enum_q`: "list 200 distinct English nouns starting with q" (there are not 200), scored as distinct items out of items written;
+- `selfsum`: 40 rounds of summarizing the previous summary, counted as looped when 10 or more lines repeat or 12-gram repetition exceeds 10 %;
+- `think_imp`: an impossible digit puzzle with thinking on, counted when it hits 4096;
+- free JSON: an 80-object array with no grammar, counted as parseable (more seeds where noted).
+
+| model | pp | `enum_q` distinct/items (seed 1, seed 2) | `selfsum` looped | `think_imp` hit 4096 | free JSON parses |
+|---|---|---|---|---|---|
+| coder | 0 | 19/200, 19/200 | 1/2 | 2/2 | 3/3 |
+| coder | 0.5 | 47/200, 200/200 | 1/2 | 1/2 | 2/2 |
+| coder | 1.0 | 20/200, 76/200 | 0/2 | 1/2 | 2/3 (populations count down to `00`) |
+| coder | 1.5 | 31/200, 60/62 | 0/2 | 2/2 | 3/3 (switches to one-line JSON) |
+| coder | 1.5, `repeat_last_n` 256 / 1024 | 63/200, 124/124 / 101/200, 172/204 | | | |
+| coder-fast | 0 | 21/200, 40/153 | 1/2 | 2/2 | 4/7 |
+| coder-fast | 0.5 | 2/2 (declines), 26/200 | 1/2 | 2/2 | 2/2 |
+| coder-fast | 1.0 | 19/23, 36/53 | 1/2 | 2/2 | 6/7 |
+| coder-fast | 1.5 | 7/7 (declines), 119/183 | 0/2 | 2/2 | 6/7 |
+| coder-fast | 1.5, `repeat_last_n` 256 / 1024 | 3/3, 77/93 / 3/3, 83/93 | | | |
+
+`coder-fast`'s invalid free JSON is a model quirk at every setting (a dropped opening quote, `"canton": Capellen"`), not a penalty effect. `coder`'s cycling list (about 20 nouns repeated to 200) has a period longer than 64 tokens, so the default window misses it. It eases only with a wider window. DRY (`dry_multiplier` 0.8) did not change `enum_q` either, because a newline is one of its sequence breakers.
+
+Quality (thinking on for code, the way coding harnesses run):
+- code 1: run-length encode/decode plus a duration parser with a slightly ambiguous spec (12288-token cap);
+- code 2: an LRU cache, top-k words and word wrap;
+- both scored by local asserts.
+
+| model | pp | code 1 pass / reasoning ran to 12288 / mean tokens | code 2 pass / mean tokens | code 1, thinking off (pass) | `json_schema` extraction (fields right) | judge-style, temp 0, `json_object` (items) |
+|---|---|---|---|---|---|---|
+| coder | 0 | 2/5, 3/5, 9070 | | 4/4 | 10/10, 10/10 | 5 |
+| coder | 0.5 | 0/2, 2/2, 12288 | | | 10/10, 10/10 | |
+| coder | 1.0 | 1/2, 1/2, 8084 | | 4/4 | 10/10, 10/10 | |
+| coder | 1.5 | 2/5, 3/5, 10544 | | 4/4 | 10/10, 10/10 | 7 |
+| coder-fast | 0 | 7/12, 5/12, 10152 | 7/8, 4884 | 12/12 | 10/10, 10/10 | 6 |
+| coder-fast | 0.5 | 1/2, 1/2, 10330 | | | 10/10, 10/10 | 6 |
+| coder-fast | 1.0 | 3/6, 3/6, 10548 | | 4/4 | 10/10, 10/10 | 6 |
+| coder-fast | 1.5 | **11/12, 1/12, 8029** | 7/8, 4912 | 11/12 | 10/10, 10/10 | 6 (same findings) |
+
+Digest curation, using the real `pipeline.curate_with_llm` over invented items with `json_schema` and thinking off. The penalty was injected into each request.
+
+| model | pp | ai-research selected/sent | ai-security | default | repairs, splits |
+|---|---|---|---|---|---|
+| coder (the digest's model) | 0 | 26/27 | 7/27 | 7/20 | 0, 0 |
+| coder | 1.5 | 21/27 | 7/27 | 6/20 | 0, 0 |
+| coder-fast | 0 | 21/27 | 5/27 | 4/20 | 0, 0 |
+| coder-fast | 1.5 | 19/27 | 5/27 | 4/20 | 0, 0 |
+
+Decision:
+- **`coder-fast`: `--presence-penalty 1.5`** as the server default. Runaway reasoning on the ambiguous code task fell from 5/12 to 1/12 and its passes rose from 7/12 to 11/12 (both code tasks: 14/20 → 18/20). That is Fisher p ≈ 0.15 (two-sided) on code 1, so it is a moderate signal, not a proof. Nothing measured got worse beyond noise:
+  - code 2 and code with thinking off;
+  - `json_schema`;
+  - the judge's greedy `json_object` (same six findings);
+  - digest curation (0 repairs).
+
+  On impossible enumerations it now declines or stops short instead of cycling.
+- **`coder`: leave it off.** Runaway reasoning was unchanged (3/5 at 0 and at 1.5). The list loop survives the 64-token window. 1.0 corrupted numbers in free JSON (`"population": 00`), and 1.5 made the judge-style answer longer (5 → 7 items) and the digest pick fewer items. Its model card also gives 0 for thinking mode.
+- **`big`: not measured, left off.**
+- The output cap (gateway `max_tokens` clamp, `-n` backstop) stays the guard against runaway generations; a penalty only lowers how often they happen. Clients can still send `presence_penalty` (0 restores the old behaviour on `coder-fast`). Re-measure after an image or model bump.
