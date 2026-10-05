@@ -66,7 +66,7 @@ Then run the checks in [power-loss-recovery §2](../docs/runbooks/power-loss-rec
 | Walter does not start after a hardware change, with a hostdev / PCI device error | The hostdev addresses are stale. Fix them as in step 4. Keep autostart off until Walter starts cleanly. |
 | A GPU function shows a host driver (`nvidia`, `nouveau`, `snd_hda_intel`) instead of `vfio-pci` | The `vfio-pci ids=` / softdep config is missing or not applied at boot. Fix it in the host IaC and reboot. |
 | `nvidia-smi` in Walter shows `x1`, or Gen1 under load | Check the riser seating and the BIOS bifurcation setting for that slot. Gen1/2 **at idle** is normal. |
-| The telemetry dashboard labels the GPUs "chipset slot" | Cosmetic known issue: it labels any link narrower than the card's maximum (x8 of x16) that way. See [walter/telemetry](../walter/telemetry/README.md.tmpl#known-issues). |
+| The telemetry dashboard shows "PCIe Gen1 x8 · power-save" on an idle GPU | Normal: an idle GPU drops its link generation and returns to Gen4 under load. Only a "below xN" warning means a narrower link than expected (set `TELEMETRY_GPU_EXPECTED_WIDTH`; see [walter/telemetry](../walter/telemetry/README.md.tmpl)). |
 | Host `systemctl --failed` lists `nvidia-cdi-refresh` | It was unmasked; mask it again while both GPUs are on vfio-pci. |
 
 ## Rollback

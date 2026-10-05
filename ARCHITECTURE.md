@@ -388,7 +388,6 @@ What leaves the house for the frontier judge is decided per path (`secret`, `scr
 
 | Issue | Effect | Follow-up |
 |---|---|---|
-| **Telemetry link label.** The dashboard labels any GPU whose link is narrower than the device maximum as "chipset slot" with an "x1 by design" tooltip (`walter/telemetry/build/app/static/app.js`). | Since the riser both GPUs run x8 of a possible x16, so both show a wrong "chipset slot / x1" note. Cosmetic. | Drop the chipset/x1 wording; show the width plainly. |
 | **`RESTORE.md.tmpl` with an empty bucket.** The restore doc template references `RESTIC_BUCKET` and `RESTIC_REGION`. | Rendering it fails when `RESTIC_BUCKET` is empty, although offsite backups are optional. | Render the offsite section only when the bucket is set, or default the variables. |
 | **`walter/deploy.sh` restarts more than it changed.** It always restarts `nvidia-persistenced` and always runs `compose up --build` for the telemetry and digest images. | A no-op deploy still bounces persistenced and rebuilds two images. | Restart persistenced only when its drop-in changed; build only when the build tree changed. |
 | **CISA advisories feed returns 403.** The digest's `default` watch fetches CISA advisories; the server answers `403 Forbidden` (HTML). | The run reports "4 of 5 sources ok" with a coverage gap; the other feeds, including CISA KEV, work. | Find a fetch that CISA accepts (headers, a different feed URL) or replace the source. |
