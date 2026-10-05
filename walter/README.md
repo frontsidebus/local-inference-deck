@@ -96,13 +96,20 @@ overwrites; reports drift) → `scripts/gen-secrets.sh walter` → enable units
 (`nvidia-persistenced`, `wg-quick@wg0`, `docker-user-rules`, `docker`, `llama-swap`,
 `spark-backup.timer`, `spark-update-check.timer`) and run `ufw-rules.sh` → offsite backups
 (`backup/offsite-setup.sh`, only when `RESTIC_BUCKET` is set and `/etc/spark-restic/aws.env` exists) → compose stacks in order:
-gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build`) →
-digest (key copy, `--build`; only when `SPARK_DIGEST_HOST` is set).
-A stack is force-recreated only when one of its files changed (telemetry and digest are also recreated by
-their image rebuild on every run; see below).
+gateway (`--wait`) → `provision-keys.py` → webui (`--wait`) → monitoring → telemetry (`--build` only when
+its build inputs changed) → digest (key copy, `--build` likewise; only when `SPARK_DIGEST_HOST` is set).
+A stack is force-recreated only when one of its files changed.
+
+Optional parts are off unless `site.env` turns them on, and each prints one "off" line in the render step:
+the digest app (`SPARK_DIGEST_HOST`) and offsite backups (`RESTIC_BUCKET`; empty or `CHANGEME` = off). With
+offsite off, the offsite script, units, timer and IAM policy are not rendered, `offsite-setup.sh` does not run,
+and the installed `RESTORE.md` says in section 7 that there is no offsite copy.
 
 Options: `--dry-run`, `--destdir DIR` (install under a prefix and skip every system action — useful
-for review), `--skip-packages`, `--no-start`, `--with-hermes`, `--site-env FILE`.
+for review), `--skip-packages`, `--no-start`, `--with-hermes`, `--site-env FILE`, `--rebuild` (rebuild
+the telemetry and digest images even when their build inputs are unchanged).
+
+Tests (`--destdir` only, never touch the host): `python3 -m pytest walter/tests -q -p no:cacheprovider`.
 
 A new NVIDIA driver needs a reboot. On a fresh VM: deploy, reboot, deploy again.
 
@@ -116,9 +123,16 @@ every line, not only the ones you expect:
 - **Every run**, whatever changed:
   - `apt-get update` and the pinned package installs (skip with `--skip-packages`);
   - `ufw-rules.sh` (idempotent; ufw skips existing rules) and a start of `docker-user-rules` (a restart if its script changed);
-  - `systemctl restart nvidia-persistenced`. Only `--no-start` skips it, and that also skips every compose stack;
-  - `docker compose up -d --build` for **telemetry** and **digest**. The rebuilt image gets a new ID even when every
-    layer is cached, so `telemetry-app` and `digest-app-1` are recreated (a few seconds each). The dry run does not show this.
+  - a `systemctl start` of `nvidia-persistenced` (a no-op when it runs). It is **restarted** only when its drop-in
+    (`nvidia-persistenced.service.d/override.conf`) changed in this run;
+  - `docker compose up -d` for every stack (a no-op when nothing changed).
+- **Telemetry and digest images** are rebuilt (`up -d --build`, which recreates the app container: a few seconds
+  each) only when the stack's `compose.yaml` or `build/` tree changed in this run, differs from the last
+  successful build, or `--rebuild` is given. Each run prints `rebuild: yes (<why>)` or `rebuild: no` per stack,
+  in the dry run too. The last build's content hash (compose.yaml plus every file under `build/`, as installed)
+  is kept in `/srv/<stack>/.build-hash`, written after a successful `up`. A change installed with `--no-start`
+  is therefore still rebuilt on the next run. **The first run after this was added rebuilds both images once**
+  (no `.build-hash` yet); later runs with no change do not.
 - A changed `/etc/llama-swap/config.yaml` is reloaded by llama-swap itself (`--watch-config`): the loaded models restart,
   and the coding pair comes back through the startup preload.
 - It never deletes anything: a file removed from the repo stays on the host until you remove it.
@@ -137,7 +151,9 @@ find "$R" -name __pycache__ -prune -exec rm -rf {} +
 
 - **llama-swap config:** `sudo install -m 0640 -o root -g llamaswap "$R/llama-swap/config.yaml" /etc/llama-swap/config.yaml`
   (keep a `.bak-<ts>` copy first). `--watch-config` reloads it.
-- **Digest app:** see [digest/README.md](digest/README.md#redeploy-only-the-digest).
+- **Digest app:** see [digest/README.md](digest/README.md#redeploy-only-the-digest). A narrow redeploy does
+  not update `/srv/digest/.build-hash`, so the next full `deploy.sh` run rebuilds the digest image once more
+  (its dry run says `rebuild: yes (build inputs differ from the last build ...)`).
 
 Remove `$R` afterwards. The next full `deploy.sh` run converges everything else.
 
@@ -324,8 +340,6 @@ cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsit
 
 | Issue | Effect | Workaround |
 |---|---|---|
-| `backup/RESTORE.md.tmpl` references `${RESTIC_BUCKET}`, and `render.sh` refuses a template with an empty site variable | With `RESTIC_BUCKET=""` (offsite off, the `site.env.example` default) `deploy.sh` stops at "render templates", although the offsite step itself treats an empty bucket as off | Set the real bucket, or `RESTIC_BUCKET=CHANGEME`: `deploy.sh` treats `CHANGEME` as off and the render passes (the installed `RESTORE.md` then names the placeholder) |
-| `deploy.sh` restarts `nvidia-persistenced` and rebuilds the telemetry and digest images on every run | GPU persistence daemon restart, and both app containers recreated | Run deploys with the GPUs idle; use a [narrow redeploy](#narrow-redeploys-one-component) for single-component changes |
 | Telemetry labels x8 links "chipset slot" | Cosmetic; both GPUs are shown that way since the riser | None needed. See [telemetry](telemetry/README.md.tmpl#known-issues) |
 | llama-swap logs `failed to preload ... status 404` at start | Harmless; both preloaded models load and stay healthy | None |
 
@@ -333,7 +347,7 @@ cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsit
 
 | Symptom | Check / fix |
 |---|---|
-| `render: refusing to render .../RESTORE.md.tmpl with missing values` | `RESTIC_BUCKET` is empty: see Known issues |
+| `render: refusing to render .../<file>.tmpl with missing values` | a site variable that file needs is empty: `scripts/render.sh -e site.env --check walter/<component>` lists them |
 | `<VAR> is empty in site.env` / `set <VAR> in site.env` | fill it in `site.env` (`site.env.example` documents each one) |
 | models load CPU-only, or llama-swap fails right after boot | `sudo systemctl restart nvidia-persistenced llama-swap`; check `nvidia-smi` |
 | a split model (`vision`, `hermes`) crashes at load with `ncclGroupEnd()` / "unhandled system error" | the container lacks `--shm-size 2g`: the `${tp}` macro must be in its `cmd` ([BENCHMARKS](llama-swap/BENCHMARKS.md)) |

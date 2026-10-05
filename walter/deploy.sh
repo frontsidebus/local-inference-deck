@@ -13,10 +13,18 @@
 #   --skip-packages    do not apt-get install / pin the NVIDIA, Docker and tool packages
 #   --no-start         install and enable, but do not start units or compose stacks
 #   --with-hermes      also configure Hermes Agent for BACKEND_SSH_USER (needs Hermes installed)
+#   --rebuild          rebuild the telemetry and digest images even when their build inputs are unchanged
 #
 # Optional components (off unless site.env turns them on):
 #   digest             walter/digest: on when SPARK_DIGEST_HOST is set. Off: no /srv/digest, no 3300
 #                      firewall rules, no stack; deploy prints one "digest: off" line.
+#   offsite backups    walter/backup/OFFSITE.md: on when RESTIC_BUCKET is set (not empty, not CHANGEME).
+#                      Off: the offsite script, units, timer and IAM policy are not rendered, offsite-setup
+#                      is not run, RESTORE.md says offsite is not configured; one "offsite: off" line.
+#
+# Restarts and rebuilds happen only when needed: nvidia-persistenced is restarted only when its drop-in
+# changed; the telemetry and digest images are rebuilt (docker compose up -d --build) only when their
+# compose.yaml or build/ tree differs from the last build (content hash in /srv/<stack>/.build-hash).
 #
 # Order: render -> packages -> users -> /models mount -> llama-swap binary -> files ->
 #        env files -> gen-secrets -> systemd units + firewall -> (offsite backups) -> gateway -> keys -> webui ->
@@ -36,7 +44,7 @@ NVIDIA_CTK_VERSION=1.20.1-1                     # nvidia-container-toolkit (NVID
 APT_PKGS=(docker.io docker-compose-v2 wireguard-tools ufw xfsprogs zstd jq curl python3 python3-yaml gettext-base iptables)
 
 # ---- options -------------------------------------------------------------------------
-DRY=0 DESTDIR="" SITE_ENV_FILE="$REPO/site.env" SKIP_PKGS=0 NO_START=0 WITH_HERMES=0
+DRY=0 DESTDIR="" SITE_ENV_FILE="$REPO/site.env" SKIP_PKGS=0 NO_START=0 WITH_HERMES=0 REBUILD=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --dry-run) DRY=1 ;;
@@ -47,7 +55,8 @@ while [[ $# -gt 0 ]]; do
     --skip-packages) SKIP_PKGS=1 ;;
     --no-start) NO_START=1 ;;
     --with-hermes) WITH_HERMES=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --rebuild) REBUILD=1 ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "deploy: unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -93,6 +102,10 @@ if [[ $DIGEST == 1 ]]; then
   esac
 fi
 
+# Optional offsite backups (walter/backup/OFFSITE.md): on only when RESTIC_BUCKET is set. CHANGEME counts
+# as off (older site.env files used it to get past the render before empty was supported).
+OFFSITE=0; [[ -n ${RESTIC_BUCKET:-} && $RESTIC_BUCKET != CHANGEME ]] && OFFSITE=1
+
 T=$DESTDIR   # target root prefix
 USER_HOME=$(getent passwd "$BACKEND_SSH_USER" | cut -d: -f6 || true)
 USER_HOME=${USER_HOME:-/home/$BACKEND_SSH_USER}
@@ -104,7 +117,9 @@ trap 'rm -rf "$STAGE"' EXIT
 COMPONENTS=(base wireguard llama-swap gateway webui monitoring telemetry backup update-check firewall hermes)
 [[ $DIGEST == 1 ]] && COMPONENTS+=(digest)
 for d in "${COMPONENTS[@]}"; do
-  "$REPO/scripts/render.sh" -e "$SITE_ENV_FILE" "$HERE/$d" "$STAGE/$d"
+  rx=()   # offsite off: skip its files (the IAM policy template needs RESTIC_BUCKET)
+  [[ $d == backup && $OFFSITE == 0 ]] && rx=(-x 'spark-offsite*' -x 'offsite-*')
+  "$REPO/scripts/render.sh" -e "$SITE_ENV_FILE" "${rx[@]}" "$HERE/$d" "$STAGE/$d"
 done
 find "$STAGE" -name __pycache__ -prune -exec rm -rf {} +
 if [[ $DIGEST == 0 ]]; then
@@ -112,6 +127,9 @@ if [[ $DIGEST == 0 ]]; then
   # drop those blocks so the installed scripts are exactly what they were before the digest app.
   sed -i '/^# >>> digest/,/^# <<< digest/d' "$STAGE"/firewall/*.sh
   say "  digest: off (SPARK_DIGEST_HOST is empty in site.env); skipping walter/digest, its firewall rules and its stack"
+fi
+if [[ $OFFSITE == 0 ]]; then
+  say "  offsite: off (RESTIC_BUCKET is empty or CHANGEME in site.env); skipping the offsite script, units, timer, IAM policy and credentials; RESTORE.md says offsite is not configured"
 fi
 say "  rendered to $STAGE"
 
@@ -273,7 +291,7 @@ if [[ $DIGEST == 1 ]]; then
   mkdir_p /srv/digest/state 0750 10001 10001
 fi
 
-install_file "$S/base/nvidia-persistenced.service.d/override.conf" /etc/systemd/system/nvidia-persistenced.service.d/override.conf 0644 root root units
+install_file "$S/base/nvidia-persistenced.service.d/override.conf" /etc/systemd/system/nvidia-persistenced.service.d/override.conf 0644 root root persistenced
 # wg0.conf holds the private key once gen-secrets has filled it: compare with the key masked.
 if [[ -r $T/etc/wireguard/wg0.conf ]] && cmp -s "$S/wireguard/wg0.conf" \
      <(sed -E 's/^(PrivateKey[[:space:]]*=[[:space:]]*).*/\1@WG_PRIVATE_KEY@/' "$T/etc/wireguard/wg0.conf"); then :
@@ -350,7 +368,9 @@ run systemctl enable nvidia-persistenced.service wg-quick@wg0.service docker-use
     llama-swap.service spark-backup.timer spark-update-check.timer
 run /usr/local/sbin/ufw-rules.sh
 if [[ $NO_START == 0 ]]; then
-  run systemctl restart nvidia-persistenced.service
+  # Restart the GPU persistence daemon only when its drop-in changed in this run; otherwise just make sure it runs.
+  if [[ -n ${CHANGED[persistenced]:-} ]]; then run systemctl restart nvidia-persistenced.service
+  else run systemctl start nvidia-persistenced.service; fi
   if [[ -n ${CHANGED[wg]:-} ]]; then run systemctl restart wg-quick@wg0.service
   else run systemctl start wg-quick@wg0.service; fi
   if [[ -n ${CHANGED[fw-docker]:-} ]]; then run systemctl restart docker-user-rules.service
@@ -365,8 +385,8 @@ if [[ $NO_START == 0 ]]; then
 fi
 
 # ---- 9b. offsite backups (optional: restic to S3, walter/backup/OFFSITE.md) ---------------
-if [[ -z ${RESTIC_BUCKET:-} || ${RESTIC_BUCKET} == CHANGEME ]]; then
-  step "offsite backups: off (RESTIC_BUCKET empty)"
+if [[ $OFFSITE == 0 ]]; then
+  step "offsite backups: off (RESTIC_BUCKET empty or CHANGEME)"
 elif [[ -n $DESTDIR ]]; then
   step "offsite backups: skipped (--destdir)"
 elif [[ $DRY == 0 && ! -s /etc/spark-restic/aws.env ]]; then
@@ -385,6 +405,32 @@ compose_up() {
   local t; for t in "$@"; do [[ -n ${CHANGED[$t]:-} ]] && recreate=(--force-recreate); done
   run docker compose -f "$dir/compose.yaml" up -d "${recreate[@]}" "${EXTRA_UP[@]}"
 }
+# build_hash DIR: sha256 over the stack's build inputs as installed (compose.yaml + every file under build/,
+# path and content), i.e. what `docker compose build` sees.
+build_hash() {
+  [[ -d $T$1/build && -f $T$1/compose.yaml ]] || { echo none; return 0; }
+  (cd "$T$1" && find compose.yaml build -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) \
+    | sha256sum | cut -c1-64
+}
+# compose_build_up DIR TAG: compose_up with --build only when the build inputs changed in this run, differ
+# from the last successful build (DIR/.build-hash), have no marker yet, or --rebuild was given. A plain
+# `up -d --build` gives the image a new ID even when every layer is cached, which recreates the container.
+compose_build_up() {
+  local dir=$1 tag=$2 want have="" why=""
+  want=$(build_hash "$dir")
+  [[ -r $T$dir/.build-hash ]] && have=$(<"$T$dir/.build-hash")
+  if [[ $REBUILD == 1 ]]; then why="--rebuild"
+  elif [[ -n ${CHANGED[$tag]:-} ]]; then why="compose.yaml or build/ changed in this run"
+  elif [[ -z $have ]]; then why="no $dir/.build-hash yet (first run with build tracking)"
+  elif [[ $have != "$want" ]]; then why="build inputs differ from the last build ($dir/.build-hash)"
+  fi
+  if [[ -n $why ]]; then say "  rebuild: yes ($why)"; EXTRA_UP+=(--build)
+  else say "  rebuild: no (build inputs unchanged since the last build)"; fi
+  compose_up "$dir" "$tag"
+  if [[ -n $why && $DRY == 0 && $want != none ]]; then   # only after a successful up (set -e)
+    printf '%s\n' "$want" >"$T$dir/.build-hash"; chmod 0644 "$T$dir/.build-hash"
+  fi
+}
 if [[ $NO_START == 1 ]]; then step "compose stacks: skipped (--no-start)"
 else
   step "gateway (Postgres + LiteLLM)";   EXTRA_UP=(--wait); compose_up /srv/gateway gateway
@@ -393,7 +439,7 @@ else
   else python3 "$S/gateway/provision-keys.py" --dry-run ${DESTDIR:+--root "$DESTDIR"} 2>&1 | sed 's/^/  /' || true; fi
   step "webui (Pocket-ID + Open WebUI)"; EXTRA_UP=(--wait); compose_up /srv/webui webui webui-theme
   step "monitoring";                     EXTRA_UP=(); compose_up /srv/monitoring monitoring
-  step "telemetry";                      EXTRA_UP=(--build); compose_up /srv/telemetry telemetry
+  step "telemetry";                      EXTRA_UP=(); compose_build_up /srv/telemetry telemetry
   if [[ $DIGEST == 1 ]]; then
     step "digest key"
     if [[ -f $T/srv/gateway/keys/digest.key ]]; then
@@ -415,7 +461,7 @@ else
       warn "digest key missing: /srv/gateway/keys/digest.key (is 'digest' in HARNESS_KEYS?)"
     fi
     if [[ -f $T/srv/digest/secrets/digest-litellm-key ]]; then
-      step "digest"; EXTRA_UP=(--build); compose_up /srv/digest digest
+      step "digest"; EXTRA_UP=(); compose_build_up /srv/digest digest
     elif [[ $DRY == 1 && -f $T/srv/gateway/keys/digest.key ]]; then
       say "  would start digest (key copy pending)"
     else
