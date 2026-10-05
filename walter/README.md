@@ -13,6 +13,7 @@ edge (Covenant) ──wg0──► BACKEND_WG_IP
                            :3200  telemetry app   (/srv/telemetry, host network; ufw: only EDGE_WG_IP on wg0)
                            :3300  digest app      (/srv/digest, host network; ufw: only EDGE_WG_IP on wg0; optional)
                            :8080  llama-swap      (systemd, user llamaswap; ufw: only GATEWAY_DOCKER_SUBNET)
+                           :22    sshd            (all addresses; ufw: hypervisor bridge subnet on BACKEND_LAN_IF, EDGE_WG_IP on wg0)
                                     └─► llama-server containers on 127.0.0.1:<dynamic> (GPU0 / GPU1 / both)
                     127.0.0.1:3001/9090/...  monitoring (/srv/monitoring, host network, SSH tunnel only)
 ```
@@ -44,7 +45,7 @@ Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `co
 | `backup/spark-offsite*`, `backup/offsite-setup.sh` | `/usr/local/sbin/spark-offsite.sh`, `spark-offsite.{service,timer}`, `/usr/local/bin/restic`, `/etc/spark-restic/` | optional encrypted offsite copy of the backups (restic to S3, bucket-scoped IAM user), when `RESTIC_BUCKET` is set ([OFFSITE](backup/OFFSITE.md)) |
 | `update-check/*` | `/usr/local/sbin/spark-update-check.py`, units, `/etc/update-motd.d/90-spark-updates`, `/var/lib/spark-update-check/README.md` | weekly report-only update/advisory check ([README](update-check/README.md.tmpl)) |
 | `firewall/docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/`, `/etc/systemd/system/` | `WALTER-PUBLISHED` chain in DOCKER-USER |
-| `firewall/ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` | ufw defaults (deny in/routed) + INPUT allows: SSH, `GATEWAY_DOCKER_SUBNET` → 8080, `EDGE_WG_IP` on wg0 → 3200 (and 3300 with the digest) |
+| `firewall/ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` | ufw defaults (deny in/routed) + INPUT allows: SSH 22 only from the hypervisor bridge subnet (kernel route of `BACKEND_LAN_IF`, must contain `HYPERVISOR_BRIDGE_IP`) and from `EDGE_WG_IP` on wg0, `GATEWAY_DOCKER_SUBNET` → 8080, `EDGE_WG_IP` on wg0 → 3200 (and 3300 with the digest); deletes the legacy any-source `allow 22/tcp` after the scoped allows exist ([firewall/README.md](firewall/README.md)) |
 | `hermes/*` | `~${BACKEND_SSH_USER}/.local/bin/hermes-spark`, merged into `~/.hermes/config.yaml` | optional, `--with-hermes` |
 
 `*.tmpl` files are rendered by `../scripts/render.sh` (envsubst with an explicit variable list).
@@ -340,7 +341,6 @@ cat /var/lib/spark-offsite/LAST_OK; journalctl -u spark-offsite -n 20   # offsit
 
 | Issue | Effect | Workaround |
 |---|---|---|
-| Telemetry labels x8 links "chipset slot" | Cosmetic; both GPUs are shown that way since the riser | None needed. See [telemetry](telemetry/README.md.tmpl#known-issues) |
 | llama-swap logs `failed to preload ... status 404` at start | Harmless; both preloaded models load and stay healthy | None |
 
 ## Troubleshooting

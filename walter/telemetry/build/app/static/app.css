@@ -199,6 +199,9 @@ h2::before { content: "▮"; color: var(--accent); margin-right: 8px; text-shado
 }
 .chip-info { border-color: rgba(0, 240, 255, .4); }
 .chip-info::before { content: "i"; display: inline-grid; place-items: center; width: 13px; height: 13px; border-radius: 50%; font-size: 9px; font-weight: 700; color: var(--cp-bg); background: var(--cp-cyan); }
+.chip-info.chip-note { color: var(--cp-muted); }
+.chip-info.chip-warn { color: var(--cp-yellow); border-color: rgba(252, 238, 10, .6); }
+.chip-info.chip-warn::before { content: "!"; background: var(--cp-yellow); }
 .chip-model { border-color: rgba(255, 42, 109, .45); }
 .chip-model::before { content: ""; width: 6px; height: 6px; background: var(--cp-magenta); box-shadow: 0 0 6px var(--cp-magenta); }
 

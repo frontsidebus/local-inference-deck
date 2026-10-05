@@ -44,6 +44,9 @@ HIST_S = float(os.environ.get("HISTORY_INTERVAL", "30"))
 HIST_WINDOW = int(os.environ.get("HISTORY_WINDOW", "1800"))
 HIST_STEP = int(os.environ.get("HISTORY_STEP", "15"))
 MAX_SSE = int(os.environ.get("MAX_SSE_CLIENTS", "64"))
+# Expected PCIe link width: "8" (every GPU) or "0=16,1=8" (per GPU index). Empty = no width warning.
+# The default comes from site.env at render time; an unrendered placeholder parses as "no expectation".
+GPU_EXPECTED_WIDTH = os.environ.get("TELEMETRY_GPU_EXPECTED_WIDTH", "${TELEMETRY_GPU_EXPECTED_WIDTH}")
 HEARTBEAT_S = 15
 STATIC = Path(__file__).parent / "static"
 
@@ -325,7 +328,7 @@ class Collector:
                     "power_w": _r(power.get(g), 1),
                     "fan_pct": fan.get(g),
                     "sm_clock_mhz": clock.get(g),
-                    "pcie": pcie_link(buses.get(g, "")),
+                    "pcie": pcie_describe(pcie_link(buses.get(g, "")), expected_width(gi, EXPECTED_WIDTHS)),
                     "models": [m["id"] for m in self.running if gi in m["gpus"]],
                 }
             )
@@ -544,6 +547,54 @@ def pcie_link(bus_id: str) -> dict | None:
     g = lambda s: gen.get(s.split()[0])  # noqa: E731
     return {"width": cur_w, "max_width": max_w, "gen": g(cur_s), "max_gen": g(max_s), "speed": cur_s.split(" PCIe")[0]}
 
+
+def parse_expected_widths(spec: str | None) -> dict:
+    """"8" -> {"*": 8}; "0=16,1=8" -> {0: 16, 1: 8}. Empty, malformed or unrendered -> {} (no warnings)."""
+    out: dict = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        k, sep, v = part.rpartition("=")
+        if not v.isdigit() or int(v) <= 0:
+            continue
+        if not sep:
+            out["*"] = int(v)
+        elif k.strip().isdigit():
+            out[int(k)] = int(v)
+    return out
+
+
+def expected_width(index: int, widths: dict) -> int | None:
+    return widths.get(index, widths.get("*"))
+
+
+def pcie_describe(link: dict | None, expected: int | None = None) -> dict | None:
+    """Add a display label to a pcie_link() dict. The UI shows `label`, styles by `level`, tooltips `title`.
+
+    level: "ok" (nothing to say), "info" (neutral note, e.g. an idle link-speed downshift or a link
+    narrower than the card's maximum) or "warn" (width below the configured expectation). Nothing is
+    inferred about the slot: the server only knows what sysfs reports.
+    """
+    if not link:
+        return None
+    w, mw, gen, mg = link.get("width"), link.get("max_width"), link.get("gen"), link.get("max_gen")
+    label = f"PCIe {f'Gen{gen} ' if gen else ''}x{w}"
+    title = f"Link: {link.get('speed') or '?'} x{w} (device max {f'Gen{mg} ' if mg else ''}x{mw})."
+    level = "ok"
+    if gen and mg and gen < mg:
+        level = "info"
+        label += " · power-save"
+        title += f" Running Gen{gen} of Gen{mg}: GPUs drop link speed at idle to save power and go back up under load. Normal."
+    if w and mw and w < mw:
+        title += f" Link is x{w} of a possible x{mw}"
+        title += f"; x{expected} is expected here." if expected is not None and w >= expected else "."
+    if expected is not None and w is not None and w < expected:
+        level = "warn"
+        label += f" · below x{expected}"
+        title += f" Width x{w} is below the expected x{expected} (TELEMETRY_GPU_EXPECTED_WIDTH): check the card's seating, riser and slot settings."
+    return {**link, "expected_width": expected, "label": label, "level": level, "title": title}
+
+
+EXPECTED_WIDTHS = parse_expected_widths(GPU_EXPECTED_WIDTH)
 
 collector = Collector()
 

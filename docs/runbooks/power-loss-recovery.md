@@ -64,7 +64,7 @@ journalctl -u spark-backup -b                   # the catch-up run, if one was d
 cat /models/backups/LAST_OK
 ```
 
-Expect `coder` on GPU0 and `coder-fast` on GPU1, both resident, about a minute after llama-swap starts (each model itself loads in 10–12 s from a cold disk). The telemetry dashboard labels both GPUs "chipset slot": that is a cosmetic known issue, not a lost link ([telemetry](../../walter/telemetry/README.md.tmpl#known-issues)).
+Expect `coder` on GPU0 and `coder-fast` on GPU1, both resident, about a minute after llama-swap starts (each model itself loads in 10–12 s from a cold disk). The telemetry dashboard should show each GPU as "PCIe Gen4 x8" under load; an idle GPU shows a lower generation with "power-save", which is normal. A "below xN" warning means a link came back narrower than expected ([telemetry](../../walter/telemetry/README.md.tmpl)).
 
 Walter's own boot-time fsck handles its disks: ext4 `/` and `/boot` replay their journals, and the vfat EFI partition has its dirty bit cleared automatically ("Dirty bit is set... Automatically removing dirty bit"). The same fsck notes "differences between boot sector and its backup (offset 65)". Offset 65 is the in-use flag Linux sets while the partition is mounted, so it is harmless. To confirm it clears on a clean unmount:
 

@@ -21,6 +21,9 @@ secrets/llama-swap-api-key   copy of /etc/llama-swap/api-key (root:10001 0440), 
 The nightly backup's config tarball covers all of `/srv/telemetry` (`secrets/` included, like every `/srv/*/`; see
 `${MODELS_DIR}/backups/RESTORE.md`). The dashboard keeps no state of its own.
 
+Tests live in the repo only (`walter/telemetry/tests`, not deployed): `python3 -m pytest walter/telemetry/tests -q`.
+They need starlette, httpx and uvicorn installed locally; otherwise they are skipped.
+
 ## How it works
 - One collector loop. llama-swap `/running` is polled every 2 s, the fast PromQL set every 4 s (Prometheus scrapes every 15 s),
   the slow set (latency, 1 h totals, per-key today, probes, up, alerts) every 15 s, and range queries every 30 s.
@@ -29,7 +32,15 @@ The nightly backup's config tarball covers all of `/srv/telemetry` (`secrets/` i
   network to join. The app binds ${BACKEND_WG_IP}:3200 itself (IP_FREEBIND, so it starts even before wg0 is up).
 - `backup-status` (alpine, root without capabilities, no network, read-only) reads `${MODELS_DIR}/backups/LAST_OK` every 60 s
   and writes only `{ts, name}` to a tmpfs volume.
-- PCIe link width and speed come from `/sys/bus/pci/devices/<bus>/current_link_*`, because DCGM doesn't export them on GeForce.
+- PCIe link width and speed come from `/sys/bus/pci/devices/<bus>/current_link_*` and `max_link_*`, because DCGM
+  doesn't export them on GeForce. The server builds the GPU card's link chip (`pcie.label`, `pcie.level`, `pcie.title` in
+  the snapshot) and the browser only displays it:
+  - `PCIe Gen4 x8`: the current generation and width. A link narrower than the card's maximum (x8 of x16 on a
+    bifurcated slot, say) is mentioned in the tooltip only. The app knows nothing about slots or chipsets and claims nothing.
+  - `· power-save` (muted): the link runs below its maximum generation. GPUs drop to Gen1/2 at idle and go back to Gen4 under
+    load. This is normal.
+  - `· below x8` (yellow): the width is below `TELEMETRY_GPU_EXPECTED_WIDTH` (see Configuration). This is the only warning,
+    and with the setting unset there is none.
 - X-Forwarded-User/Email are only displayed, after being sanitised. They are never used for authorisation.
 
 ## Configuration
@@ -43,6 +54,12 @@ Environment of the `app` service in `compose.yaml` (change it there, then `sudo 
 | `LLAMA_SWAP_KEY_FILE` | `/run/secrets/llama-swap-api-key` | read on every poll |
 | `BACKUP_STATUS_FILE` | `/state/backup.json` | written by the `backup-status` sidecar |
 | `TZ_DISPLAY` | `UTC` | "today" boundary for the per-key breakdown |
+
+`TELEMETRY_GPU_EXPECTED_WIDTH` is optional. It sets the PCIe width each GPU should train at: `8` for every GPU, or
+`0=16,1=8` per GPU index. The chip warns when a link is narrower than that. Set it in `site.env`; it is rendered into
+`build/app/main.py` as the default, and an environment variable of the same name on the `app` service overrides it.
+Leave it out of `site.env` (or commented) for no warning. Don't set it to an empty value, because `render.sh` refuses
+templates whose site variables are empty. Current riser topology: both GPUs are on CPU root ports at x8, so `8` fits.
 
 Optional cadence knobs (seconds, app defaults): `PUBLISH_INTERVAL` 2, `PROM_FAST_INTERVAL` 4, `SLOW_INTERVAL` 15, `HISTORY_INTERVAL` 30.
 
@@ -66,12 +83,6 @@ sudo install -m 0440 -o root -g 10001 /etc/llama-swap/api-key secrets/llama-swap
 `walter/deploy.sh` rebuilds this stack (`docker compose up -d --build`, which recreates `telemetry-app`: a few seconds of
 dashboard reconnects) only when `compose.yaml` or `build/` changed, when the `.build-hash` marker here is missing or stale,
 or with `--rebuild`; otherwise it runs a plain `up -d`. Each run prints `rebuild: yes (<why>)` or `rebuild: no`.
-
-## Known issues
-- **"chipset slot" label on x8 links.** `build/app/static/app.js` labels any GPU link narrower than the card's maximum as
-  `· chipset slot`, with the tooltip "Slot is x1 by design". It dates from when the second GPU sat in a chipset x1 slot.
-  Since the bifurcation riser both GPUs run x8 of a possible x16, so both are mislabelled. Cosmetic: the width and
-  generation shown are correct (`Gen4 x8` under load; Gen1/2 at idle is power saving).
 
 ## Troubleshooting
 | Symptom | Check / fix |
