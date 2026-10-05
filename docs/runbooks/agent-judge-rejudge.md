@@ -1,12 +1,13 @@
 # Runbook: measure a judge change by re-judging saved bundles
 
-Before you trust a new judge prompt, a new local model or a new severity policy, measure it: run the old and the new judge on the **same saved evidence bundles** and score both against ground truth you checked yourself. Background: [docs/agent-judge.md](../agent-judge.md), especially [Pilot results: run 1](../agent-judge.md#pilot-results-run-1). The pilot procedure that produces the bundles is [agent-judge-pilot.md](agent-judge-pilot.md).
+Before you trust a new judge prompt, a new local model or a new severity policy, measure it: run the old and the new judge on the **same saved evidence bundles** and score both against ground truth you checked yourself. Background: [docs/agent-judge.md](../agent-judge.md), especially [Measured results](../agent-judge.md#7-measured-results). The pilot procedure that produces the bundles is [agent-judge-pilot.md](agent-judge-pilot.md).
 
 Why bundles and not live runs: a live re-run changes the agent's behaviour, the timing and the host state, so two judges never see the same input. A saved bundle is fixed. The only variable left is the judge.
 
 ## What you need
 
 - **Saved bundles** from a run: `$JUDGE_REVIEW_DIR/evidence/<request-id>/` and the request in `queue/` or `done/`. `rejudge.py` never collects, so a missing bundle is an error, not a fresh collection.
+- **Bundles for a code change can be rebuilt offline** when the originals are not good enough (for example after a collector fix): copy the session snapshot, the request and `gate.log` into a private review root (with paths rewritten to a checkout of the build branch at the task's commit), and run `collector/collect.py` with `JUDGE_HOST_PROBES=0` and that `JUDGE_REVIEW_DIR`. That is how the pilot-2 bundles were rebuilt after #43–#45. Audit the rebuilt bundle before any frontier call.
 - **Ground truth per request**, written down before you read any finding: what the agent actually did and whether each of its claims was true, checked independently (host journal, file diffs, the gate `outcome`, live read-only commands). See [Verifying ground truth](agent-judge-pilot.md#verifying-ground-truth). Run 1's table in the design doc is an example.
 
 ## The tool
@@ -51,7 +52,7 @@ The local judge is any gateway alias. Run 1 used `coder-fast`, from the same fam
 | Alias | Family | Notes |
 |---|---|---|
 | `big` | the worker's family (Qwen3-Coder-Next) | the default `JUDGE_LOCAL_MODEL` |
-| `coder-fast` | the worker's family | run 1's local baseline; not a fair judge |
+| `coder-fast` | the worker's family | deployed for sensitive reviews only, capped at medium and not injected; not a fair judge (run 1) |
 | `vision` | Gemma 4, a different family | the recommended candidate; not yet measured as a judge |
 
 ```bash
@@ -84,4 +85,4 @@ Then compare, per run:
 
 **What "better" means.** For a judge whose findings reach the agent, a high false positive is the most expensive error: the agent either argues with it or "fixes" correct work. A change that removes high FPs but also loses a true finding needs a human decision, not an automatic yes. Write the decision and the numbers next to the change (its commit message or PR).
 
-**When a local model has earned trust.** The [local-judge policy](../agent-judge.md#local-judge-policy) caps local findings at `JUDGE_LOCAL_MAX_SEVERITY` and keeps them out of the agent's context (`JUDGE_INJECT_LOCAL=0`). Relax either setting only after a local model has shown no high or medium FPs on a scored set of bundles that includes clean tasks, declines and blocks (run 1's S1, S6, S7 and S8 are good cases), and record that set.
+**When a local model has earned trust.** The [local-judge policy](../agent-judge.md#runner-and-judges) caps local findings at `JUDGE_LOCAL_MAX_SEVERITY` and keeps them out of the agent's context (`JUDGE_INJECT_LOCAL=0`). Relax either setting only after a local model has shown no high or medium FPs on a scored set of bundles that includes clean tasks, declines and blocks (run 1's S1, S6, S7 and S8 are good cases), and record that set.

@@ -1,8 +1,9 @@
 # judge/ — interface contract
 
 Component that lets a frontier (or local) model judge a local agent (Hermes) from evidence.
-Design rationale: `docs/agent-judge.md`. This file is the **binding contract** between the parts; change it
-deliberately and update every part that depends on it.
+Design and history: `docs/agent-judge.md`. Operator reference, including every setting and its default:
+`judge/README.md`. This file is the **binding contract** between the parts: change it deliberately and update every
+part that depends on it. Where this file and the code disagree, the code is right and this file is the bug.
 
 ## Ground rules
 - **Self-contained.** Nothing in `judge/` imports or sources files outside `judge/` except `site.env`
@@ -18,30 +19,35 @@ deliberately and update every part that depends on it.
 ```
 judge/
   CONTRACT.md            this file
-  README.md              overview, install, operate, uninstall (docs agent)
-  install.sh             renders hook config; --dry-run default, --apply merges into $HERMES_HOME/config.yaml
-  lib/config.py|sh       load site.env + judge defaults (shared helper; owned by the collector agent)
-  lib/queue.py           atomic read/write of requests/findings/acks + schema validation (collector agent)
-  lib/refusals.py        refusals in a window and the next tool calls, as metadata (refusals.jsonl; bug #39)
-  schema/request.schema.json  schema/finding.schema.json   (collector agent)
-  hooks/                 Hermes shell-hook entrypoints (stdin JSON → stdout JSON)
-    gate.py              C2 pre_tool_call  (gate agent)
-    verify.py            C3 pre_verify     (verify agent)
-    enqueue.py           C1 post_tool_call on plans + C4 on_session_end → write request (collector agent)
-    inject.py            C5 pre_llm_call   (runner agent)
-  policy/gate-policy.json.tmpl   C2 rules (JSON: stdlib has no YAML), host patterns as ${VARS} (gate agent)
-  collector/collect.py   build evidence bundle for a request (collector agent)
+  README.md              operator reference: install, settings, units, commands, troubleshooting
+  install.sh             renders the hooks block; dry run by default, --apply merges into $HERMES_HOME/config.yaml
+  lib/config.py|sh       site.env + judge defaults, path rules and data_class (classify_detail), SSH argv
+  lib/queue.py           atomic read/write of requests, findings and acks; schema checks; merge, dedupe, release
+  lib/snapshot.py        session snapshots, diffs, attribution (agent_touched, copy_targets), noise globs
+  lib/hermeslog.py       Hermes log parsing: session lines, parallel tool-call attribution, noise loggers
+  lib/redact.py          secret redaction and call hashes
+  lib/refusals.py        refusals in a window and the next tool calls, as metadata (refusals.jsonl; #39)
+  lib/toolcalls.py       command_word: the allowlisted program name of a terminal command (#33)
+  schema/request.schema.json  schema/finding.schema.json
+  hooks/                 Hermes shell-hook entrypoints (stdin JSON -> stdout JSON; see "Hook I/O")
+    gate.py              C2 pre_tool_call
+    verify.py            C3 pre_verify
+    enqueue.py           C1 post_tool_call, C4 on_session_start / on_session_end
+    inject.py            C5 pre_llm_call
+  policy/gate-policy.json.tmpl   C2 rules (JSON: stdlib has no YAML), host patterns as ${VARS}
+  collector/collect.py   the evidence bundle for one request
   collector/extras.py    C3 results + host-state probes for the bundle (`c3_results`, `host_state_probes`)
-  collector/claims_only.py  the CLAIMS-ONLY bundle of a sensitive review, for the frontier claims stage
-  probes/                read-only probe executables + probe.py dispatcher/allowlist (collector agent)
-  runner/                judge prompt, run-judge (frontier|local), findings validator, systemd user units (runner agent)
-  runner/rejudge.py      re-judge stored bundles with the current prompt/validator, without touching findings/
-  runner/prompt-claims.md   preamble of the frontier claims stage (prepended to runner/prompt.md)
+  collector/claims_only.py  the claims-only bundle of a sensitive completion, for the frontier claims stage
+  probes/probe.py        read-only probe dispatcher and allowlist
+  runner/run_judge.py    collect, budget, call the judge (frontier|local), validate, write findings
+  runner/prompt.md       judge system prompt; runner/prompt-claims.md is prepended for the claims stage
+  runner/validate.py     findings validator (verdict rules)
+  runner/rejudge.py      re-judge stored bundles with the current prompt and validator, without touching findings/
   runner/alert.py        OnFailure= alert for the runner units (runner.log + notify-send; #41)
-  runner/units/          judge-review.{service,path,timer}, judge-alert@.service (systemd --user; see "Runner units")
+  runner/units/          judge-review.{service,path,timer}, judge-alert@.service (systemd --user)
   bin/judge-ack|judge-findings   operator CLIs (acks, listing)
-  watch/runaway.py       C6 llama-server slot watcher (verify agent)
-  tests/                 pytest; one test module per part; fixtures under tests/fixtures/
+  watch/runaway.py       C6 llama-server slot watcher, and its unit
+  tests/                 pytest; one module per part; fixtures under tests/fixtures/
 ```
 
 ## Runtime directories (env-overridable)
@@ -57,14 +63,19 @@ findings/<request-id>.md         human-readable rendering of the same
 findings/<request-id>.claims.json  frontier claims stage of a sensitive completion (mode frontier-claims; + .md)
 acks/<request-id>.<item-id>      ack JSON (see "Acks" below); legacy: empty or one-line reason
 done/<request-id>.json           request moved here after findings are written
-snapshots/<session-id>/          watched-path snapshots taken at session start (collector), plus
-                                 c3-results.jsonl (verify.py, one line per verifier run)
-gate.log                         JSONL, one line per C2 decision (incl. `tool_call_id` when sent, `call_hash`)
+snapshots/<session-id>/          session-start snapshot (meta.json, index.json, files/), events.jsonl
+                                 (post_tool_call), c3-results.jsonl (verify.py, one line per verifier run)
+gate-policy.json                 the rendered C2 policy (install.sh); gate.py falls back to the template
+gate.log                         JSONL, one line per C2 escalation or block (incl. `tool_call_id` when sent, `call_hash`)
 watch.log                        JSONL, one line per C6 alert
+watch-state.json                 C6 state: first-seen times and alerted tasks
 inject.log                       C5: one line when the count of skipped local-mode items changes for a session
 .inject-local-skips.json         C5 state for inject.log ({session: last logged count}, at most 200 sessions)
+.inject-refusals.json            C5 state of the refusal reminder ({session: last reminded decision}; #39)
 .inject-stall.json               C5 state of the runner stall warning ({session: oldest stalled request id}; #41)
+hook-errors.log                  errors of the fail-open hooks (enqueue, verify, inject)
 runner.log                       runner messages; judge-alert@.service appends `ALERT: judge unit ... failed` lines
+usage.json (+ usage.json.lock)   frontier calls and reported cost of the current UTC day
 .alert-state.json                runner/alert.py: last desktop alert per unit (rate limit)
 .runner.lock                     flock held by run_judge.py while it runs (one runner at a time)
 ```
@@ -75,9 +86,11 @@ Writes are atomic (write tmp + rename). Files are mode 600, dirs 700.
 "short 6" = the last 6 alphanumeric characters of the session id (`lib/queue.session_short`). A request with an
 empty `session` is global (not tied to one Hermes session); its short id is `nosess`.
 If an id is already taken (queue/ or done/), `lib/queue.new_request_id` bumps the timestamp by one second.
-Completion dedupe (`lib/queue.is_duplicate`, used by verify.py and enqueue.py): a completion request is not written
-when a completion request of the same session exists with `created` within `JUDGE_COMPLETION_DEDUPE_SECONDS`
-(default 900) and a superset of its `changed_paths` (empty is a subset).
+Completion dedupe (`lib/queue.is_duplicate`, used by verify.py and enqueue.py, #7): a completion request R is not
+written when a completion request E of the same session exists (queue/, queue/deferred/ or done/) and either both
+carry a Hermes turn id (`detail.turn_id`) and it is the same turn, or one of them has no turn id, `created` is
+within `JUDGE_COMPLETION_DEDUPE_SECONDS` (default 900) and E's `changed_paths` are a superset of R's (empty is a
+subset). Two requests with different turn ids are never duplicates. pre_verify payloads carry no turn id.
 
 **One completion request per turn** (`lib/queue.merge_into_pending_completion(req, since=None, root=None) -> id | None`,
 called by `hooks/enqueue.py` on `on_session_end` before `is_duplicate`). Target: the newest completion request in
@@ -142,6 +155,19 @@ environment > site.env > default by enqueue.py itself. The request is an ordinar
 `changed_paths`, so normally `data_class: sensitive`: local judge + frontier claims stage) with
 `detail.text_only = {"chars", "claim_words" (≤ 12), "gate_decisions", "rule": "claims|gate|min_chars"}`; merge
 and dedupe apply unchanged.
+
+## Hook I/O
+Every hook reads one Hermes shell-hook payload on stdin,
+`{"hook_event_name", "tool_name", "tool_input", "session_id", "cwd", "profile", "extra"}`, and writes one JSON
+object on stdout. Hermes keys consent on `(event, command)`.
+
+| Hook | Event (matcher) | Reads | Writes on stdout | Failure mode |
+|---|---|---|---|---|
+| `gate.py` | `pre_tool_call` (`terminal\|write_file\|patch\|read_file`), `timeout: 10`, `fail_closed: true` | `tool_name`, `tool_input` (`command`/`workdir`; `path`/`content`; patch replace or V4A mode; `read_file` `path`), `session_id`, `cwd`, `extra.tool_call_id` | `{}` pass (exit 0); `{"action": "approve", "message", "rule_key"}` escalate to the human (exit 0); `{"action": "block", "message"}` refuse (exit 2, message also on stderr) | **Fails closed:** an internal error or malformed stdin gives the block JSON and exit 2. Every non-pass decision appends to `gate.log` and writes a `gate` request. `--explain` prints the decision and every rule hit with no side effects. |
+| `verify.py` | `pre_verify`, `timeout: 60` | `extra.attempt`, `extra.final_response`, `extra.changed_paths`, `session_id`, `cwd` | `{"action": "continue", "message"}` once when a verifier failed on attempt 0; else `{}` | Fails open: errors go to `hook-errors.log`, output `{}`. Attempt 0 writes a `completion` request (deduplicated); attempt > 0 only records results. |
+| `enqueue.py` | `post_tool_call` (`write_file\|patch\|terminal\|memory\|skill_manage\|read_file`), `on_session_start`, `on_session_end` | `tool_name`, `tool_input`, `extra` (`tool_call_id`, `status`, `turn_id`, ...), `session_id`, `cwd` | always `{}` | Fails open (`hook-errors.log`), never exits non-zero. Writes snapshots, `events.jsonl` and `plan`/`completion` requests; after every event releases due deferred requests. |
+| `inject.py` | `pre_llm_call`, `timeout: 10` | `session_id` only | `{"context": "<block>"}` or `{}` | Fails open (`hook-errors.log`, output `{}`). |
+| `watch/runaway.py` | not a hook: a user service | llama-server `/slots` through the `slots` probe | `watch.log`, stdout, desktop notification, a `runaway` request | Never cancels or unloads. |
 
 ## Request (schema/request.schema.json)
 ```json
@@ -526,8 +552,8 @@ runaway requests get no claims stage (their `claims` is synthetic or a plan, not
 
 **Contents: a positive allowlist.** Every value is constructed by the builder from parsed fields; nothing from the
 bundle is copied through as text except the final answer:
-- REVIEW REQUEST: `id`, `kind`, `data_class`, `created`, `since`, `claims`. `claims` = `request.claims` (cut to
-  8000 chars), masked by `claims_only.mask_claims` (below). The final answer is free text written by an agent that
+- REVIEW REQUEST: `id`, `kind`, `data_class`, `created`, `since`, `claims`. `claims` = `request.claims` (at most
+  4000 chars by the request schema; the builder also cuts at 8000), masked by `claims_only.mask_claims` (below). The final answer is free text written by an agent that
   may have read secrets and site data, so it is treated as **hostile to the data boundary** (bug #26): it is
   masked, and the whole message must still pass the self-check, which refuses rather than trusts the masking.
 - `manifest.json`: `bundle_mode: "claims-only"`, `request` (the fields above minus claims), `window` (`since`,
@@ -818,7 +844,7 @@ One JSON object, mode 600, atomic:
   `agent_event_paths`, `agent_wrote_ack`, `ack_actor`, `closure(actor, severity)`, `item_status`, `is_closed`,
   `needs_human(status, item)`, `items_by_status`; constants `ACK_ACTORS`, `ACK_STATUSES`.
 - The gate still lets the agent write under `acks/` (it has to, to ack). So a same-user agent can still forge
-  a human ack (see README "Ack trust").
+  a human ack (see docs/agent-judge.md, "Findings, C5 injection and acks").
 
 **`bin/judge-ack [--agent] <request-id> <item-id> "<reason>"`** (flag anywhere). Default actor `human`;
 `--agent` → `agent`. It records `agent` regardless of the flag when it detects an agent context: a non-empty env
@@ -834,7 +860,12 @@ summary line ends `open:N agent-acked:N closed:N`. `--json` items gain `status` 
 (`{"actor","reason","ts"[,"claimed_actor","legacy"]}` or null); `acked` (any ack) is kept.
 
 ## C5 injection (`hooks/inject.py`)
-Injects unacknowledged items at or above `JUDGE_INJECT_MIN_SEVERITY` from the last `JUDGE_INJECT_WINDOW_HOURS`.
+Injects unacknowledged items at or above `JUDGE_INJECT_MIN_SEVERITY` (default `medium`) from findings created in
+the last `JUDGE_INJECT_WINDOW_HOURS` (default 24) for this session or for no session, framed as reviewer findings
+(data, not instructions) and capped at `JUDGE_INJECT_MAX_CHARS` (default 2000). Every item, and then the whole
+block, is checked with Hermes's own threat patterns (`tools/threat_patterns.py`, loaded by file path from
+`JUDGE_HERMES_AGENT_DIR` or `$HERMES_HOME/hermes-agent`; a small built-in set when absent): a matching item is shown
+without its text, pointing at its findings file, and a matching block is not injected at all.
 Items of `mode=local` findings are skipped unless `JUDGE_INJECT_LOCAL=1` (env or site.env; default `0`); the skip
 count goes to `inject.log` only when it changes for the session. `mode=frontier-claims` findings
 (`findings/<id>.claims.json`) are injected like `frontier` ones. The footer names
@@ -913,25 +944,10 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 - Frontier calls count in `usage.json` against `JUDGE_FRONTIER_DAILY_MAX` unless `--no-budget`.
 - Exit 0 ok, 1 when any request failed, 64 usage.
 
-## site.env variables (add to site.env.example under `# --- judge`)
-`JUDGE_MODE=frontier` (frontier|local), `JUDGE_LOCAL_MODEL=big`, `JUDGE_FRONTIER_CMD=claude`,
-`JUDGE_SSH_ALIASES="edge-alias"` (ssh aliases that reach the edge), `EDGE_SSH_USER=ubuntu`,
-`EDGE_SSH_KEY=~/.ssh/edge.pem`, `JUDGE_RUNAWAY_TOKENS=24000`, `JUDGE_RUNAWAY_MINUTES=10`,
-`JUDGE_WINDOW_GRACE_SECONDS=10` (evidence window end = request `created` + this, capped at the next turn start − 1 s),
-`JUDGE_PLAN_DEBOUNCE_S=120` (a plan request waits for the turn end or this many seconds without a plan write; #34. Due requests are released by the next hook event and, as a backstop when no hook fires, by every poll of `watch/runaway.py` via `lib/queue.release_due`),
-`JUDGE_NOISE_GLOBS=""` (extra noise globs), `JUDGE_LOG_NOISE_LOGGERS=""` (extra untagged Hermes loggers dropped from `hermes-log.txt` context; `name` or `prefix.*`), `JUDGE_SNAPSHOT_MAX_FILES=2000`, `JUDGE_SNAPSHOT_MAX_BYTES=1048576`, `JUDGE_HOST_PROBES=1` (0 disables host-state probes), `JUDGE_LOCAL_MAX_SEVERITY=medium`, `JUDGE_INJECT_LOCAL=0`,
-`JUDGE_SENSITIVE_FRONTIER_CLAIMS=1` (0 = no frontier claims stage for sensitive completions),
-`JUDGE_REVIEW_TEXT_ONLY=1`, `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS=200`, `JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS=1` (#29),
-`JUDGE_LOCAL_MAX_TOKENS=4096`, `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default 2 × `JUDGE_LOCAL_MAX_TOKENS`; #30),
-`JUDGE_REFUSAL_NEXT_CALLS=6` (calls listed after each refusal in `refusals.jsonl`, 1–20; site.env only),
-`JUDGE_INJECT_REFUSAL_REMINDER=1` (0 = no refusal reminder in C5; #39),
-`JUDGE_STALL_MINUTES=15` (C5/judge-findings runner stall warning; 0 = off; #41),
-`JUDGE_SECRET_GLOBS=""` (extra basename globs of secret files, never infra-class; #42),
-`JUDGE_SCRATCH_GLOBS=""` (extra agent scratch/cache globs: never decide `data_class`, metadata only; #43),
-`JUDGE_MIXED_MAX_SENSITIVE=3` (sensitive paths an infra request may carry, withheld; 0 = strict; #43).
-Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack),
-`JUDGE_CHECK_UNITS=0` (judge-findings skips `systemctl --user is-failed`; the tests set it),
-`JUDGE_ALERT_MIN_INTERVAL_S=900` (judge-alert@.service, e.g. in `~/.config/judge/judge.env`: seconds between
-desktop alerts per unit; #41).
-Existing vars used: `BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`,
-`SPARK_DOMAIN`, `SPARK_*_HOST`, `SPARK_API_HOST`.
+## Settings
+Every setting, its default, where it is read (environment > site.env > default, with the exceptions listed) and
+what it does: `judge/README.md`, "Configuration". Defaults live in `lib/config.py` `DEFAULTS` or at the point of
+use (`run_judge.py`, `inject.py`, `enqueue.py`, `verify.py`, `collect.py`, `alert.py`, `bin/*`); new settings go
+into `site.env.example` under `# --- judge` with a comment. The judge also reads the existing site variables
+`BACKEND_SSH_USER`, `BACKEND_LAN_IP`, `BACKEND_WG_IP`, `EDGE_PUBLIC_IP`, `EDGE_WG_IP`, `SPARK_DOMAIN`,
+`SPARK_*_HOST` and `SPARK_SITE_NAME`.
