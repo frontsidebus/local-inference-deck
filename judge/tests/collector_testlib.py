@@ -44,7 +44,8 @@ def make_env(tmp_path: Path, monkeypatch, site_text: str = SITE_ENV_TEXT) -> dic
     site = tmp_path / "site.env"
     site.write_text(site_text)
     for k in ("JUDGE_MODE", "EDGE_SSH_KEY", "EDGE_SSH_USER", "JUDGE_SSH_ALIASES", "JUDGE_INFRA_REPOS",
-              "JUDGE_ENQUEUE_ALWAYS", "BACKEND_LAN_IP", "EDGE_PUBLIC_IP", "SPARK_DOMAIN"):
+              "JUDGE_ENQUEUE_ALWAYS", "BACKEND_LAN_IP", "EDGE_PUBLIC_IP", "SPARK_DOMAIN",
+              "JUDGE_MIXED_MAX_SENSITIVE", "JUDGE_SCRATCH_GLOBS", "JUDGE_SECRET_GLOBS"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(hermes))

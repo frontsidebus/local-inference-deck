@@ -49,8 +49,12 @@ def test_classify(env, tmp_path):
     assert config.classify(["/work/deck/.hermes/plans/p.md"]) == "infra"
     assert config.classify([str(env["repo"] / "walter/x.tmpl")]) == "infra"
     assert config.classify(["walter:/etc/llama-swap/config.yaml"]) == "infra"
-    # anything else -> sensitive; one sensitive path taints the whole set
-    assert config.classify([str(hh / "config.yaml"), "/home/someone/company/code.py"]) == "sensitive"
+    # anything else -> sensitive. #43: a few sensitive paths next to infra ones are withheld (the bundle stays
+    # infra); strict (max_mixed=0, JUDGE_MIXED_MAX_SENSITIVE=0) or a sensitive majority -> sensitive
+    assert config.classify([str(hh / "config.yaml"), "/home/someone/company/code.py"]) == "infra"
+    assert config.classify([str(hh / "config.yaml"), "/home/someone/company/code.py"], max_mixed=0) == "sensitive"
+    assert config.classify([str(hh / "config.yaml"), "/home/a/x.py", "/home/a/y.py"]) == "sensitive"
+    assert config.classify(["/home/someone/company/code.py"]) == "sensitive"
     assert config.classify([str(hh / ".env")]) == "sensitive"
     assert config.classify(["~/.ssh/id_ed25519"]) == "sensitive"
     assert config.classify(["/etc/../home/x"]) == "sensitive"
@@ -115,7 +119,8 @@ def test_classify_git_worktree_of_repo_is_infra(env, tmp_path, monkeypatch):
     assert config.classify([str(wt / "walter" / "deploy.sh"), str(wt / "README.md")]) == "infra"
     assert config.classify([], cwd=str(wt)) == "infra"
     assert config.classify([str(other / "README.md")]) == "sensitive"
-    assert config.classify([str(wt / "README.md"), str(other / "README.md")]) == "sensitive"
+    assert config.classify([str(wt / "README.md"), str(other / "README.md")]) == "infra"  # mixed: withheld (#43)
+    assert config.classify([str(wt / "README.md"), str(other / "README.md")], max_mixed=0) == "sensitive"
     assert config.classify([str(wt / ".env")]) == "sensitive"
     # live layout: JUDGE_REPO_DIR is itself a worktree; a sibling worktree shares its common dir
     wt2 = tmp_path / "deck-main"
