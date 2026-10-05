@@ -11,7 +11,23 @@ LiteLLM) to curate the rest, and stores the result as Markdown + JSON on Walter.
 | `ai-research` | AI Research | arXiv cs.AI / cs.LG / cs.CL / cs.MA, frontier-lab and research blogs, newsletters, policy, industry press |
 
 The exact feed list is `SOURCES` / `WATCHES` at the top of the two collectors in `build/app/collectors/`.
-Shared fetching, parsing and windowing live in `build/app/collectors/feedlib.py`.
+Shared fetching, caching, parsing and windowing live in `build/app/collectors/feedlib.py`.
+
+Threat Intel (`default`) sources:
+
+| Source | Primary | Fallback (used when the primary fails or is backing off) | Format |
+|---|---|---|---|
+| `CISA_KEV` | `www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json` | none | KEV JSON (25 most recent) |
+| `CISA_Advisories` | `www.cisa.gov/cybersecurity-advisories/all.xml`: every advisory type (ICS, ICS medical, alerts, joint `AA` advisories, analysis reports) | CISA's official CSAF repository, `raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/OT/white/changes.csv` plus one CSAF JSON per new advisory: ICS (`ICSA-`) and ICS medical (`ICSMA-`) advisories only | RSS 2.0 / CSAF 2.0 |
+| `SANS_ISC` | `isc.sans.edu/rssfeed.xml` | none | RSS 2.0 |
+| `BleepingComputer` | `www.bleepingcomputer.com/feed/` | none | RSS 2.0 |
+| `TheHackerNews` | `feeds.feedburner.com/TheHackersNews` | none | RSS 2.0 |
+
+`www.cisa.gov` sits behind Akamai, which can answer **403 Access Denied** to a client IP for hours
+(it did after a burst of test fetches on 2026-10-05, for every feed path except the KEV JSON). The
+CSAF fallback is official CISA data on a different host; it carries the ICS advisories the same day,
+in a few hours, with the same titles and web links as the RSS feed. It has no alerts or joint
+advisories, so a run served by the fallback says so in the source `note`.
 
 **Optional and off by default.** Both `walter/deploy.sh` and `covenant/deploy.sh` skip every digest
 part (this directory, port 3300 in the firewall, the `60-digest` site, its certificate, the second
@@ -78,6 +94,36 @@ One run of a watch (`pipeline.run_watch`):
      48 h of slack, uses 14 days when there is no cutoff, and never looks back more than 30 days.
      Then the newest 15 (threat intel) or 40 (AI) items per source are kept; undated items are
      capped at the first 30 in feed order. KEV keeps its 25 most recent entries.
+   - **Cache and backoff** (`feedlib.FeedCache`, in `$STATE_DIR/feedcache/`: one metadata JSON and
+     one body file per URL, plus the CSAF document cache and the advisory id map):
+     - **Minimum refetch interval:** a URL fetched less than 15 minutes ago
+       (`DIGEST_MIN_REFETCH_MINUTES`) is served from the cache, without a request. Pressing RUN NOW
+       repeatedly, or two watches sharing a feed, costs no extra fetches. The cached copy is parsed
+       and windowed again, so the result is the same as a fresh fetch of an unchanged feed.
+     - **Conditional GET:** after that, the request carries `If-None-Match` / `If-Modified-Since`
+       from the last good answer; a **304** serves the cached copy. The source shows
+       `cache: fetched | revalidated (304) | fresh (...)` in the collector output.
+     - **403/429 backoff:** a 403 or 429 is not retried. It starts a backoff persisted in the cache:
+       1 h, doubling with each consecutive block (2 h, 4 h, ...), at most 24 h, and at least the
+       server's `Retry-After`. Until it expires the URL is **not requested at all**; the source
+       reports `blocked: HTTP 403 at ...; backing off until ... (no request sent)`. The first good
+       answer clears it. Without a fallback this is a coverage gap like any failed source.
+     - **Fallback:** a source with a fallback (`FALLBACKS` in `collect_threat_intel.py`; today only
+       `CISA_Advisories`) uses it when the primary fails for any reason, including a backoff. The
+       source is then **ok**, with `via: fallback` and a `note` naming the primary's error and the
+       fallback's limits. Items are deduped by **advisory id** (`ICSA-26-274-02`, `ICSMA-..`,
+       `AA25-212A`, ...) across the primary and the fallback: a primary copy younger than 72 h
+       (`DIGEST_STALE_MAX_HOURS`) is merged under the fallback items and wins on a shared id. The
+       primary's titles are remembered per advisory id (`ids-<source>.json`), so a fallback item
+       for an advisory the primary already reported gets the same title, and the pipeline's
+       title-key dedupe recognises it.
+     - **CSAF fallback cost:** one conditional GET of `changes.csv` (none inside the refetch
+       interval), plus one GET per new advisory in the window (at most 15 per run,
+       `DIGEST_CSAF_MAX_DOCS`, within 60 s, `DIGEST_CSAF_BUDGET`). Documents are cached by path and
+       change date, so each one is fetched once. It uses `raw.githubusercontent.com`, not the
+       GitHub REST API, so the 60-requests-per-hour unauthenticated API quota does not apply.
+     - Cache I/O errors never fail a fetch. `DIGEST_CACHE_DIR=off` disables the cache (and with it
+       the backoff); deleting a file in `feedcache/` resets that URL.
    - **Counts.** Per source: `count` = items handed to the pipeline (in window, after the cap),
      `raw_count` = items in the feed, plus `in_window`, `older`, `undated` and an optional `note`.
      Full-archive feeds are why `raw_count` can be large (OpenAI ~1250, Hugging Face ~870,
@@ -181,6 +227,13 @@ Collector knobs (optional; the collectors inherit the app environment, so set th
 | `DIGEST_RETRY_BACKOFF` | `2` | seconds before the first retry, doubling |
 | `DIGEST_MAX_BODY_BYTES` | `8388608` | cap on the downloaded and the decoded body |
 | `DIGEST_COLLECT_WORKERS` | `6` | sources fetched in parallel |
+| `DIGEST_CACHE_DIR` | `$STATE_DIR/feedcache` | feed cache and backoff state; `off` disables both |
+| `DIGEST_MIN_REFETCH_MINUTES` | `15` | a URL fetched more recently is served from the cache, no request (0 disables) |
+| `DIGEST_BLOCK_BACKOFF_MINUTES` | `60` | first backoff after a 403/429, doubling per consecutive block |
+| `DIGEST_BLOCK_BACKOFF_MAX_HOURS` | `24` | backoff ceiling |
+| `DIGEST_STALE_MAX_HOURS` | `72` | a primary copy this young is merged (deduped by advisory id) under fallback items |
+| `DIGEST_CSAF_MAX_DOCS` | `15` | CSAF advisory documents fetched per run at most (the rest next run) |
+| `DIGEST_CSAF_BUDGET` | `60` | seconds per run for CSAF document fetches |
 
 ## Files and permissions
 
@@ -193,13 +246,15 @@ Collector knobs (optional; the collectors inherit the app environment, so set th
     requirements.txt                      every dependency pinned (direct + transitive)
     app/main.py                           HTTP, SSE, run scheduling
     app/pipeline.py                       collect -> dedupe -> curate -> persist -> state
-    app/collectors/                       collect_threat_intel.py, collect_ai_digest.py, feedlib.py (stdlib only)
+    app/collectors/                       collect_threat_intel.py, collect_ai_digest.py, feedlib.py, csaf.py (stdlib only)
     app/static/                           index.html, app.css, app.js, fonts/ (OFL, licenses included)
   secrets/                                root 0700
     digest-litellm-key                    root:10001 0440   copy of /srv/gateway/keys/digest.key
   state/                                  10001:10001 0750  bind-mounted at /state (the only writable path)
     state/<watch>.json                    watch state: cutoffs, per-source status, seen ids
     runs/<watch>/<run_id>.md|.json        one pair per run; run ids look like 20261004T120000Z
+    feedcache/                            per-URL feed cache: <hash>.json (validators, fetch time,
+                                          403/429 backoff) + <hash>.body; csaf-docs.json; ids-<source>.json
 ```
 
 Container hardening (`compose.yaml`): `user: 10001:10001`, `read_only: true`, tmpfs `/tmp` (16 MiB),
@@ -310,11 +365,16 @@ sudo install -m 0440 -o root -g 10001 /srv/gateway/keys/digest.key /srv/digest/s
 **Tests** (no network, no real key): `python3 -m pytest walter/digest/tests -q` from the repo root.
 `tests/fixtures/` holds small sanitized samples of every feed format met in the wild (arXiv RSS
 weekday and empty weekend listing, arXiv API Atom, gzip-served RSS, a full-archive unsorted feed,
-Atom, RDF/RSS 1.0, an undated feed, an HTML page).
+Atom, RDF/RSS 1.0, an undated feed, an HTML page, the CISA advisories RSS, and a CSAF
+`changes.csv` with three CSAF advisory documents). `tests/test_feed_resilience.py` covers the
+cache (304, minimum refetch interval), the persisted 403/429 backoff and its expiry, and the
+`CISA_Advisories` fallback and its dedupe, against a local HTTP server with a fake clock.
 
 **Dry-run the collectors** (real network, no LLM, no state change):
 `python3 build/app/collectors/collect_ai_digest.py ai-research /tmp/out.json` (or `ai-security`;
 `collect_threat_intel.py /tmp/out.json` for `default`). It prints one `[OK]`/`[FAIL]` line per source.
+Without `STATE_DIR` or `DIGEST_CACHE_DIR` there is no cache, so every run fetches every feed; set
+`DIGEST_CACHE_DIR=/tmp/digest-cache` to keep repeated dry runs polite.
 The route tests need `starlette` and `httpx` and are skipped without them.
 
 ## Security model
@@ -362,6 +422,8 @@ The route tests need `starlette` and `httpx` and are skipped without them.
 | 502 / 504 from the edge | the app or the tunnel is down. Check `sudo wg show` on either side, `curl http://${BACKEND_WG_IP}:3300/healthz` from Covenant, and `sudo ufw status \| grep 3300` on Walter |
 | a digest says "Curation failed" | the banner names the reason (also `curation_error` in the run JSON and `curation failed for <watch>` in the app log). `cannot read LLM key file`: re-copy the key. `HTTP 401`: the key was rotated, so re-copy it. `hit max_tokens ... 1 item(s)`: raise `DIGEST_MAX_TOKENS`. `does not match ... schema after one repair retry: <field>`: the model output drifted twice; the listing is still complete. The log line `server rejected json_schema` means the gateway or llama-server stopped accepting the schema, so curation runs on the `json_object` fallback |
 | a source is always in "Coverage gaps" | the feed moved or blocks the user agent. Fix its URL in the collector (a 404 is a gap, not "no news") |
+| a gap says `blocked: HTTP 403 ...; backing off until ...` | the site's CDN refused this IP. The collector sends no request until the time shown, then tries once. Do not hammer it by hand. To retry earlier (once), delete that URL's files in `state/feedcache/` (`grep -l <url> /srv/digest/state/feedcache/*.json`) |
+| `CISA_Advisories` note says `served via fallback cisagov/CSAF` | `all.xml` is blocked or failing; ICS advisories still arrive via CSAF, but CISA alerts and joint advisories (`AA..`) do not. The run lists it as a coverage gap and keeps the source's cutoff, so alerts dated inside the blocked period are reported once the primary recovers |
 | progress stalls in the UI | SSE needs the unbuffered `location` in `60-digest`. Check `docker compose logs app` for the run |
 | 409 on RUN NOW | that watch is still running; wait for `done` |
 | the UI loads unstyled, or the browser console shows 404s for `/static/...` | the running image predates the `/static` mount: rebuild ([redeploy](#redeploy-only-the-digest)) |

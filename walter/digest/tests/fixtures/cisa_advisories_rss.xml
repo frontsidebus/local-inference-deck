@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sanitized sample of the CISA "all advisories" RSS 2.0 feed: synthetic vendors, titles and
+     ids (day 999 cannot exist); the link and date shapes are the real ones. -->
+<rss xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" xml:base="https://www.cisa.gov/">
+  <channel>
+    <title>All CISA Advisories</title>
+    <link>https://www.cisa.gov/</link>
+    <description/>
+    <language>en</language>
+    <item>
+      <title>Examplecorp WidgetPLC Series</title>
+      <link>https://www.cisa.gov/news-events/ics-advisories/icsa-26-999-01</link>
+      <description>&lt;p&gt;Synthetic summary of a sample ICS advisory.&lt;/p&gt;</description>
+      <pubDate>Thu, 01 Oct 26 12:00:00 +0000</pubDate>
+      <dc:creator>CISA</dc:creator>
+      <guid isPermaLink="false">/news-events/ics-advisories/icsa-26-999-01</guid>
+    </item>
+    <item>
+      <title>Examplecorp FlowMeter Gateway</title>
+      <link>https://www.cisa.gov/news-events/ics-advisories/icsa-26-999-02</link>
+      <description>&lt;p&gt;Synthetic summary of a second sample advisory.&lt;/p&gt;</description>
+      <pubDate>Thu, 01 Oct 26 12:00:00 +0000</pubDate>
+      <dc:creator>CISA</dc:creator>
+      <guid isPermaLink="false">/news-events/ics-advisories/icsa-26-999-02</guid>
+    </item>
+    <item>
+      <title>Sample Actors Target Example Networks</title>
+      <link>https://www.cisa.gov/news-events/cybersecurity-advisories/aa26-999a</link>
+      <description>&lt;p&gt;Synthetic joint advisory text.&lt;/p&gt;</description>
+      <pubDate>Wed, 30 Sep 26 12:00:00 +0000</pubDate>
+      <dc:creator>CISA</dc:creator>
+      <guid isPermaLink="false">/news-events/cybersecurity-advisories/aa26-999a</guid>
+    </item>
+  </channel>
+</rss>
