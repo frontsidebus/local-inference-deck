@@ -90,13 +90,13 @@ The content is redacted before and after excerpting. The manifest's `data_files`
 - the agent's final answer is only redacted, so it could describe a withheld file;
 - real site identifiers (the domain, IP addresses) in Hermes log lines now reach the frontier judge for mixed bundles.
 
-Set `JUDGE_MIXED_MAX_SENSITIVE=0` for strict mode. Revisit when the stack handles anything beyond the owner's own infrastructure (work, client or personal data). The follow-ups are listed in [section 9](#9-open-follow-ups). The decision is recorded as [decision 11](decisions.md#11-mixed-infra-bundles-with-withheld-sensitive-paths).
+Both now have a guard (2026-10-05, owner-approved follow-ups): every frontier input has its site values masked ([below](#site-values-are-masked-for-the-frontier-judge)), and in a mixed bundle the agent's free text must pass the claims self-check before it is sent ([below](#agent-free-text-in-mixed-bundles)). Set `JUDGE_MIXED_MAX_SENSITIVE=0` for strict mode. Revisit when the stack handles anything beyond the owner's own infrastructure (work, client or personal data). The follow-ups are listed in [section 9](#9-open-follow-ups). The decision is recorded as [decision 11](decisions.md#11-mixed-infra-bundles-with-withheld-sensitive-paths).
 
 ### What each judge sees
 
 | Class | Local judge | Frontier judge |
 |---|---|---|
-| `infra` | — | The full bundle: diffs of infra paths, logs, gate decisions, C3 results, host probes, excerpts of infra data files the code reads |
+| `infra` | — | The full bundle: diffs of infra paths, logs, gate decisions, C3 results, host probes, excerpts of infra data files the code reads. Site values are masked as `${KEY}`; in a mixed bundle the agent's free text is self-checked first |
 | `sensitive` | The full bundle, with file contents replaced by `# content withheld … N lines changed (+a/-b)` lines | For a **completion** only: a **claims-only** bundle ([decision 10](decisions.md#10-frontier-review-of-claims-only-bundles-for-sensitive-sessions)). Never for gate, plan or runaway requests |
 
 ### The claims-only frontier stage
@@ -114,6 +114,34 @@ Most agent slips in the test runs were in the agent's own report, in sessions cl
 | Counts and the window | |
 
 The final answer is written by an agent that may have read secrets and site data, so it is treated as **hostile to the boundary** (#26). Masking is the first layer. The second is a **self-check that fails closed**: it runs on the exact message, and if `lib/redact` would change it, or it still holds a path, an address, a hex or base64-like run, a `user:group` pattern, a local account name, a site host or domain, a user-message marker, a diff or a bundle marker, nothing is sent and the stage is skipped (logged by problem kind only). The text that was sent is kept as `evidence/<id>/claims-input.txt` for audit. What remains is meaning in plain words: the answer can still say what a config line does or quote a number. `JUDGE_SENSITIVE_FRONTIER_CLAIMS=0` keeps sensitive sessions fully local. The exact spec is in [CONTRACT.md](../judge/CONTRACT.md#claims-only-bundle-collectorclaims_onlypy-and-the-frontier-claims-stage).
+
+### Site values are masked for the frontier judge
+
+Infra bundles carry the site's real identifiers: the API base URL in a Hermes log line, a backend address in a compose file, an SSH login in a gate excerpt. Before **any** frontier call, the main stage and the claims stage alike, the runner replaces each configured `site.env` value with a placeholder named after its variable (`lib/sitemask.py`), so the judge can still reason about it: "`${SPARK_DIGEST_HOST}` serves the UI from `${BACKEND_WG_IP}:3300`".
+
+| Masked | Placeholder |
+|---|---|
+| The domain and every `SPARK_*_HOST` (subdomains too: `new.${SPARK_DOMAIN}`) | `${SPARK_DOMAIN}`, `${SPARK_API_HOST}`, …; the domain without its TLD as `${SPARK_DOMAIN:stem}` |
+| Addresses: every `*_IP`, `*_IPS`, `*_SUBNET` | `${BACKEND_LAN_IP}`, `${ADMIN_SOURCE_IPS[2]}`, `${WG_SUBNET}`, `${WG_SUBNET:net}`; dashed forms (`ec2-…`) as `${EDGE_PUBLIC_IP:dashed}` |
+| SSH users (`*_SSH_USER`, `SPARK_USERS`) and aliases (`JUDGE_SSH_ALIASES`) | `${BACKEND_SSH_USER}`, `${JUDGE_SSH_ALIASES}`; generic names such as `ubuntu` and `operator` only where they are a login (`name@`, `/home/name`) |
+| Bucket names, the site name, emails, public keys and UUIDs | `${RESTIC_BUCKET}`, `${SPARK_SITE_NAME}`, `${ADMIN_EMAIL}`, … |
+
+- **How.** The mapping is built from `site.env` when the runner starts a call. Values are matched longest first, case-insensitively, at word boundaries, and inside URLs. A second sweep catches any non-address value left as a substring, and a self-check on the exact text refuses the call (nothing sent) if a value survives.
+- **Unmasked locally.** The reverse map exists only in the runner's memory. The judge's reply is validated against the **masked** bundle, because that is what its quotes come from; then the finding is unmasked. The owner, `judge-findings` and Hermes (C5) see real names; Claude never does. A placeholder that already appears literally in the input, such as a template's `${SPARK_DOMAIN}`, is ambiguous and stays as written.
+- **What stays masked.** `claims-input.txt`, rejudge's `.input.txt` (exactly what was sent) and the raw replies.
+- **The local judge** gets real values: it runs on site and its probes need them.
+
+Measured offline on 2026-10-05, on the three rebuilt pilot-2 bundles and the eight archived frontier inputs of the R8 rounds. Before masking, real values appeared in B2 (the API host and domain, in a log line) and in one other input (a WireGuard address and the subnet). After masking, every input had 0. One frontier re-judge ran on a copy of B1 in which the compose template's `${BACKEND_WG_IP}` was replaced by the real address, so 12 real values had to be masked. It kept all three R8 catches (the run-id mismatch, the `/static` mount and the SSE race), with no value in the input or the reply. Spec: [CONTRACT.md](../judge/CONTRACT.md#runner-site-values-masked-for-every-frontier-call-libsitemaskpy).
+
+### Agent free text in mixed bundles
+
+In a mixed bundle the files are withheld, but the agent's own text is not: its final answer and the command excerpts of its gate decisions could describe a withheld file. Before such a bundle goes to the frontier judge, each piece of that text goes through the claims-only masking and self-check (`claims_only.gate_free_text`):
+
+- **Masked further:** non-infra paths become `file#N`, other addresses `ip#N`, `user:group` pairs `user#N`, hex and base64-like runs `hex#N`/`blob#N`, and sentences that give a secret's prefix or length are withheld. Infra paths stay, because the judge needs them to match claims against the diff.
+- **Checked:** the self-check then runs, without its path and account-name rules, which an infra bundle carries anyway.
+- **Withheld on failure:** a piece that still fails (a diff hunk, a bundle marker, a value only the redactor catches) is replaced by `[agent free text withheld: the claims self-check refused it (<kinds>)]`. The rest of the bundle is still judged by the frontier judge, and the finding's notes give the counts.
+
+This was chosen over a fallback to the local judge: it sends nothing that failed, and it keeps the code review and the other rubric items at the frontier judge. The three rebuilt pilot-2 answers, run through it as if their bundles were mixed, all passed; B4b's lost two non-infra paths to `file#N`.
 
 ### Other guards on the boundary
 
@@ -405,8 +433,8 @@ Numbers 1–4 come from the first live judge session, before run 1. Their number
 **From pilot 2 and the round-2 fixes:**
 
 1. **A code-correctness rubric item: done (partial recall).** R8 is in the prompt and the validator, measured offline: 3 TP and 0 FP on five pilot-2 bundles, and it caught the B1 run-id mismatch. Data files the code reads are now in the bundle when they are infra ([section 4](#data-files-for-the-code-review)); with a synthetic in-repo seed R8 caught B2's `seen.items` defect. The real seeds live in a non-infra location, so the digest now keeps a sanitized sample of its state in the repo (`walter/digest/state-sample/`) rather than widening the infra rules; build briefs should point agents at it. Also measure R8 on a live build before trusting it as a gate, and decide whether `JUDGE_LOCAL_CODE_REVIEW=1` is worth measuring with `vision`.
-2. **Mask site values before frontier calls.** Replace configured `site.env` identifier values (domain, hosts, addresses) with `${KEY}` in every bundle sent to the frontier judge. The concrete case is a Hermes log line with the API base URL in a mixed bundle.
-3. **A claims self-check when files are withheld.** In a mixed bundle the agent's final answer is only redacted and could describe a withheld file. Run the claims-only self-check on `claims` when `withheld.sensitive_paths` > 0, and fall back to `sensitive` if it fails.
+2. **Mask site values before frontier calls: done.** Every frontier input has its `site.env` identifier values masked as `${KEY}`, and findings are unmasked locally ([section 4](#site-values-are-masked-for-the-frontier-judge)). Values that are not in `site.env` (another site's address, the workstation's account name in home paths) are not masked.
+3. **A claims self-check when files are withheld: done.** In a mixed bundle the agent's final answer and gate excerpts are masked and self-checked, and a piece that fails is withheld ([section 4](#agent-free-text-in-mixed-bundles)). It has not been seen live yet: no pilot bundle was mixed.
 4. **#47, `***` from Hermes redaction.** Have C3 or the judge flag a literal `***` run in files the agent wrote, as a likely redaction artifact. Ask the Hermes owner for redaction that does not alter non-secret words.
 
 **Smaller items:**

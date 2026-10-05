@@ -25,7 +25,8 @@ Contents: [How it works](#how-it-works) · [Components](#components) · [Install
                                                    refusals, the agent's diff vs. others' changes, C3 results,
                                                    host find in UTC, read-only host probes, slots)
      2. judge                 -> frontier `claude -p` for infra data; local gateway alias for sensitive data;
-                                 sensitive completions also: frontier on a claims-only bundle
+                                 sensitive completions also: frontier on a claims-only bundle;
+                                 every frontier input has site.env values masked as ${KEY} (lib/sitemask)
      3. validate.py           -> findings/<id>.json + .md (+ <id>.claims.json); request -> done/
 ```
 
@@ -45,7 +46,8 @@ Contents: [How it works](#how-it-works) · [Components](#components) · [Install
 | `install.sh` | Merges the hooks block into `$HERMES_HOME/config.yaml`, creates the review dir, renders the gate policy, optionally installs the user units. Dry run by default. |
 | `hooks/` | Hermes shell-hook entrypoints: JSON on stdin, JSON on stdout. All but `gate.py` fail open and log to `hook-errors.log`; `gate.py` fails closed. |
 | `policy/gate-policy.json.tmpl` | C2 rules. Host patterns are `${VARS}` from `site.env`; rendered to `$JUDGE_REVIEW_DIR/gate-policy.json`. |
-| `collector/collect.py`, `extras.py`, `claims_only.py` | The evidence bundle; C3 results and host-state probes; the claims-only bundle for the frontier claims stage. |
+| `collector/collect.py`, `extras.py`, `claims_only.py` | The evidence bundle; C3 results and host-state probes; the claims-only bundle for the frontier claims stage, and the self-check of the agent's free text in mixed bundles. |
+| `lib/sitemask.py` | Masks the site's identifier values from `site.env` (domain, hosts, addresses, SSH users and aliases, buckets, site name) as `${KEY}` before every frontier call; the runner unmasks the finding locally. |
 | `probes/probe.py` | The only way the judge touches hosts: an allowlist of read-only probes with per-argument validation. |
 | `runner/` | `run_judge.py` (frontier or local), `prompt.md` and `prompt-claims.md`, `validate.py`, `rejudge.py`, `alert.py`, and the units in `units/`. |
 | `bin/` | `judge-findings` and `judge-ack`, the operator CLIs. |
@@ -323,6 +325,7 @@ gate.log  watch.log  inject.log  runner.log  hook-errors.log  usage.json  gate-p
 | Both runner units `failed` (`start-limit-hit`), or `runner.log` has `ALERT: judge unit … failed` | Units installed before #40 hit systemd's start limit on bursts. Re-install: `judge/install.sh --apply --with-units --start`. By hand: `systemctl --user reset-failed judge-review.service judge-review.path && systemctl --user start judge-review.path`, then start the service for the backlog. A judge backend failure also exits non-zero and alerts: read `runner.log`. |
 | Frontier calls fail only from the service (`frontier exited …`) | Is `claude` on the unit's `PATH` (`systemctl --user show judge-review.service -p Environment`)? If not, set a full `PATH` in `judge.env`. Is the login valid? Run `claude` once in a terminal. Does anything force another endpoint (`systemctl --user show-environment \| grep -i anthropic`, the `env` block of `~/.claude/settings.json`)? Never copy credentials into the repo, `site.env` or a unit. A failed request stays queued and is retried, up to `JUDGE_MAX_ATTEMPTS`. |
 | Findings come from the local judge although `JUDGE_MODE=frontier` | Expected for `sensitive` requests or past the daily cap; the finding's notes say which. Check a path with `python3 judge/lib/config.py --explain <path>`: a secret-shaped file makes the whole request sensitive, even in the repo; more than `JUDGE_MIXED_MAX_SENSITIVE` non-infra paths do too. A worktree comes out `sensitive` only when its `.git` file does not point into the main repo's `.git/worktrees/`. |
+| A frontier finding shows `${SPARK_DOMAIN}` or another `${KEY}` instead of a real value | Expected when the same placeholder also occurs literally in the input (a template line): it is ambiguous, so it is left as written; the finding's notes list it. Every other placeholder is replaced by the real value before the finding is stored. The frontier input itself (`claims-input.txt`, rejudge's `.input.txt`) and `judge-raw.txt` stay masked. A `site-mask self-check failed` error means a configured value was left in the input; nothing was sent. |
 | A plan review is queued but not judged | Expected until the turn ends or `JUDGE_PLAN_DEBOUNCE_S` passes: it waits in `queue/deferred/`. The next hook event, the C6 watcher's poll or the timer releases it. To judge it at once, move it into `queue/` and run `run_judge.py <id>`. |
 | A turn got no review, or chit-chat is reviewed | A turn without tool calls is reviewed only when its answer is at least `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS` long and makes a claim, or coincides with a gate decision; the same answer is never reviewed twice. Tune the `JUDGE_REVIEW_TEXT_ONLY*` settings; `JUDGE_ENQUEUE_ALWAYS=1` reviews every turn. |
 | Two completion requests for one turn | The session-end audit merges into the turn's C3 request only while the runner has not started on it. If it had, a second request is written only when the session end adds new paths. |

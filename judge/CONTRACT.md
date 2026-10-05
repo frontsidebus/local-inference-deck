@@ -26,6 +26,7 @@ judge/
   lib/snapshot.py        session snapshots, diffs, attribution (agent_touched, copy_targets), noise globs
   lib/hermeslog.py       Hermes log parsing: session lines, parallel tool-call attribution, noise loggers
   lib/redact.py          secret redaction and call hashes
+  lib/sitemask.py        site.env identifier values <-> ${KEY} placeholders for frontier calls (masked at send time)
   lib/refusals.py        refusals in a window and the next tool calls, as metadata (refusals.jsonl; #39)
   lib/toolcalls.py       command_word: the allowlisted program name of a terminal command (#33)
   schema/request.schema.json  schema/finding.schema.json
@@ -220,8 +221,10 @@ the request, and the bundle, sensitive (local judge, `# content withheld` stat l
 **Reads.** A file the agent only read never enters a bundle: `read_file` events carry no paths, Hermes logs a
 read as `tool read_file completed (Ns, N chars)` (no content), `tool-calls.jsonl` holds tool and program names
 only, and `agent-diff.patch` covers changed paths only. Text the agent itself writes (its final answer in
-`claims`, a command line in a gate excerpt) is redacted (`lib/redact`), not value-checked; the frontier claims
-stage additionally masks IPs, hosts and accounts (`claims_only`). Tested in `test_collector.py`
+`claims`, a command line in a gate excerpt) is redacted (`lib/redact`); the frontier claims stage additionally
+masks IPs, hosts and accounts (`claims_only`), and in a mixed infra bundle it is masked further and
+claims-self-checked before a frontier call (see "Runner: agent free text of mixed bundles"). Every frontier call
+also has the site's configured values masked as `${KEY}` (see "Runner: site values masked"). Tested in `test_collector.py`
 (`test_site_env_values_never_reach_a_bundle`: site.env in an infra worktree, read only and read + edited).
 A request without paths is `infra` only when the session cwd is infra (`classify([], cfg, cwd)`), or when it is a
 `gate` request whose `detail.rules` are all host rules (`lib/config.HOST_RULES`: `remote-mutation`,
@@ -751,6 +754,93 @@ Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a st
   finish_reason=length)`. The next call after a truncated reply (the validation re-ask, which also says the reply
   was cut off and asks to keep every item with shorter text) uses `JUDGE_LOCAL_RETRY_MAX_TOKENS` (default
   2 × `JUDGE_LOCAL_MAX_TOKENS`, never less than it). Frontier replies have no finish_reason and get no such note.
+
+## Runner: site values masked for every frontier call (`lib/sitemask.py`)
+- **What.** Before ANY frontier call (the main stage with its validation re-ask and probe round, and the claims
+  stage), each message is masked at send time (`run_judge.frontier_messages`). Every configured site value becomes
+  a `${KEY}` placeholder named after its site.env variable:
+  - `SPARK_DOMAIN`, and its name without the TLD as `${SPARK_DOMAIN:stem}` (6+ chars);
+  - every `SPARK_*_HOST` and every `*_EMAIL`;
+  - every `*_IP`; the elements of `*_IPS` (`${KEY[n]}` when there are several); every `*_SUBNET`, and its network
+    address as `${KEY:net}`; an IPv4 value also in dashed form (`ip-…`/`ec2-…` host names) as `${KEY:dashed}`;
+  - every `*_SSH_USER` and the elements of `SPARK_USERS`;
+  - the elements of `JUDGE_SSH_ALIASES`, every `*_BUCKET`, and `SPARK_SITE_NAME`;
+  - every `*_PUBLIC_KEY`, `*_UUID` and `*_CLIENT_ID` of 16+ chars with a digit.
+
+  Never masked: values under 3 chars, `walter`, `covenant`, and loopback or any-addresses. Ports, groups, model
+  names and paths are not identifiers.
+- **How.**
+  - The mapping is built from site.env + environment at run time (`SM.build(C._site())`). The reverse map lives
+    only in memory; it is never written or sent.
+  - Matching is longest value first, case-insensitive, at word boundaries: a name is not part of a longer
+    `[A-Za-z0-9_-]` run, and an address is not part of a longer dotted number. So it works inside URLs,
+    `user@host`, JSON and subdomains (`new.${SPARK_DOMAIN}`).
+  - A second sweep replaces any non-address value still present as a plain substring.
+  - Generic account names (`ubuntu`, `operator`, `root`, …; `sitemask.GENERIC_USERS`) are masked only in login
+    position (`name@`, `/home/name`, `~name`, `-l name`, `User name`), so the word "Ubuntu" stays readable.
+  - Placeholders already in the text are protected: no value is matched inside one.
+  - The system prompt gets `run_judge.MASK_NOTE`, which says what the placeholders mean.
+- **Self-check (fails closed).** `SiteMask.residual` runs on the exact messages to be sent. Any configured value
+  left (substring match; boundary match for addresses and generic accounts) raises `JudgeError`, and nothing is
+  sent. By construction it is empty.
+- **Validate first, then unmask.** The judge quotes what it saw, so its reply is validated against the MASKED
+  bundle and the MASKED request: `validate_finding(bundle_text=mask(bundle), request=mask(request))`, for the
+  verbatim-quote gate and the grounded/contradicting spans. Only then are the item fields (claim, evidence,
+  recommendation, failure_scenario) and the runner's validator notes unmasked (`run_judge.unmask_finding`, which
+  re-caps them).
+  - So `findings/<id>.json`/`.md`, `.claims.json`, the C5 injection and `judge-findings` show real values.
+  - A placeholder that already occurs **literally** in the unmasked input (a template line with
+    `${SPARK_DOMAIN}`) is ambiguous: it stays a placeholder in the finding, and the note lists it.
+  - Probe requests from the frontier judge are unmasked before `probe.py` validates them; probe output is masked
+    with the next message.
+- **Records.**
+  - `evidence/<id>/claims-input.txt` and rejudge's `<id>.input.txt` are exactly what was sent (masked).
+  - `judge-raw.txt`/`claims-raw.txt` keep the replies as received (masked).
+  - When anything was masked or kept, the finding gets the note `site values masked for the frontier judge: N
+    occurrence(s), K configured value(s) as ${KEY} placeholders; the finding was unmasked locally[; left as
+    placeholders …]`.
+- **The local judge is not masked.** It runs on site, nothing leaves the machine, and its probes need the real
+  names. `_judge_loop` masks per frontier call, so a frontier-cap fallback sends the real values to the local judge
+  only.
+
+## Runner: agent free text of mixed bundles (`claims_only.gate_free_text`)
+- **When.** The main stage with `mode=frontier`, on an infra bundle whose collector withheld sensitive paths
+  (`claims_only.is_mixed`: `classification.withheld_sensitive_paths` > 0, or `withheld.sensitive_paths`; #43).
+- **What.** Each piece of agent-written free text:
+  - the request's `claims` (the final answer), and the same text in the manifest's request copy;
+  - each `excerpt` of `gate-decisions.jsonl`.
+
+  `plan` is a path there, labelled by the collector. Hermes log lines carry no agent text.
+- **How** (`run_judge.MixedFreeText`).
+  1. `claims_only.mask_free_text` masks it further:
+     - redact, and withhold secret-detail sentences (#31);
+     - absolute and home paths that are not `infra` by `config.path_class` -> `file#N`;
+     - the site mask (`${KEY}`);
+     - other IPv4/IPv6 -> `ip#N`, other site hosts (e.g. /etc/hostname) -> `host#N`;
+     - `user:group` pairs -> `user#N`, hex/base64 runs -> `hex#N`/`blob#N`.
+  2. Then `self_check` must pass. Two kinds are left out because the infra bundle carries them anyway
+     (`MIXED_IGNORED_KINDS`): infra paths (all that is left after step 1) and local account names (they are in the
+     diff's paths).
+  3. A piece that still fails (a diff hunk, a bundle marker, a `msg=` marker, a value only `lib/redact` catches …)
+     is replaced by `[agent free text withheld: the claims self-check refused it (<kinds>)]`. The marker names
+     problem kinds only, never text. It replaces the piece in the request and in the manifest copy alike.
+
+  The rest of the bundle still goes to the frontier judge. The finding gets the note `mixed bundle (N withheld
+  sensitive path(s)): agent free text (final answer, gate excerpts) claims-self-checked before the frontier call:
+  P passed after masking, W withheld (<kinds>)`.
+- **Why not fall back to the local judge.** Withholding only the piece that failed keeps the code review (R8) and
+  the other rubric items at the frontier judge, and sends nothing that failed the check. A local fallback would
+  lose both for a slip in one field. Local-judge bundles are not gated, because nothing leaves the machine.
+
+## Runner: code-version stamp (`run_judge.code_versions`, `write_finding`)
+- When `lib/version.py` is installed (judge-hardening branch), every finding the runner writes (main, claims stage,
+  placeholders) gets `code_versions: {request, collector, runner}`: the request's `code_version`, the manifest's
+  `code_versions.collector` (null for older bundles) and `lib.version.code_version()` of the runner, plus one
+  `lib.version.mismatch_note` per stamp that is not provably the runner's code (a warning, never a failure).
+  Without `lib/version.py` nothing is stamped. The stamp is added after the frontier call and the unmasking, so
+  it is never masked. The prompt tells the judge that `detail.unconfirmed_paths` / `attribution.unconfirmed_paths`
+  (`[unconfirmed path #N withheld]` labels in infra bundles) are claimed paths no tool event confirms, never the
+  agent's edits; the site mask leaves those labels untouched.
 
 ## Runner: code review (R8)
 - **Decision** (`run_judge.code_review_decision(request, evidence_dir, mode, data_class) -> (on, why, has_code)`).

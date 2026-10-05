@@ -31,6 +31,9 @@ message must then pass a strict self_check() that refuses (fails closed) on anyt
     mask_ips / mask_identity / mask_digests
         IPv4/IPv6 -> ip#N; site hosts/domains -> host#N; accounts and user:group -> user#N; hex runs of 16+
         -> hex#N; base64-like runs of 24+ -> blob#N (ids stable within one text).
+    is_mixed(manifest) / gate_free_text(text, ident, keep_path, premask, index) -> (text, problems)
+        Mixed infra bundles (#43): the agent's free text masked further (mask_free_text; infra paths kept) and
+        self-checked without the path/account kinds; on failure FREE_TEXT_WITHHELD (problem kinds only).
     site_identity(cfg=None) -> Identity
         Local account names (current user, /etc/passwd uid 1000..65533, getpass, home basename,
         BACKEND_SSH_USER, EDGE_SSH_USER, SPARK_USERS) and site identifiers (SPARK_DOMAIN and subdomains,
@@ -567,6 +570,75 @@ def self_check(text: str, ident: Optional[Identity] = None) -> List[str]:
         if h not in SECTIONS:
             problems.append("unknown section header")
     return list(dict.fromkeys(problems))
+
+
+# ------------------------------------------------------------------ mixed infra bundles: agent free text
+# An infra bundle with withheld sensitive paths (#43, JUDGE_MIXED_MAX_SENSITIVE) goes to the frontier judge in
+# full, but the agent's own free text (its final answer, the command excerpts of its gate decisions) was only
+# redacted and could describe a withheld file. Before such a bundle is sent, every piece of agent free text is
+# masked further and then must pass self_check(); a piece that still fails is replaced by FREE_TEXT_WITHHELD
+# (the rest of the bundle is still judged by the frontier judge). Two self_check kinds do not apply here, because
+# the infra bundle carries them anyway: infra paths (every non-infra absolute or home path is masked first, so
+# what is left is infra by construction) and local account names (the agent's home paths are in the diff).
+FREE_TEXT_WITHHELD = "[agent free text withheld: the claims self-check refused it ({kinds})]"
+MIXED_IGNORED_KINDS = ("path-like token", "local account name")
+
+
+def is_mixed(manifest: Any) -> bool:
+    """An infra bundle whose collector withheld sensitive paths (#43)."""
+    if not isinstance(manifest, dict) or manifest.get("data_class") != "infra":
+        return False
+    cls = manifest.get("classification") if isinstance(manifest.get("classification"), dict) else {}
+    wh = manifest.get("withheld") if isinstance(manifest.get("withheld"), dict) else {}
+    return bool(_int(cls.get("withheld_sensitive_paths")) or wh.get("sensitive_paths"))
+
+
+def mask_free_text(text: str, index: PathIndex, ident: Identity, keep_path=None, premask=None) -> str:
+    """Agent free text of a mixed bundle as it may be sent: redact, withhold secret-detail sentences, absolute and
+    home paths that are not infra (keep_path(path) False) -> file#N, then *premask* (the runner's site mask:
+    configured site values -> ${KEY}), other IPv4/IPv6 -> ip#N, other site hosts -> host#N, user:group pairs
+    -> user#N, hex/base64 runs -> hex#N/blob#N. Infra paths and bare account names are kept."""
+    ids = _Ids()
+    text = redact(text)
+    text, _ = withhold_secret_sentences(text)
+
+    def abs_sub(m: re.Match) -> str:
+        tok = m.group(0)
+        core = tok.rstrip(_TRAIL)
+        if keep_path is not None and keep_path(core):
+            return tok
+        return index.id_for(core, "claims") + tok[len(core):]
+    text = _ABS_PATH_RE.sub(abs_sub, text)
+    if premask is not None:
+        text = premask(text)
+    text = mask_ips(text, ids)
+    hrx = ident.host_re()
+    if hrx:
+        text = hrx.sub(lambda m: ids.get("host", " ".join(m.group(0).split())), text)
+    users = {u.lower() for u in ident.users}
+    text = _OWNER_PAIR_RE.sub(lambda m: m.group(0)[:m.start(1) - m.start(0)] + ids.get("user", m.group(1) + ":" + m.group(2)), text)
+    text = _PAIR_RE.sub(lambda m: ids.get("user", m.group(0)) if _pair_is_account(m.group(1), m.group(2), users)
+                        else m.group(0), text)
+    return mask_digests(text, ids)
+
+
+def free_text_problems(text: str, ident: Identity) -> List[str]:
+    """self_check() kinds that make a piece of mixed-bundle free text unsendable (MIXED_IGNORED_KINDS left out)."""
+    return [p for p in self_check(text, ident) if not p.startswith(MIXED_IGNORED_KINDS)]
+
+
+def gate_free_text(text: str, ident: Identity, keep_path=None, premask=None,
+                   index: Optional[PathIndex] = None) -> Tuple[str, List[str]]:
+    """(text to send, problems). Empty problems: the masked text passed; else the text is FREE_TEXT_WITHHELD
+    naming the problem kinds only (never the text)."""
+    if not text:
+        return text, []
+    masked = mask_free_text(text, index or PathIndex(), ident, keep_path, premask)
+    problems = free_text_problems(masked, ident)
+    if problems:
+        kinds = ", ".join(dict.fromkeys(p.replace(" (unescaped)", "") for p in problems))
+        return FREE_TEXT_WITHHELD.format(kinds=kinds), problems
+    return masked, []
 
 
 # ------------------------------------------------------------------ parsers (evidence -> allowlisted values)

@@ -161,4 +161,9 @@ Short records of the choices behind gen3. Each says what was decided, why, and w
 
 `JUDGE_MIXED_MAX_SENSITIVE=0` restores strict mode.
 
-**Revisit when** the stack handles anything beyond the owner's own infrastructure (work, client or personal data). Follow-ups: mask site values as `${KEY}` before frontier calls, and run the claims self-check on the final answer when files are withheld.
+**Revisit when** the stack handles anything beyond the owner's own infrastructure (work, client or personal data).
+
+**Amended 2026-10-05 (the two follow-ups, owner-approved).**
+- **Site values are masked before every frontier call**, for full infra bundles and the claims stage alike. Each configured `site.env` identifier (the domain and hosts, addresses, SSH users and aliases, bucket names, the site name) becomes a `${KEY}` placeholder. The reverse map is kept only in the runner's memory, and the judge's reply is validated against the masked bundle before the finding is unmasked, so the owner and Hermes see real names and Claude never does. The local judge is not masked: nothing leaves the machine, and its probes need the real names.
+- **In a mixed bundle, the agent's free text** (its final answer and gate excerpts) is masked further and must pass the claims self-check. A piece that fails is withheld with a marker naming the problem kinds; the rest of the bundle still goes to the frontier judge. This was preferred to falling back to the local judge, which would lose the code review for a slip in one field.
+- **Residual risk:** values that are not in `site.env` (another site's address, the workstation account in home paths) are not masked; a final answer can still paraphrase a withheld file in plain words that no rule detects. Spec: `judge/CONTRACT.md` ("Runner: site values masked", "Runner: agent free text of mixed bundles").
