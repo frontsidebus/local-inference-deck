@@ -1,0 +1,15 @@
+# Loads only the hermes_gateway_guard nft table at boot. Deliberately NOT nftables.service: its default
+# /etc/nftables.conf starts with "flush ruleset", which would wipe libvirt's and Docker's rules.
+[Unit]
+Description=Allow only the backend VM to reach the hermes-gateway port
+After=network-pre.target
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/hermes-gateway-guard.nft
+ExecStop=/usr/sbin/nft delete table inet hermes_gateway_guard
+
+[Install]
+WantedBy=multi-user.target

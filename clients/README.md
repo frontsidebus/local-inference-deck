@@ -275,10 +275,36 @@ with `openssl rand -hex 32`. Existing values are never read or printed.
   model is invisible to them and returns 400.
 - **`API_SERVER_KEY` is the only authentication.** Keep it long and random, keep
   `~/.hermes/.env` mode 600, and rotate it in both places together.
-- Keep the bind on the bridge address; never `0.0.0.0`. Optionally add a host firewall
-  rule that allows the port on the bridge only from the backend VM
-  (`${BACKEND_LAN_IP}`).
+- Keep the bind on the bridge address; never `0.0.0.0`.
+- Restrict the port to the backend VM with the nft guard in `clients/hermes/` (see below).
 - Keep `security.redact_secrets: true`.
+
+### Port guard: only the backend VM may connect
+
+The bearer key is the gateway's only authentication, so also limit who can reach the port.
+`clients/hermes/hermes-gateway-guard.nft.tmpl` is a standalone nftables table:
+
+- loopback and `${BACKEND_LAN_IP}` → `${HYPERVISOR_BRIDGE_IP}:${HERMES_GATEWAY_PORT}` are accepted;
+- any other connection to that port is dropped;
+- the table's policy is accept, so no other port is touched.
+
+**Do not use ufw for this on the hypervisor.** Enabling ufw drops forwarded traffic by default,
+which cuts the backend VM's NAT egress, and with it the WireGuard tunnel to the edge and every public site.
+Do not use `nftables.service` either: its default config starts with `flush ruleset`, which wipes libvirt's
+and Docker's rules. The unit below loads only this table.
+
+```bash
+scripts/render.sh -e site.env clients/hermes/hermes-gateway-guard.nft.tmpl /tmp/hermes-gateway-guard.nft
+sudo nft -c -f /tmp/hermes-gateway-guard.nft     # syntax check
+sudo nft -f /tmp/hermes-gateway-guard.nft        # apply now (not yet persistent)
+# from the backend VM: curl -s -o /dev/null -w '%{http_code}' http://${HYPERVISOR_BRIDGE_IP}:${HERMES_GATEWAY_PORT}/v1/models   -> 401
+sudo install -m 0644 /tmp/hermes-gateway-guard.nft /etc/hermes-gateway-guard.nft
+sudo install -m 0644 clients/hermes/hermes-gateway-guard.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable hermes-gateway-guard
+```
+
+Check the counters with `sudo nft list table inet hermes_gateway_guard`.
+Remove it with `sudo systemctl disable --now hermes-gateway-guard`.
 
 Rollback: `systemctl --user disable --now hermes-gateway`, remove the unit, and
 remove the `hermes-agent` connection from Open WebUI.

@@ -1,0 +1,15 @@
+#!/usr/sbin/nft -f
+# Only the backend VM (${BACKEND_LAN_IP}) may reach the workstation hermes-gateway
+# (${HYPERVISOR_BRIDGE_IP}:${HERMES_GATEWAY_PORT}). A standalone table with policy accept and one drop
+# rule: it has no forward hook, touches no other port and never flushes the ruleset, so libvirt NAT
+# (the VM's internet and WireGuard egress), Docker and everything else are unaffected.
+table inet hermes_gateway_guard
+delete table inet hermes_gateway_guard
+table inet hermes_gateway_guard {
+  chain input {
+    type filter hook input priority 0; policy accept;
+    iifname "lo" tcp dport ${HERMES_GATEWAY_PORT} accept
+    ip saddr ${BACKEND_LAN_IP} ip daddr ${HYPERVISOR_BRIDGE_IP} tcp dport ${HERMES_GATEWAY_PORT} counter accept
+    tcp dport ${HERMES_GATEWAY_PORT} counter drop
+  }
+}
