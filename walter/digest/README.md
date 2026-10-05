@@ -187,6 +187,36 @@ One run of a watch (`pipeline.run_watch`):
 
 Progress goes to the run's subscribers over SSE: `collecting` -> `curating` -> `done` (or `error`).
 
+## State files
+
+One JSON file per watch, `STATE_DIR/state/<watch>.json`, read at the start of a run
+(`_load_state`) and rewritten atomically at the end (`run_watch` step 5, `_save_state`). A missing
+or unreadable file starts a fresh state.
+
+```
+watch_slug, created, last_run, cutoff, window_days, notes[, audience], failures
+sources.<name>:  url, ok, cutoff (absent in seeded entries; null = never succeeded), last_error
+seen.cves.<CVE id>:         first_seen, date_added, due_date, product, ransomware     (default)
+seen.events.<title key>:    first_seen, title, url, date, source                      (default)
+seen.papers.<arXiv id>:     first_seen, title, link                                   (AI watches)
+seen.items.<title key>:     first_seen, title, url, date, source                      (AI watches)
+```
+
+- **Dedupe** drops an item whose id is in any of the watch's `seen` buckets. News is keyed by
+  `_norm_key(title)` and lives in `seen.events` for `default` but in `seen.items` for the AI
+  watches; papers are keyed by the bare arXiv id.
+- **The update keeps what it does not own:** existing `seen` entries, `sources.<name>.url`, and
+  top-level or per-source keys the code does not know are carried over unchanged. Only `cutoff`,
+  `last_run`, `sources.<name>.ok`/`cutoff`/`last_error` and new `seen` entries change.
+- **[`state-sample/`](state-sample/)** has one sanitized file per watch: the real key structure with
+  invented values (`CVE-2099-0001`, `9999.00001`, `example.com`), a few entries per bucket, and a
+  [field reference](state-sample/README.md). `tests/test_state_sample.py` runs the samples through
+  `_load_state`, `_dedupe` and `run_watch`. The samples are not deployed and are not a seed.
+
+**Agents changing state handling should read `state-sample/`** (the agent judge's R8 review sees
+these files), not the live state files: those live outside the repo, and the judge never shows
+them to the reviewer ([docs/agent-judge.md](../../docs/agent-judge.md)).
+
 ## Configuration
 
 Site values (`site.env`, read by the deploy scripts):
@@ -334,7 +364,7 @@ ssh ${BACKEND_SSH_USER}@${BACKEND_LAN_IP} 'curl -fsS http://${BACKEND_WG_IP}:330
 copy them so the first digest reports only what is new since then. Examples are the workstation's
 `~/.hermes/threat-intel-watches/default.json`, `~/.hermes/ai-digest-watches/ai-security.json` and
 `ai-research.json`. The pipeline reads `STATE_DIR/state/<watch>.json`, and `STATE_DIR` is
-`/srv/digest/state`, hence the doubled `state/state/`:
+`/srv/digest/state`, hence the doubled `state/state/` (format: [State files](#state-files)):
 
 ```bash
 sudo install -d -o 10001 -g 10001 -m 0750 /srv/digest/state/state

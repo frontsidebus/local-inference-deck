@@ -1,0 +1,80 @@
+{
+  "watch_slug": "ai-security",
+  "notes": "Sanitized sample of a digest state file (structure only). Every value is invented. See README.md.",
+  "created": "2026-01-01T00:00:00Z",
+  "last_run": "2026-01-05T12:00:00Z",
+  "cutoff": "2026-01-05T12:00:00Z",
+  "window_days": 7,
+  "sources": {
+    "arxiv_csCR": {
+      "url": "https://example.com/rss/cs.CR",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "SimonWillison": {
+      "url": "https://example.com/blog/atom.xml",
+      "ok": true,
+      "cutoff": "2026-01-05T12:00:00Z"
+    },
+    "TrailOfBits": {
+      "url": "https://example.org/blog/feed/",
+      "ok": false,
+      "cutoff": "2026-01-02T12:00:00Z",
+      "last_error": "timeout after 20s (sample error text)"
+    },
+    "KrebsOnSecurity": {
+      "url": "https://example.org/feed/",
+      "ok": true
+    }
+  },
+  "seen": {
+    "papers": {
+      "9999.00001": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "title": "Sample paper 1",
+        "link": "https://example.com/abs/9999.00001"
+      },
+      "9999.00002": {
+        "first_seen": "2026-01-03T12:00:00Z",
+        "title": "Sample paper 2",
+        "link": "https://example.com/abs/9999.00002"
+      },
+      "9999.00003": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample paper 3",
+        "link": "https://example.com/abs/9999.00003"
+      }
+    },
+    "items": {
+      "sample-security-post-1": {
+        "first_seen": "2026-01-02T12:00:00Z",
+        "title": "Sample security post 1",
+        "url": "https://example.com/blog/sample-security-post-1",
+        "date": "Fri, 02 Jan 2026 15:00:00 +0000",
+        "source": "SimonWillison"
+      },
+      "sample-security-post-2": {
+        "first_seen": "2026-01-03T12:00:00Z",
+        "title": "Sample security post 2",
+        "url": "https://example.org/blog/sample-security-post-2",
+        "date": "2026-01-03T10:00:00-05:00",
+        "source": "TrailOfBits"
+      },
+      "sample-security-post-3": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample security post 3",
+        "url": "https://example.org/sample-security-post-3",
+        "date": "Mon, 05 Jan 2026 06:00:00 +0000",
+        "source": "KrebsOnSecurity"
+      },
+      "sample-security-post-4": {
+        "first_seen": "2026-01-05T12:00:00Z",
+        "title": "Sample security post 4",
+        "url": "https://example.com/blog/sample-security-post-4",
+        "date": "2026-01-05T09:00:00Z",
+        "source": "SimonWillison"
+      }
+    }
+  },
+  "failures": {}
+}
