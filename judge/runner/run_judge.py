@@ -30,7 +30,9 @@ Settings (environment, else site.env via lib/config.py):
   e.g. for tests; default https://${SPARK_API_HOST}/v1), JUDGE_BUNDLE_MAX_CHARS (150000 frontier,
   60000 local), JUDGE_PROBES (1 = allow one round of extra allowlisted probes), JUDGE_MAX_ATTEMPTS (3),
   JUDGE_LOCAL_MAX_SEVERITY (medium: items of a mode=local finding are capped at this severity; the cap
-  is recorded in the finding's notes).
+  is recorded in the finding's notes), JUDGE_CODE_REVIEW (1: rubric R8 "code correctness" for infra
+  completion/plan bundles whose agent-diff.patch changes code; 0 = off everywhere), JUDGE_LOCAL_CODE_REVIEW
+  (0: R8 stays off for the local judge unless set to 1).
 Verdict rules (validate.py step 4) downgrade unsupported `false` items to n/a/low and drop items backed
 only by the request or user text; each change is recorded in the finding's notes.
 Exit: 0 ok, 1 at least one request failed (left in queue), 64 usage.
@@ -548,6 +550,66 @@ def fit_diff(text: str, budget: int) -> str:
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------ code review (R8)
+# A file is code for R8 when, without a trailing template suffix, it is neither a static asset nor a document.
+DOC_SUFFIXES = (".md", ".markdown", ".rst", ".txt", ".adoc")
+TEMPLATE_SUFFIXES = (".tmpl", ".j2", ".example", ".in")
+CODE_REVIEW_KINDS = ("completion", "plan")
+_CR_BLOCK_RE = re.compile(r"^<!-- code-review:(on|off) -->\n(.*?)^<!-- /code-review -->\n", re.DOTALL | re.MULTILINE)
+
+
+def is_code_path(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1].lower()
+    while name.endswith(TEMPLATE_SUFFIXES) and "." in name[:-1]:
+        name = name.rsplit(".", 1)[0]
+    return bool(name) and not name.endswith(ASSET_SUFFIXES + DOC_SUFFIXES)
+
+
+def diff_code_paths(diff: str) -> List[str]:
+    """Paths of agent-diff.patch file sections that are code (is_code_path) and add or remove a line."""
+    out = []
+    for path, lines in _diff_sections(diff or ""):
+        if path and is_code_path(path) and any(
+                (x.startswith("+") and not x.startswith("+++")) or (x.startswith("-") and not x.startswith("---"))
+                for x in lines):
+            out.append(path)
+    return out
+
+
+def code_review_decision(request: Dict[str, Any], evidence_dir: Path, mode: str,
+                         data_class: str) -> Tuple[bool, str, bool]:
+    """(on, why, has_code) for rubric R8. has_code: an infra completion/plan bundle whose agent-diff.patch changes
+    code. on: has_code, and the frontier judge (JUDGE_CODE_REVIEW, default 1) or the local judge only with
+    JUDGE_LOCAL_CODE_REVIEW=1 (default 0: local code items were mostly noise in the pilots). Never for the
+    claims stage (claims-only bundles carry no code)."""
+    if mode == CLAIMS_MODE:
+        return False, "claims-only bundle (no code)", False
+    if data_class != "infra":
+        return False, f"data_class={data_class}", False
+    if str(request.get("kind") or "") not in CODE_REVIEW_KINDS:
+        return False, f"kind={request.get('kind')}", False
+    try:
+        diff = (evidence_dir / "agent-diff.patch").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False, "no agent-diff.patch", False
+    paths = diff_code_paths(diff)
+    if not paths:
+        return False, "agent-diff.patch changes no code file", False
+    what = f"{len(paths)} code file(s) in agent-diff.patch"
+    if C.setting("JUDGE_CODE_REVIEW", "1").strip() == "0":
+        return False, f"JUDGE_CODE_REVIEW=0; {what}", True
+    if mode == "local" and C.setting("JUDGE_LOCAL_CODE_REVIEW", "0").strip() != "1":
+        return False, f"local judge, JUDGE_LOCAL_CODE_REVIEW=0; {what}", True
+    return True, what, True
+
+
+def render_prompt(code_review: bool, text: Optional[str] = None) -> str:
+    """prompt.md with its `<!-- code-review:on -->` blocks kept (R8) or removed, and the `:off` blocks the other
+    way round; the marker lines themselves never reach the judge."""
+    text = PROMPT_PATH.read_text(encoding="utf-8") if text is None else text
+    return _CR_BLOCK_RE.sub(lambda m: m.group(2) if (m.group(1) == "on") == code_review else "", text)
+
+
 def bundle_text(evidence_dir: Path, max_chars: int) -> str:
     """The evidence bundle as one text, at most about *max_chars*. manifest.json comes first. hermes-log.txt's
     session-tagged lines and gate-decisions.jsonl are priority content (see SESSION_LOG_SHARE), reserved up front.
@@ -676,8 +738,10 @@ def render_md(f: Dict[str, Any], notes: List[str]) -> str:
         lines += ["", "No findings."]
     for it in C.items_sorted(f["items"]):
         lines += ["", f"## {it['id']} [{it['severity'].upper()}] {it['rubric']} verdict={it['verdict']}", "",
-                  f"**Claim:** {it['claim']}", "", "**Evidence:**", "", "```", it["evidence"], "```", "",
-                  f"**Recommendation:** {it['recommendation']}"]
+                  f"**Claim:** {it['claim']}", "", "**Evidence:**", "", "```", it["evidence"], "```", ""]
+        if it.get("failure_scenario"):
+            lines += [f"**Failure scenario:** {it['failure_scenario']}", ""]
+        lines += [f"**Recommendation:** {it['recommendation']}"]
     return "\n".join(lines) + "\n"
 
 
@@ -874,10 +938,10 @@ def judge_claims(request_id: str, request: Dict[str, Any], evidence_dir: Path, n
     built = CO.build(request, evidence_dir)
     if built.problems:
         raise ClaimsSkipped("self-check refused the claims-only bundle (nothing sent): " + "; ".join(built.problems))
-    system = CLAIMS_PREAMBLE_PATH.read_text(encoding="utf-8") + "\n\n" + PROMPT_PATH.read_text(encoding="utf-8")
+    system = CLAIMS_PREAMBLE_PATH.read_text(encoding="utf-8") + "\n\n" + render_prompt(False)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": built.message}]
     res = _judge_loop(request_id, built.request, messages, built.bundle_text, CLAIMS_MODE, notes, evidence_dir,
-                      probes_allowed=False, use_budget=use_budget, cap_fallback=False)
+                      probes_allowed=False, use_budget=use_budget, cap_fallback=False, code_review=False)
     claims_ids(res["finding"])
     res["notes"].append(f"claims-only bundle ({len(built.message)} chars, self-check passed) judged by the "
                         f"frontier judge; no file contents, diffs, paths or user messages were sent")
@@ -936,17 +1000,28 @@ def judge_bundle(request_id: str, request: Dict[str, Any], evidence_dir: Path, m
     max_chars = int(C.setting("JUDGE_BUNDLE_MAX_CHARS", "150000" if mode == "frontier" else "60000"))
     bundle = bundle_text(evidence_dir, max_chars)
     request = bundle_request(request, evidence_dir)
-    messages = [{"role": "system", "content": PROMPT_PATH.read_text(encoding="utf-8")},
+    try:
+        man = C.read_json(evidence_dir / "manifest.json")
+    except Exception:
+        man = {}
+    code_review, why, has_code = code_review_decision(request, evidence_dir, mode, bundle_data_class(
+        request, man if isinstance(man, dict) else {}))
+    if has_code:  # a bundle without code needs no note
+        notes.append(f"code review (R8): {'on' if code_review else 'off'} ({why})")
+    messages = [{"role": "system", "content": render_prompt(code_review)},
                 {"role": "user", "content": build_user_message(request, bundle, probes_allowed)}]
     return _judge_loop(request_id, request, messages, bundle, mode, notes, evidence_dir,
-                       probes_allowed=probes_allowed, use_budget=use_budget, cap_fallback=True)
+                       probes_allowed=probes_allowed, use_budget=use_budget, cap_fallback=True,
+                       code_review=code_review)
 
 
 def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[str, str]], bundle: str, mode: str,
                 notes: List[str], evidence_dir: Path, *, probes_allowed: bool, use_budget: bool,
-                cap_fallback: bool) -> Dict[str, Any]:
+                cap_fallback: bool, code_review: bool = False) -> Dict[str, Any]:
     """Call the judge (frontier for mode frontier/frontier-claims, else local), one probe round, validate with
-    one retry. cap_fallback: at the daily cap fall back to local (main stage) or raise ClaimsSkipped."""
+    one retry. cap_fallback: at the daily cap fall back to local (main stage) or raise ClaimsSkipped.
+    code_review: the prompt carried rubric R8; without it the validator drops R8 items. A fallback to the local
+    judge at the daily cap keeps R8 only with JUDGE_LOCAL_CODE_REVIEW=1."""
     user_input = messages[1]["content"]
 
     raws: List[str] = []
@@ -969,6 +1044,10 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
                     raise ClaimsSkipped(f"frontier daily cap ({cap}) reached")
                 mode, frontier = "local", False
                 notes.append(f"frontier daily cap ({cap}) reached: fell back to local")
+                if code_review and C.setting("JUDGE_LOCAL_CODE_REVIEW", "0").strip() != "1":
+                    code_review = False
+                    messages[0] = {"role": "system", "content": render_prompt(False)}
+                    notes.append("code review (R8): off for the local fallback (JUDGE_LOCAL_CODE_REVIEW=0)")
             truncated_before = bool(finish) and finish[-1] == "length"
             LAST_LOCAL.clear()
             raw, model = (call_frontier(messages, record_cost=use_budget) if frontier
@@ -996,7 +1075,7 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
             finding, errs, dropped = V.validate_finding(
                 parsed if parsed is not None else raw, request_id=request_id, judge=model, mode=mode,
                 created=C.iso(C.utc_now()), bundle_text=bundle, request=request,
-                max_severity=local_max_severity(), notes_out=rule_notes)
+                max_severity=local_max_severity(), notes_out=rule_notes, code_review=code_review)
             if finding is not None or retried:
                 break
             retried = True

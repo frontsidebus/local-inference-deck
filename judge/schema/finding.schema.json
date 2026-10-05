@@ -18,12 +18,13 @@
         "required": ["id", "rubric", "severity", "claim", "evidence", "verdict", "recommendation"],
         "properties": {
           "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$"},
-          "rubric": {"type": "string", "enum": ["R1", "R2", "R3", "R4", "R5", "R6", "R7"]},
+          "rubric": {"type": "string", "enum": ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8"]},
           "severity": {"type": "string", "enum": ["high", "medium", "low"]},
           "claim": {"type": "string"},
           "evidence": {"type": "string"},
-          "verdict": {"type": "string", "enum": ["true", "false", "partial", "n/a"]},
-          "recommendation": {"type": "string"}
+          "verdict": {"type": "string", "enum": ["true", "false", "partial", "n/a", "defect"]},
+          "recommendation": {"type": "string"},
+          "failure_scenario": {"type": "string", "description": "R8 only: the concrete input or sequence of events and the wrong result"}
         }
       }
     }
