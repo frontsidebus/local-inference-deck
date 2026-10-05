@@ -30,7 +30,7 @@ services:
       BIND: ${BACKEND_WG_IP}:3300
       LITELLM_URL: http://${BACKEND_WG_IP}:4000/v1
       DIGEST_MODEL: coder
-      DIGEST_MAX_TOKENS: "4096"     # output cap of the curation call (clamped to 256..16384 in the app)
+      DIGEST_MAX_TOKENS: "8192"     # ceiling for each curation call's max_tokens (clamped to 1024..16384)
       LITELLM_KEY_FILE: /run/secrets/digest-litellm-key
       STATE_DIR: /state
     volumes:

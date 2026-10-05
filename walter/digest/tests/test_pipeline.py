@@ -110,9 +110,8 @@ def test_llm_call_uses_key_file_and_bounded_output(env, monkeypatch):
             seen["max_tokens"] = body.get("max_tokens")
             seen["thinking"] = body.get("chat_template_kwargs", {}).get("enable_thinking")
             content = json.dumps({"tiers": [{"tier": 1, "items": [
-                {"title": "x", "why": "y", "confidence": "HIGH", "evidence": ["https://e.example/a"]}]}],
-                "markdown": "# ok"})
-            data = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                {"id": "i1", "also": [], "why": "y", "confidence": "HIGH", "follow_up": ""}]}]})
+            data = json.dumps({"choices": [{"message": {"content": content}, "finish_reason": "stop"}]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -223,8 +222,8 @@ def test_dedupe_cutoff_resolution():
     assert got == {"A item", "B item"}
 
 
-@pytest.mark.parametrize("val,want", [(None, 4096), ("8192", 8192), ("0", 256), ("-1", 256),
-                                      ("1000000", 16384), ("lots", 4096)])
+@pytest.mark.parametrize("val,want", [(None, 8192), ("4096", 4096), ("0", 1024), ("-1", 1024),
+                                      ("1000000", 16384), ("lots", 8192)])
 def test_max_tokens_always_bounded(monkeypatch, val, want):
     if val is None:
         monkeypatch.delenv("DIGEST_MAX_TOKENS", raising=False)
