@@ -1130,3 +1130,192 @@ def test_gate36_timing(env, pilot):
         times.append(time.perf_counter() - t0)
         assert r.returncode == 0 and json.loads(r.stdout) == {}
     assert statistics.median(times) < 0.1, times
+
+
+# ---------------------------------------------------------------- #46: pilot-2 metadata / label / jq false positives
+# Pilot 2 Phase B escalated 3 commands, all false positives (pilot2 results, "Gate false positives"). Re-run with
+# --explain, the triggers were not the metadata commands themselves (stat/wc -c/test/cmp -s already passed alone):
+#   B3 (x2): `echo "=== secrets script ..."` put the word "secrets" (*secret*) on the line, so the unresolved
+#            grep operand inside scripts/check-sanitized.sh ("${files[@]}", captured into $hits) counted as a
+#            possible secret read, and `echo "$hits"` became "echo of a value read from a secret file".
+#   B2fix:   the jq filter `"\(.key)=..."` put ".key" (*.key) on the line; the loop variable "$f" is unresolved.
+# The fixture holds the triggering parts of the real files; the commands are the pilot's, with paths moved.
+PILOT2_FILES = {
+    "scripts/check-sanitized.sh":
+        "#!/usr/bin/env bash\nset -euo pipefail\ncd \"$(git rev-parse --show-toplevel)\"\n"
+        "mapfile -t files < <(git ls-files)\npatterns=$(mktemp)\nfail=0\n"
+        "if hits=$(grep -nFI -f \"$patterns\" -- \"${files[@]}\" 2>/dev/null); then\n"
+        "  echo \"FORBIDDEN site-specific values found:\"; echo \"$hits\" | cut -c1-200; fail=1\nfi\n"
+        "if ((fail)); then exit 1; fi\necho \"check-sanitized: OK (${#files[@]} files)\"\n",
+    "scripts/secrets.d/covenant.sh":
+        "# shellcheck shell=bash\n# never print a secret value. Honors: DESTDIR (stage under a prefix)\n"
+        "_cov_root=${DESTDIR:-}\n_cov_put() { install -d -m 0755 \"$(dirname \"$_cov_root$1\")\"; }\n"
+        "_cov_put /etc/oauth2-proxy-digest/cookie-secret\n",
+}
+WATCHES = ["threat-intel-watches/default.json", "ai-digest-watches/ai-security.json",
+           "ai-digest-watches/ai-research.json"]
+STAGE = "{HH}/cache/scratch/tmp.Xq7Lm2Rt9a"
+B3_HEAD = ('cd {REPO} && T=' + STAGE + ' && \\\n'
+           'echo "=== check-sanitized --all ===" && scripts/check-sanitized.sh --all && \\\n'
+           'echo "=== secrets script, run 1 (staging) ===" && env DESTDIR=$T/stage bash -c '
+           "'source scripts/secrets.d/covenant.sh' && \\\n"
+           'echo "=== run 2 (idempotency) ===" && env DESTDIR=$T/stage bash -c '
+           "'source scripts/secrets.d/covenant.sh' && \\\n")
+PILOT2_CASES = [
+    ("p2-B3-wc-c", T(B3_HEAD +
+                     'echo "=== staged tree ===" && ls -laR "$T/stage/etc" | grep -vE \'^\\s*$\' && \\\n'
+                     'echo "=== cookie secret shape (length only, not value) ===" && '
+                     'wc -c < "$T/stage/etc/oauth2-proxy-digest/cookie-secret" && \\\n'
+                     'rm -rf "$T" && echo "temp dir removed"'), "pass", None),
+    ("p2-B3-stat-test-cmp", T(B3_HEAD +
+                              'echo "=== staged paths (metadata only, no content) ===" && \\\n'
+                              'stat -c \'%a %U %n\' "$T/stage/etc/oauth2-proxy-digest/cookie-secret" '
+                              '"$T/stage/etc/oauth2-proxy/cookie-secret" && \\\n'
+                              'test -s "$T/stage/etc/oauth2-proxy-digest/cookie-secret" && '
+                              'echo "digest cookie-secret: non-empty" && \\\n'
+                              'cmp -s "$T/stage/etc/oauth2-proxy-digest/cookie-secret" '
+                              '"$T/stage/etc/oauth2-proxy/cookie-secret" && echo "NOTE: secrets identical '
+                              '(unexpected)" || echo "digest cookie-secret differs from telemetry\'s" && \\\n'
+                              'rm -rf "$T" && echo "temp dir removed"'), "pass", None),
+    ("p2-B2fix-jq-loop", T('for f in ~/.hermes/threat-intel-watches/default.json '
+                           '~/.hermes/ai-digest-watches/ai-security.json ~/.hermes/ai-digest-watches/ai-research.json; '
+                           'do echo "== $f"; jq -r \'.seen | to_entries | map("\\(.key)=\\(.value|length)") | '
+                           'join(" ")\' "$f"; done'), "pass", None),
+    # the route-around that followed (one jq per file) already passed; it still does
+    ("p2-B2fix-jq-single", T("jq -r '.seen | keys' ~/.hermes/ai-digest-watches/ai-security.json"), "pass", None),
+]
+
+LIT = STAGE + "/stage/etc/oauth2-proxy-digest/cookie-secret"   # a staged secret, secret-shaped by name only
+CS = " && scripts/check-sanitized.sh --all"                     # holds an unresolved, captured grep operand
+GATE46_CASES = [
+    # metadata-only commands on a staged secret, written out, next to an unresolved read: pass
+    ("stat-staged", T(f"stat -c %s {LIT}{CS}"), "pass", None),
+    ("ls-l-staged", T(f"ls -l {LIT}{CS}"), "pass", None),
+    ("wc-c-staged", T(f"wc -c {LIT}{CS}"), "pass", None),
+    ("wc-l-stdin-staged", T(f"wc -l < {LIT}{CS}"), "pass", None),
+    ("test-f-staged", T(f"test -f {LIT} && echo present{CS}"), "pass", None),
+    ("bracket-s-staged", T(f"[ -s {LIT} ] && echo non-empty{CS}"), "pass", None),
+    ("dbl-bracket-staged", T(f"[[ -s {LIT} ]] && echo non-empty{CS}"), "pass", None),
+    ("file-staged", T(f"file {LIT}{CS}"), "pass", None),
+    ("du-staged", T(f"du -b {LIT}{CS}"), "pass", None),
+    ("cmp-s-staged", T(f"cmp -s {LIT} {LIT}.old || echo differs{CS}"), "pass", None),
+    ("diff-q-staged", T(f"diff -q {LIT} {LIT}.old{CS}"), "pass", None),
+    ("echo-label", T(f'echo "=== secrets and api-key check ==="{CS}'), "pass", None),
+    # metadata-only commands on a configured secret, alone: pass (as before)
+    ("stat-key", T(f"stat -c %s {KEY}"), "pass", None),
+    ("ls-l-key", T(f"ls -l {KEY}"), "pass", None),
+    ("wc-c-key", T(f"wc -c {KEY}"), "pass", None),
+    ("wc-c-stdin-key", T(f"wc -c < {KEY}"), "pass", None),
+    ("test-f-key", T(f"test -f {KEY}"), "pass", None),
+    ("bracket-s-key", T(f"[ -s {KEY} ]"), "pass", None),
+    ("file-key", T(f"file {KEY}"), "pass", None),
+    ("cmp-s-key", T(f"cmp -s {KEY} /etc/hostname"), "pass", None),
+    ("diff-q-key", T(f"diff -q {KEY} /etc/hostname"), "pass", None),
+    # content reads: still escalate
+    ("head-c1-key", T(f"head -c1 {KEY}"), "approve", "secret-output"),
+    ("xxd-key", T(f"xxd {KEY}"), "approve", "secret-output"),
+    ("cat-key", T(f"cat {KEY}"), "approve", "secret-output"),
+    ("diff-key", T(f"diff {KEY} /etc/hostname"), "approve", "secret-output"),
+    ("cmp-l-key", T(f"cmp -l {KEY} /dev/zero"), "approve", "secret-output"),
+    ("cmp-b-key", T(f"cmp -b {KEY} /etc/hostname"), "approve", "secret-output"),
+    ("jq-hermes-env", T("jq . ~/.hermes/.env"), "approve", "secret-output"),
+    ("jq-arg-then-env", T("jq --arg a b '.x' ~/.hermes/.env"), "approve", "secret-output"),
+    ("jq-rawfile-key", T("jq -n --rawfile k ~/.ssh/id_ed25519 '$k'"), "approve", "secret-output"),
+    ("jq-from-file-key", T("jq -f ~/.ssh/id_ed25519 x.json"), "approve", "secret-output"),
+    ("jq-loop-hermes-env", T('for f in ~/.hermes/.env; do jq . "$f"; done'), "approve", "secret-output-unknown"),
+    ("jq-secret-field-unknown", T('jq -r .client_secret "$f"'), "approve", "secret-output-unknown"),
+    ("head-c-staged-unknown", T(f'T={STAGE}; head -c 8 "$T/stage/etc/oauth2-proxy-digest/cookie-secret"'),
+     "approve", "secret-output"),
+    # a configured secret path on the line still counts as a mention, even in a metadata command (#27)
+    ("stat-key-then-unknown", T(f'stat -c %s {KEY}; cat "$f"'), "approve", "secret-output-unknown"),
+    ("ls-spark-dir-then-env-var", T('ls -l ~/.config/spark/; cat "$SPARK_KEY_FILE"'), "approve", "secret-output-unknown"),
+    # the label/metadata exemption needs output that goes only to the transcript
+    ("echo-key-pipe-xargs", T(f"echo {KEY} | xargs cat"), "approve", "secret-output-unknown"),
+    ("echo-staged-file-xargs", T(f"echo {LIT} > list; xargs cat < list"), "approve", "secret-output-unknown"),
+    ("stat-n-pipe-xargs", T("stat -c %n ~/.config/spark/* | xargs cat"), "approve", "secret-output-unknown"),
+    ("ls-subst-cat", T('f=$(ls ~/.config/spark/*); cat "$f"'), "approve", "secret-output-unknown"),
+    ("printf-v-cat", T(f'printf -v f %s {LIT}; cat "$f"'), "approve", "secret-output-unknown"),
+    ("loop-stat-cat", T('for f in ~/.config/spark/*; do stat "$f"; cat "$f"; done'),
+     "approve", "secret-output-unknown"),
+    ("dbl-bracket-subst", T(f'[[ -s {KEY} ]] && cat "$(ls ~/.config/spark/*)"'), "approve", "secret-output-unknown"),
+]
+
+
+@pytest.fixture
+def pilot2(env):
+    repo = Path(env["TMP"]) / "digest-wt2"
+    for rel, text in PILOT2_FILES.items():
+        f = repo / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    for rel in WATCHES:
+        f = Path(env["HERMES_HOME"]) / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text('{"seen": {"events": ["a"], "items": ["b"]}}\n')
+    (Path(env["HOME"]) / ".config" / "spark" / "hermes.key").write_text("not-a-real-key\n")
+    return str(repo)
+
+
+def _run46(env, repo, call):
+    tool, ti = call
+    ti = _fmt_repo(fmt(ti, env), repo)
+    out, code, record = gate.run(payload(tool, ti, cwd=repo), side_effects=False)
+    decision = record["decision"] if record else "pass"
+    got_rule = (record.get("rules") or [None])[0] if record and decision != "pass" else None
+    return decision, got_rule, record
+
+
+@pytest.mark.parametrize("cid,call,expected,rule", PILOT2_CASES + GATE46_CASES,
+                         ids=[c[0] for c in PILOT2_CASES + GATE46_CASES])
+def test_gate46_corpus(env, pilot2, cid, call, expected, rule):
+    decision, got_rule, record = _run46(env, pilot2, call)
+    assert (decision, got_rule) == (expected, rule), json.dumps(record and record.get("hits"), indent=1)
+
+
+@pytest.mark.parametrize("cid,call,expected,rule", PILOT_CASES + GATE36_CASES,
+                         ids=[c[0] for c in PILOT_CASES + GATE36_CASES])
+def test_gate46_keeps_gate36(env, pilot, pilot2, cid, call, expected, rule):
+    """The #36 corpus (and its #27 controls) with the pilot-2 fixture files also present."""
+    test_gate36_corpus(env, pilot, cid, call, expected, rule)
+
+
+def test_gate46_pilot2_count():
+    assert len(PILOT2_CASES) == 4 and all(c[2] == "pass" for c in PILOT2_CASES)
+
+
+def test_gate46_jq_operands():
+    jo = gate.jq_operands
+    assert jo([".a", "x.json", "y.json"]) == (".a", ["x.json", "y.json"])
+    assert jo(["-r", "--arg", "k", "v", ".[$k]", "x.json"]) == (".[$k]", ["x.json"])
+    assert jo(["-n", "--rawfile", "k", "key", "--slurpfile", "s", "s.json", "$k"]) == ("$k", ["key", "s.json"])
+    assert jo(["-f", "prog.jq", "x.json"]) == (None, ["prog.jq", "x.json"])
+    assert jo(["-rf", "prog.jq"]) == (None, ["prog.jq"])
+    assert jo(["-L", "/lib/jq", "--indent", "4", ".", "x.json"]) == (".", ["x.json"])
+    assert jo(["-L/usr/lib/jq", ".", "x.json"]) == (".", ["x.json"])
+    assert jo(["--", "-weird-filter", "x.json"]) == ("-weird-filter", ["x.json"])
+    assert jo([]) == (None, [])
+
+
+def test_gate46_display_only_args():
+    da = gate._display_only_args
+    assert da('echo "== secrets"; stat -c %s a.key; wc -c < b.key') == ["== secrets", "-c", "%s", "a.key", "-c",
+                                                                          "b.key"]
+    assert da("[[ -s c.key ]] && test -f d.key") == ["-s", "c.key", "-f", "d.key"]
+    assert da("echo a.key | xargs cat") == []
+    assert da("echo a.key > list") == []
+    assert da("echo a.key >&2; ls x 2>/dev/null") == ["a.key", "x"]
+    assert da('f=$(ls a.key); printf -v g %s b.key') == []
+    assert da("cmp -l a.key b; cmp -s c.key d; diff a.key b; diff -q e.key f") == ["-s", "c.key", "d", "-q",
+                                                                                      "e.key", "f"]
+
+
+def test_gate46_timing(env, pilot2):
+    tool, ti = PILOT2_CASES[1][1]
+    p = json.dumps(payload(tool, _fmt_repo(fmt(ti, env), pilot2), cwd=pilot2))
+    times = []
+    for _ in range(7):
+        t0 = time.perf_counter()
+        r = run_cli(p, env)
+        times.append(time.perf_counter() - t0)
+        assert r.returncode == 0 and json.loads(r.stdout) == {}
+    assert statistics.median(times) < 0.1, times

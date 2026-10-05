@@ -28,7 +28,11 @@ indexed, diffed or attributed: they change on read-only turns too.
     record_event(snapdir, tool, paths, status)
     events(snapdir) -> list[dict]
     changed_files(snapdir, cfg) -> list[(status, path)]   status in A|M|D ; includes repo changes
-    agent_touched(snapdir, cfg, until=None, tools=()) -> (paths, prefixes)   what the agent's tool calls touched
+    agent_touched(snapdir, cfg, until=None, tools=(), commands=None) -> (paths, prefixes)
+                                                          what the agent's tool calls touched (incl. cp/mv/install
+                                                          destinations of its terminal commands, #45)
+    copy_targets(command, cwd) -> (paths, prefixes)       files a cp/mv/install in *command* created
+    terminal_commands(hermes_home, session) -> {call_id: (command, workdir)}   from state.db, attribution only
     attribute(changed, paths, prefixes=()) -> (agent, others)                split changed paths by who touched them
     diff_text(snapdir, cfg, sensitive, include=None, until=None) -> str
                                                           unified diff (infra) or stat summary (sensitive),
@@ -37,18 +41,23 @@ indexed, diffed or attributed: they change on read-only turns too.
 
 Attribution: snapshot diffs show every change to a watched path, whoever made it (the human, other tools,
 a `git pull`). A changed path counts as the agent's only when one of the session's recorded tool events
-(events.jsonl: write_file/patch targets, path-like tokens of terminal commands) names it, or when it lies
-under a HERMES_HOME dir written by a Hermes self-write tool the session ran (SELF_WRITE_TOOLS).
+(events.jsonl: write_file/patch targets, path-like tokens of terminal commands) names it, when it lies
+under a HERMES_HOME dir written by a Hermes self-write tool the session ran (SELF_WRITE_TOOLS), or (#45) when
+it is a file a `cp`/`mv`/`install` of one of the session's terminal commands created (copy_targets; the
+command text is read from Hermes' state.db by tool_call_id, in memory only: it never reaches a bundle).
 """
 from __future__ import annotations
 
 import difflib
 import fnmatch
+import glob as _glob
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
+import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -340,12 +349,18 @@ def ran(ev) -> bool:
 
 
 def agent_touched(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until: Optional[datetime] = None,
-                  tools=()) -> Tuple[set, List[str]]:
+                  tools=(), commands=None) -> Tuple[set, List[str]]:
     """(paths, prefixes) touched by the agent's tool calls: every path recorded in events.jsonl with
     t <= *until* (all events when None), plus `HERMES_HOME/<dir>/` prefixes of SELF_WRITE_TOOLS that appear
-    in those events or in *tools* (tool names from the Hermes log). Paths are realpath-normalised."""
+    in those events or in *tools* (tool names from the Hermes log), plus (#45) the files created by a
+    cp/mv/install of the session's terminal calls (copy_targets of the command; *commands* maps tool_call_id ->
+    (command, workdir), default: read from Hermes' state.db). Paths are realpath-normalised."""
     paths, names = set(), {str(t) for t in (tools or ())}
-    noise = noise_globs(cfg, load_meta(snapdir))
+    meta = load_meta(snapdir)
+    noise = noise_globs(cfg, meta)
+    hh = (cfg or {}).get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    prefixes: List[str] = []
+    term_ids: List[Tuple[str, str]] = []
     for ev in events(snapdir):
         if not ran(ev):
             continue
@@ -359,9 +374,266 @@ def agent_touched(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, until:
             if isinstance(p, str) and p.strip() and not is_noise(p, noise):
                 paths.add(_key(p))
         names.add(str(ev.get("tool") or ""))
-    hh = (cfg or {}).get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    prefixes = [_key(os.path.join(hh, d)).rstrip("/") + "/" for n, d in SELF_WRITE_TOOLS.items() if n in names]
+        if ev.get("tool") == "terminal" and ev.get("call_id"):
+            term_ids.append((str(ev["call_id"]), str(ev.get("cwd") or "")))
+    if term_ids:
+        if commands is None:
+            commands = terminal_commands(hh, str(meta.get("session") or ""))
+        for cid, ev_cwd in term_ids:
+            got = (commands or {}).get(cid)
+            if not got:
+                continue
+            command, workdir = got if isinstance(got, tuple) else (got, "")
+            try:  # best effort: attribution must never break a hook or a bundle
+                cps, cpre = copy_targets(command, workdir or ev_cwd or str(meta.get("cwd") or "") or "/")
+            except Exception:
+                continue
+            paths |= {p for p in cps if not is_noise(p, noise)}
+            prefixes += [x for x in cpre if x not in prefixes]
+    prefixes += [_key(os.path.join(hh, d)).rstrip("/") + "/" for n, d in SELF_WRITE_TOOLS.items() if n in names]
     return paths, prefixes
+
+
+# ---------------------------------------------------------------- cp/mv/install destinations (#45)
+COPY_PROGRAMS = ("cp", "mv", "install")
+COPY_WALK_MAX = 5000            # files walked per recursive source
+_SEPARATORS = {"&&", "||", ";", "|", "&", "|&", ";;", "(", ")", "{", "}", "!"}
+_REDIRECTS = {">", ">>", "<", "<<", "<<<", ">&", "&>", "&>>", ">|", "<>"}
+_WRAPPERS = {"sudo", "command", "builtin", "exec", "nohup", "time", "env", "doas"}
+_ARG_OPTS = {"cp": {"-S", "--suffix", "-t", "--target-directory"},
+             "mv": {"-S", "--suffix", "-t", "--target-directory"},
+             "install": {"-S", "--suffix", "-t", "--target-directory", "-m", "--mode", "-o", "--owner", "-g",
+                         "--group", "--strip-program", "-Z", "--context"}}
+
+
+def _simple_commands(command: str) -> List[List[str]]:
+    """Shell words of each simple command in *command* (best effort: no expansion; a line that does not
+    tokenize is skipped). Redirections and their targets are dropped."""
+    out: List[List[str]] = []
+    for line in str(command or "").splitlines():
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            lex.commenters = "#"
+            toks = list(lex)
+        except ValueError:
+            continue
+        cur: List[str] = []
+        skip = False
+        for t in toks:
+            if skip:
+                skip = False
+                continue
+            if t in _SEPARATORS:
+                if cur:
+                    out.append(cur)
+                cur = []
+            elif t in _REDIRECTS or re.fullmatch(r"\d+>>?|\d+<|\d*>&\d*", t):
+                if cur and cur[-1].isdigit():  # `2>/dev/null` tokenizes as `2`, `>`, `/dev/null`
+                    cur.pop()
+                skip = True
+            else:
+                cur.append(t)
+        if cur:
+            out.append(cur)
+    return out
+
+
+def _abs_from(path: str, cwd: str) -> str:
+    p = os.path.expanduser(path)
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or "/", p)
+    return os.path.normpath(p)
+
+
+def _parse_copy(prog: str, args: List[str]) -> Optional[Tuple[str, List[str], bool, bool]]:
+    """(dest, sources, dest_is_dir_by_syntax, recursive) of a cp/mv/install argv, or None (no destination,
+    `install -d`, unresolvable words)."""
+    target = None
+    no_target_dir = recursive = False
+    operands: List[str] = []
+    i = 0
+    opts_done = False
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if opts_done or not a.startswith("-") or a == "-":
+            operands.append(a)
+            continue
+        if a == "--":
+            opts_done = True
+            continue
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in ("--target-directory",):
+                if eq:
+                    target = val
+                elif i < len(args):
+                    target = args[i]
+                    i += 1
+            elif name == "--no-target-directory":
+                no_target_dir = True
+            elif name in ("--recursive", "--archive"):
+                recursive = True
+            elif name == "--directory" and prog == "install":
+                return None
+            elif name in _ARG_OPTS.get(prog, set()) and not eq:
+                i += 1
+            continue
+        # short option cluster, e.g. -rf, -t DIR, -tDIR, -m 0644
+        for j, ch in enumerate(a[1:], 1):
+            opt = "-" + ch
+            if ch == "d" and prog == "install":
+                return None
+            if ch in "rRa" and prog == "cp":
+                recursive = True
+            if ch == "T":
+                no_target_dir = True
+            if opt in _ARG_OPTS.get(prog, set()):
+                val = a[j + 1:]
+                if not val and i < len(args):
+                    val = args[i]
+                    i += 1
+                if opt == "-t":
+                    target = val
+                break
+    if prog == "mv":
+        recursive = True
+    words = operands + ([target] if target else [])
+    if any("$" in w or "`" in w for w in words):
+        return None
+    if target:
+        return (target, operands, True, recursive) if operands else None
+    if len(operands) < 2:
+        return None
+    dest = operands[-1]
+    by_syntax = (dest.endswith("/") or len(operands) > 2) and not no_target_dir
+    return dest, operands[:-1], by_syntax, recursive
+
+
+def _walk(root: str, cap: int) -> List[str]:
+    out: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for f in sorted(filenames):
+            out.append(os.path.relpath(os.path.join(dirpath, f), root))
+            if len(out) >= cap:
+                return out
+    return out
+
+
+def copy_targets(command: str, cwd: str) -> Tuple[set, List[str]]:
+    """(paths, prefixes) of the files that the cp/mv/install invocations in *command* create (#45). Best
+    effort and attribution only: `cd DIR` is followed, `-t DIR` and trailing-slash/multi-source directory
+    destinations are understood, a recursive copy maps every file now under the source to the destination
+    (`D/rel` and `D/<src name>/rel`), a glob source is matched against the destination dir, and a moved
+    directory (source gone) gives a `D/<src name>/` prefix (`D/` when it was a rename). Words with `$` or
+    backticks are not resolved. Nothing is executed; the command text is never stored."""
+    paths: set = set()
+    prefixes: List[str] = []
+    cur = cwd or "/"
+    for words in _simple_commands(command):
+        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            words = words[1:]
+        while words and os.path.basename(words[0]) in _WRAPPERS:
+            words = words[1:]
+            while words and (words[0].startswith("-") or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0])):
+                flag = words.pop(0)
+                if flag in ("-u", "-g") and words:
+                    words.pop(0)
+        if not words:
+            continue
+        prog = os.path.basename(words[0])
+        if prog in ("cd", "pushd"):
+            if len(words) > 1 and "$" not in words[1] and words[1] != "-":
+                cur = _abs_from(words[1], cur)
+            continue
+        if prog not in COPY_PROGRAMS:
+            continue
+        parsed = _parse_copy(prog, words[1:])
+        if not parsed:
+            continue
+        dest, sources, dir_syntax, recursive = parsed
+        d = _abs_from(dest, cur)
+        dest_dir = dir_syntax or os.path.isdir(d)
+        if not dest_dir:
+            paths.add(_key(d))
+        for src in sources:
+            s_abs = _abs_from(src, cur)
+            base = os.path.basename(s_abs.rstrip("/"))
+            if any(c in base for c in "*?["):
+                srcs = sorted(_glob.glob(s_abs))
+                if os.path.isdir(d):
+                    for name in sorted(os.listdir(d)):
+                        if fnmatch.fnmatchcase(name, base):
+                            full = os.path.join(d, name)
+                            if os.path.isdir(full) and recursive:
+                                x = _key(full).rstrip("/") + "/"
+                                if x not in prefixes:
+                                    prefixes.append(x)
+                            else:
+                                paths.add(_key(full))
+                srcs = [x for x in srcs if os.path.isdir(x)] if recursive else []
+            else:
+                srcs = [s_abs]
+                if dest_dir:
+                    paths.add(_key(os.path.join(d, base)))
+            for sp in srcs:
+                b = os.path.basename(sp.rstrip("/"))
+                if recursive and os.path.isdir(sp):
+                    for rel in _walk(sp, COPY_WALK_MAX):
+                        paths.add(_key(os.path.join(d, b, rel)))
+                        if not dir_syntax:
+                            paths.add(_key(os.path.join(d, rel)))
+                elif recursive and prog == "mv" and not os.path.exists(sp):
+                    gone = [_key(os.path.join(d, b)).rstrip("/") + "/"]
+                    if not dir_syntax and len(sources) == 1 and not os.path.exists(os.path.join(d, b)):
+                        gone.append(_key(d).rstrip("/") + "/")
+                    prefixes += [x for x in gone if x not in prefixes]
+    return paths, prefixes
+
+
+def terminal_commands(hermes_home, session: str) -> Dict[str, Tuple[str, str]]:
+    """{tool_call_id: (command, workdir)} for the terminal calls of *session* in Hermes' state.db (opened
+    read-only; empty when it is missing). Used in memory for attribution only (copy_targets): callers must
+    never write these strings anywhere."""
+    p = Path(str(hermes_home or "")) / "state.db"
+    out: Dict[str, Tuple[str, str]] = {}
+    if not session or not p.is_file():
+        return out
+    con = None
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+        con.execute("PRAGMA query_only = ON")
+        rows = con.execute("SELECT tool_calls FROM messages WHERE session_id = ? AND tool_calls IS NOT NULL",
+                           (session,)).fetchall()
+    except sqlite3.Error:
+        return out
+    finally:
+        if con is not None:
+            con.close()
+    for (raw,) in rows:
+        try:
+            calls = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        for c in calls if isinstance(calls, list) else []:
+            if not isinstance(c, dict):
+                continue
+            fn = c.get("function") if isinstance(c.get("function"), dict) else {}
+            if fn.get("name") != "terminal":
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(args, dict) or not isinstance(args.get("command"), str):
+                continue
+            wd = args.get("workdir") if isinstance(args.get("workdir"), str) else ""
+            for key in ("id", "call_id"):
+                if isinstance(c.get(key), str) and c[key]:
+                    out[c[key]] = (args["command"], wd)
+    return out
 
 
 def attribute(changed, paths, prefixes=()) -> Tuple[List[str], List[str]]:
@@ -481,11 +753,20 @@ def _stat(a: Optional[List[str]], b: Optional[List[str]]) -> str:
 
 STATUS_WORDS = {"A": "added", "M": "modified", "D": "deleted"}
 WITHHELD_PREFIX = "# content withheld (data_class=sensitive): "
+# #43: per-path withholding inside an infra (content) diff
+WITHHELD_PREFIXES = {
+    "sensitive": "# content withheld (sensitive path in an infra bundle; name not shown): ",
+    "secret": "# content withheld (secret-shaped path): ",
+    "scratch": "# content withheld (agent scratch/cache path: metadata only): ",
+}
 
 
-def withheld_line(path: str, status: str = "M", counts: Optional[Tuple[int, int]] = None, why: str = "") -> str:
-    """The explicit marker for a change whose content a sensitive bundle does not show (a stat, never content):
-    `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b) [modified]`."""
+def withheld_line(path: str, status: str = "M", counts: Optional[Tuple[int, int]] = None, why: str = "",
+                  kind: str = "") -> str:
+    """The explicit marker for a change whose content a bundle does not show (a stat, never content):
+    `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b) [modified]`. *kind*
+    (sensitive | secret | scratch) selects the per-path marker of an infra bundle (#43); *path* is then the
+    label to show (a placeholder for a sensitive path)."""
     word = STATUS_WORDS.get(status, status)
     if why:
         what = why
@@ -493,12 +774,18 @@ def withheld_line(path: str, status: str = "M", counts: Optional[Tuple[int, int]
         what = "binary file changed"
     else:
         what = f"{counts[0] + counts[1]} lines changed (+{counts[0]}/-{counts[1]})"
-    return f"{WITHHELD_PREFIX}{path} \u2014 {what} [{word}]\n"
+    prefix = WITHHELD_PREFIXES.get(kind, WITHHELD_PREFIX)
+    return f"{prefix}{path} \u2014 {what} [{word}]\n"
+
+
+def _literal(rels: List[str]) -> List[str]:
+    """Pathspecs that match exactly these paths: a name with `*`, `?` or `[` must never widen the diff."""
+    return [":(literal)" + r for r in rels]
 
 
 def _numstat(root: str, head: str, rels: List[str]) -> List[Tuple[str, Optional[Tuple[int, int]]]]:
     """[(abs path, (added, removed) | None for binary)] from `git diff --numstat <head> [-- rels]`."""
-    args = ["diff", "--numstat", "--no-renames", head] + (["--", *rels] if rels else [])
+    args = ["diff", "--numstat", "--no-renames", head] + (["--", *_literal(rels)] if rels else [])
     rc, txt = _git(root, *args)
     out = []
     if rc != 0:
@@ -526,13 +813,16 @@ def _late_note(path: str, until: Optional[datetime]) -> str:
 
 
 def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive: bool = True,
-              include=None, until: Optional[datetime] = None) -> str:
+              include=None, until: Optional[datetime] = None, withhold=None) -> str:
     """Watched files vs snapshot + repo changes since the session-start HEAD.
 
     sensitive=True: `git diff --stat`-style lines only (path | +N -M), never file contents.
     include: only these paths (realpath-compared); None = every changed path.
     until: end of the review window; files modified after it get a NOTE line (their content is as observed
-    at collection time)."""
+    at collection time).
+    withhold (#43, used with sensitive=False): callable(path) -> None (show the content) or (kind, label): the
+    path gets a withheld_line(label, kind=kind) instead of content (kind sensitive | secret | scratch). A repo
+    whose every wanted path is withheld gets no header, no start-status listing and no git diff at all."""
     snapdir = Path(snapdir)
     meta = load_meta(snapdir)
     if not meta:
@@ -542,6 +832,11 @@ def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive:
 
     def want(p: str) -> bool:
         return keys is None or _key(p) in keys
+
+    def held(p: str):
+        if sensitive or withhold is None:
+            return None
+        return withhold(p)
 
     idx = _load_index(snapdir)
     hdr = [f"# local diff vs snapshot taken {meta.get('started')} (session {meta.get('session')})"]
@@ -567,15 +862,22 @@ def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive:
         if not want(p):
             continue
         snap = snapdir / "files" / p.lstrip("/")
-        out.append(_late_note(p, until))
+        h = held(p)
+        out.append(_late_note(p, until) if h is None else "")
         if idx.get(p, {}).get("skipped"):
             why = f"snapshot skipped ({idx[p]['skipped']}); content diff unavailable"
-            out.append(withheld_line(p, status, why=why) if sensitive else f"{status} {p} | {why}\n")
+            if h is not None:
+                out.append(withheld_line(h[1], status, why=why, kind=h[0]))
+            else:
+                out.append(withheld_line(p, status, why=why) if sensitive else f"{status} {p} | {why}\n")
             continue
         a = _read_lines(snap) if status != "A" else []
         b = _read_lines(Path(p)) if status != "D" else []
         if sensitive:
             out.append(withheld_line(p, status, _counts(a, b)))
+            continue
+        if h is not None:
+            out.append(withheld_line(h[1], status, _counts(a, b), kind=h[0]))
             continue
         if a is None or b is None:
             out.append(f"Binary files {p} differ\n")
@@ -588,28 +890,43 @@ def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive:
         if not root or not head or not os.path.isdir(root):
             continue
         changes = [(st, p) for st, p in _repo_changes(repo) if not is_noise(p, noise)]
+        mine = [p for _, p in changes if want(p)]
+        if keys is not None and not mine:
+            continue
+        status_of = {p: s for s, p in changes}
+        hidden = {p: held(p) for p in mine}
+        hidden = {p: h for p, h in hidden.items() if h is not None}
+        shown = [p for p in mine if p not in hidden]
+        if hidden and not shown:
+            # #43: nothing of this repo is shown: no repo root, no start-status listing, only withheld lines
+            for p in sorted(hidden):
+                kind, label = hidden[p]
+                c = _path_counts(root, head, p, status_of.get(p, "M"))
+                out.append(withheld_line(label, status_of.get(p, "M"), c, kind=kind))
+            continue
         rels: List[str] = []
-        if keys is not None:
-            mine = [p for _, p in changes if want(p)]
-            if not mine:
-                continue
-            rels = [os.path.relpath(p, root) for p in mine]
+        if keys is not None or hidden:
+            rels = [os.path.relpath(p, root) for p in shown]
         pre = [ln for ln in (repo.get("status") or "").splitlines() if ln.strip()]
         out.append(f"\n# repo {root}: changes since session-start HEAD {head[:12]}\n")
         if pre:
             out.append(f"# {len(pre)} path(s) were already modified/untracked at session start:\n")
             out.extend(f"#   {ln}\n" for ln in pre[:50])
-        out.extend(_late_note(p, until) for _, p in changes if want(p))
-        status_of = {p: s for s, p in changes}
+        out.extend(_late_note(p, until) for p in shown)
         if sensitive:
             for p, c in _numstat(root, head, rels):
                 if want(p):
                     out.append(withheld_line(p, status_of.get(p, "M"), c))
         else:
-            args = ["diff", "--no-color", "--no-ext-diff", head] + (["--", *rels] if rels else [])
-            rc, txt = _git(root, *args)
-            out.append(txt if rc == 0 else f"# git diff failed (rc={rc})\n")
-        new = [p for s, p in changes if s == "A" and want(p) and not _tracked(root, p)]
+            for p in sorted(hidden):
+                kind, label = hidden[p]
+                c = _path_counts(root, head, p, status_of.get(p, "M"))
+                out.append(withheld_line(label, status_of.get(p, "M"), c, kind=kind))
+            if shown or keys is None and not hidden:
+                args = ["diff", "--no-color", "--no-ext-diff", head] + (["--", *_literal(rels)] if rels else [])
+                rc, txt = _git(root, *args)
+                out.append(txt if rc == 0 else f"# git diff failed (rc={rc})\n")
+        new = [p for s, p in changes if s == "A" and want(p) and p not in hidden and not _tracked(root, p)]
         for p in new:
             lines = _read_lines(Path(p))
             if sensitive:
@@ -621,6 +938,17 @@ def diff_text(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, sensitive:
                 if out and not out[-1].endswith("\n"):
                     out.append("\n")
     return "".join(out)
+
+
+def _path_counts(root: str, head: str, path: str, status: str) -> Optional[Tuple[int, int]]:
+    """(added, removed) of one repo path vs *head* (git numstat; an untracked file counts all its lines)."""
+    for p, c in _numstat(root, head, [os.path.relpath(path, root)]):
+        if _key(p) == _key(path):
+            return c
+    if status == "A":
+        lines = _read_lines(Path(path))
+        return None if lines is None else (len(lines), 0)
+    return (0, 0)
 
 
 def stat_lines(snapdir: Path, cfg: Optional[Mapping[str, str]] = None, paths=()) -> List[str]:

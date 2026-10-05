@@ -163,8 +163,17 @@ event is rejected and never reaches `agent-diff.patch`, but still counts for `da
 A `completion` request from `hooks/enqueue.py` also carries `detail.changed_by_others`: the session's other
 snapshot changes (paths only, at most 200; `detail.changed_by_others_total` when more), which never count for
 `data_class`.
-`data_class` defaults to **sensitive** unless every changed path matches an infra path rule
-(rules in `lib/config.py`: hermes config/skills/memories/plans, ~/.ssh/config, the deck repo, /etc, /srv).
+`data_class` is decided **per path** (#43, `lib/config.classify_detail(paths, cfg, cwd, max_mixed)`; `classify`
+returns its `class`). `path_class(path)` is `secret` (`is_secret_path` of the path as given or resolved), else
+`scratch` (`is_scratch_path`: the resolved path matches `SCRATCH_GLOBS` = `$HERMES_HOME/cache/*`,
+`$HERMES_HOME/tmp/*`, `~/.cache/*`, `*/__pycache__/*`, `*/.pytest_cache/*`, `*/.mypy_cache/*`, `*/.ruff_cache/*`,
+plus `JUDGE_SCRATCH_GLOBS`), else `infra` (an infra path rule, below), else `sensitive`. Then: (1) any secret path
+-> `sensitive` (reason `secret path`); (2) scratch paths are left out, and with no other path the cwd decides as for
+a path-less request (`only scratch paths: ...`); (3) every remaining path infra -> `infra`; (4) infra paths plus at
+most `min(max_mixed, number of infra paths)` sensitive ones -> `infra`, reason `mixed`, the sensitive ones withheld
+by the collector (below; `max_mixed` defaults to `JUDGE_MIXED_MAX_SENSITIVE`, 3; `0` = strict); (5) otherwise
+`sensitive`. Infra path rules (in `lib/config.py`): hermes config/skills/memories/plans, ~/.ssh/config, the deck
+repo, /etc, /srv. CLI: `config.py --explain PATH...` prints `classify_detail` as JSON.
 **Git worktrees** (#37): a path whose checkout shares its git dir with `JUDGE_REPO_DIR` or a `JUDGE_INFRA_REPOS`
 entry is infra too, so every worktree of the deck repo (and its main clone) is classed like the repo itself.
 `lib/config.git_common_dir(path)` finds the nearest ancestor with a `.git` entry: a `.git` directory is the
@@ -212,6 +221,15 @@ Snapshot diffs show every change to a watched path, whoever made it. A changed p
 URLs excluded) or when it lies under `$HERMES_HOME/memories/` or `$HERMES_HOME/skills/` and the session ran the
 `memory` / `skill_manage` tool (seen in `events.jsonl` or in the session's `agent.tool_executor` log lines).
 `changed_paths` of a completion = snapshot changes attributed this way + this turn's write_file/patch targets.
+**Copies** (#45): a file a `cp`/`mv`/`install` of one of the session's terminal calls created is the agent's too.
+The hook records only path-like tokens, so `cp -r a/fonts b/fonts` names the destination dir, not its files;
+`agent_touched` therefore reads the session's terminal commands from Hermes' `state.db` by `call_id`
+(`snapshot.terminal_commands`, read-only, in memory) and adds `snapshot.copy_targets(command, workdir or cwd)`:
+`cd DIR` is followed; `-t DIR`/`--target-directory`, a trailing `/`, several sources or an existing dir make the
+destination a dir (`D/<source name>`); a recursive copy (`cp -r/-R/-a`) maps every file now under the source to
+`D/rel` and `D/<source name>/rel`; a glob source is matched in the destination dir; a moved source that no longer
+exists gives a `D/<name>/` prefix (`D/` for a rename); `install -d` and words with `$` or backticks are ignored.
+Nothing is executed, and the command text never reaches a bundle (`tool-calls.jsonl` keeps program names only).
 Everything else is "changed by others" (`lib/snapshot.agent_touched` / `attribute`).
 
 **Request paths need a backing event** (`collect.attribution`). In the collector, a request's `changed_paths`
@@ -344,11 +362,30 @@ change` and has one line per changed agent path (snapshot files, repo files via 
 files): `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b) [added|modified|deleted]`,
 or `— binary file changed` / `— snapshot skipped (...)` (`snapshot.withheld_line`). Manifest
 `withheld: {artifact: reason}` covers `agent-diff.patch` (sensitive) and `others-changed.txt` (non-infra others
-in an `infra` bundle); `{}` when nothing is withheld.
+in an `infra` bundle), plus `sensitive_paths` and `scratch_paths` (#43, below); `{}` when nothing is withheld.
+
+**Per-path withholding in an `infra` bundle** (#43, `collect.Withholding`). `snapshot.diff_text(...,
+withhold=hold)` asks for every path it would show: `hold(path)` re-classifies it (`config.path_class`), so only
+`infra` paths ever get content, whether or not the request listed them. Others get one line with a line-count
+stat: a scratch path `# content withheld (agent scratch/cache path: metadata only): <path> — ...`; a sensitive
+path `# content withheld (sensitive path in an infra bundle; name not shown): [sensitive path #N withheld] — ...`
+(a secret one could only appear if classification were bypassed: `(secret-shaped path)`). A repo whose wanted
+paths are all withheld gets no `# repo` header, no start-status listing and no `git diff`; repo diffs use
+`:(literal)` pathspecs, so a path token with `*` can never widen them. The sensitive names (as given, resolved
+and `~/`-relative) and, when there are any, a non-infra session cwd (`[non-infra cwd withheld]`) are then
+removed from the whole bundle: the manifest's request copy (`changed_paths` labelled, `detail.changed_by_others`
+cut to infra paths plus `changed_by_others_withheld`, `masked_request: true`), `attribution.agent_paths`
+(labels), C3 records about a non-infra path (path labelled, `detail` withheld), and a last pass over every
+artifact in which a log or JSONL line naming one is replaced by `[line withheld: it names a sensitive path (#43)]`
+/ `{"withheld": "..."}` (a gate excerpt or an error line could quote the file). The runner sends the manifest's
+masked request copy (`run_judge.bundle_request`) instead of the queued request. Manifest:
+`classification: {reason, infra_paths, withheld_sensitive_paths, secret_paths, scratch_paths}`,
+`attribution.scratch_paths` (names; metadata only). Residual: the agent's own final answer (`claims`) is
+redacted, not checked for what it says about the withheld files.
 
 | File | Content | Time |
 |---|---|---|
-| `manifest.json` | request copy, `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, changed_by_others, omitted_after_window, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`) | — |
+| `manifest.json` | request copy (masked in an infra bundle with withheld paths: `masked_request`), `classification` (#43), `artifacts`, `collector_version` (2), `data_class`, `request_data_class`, `content_policy`, `collected`, `window: {since, until, grace_seconds, until_basis, next_turn_start?}`, `windowed` (list), `point_in_time: {<artifact>: {observed_at, note}}`, `attribution: {agent_paths, scratch_paths, changed_by_others, omitted_after_window, rejected_request_paths, rejected_request_paths_total, ignored_noise_paths}`, `withheld: {<artifact>: reason}`, `snapshot: {dir_roots, truncated_roots, skipped_roots, caps, noise_globs}` (`{available: false}` without a snapshot), `extras: {available, c3_results, c3_window, host_probes}`, `notes: {<artifact or topic>: "..."}` (topics: `attribution`, `noise`, `snapshot`) | — |
 | `hermes-log.txt` | agent.log/errors.log lines in the window, secrets redacted: **this session's tagged lines first**, then untagged context lines with startup/housekeeping noise dropped (none for a C6 watcher request); layout below | window |
 | `gate-decisions.jsonl` | `gate.log` lines of this session with `ts` in the window, plus (for a `gate` request) the decision that created it; re-redacted; each line gains `decision_meaning` (`approve` = escalated to the human) and `outcome` (`executed` \| `not_executed` \| `unknown`) + `outcome_basis`: executed when an `events.jsonl` event (post_tool_call fires for every call; Hermes reports a denied or timed-out approval as `status="blocked"`, interrupted calls as `cancelled`/`aborted`) matches the decision by `tool_call_id`, else by tool + `call_hash`, and its status is not in `NOT_RUN_STATUSES` (the latest earlier decision of that call within 600 s); not_executed when nothing matched and the decision is settled (block, the turn ended, or 600 s passed); not_executed also as soon as an event with a `NOT_RUN_STATUSES` status (e.g. Hermes' `blocked` for a refused approval) carries the decision's `tool_call_id` (basis `post_tool_call reported status=<s> ...`); unknown without a session snapshot, when the decision or the events predate call markers, or while too recent. Always written; when empty, `notes["gate-decisions.jsonl"]` says "no gate decisions in window" | window |
 | `tool-calls.jsonl` | one JSON line per tool call `post_tool_call` saw for this session with `t` in the window (bug #33; `collect.tool_calls`): `t` (UTC), `tool`, `command` (the program NAME only, `lib/toolcalls.command_word`: for `terminal` the first word, leading `VAR=value` assignments skipped, basename, kept only when it is in `READONLY_COMMANDS` (common read-only programs: `ls`, `stat`, `wc`, `cat`, `grep`, `systemctl`, `journalctl`, `sha256sum`, `git`, ...), else `(other)`; `(none)` for an empty command; never arguments; taken from the event's `command`, else from Hermes' `state.db` by `tool_call_id`, else `(unknown)`; other tools: the tool name), `gate` (`pass`: no gate.log decision matches the call by `tool_call_id`, or by tool + `call_hash` for events/decisions without ids; `escalated` / `blocked`: the matching decision; `not gated`: a tool outside the gate's matcher), `ran` (the event's status is not in `NOT_RUN_STATUSES`), `error` (status `error`), `after_refused_escalation` (an earlier `approve`/`block` decision of this session whose call never ran). Hermes' raw status is not copied: it says `blocked` for an escalation nobody approved, which reads as a gate block. At most 200 lines; when empty, `notes["tool-calls.jsonl"]` says so | window |
@@ -398,7 +435,8 @@ parallel call is logged twice (untagged `tool X failed`, then tagged `Tool X ret
 them. Residual risk: a Hermes process that never logs a session tag is invisible to the rule. On the real
 agent.log (2026-10-02..04) all 38 untagged tool lines were attributed, each inside one session's own turn.
 
-`data_class` of the bundle: the stricter of the request's class and the collector's own classification of the
+`data_class` of the bundle: the stricter of the request's class and the collector's own classification
+(`collect.class_detail`: `config.classify_detail`, strict for `gate` requests) of the
 agent-attributed paths and the rejected request paths (noise excluded). With no such paths, only a host-rule `gate` request or a C6 watcher request (shape above) keeps its own class; any other
 request is classified with `classify([], cfg, cwd)`, so an `infra` label on a path-less request (forged or
 buggy) comes out `sensitive` unless the cwd is infra. For `data_class=sensitive`: diffs replaced by
@@ -604,7 +642,14 @@ Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a st
   so older interleaved bundles work too) up to 50% of the budget, and `gate-decisions.jsonl` up to 20%. Only
   beyond those shares are they cut **in the middle** (first and last lines kept, one
   `[... runner omitted N session-tagged|gate decision line(s) from the middle ...]` line). Every other file, and
-  `hermes-log.txt`'s untagged context, gets an equal share of the rest (at least 4000 chars): other files are
+  `hermes-log.txt`'s untagged context, shares the rest by **water-filling** (#44, `water_fill`): smallest need
+  first, each gets min(need, an equal share of what is left), so what small files leave goes to the large ones,
+  up to the cap (minus file headers and marker allowance); a share is at least `min(need, 4000)`.
+  `agent-diff.patch` beyond its share is cut by `fit_diff`: comment lines (headers, `# content withheld`,
+  `# NOTE`) stay, every file section keeps its header, static assets (`.css`, `.html`, `.svg`, `.txt`, fonts,
+  images, `.map`, `.lock`, ...) first get 1500 chars each, code files are water-filled with the rest and assets get
+  what code leaves, and each section keeps whole hunks while they fit, then
+  `[... runner omitted N of M hunk(s) of this file (K chars) to fit the bundle budget ...]`. Other files are
   head-truncated (`[... truncated by runner: N more chars ...]`), the context is middle-cut, and structure
   lines (headers, section titles) always stay. A non-priority file that no longer fits is listed as
   `[omitted by runner: bundle size cap]`.
@@ -704,7 +749,24 @@ exit 64, no execution.
   entirely in `not_secret_names`. Otherwise it passes. The reason names the secret-shaped word, never content.
   Words of the command line that occur only inside grep/egrep/fgrep/zgrep/rg patterns, sed scripts or awk
   programs (`_pattern_args`, also inside `$(...)` and `bash -c`) are not mentions (#36): occurrence counts are
-  compared, so the same word used elsewhere in the line still counts.
+  compared, so the same word used elsewhere in the line still counts. #46 extends this:
+  - a **jq filter** (`gate.jq_operands`) is a program, not a path (`jq -r '"\(.key)"' "$f"` names no `*.key`),
+    unless it matches `secret_grep_pattern` (`jq -r .client_secret "$f"` still escalates);
+  - a word that only occurs as an argument or `<` redirect of a **display-only** command
+    (`gate._display_only_args`: `echo`, `printf` without `-v`, `stat`, `ls`, `wc`, `test`/`[ ]`, `[[ ]]`, `file`,
+    `du`, `true`, `:`, `cmp` without `-l`/`-b`, `diff -q`) is not a mention when that command is at the top level
+    (not inside `$(...)`, `<(...)` or `bash -c`), its stdout is not piped and not redirected to a file (`>&2` is
+    fine), and the word is not a configured `secret_paths` match. So an `echo "=== secrets ==="` label or `stat`/`wc
+    -c`/`test -s` of a staged throwaway `cookie-secret` no longer turns an unrelated unresolved read into an
+    escalation, while `ls ~/.config/spark/; cat "$KEY_FILE"`, `echo <key> | xargs cat`, `f=$(ls <dir>); cat "$f"`
+    and `printf -v f %s <key>; cat "$f"` still escalate.
+- **Metadata-only commands** (#46) print no file content and are not read checks: `stat` (any format), `ls`, `wc`
+  (also on stdin), `test`/`[ ]`/`[[ ]]`, `file`, `du`, plain `cmp` and `cmp -s` (an offset or nothing), and
+  `diff -q`/`--brief` ("Files A and B differ"; plain `diff` is a print command). `cmp -l`/`-b`/`--verbose`/
+  `--print-bytes` print the differing bytes and go through the read check like a print command (before #46 they
+  passed). `jq` operands are parsed by `jq_operands`: `--arg`/`--argjson`/`--slurpfile`/`--rawfile` take two values
+  and the `--slurpfile`/`--rawfile` file is read (before #46, `jq -n --rawfile k <key> '$k'` passed); with
+  `-f`/`--from-file` every positional is a file, the program file first.
 - **Not seen by the gate** (known limits): values built at run time (`f=$(printf '%s/%s' ~/.config spark)/k`
   without any secret-shaped word, base64-decoded names, `$IFS` tricks); copies or symlinks made in an earlier tool
   call (`cp key /tmp/x`, then `cat /tmp/x` next turn); secrets read by programs that are not print commands and
@@ -864,7 +926,9 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 `JUDGE_REFUSAL_NEXT_CALLS=6` (calls listed after each refusal in `refusals.jsonl`, 1–20; site.env only),
 `JUDGE_INJECT_REFUSAL_REMINDER=1` (0 = no refusal reminder in C5; #39),
 `JUDGE_STALL_MINUTES=15` (C5/judge-findings runner stall warning; 0 = off; #41),
-`JUDGE_SECRET_GLOBS=""` (extra basename globs of secret files, never infra-class; #42).
+`JUDGE_SECRET_GLOBS=""` (extra basename globs of secret files, never infra-class; #42),
+`JUDGE_SCRATCH_GLOBS=""` (extra agent scratch/cache globs: never decide `data_class`, metadata only; #43),
+`JUDGE_MIXED_MAX_SENSITIVE=3` (sensitive paths an infra request may carry, withheld; 0 = strict; #43).
 Environment only (not read from site.env): `JUDGE_ACK_AGENT_ENV` (extra agent-marker env names for judge-ack),
 `JUDGE_CHECK_UNITS=0` (judge-findings skips `systemctl --user is-failed`; the tests set it),
 `JUDGE_ALERT_MIN_INTERVAL_S=900` (judge-alert@.service, e.g. in `~/.config/judge/judge.env`: seconds between
