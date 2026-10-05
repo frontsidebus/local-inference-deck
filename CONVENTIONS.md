@@ -50,7 +50,7 @@ CHAT_GROUP=chat-users
 ```
 
 ## Templating
-- Templates end in `.tmpl` and are rendered by `scripts/render.sh` using **`envsubst` with an explicit variable list** (never bare `envsubst`, which would eat nginx `$host`, `$request_uri`, etc.). Syntax in templates: `${SPARK_API_HOST}`.
+- Templates end in `.tmpl` and are rendered by `scripts/render.sh` using **`envsubst` with an explicit variable list** (never bare `envsubst`, which would eat nginx `$host`, `$request_uri`, etc.). Syntax in templates: `${SPARK_API_HOST}`. Optional blocks: `@@if NAME@@ … @@else@@ … @@endif@@` keeps the first part only when `NAME` is set and not `CHANGEME` (directive lines are dropped; a malformed block fails the render), so a template can render with an optional value unset.
 - Non-templated files are copied verbatim.
 
 ## Secrets — NEVER in the repo
