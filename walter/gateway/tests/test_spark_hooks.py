@@ -174,3 +174,17 @@ def test_limits_match_litellm_and_llama_swap():
         assert int(found[0]) == H.MODEL_MAX_OUTPUT[alias], model_id
         seen.add(model_id)
     assert seen == set(H.LOCAL_ID_ALIAS)
+
+
+# --- presence_penalty defaults (measured 2026-10-05, llama-swap/BENCHMARKS.md) -----
+
+def test_presence_penalty_defaults():
+    """coder-fast gets a server-side default of 1.5 (a request can still override it); coder and big
+    stay at llama-server's 0. Changing this needs a re-measurement, see BENCHMARKS.md."""
+    ls = yaml.safe_load((WALTER / "llama-swap" / "config.yaml.tmpl").read_text())
+    want = {"qwen3.8-27b": None, "qwen3.6-35b-a3b": "1.5", "qwen3-coder-next": None}
+    for model_id, value in want.items():
+        found = re.findall(r"--presence-penalty\s+(\S+)", ls["models"][model_id]["cmd"])
+        assert found == ([value] if value else []), model_id
+        # the window is llama-server's default (64 tokens); the measurement did not change it
+        assert "--repeat-last-n" not in ls["models"][model_id]["cmd"], model_id

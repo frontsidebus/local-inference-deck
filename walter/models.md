@@ -24,6 +24,10 @@ Notes
 - `coder` uses llama.cpp's built-in MTP head (`--spec-type draft-mtp --spec-draft-n-max 2`). The
   Qwen3.8 GGUF embeds it, so no separate draft model is needed. See `llama-swap/BENCHMARKS.md`.
 - Qwen and Gemma think by default. A small `max_tokens` can return empty content.
+- `presence_penalty`: `coder-fast` runs with a server default of 1.5 (`--presence-penalty 1.5`); `coder` and `big`
+  stay at 0. A request's own `presence_penalty` overrides the default. llama-server applies it only to the last 64
+  tokens (`--repeat-last-n`), so it cannot break long-period loops; the output cap is still the runaway guard. Numbers
+  and the trade-off are in `llama-swap/BENCHMARKS.md`.
 - Split modes: `big` uses layer split (`-sm layer -ts 1,1`); `hermes` and `vision` use llama.cpp's experimental
   tensor split (`-sm tensor`, plus `--shm-size 2g` for the container through the `${tp}` macro), which gave them
   +39–67 % decode. Numbers and the fallback are in `llama-swap/BENCHMARKS.md`.

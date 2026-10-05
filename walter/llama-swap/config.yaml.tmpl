@@ -46,6 +46,10 @@ models:
     unloadTimeout: 30
     capabilities: { in: [text], out: [text], tools: true, context: 131072 }
 
+  # --presence-penalty 1.5 is a default: a request's own presence_penalty overrides it (0 turns it off). Measured
+  # 2026-10-05 (BENCHMARKS.md): thinking-mode code runaways (reasoning past 12288 tokens) 5/20 -> 1/20, tests passed
+  # 14/20 -> 18/20; json_schema, the judge's json_object and digest curation unchanged. llama-server applies it only
+  # to the last 64 tokens (--repeat-last-n). coder stays at 0 (no measured benefit); big was not measured.
   "qwen3.6-35b-a3b":
     name: "Qwen3.6 35B-A3B (GPU1)"
     aliases: ["coder-fast"]
@@ -53,7 +57,7 @@ models:
       ${run} --gpus "\"device=1\"" ${image}
       -m /models/gguf/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf
       ${common} -c 131072 -n 32768 -sm none
-      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.5
     cmdStop: ${stop}
     proxy: http://127.0.0.1:${PORT}
     unloadTimeout: 30

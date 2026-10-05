@@ -417,6 +417,6 @@ Numbers 1–4 come from the first live judge session, before run 1. Their number
 - Acks need a boundary the agent cannot cross (a separate user, or signed human acks).
 - Measure `vision` as the local judge before making it the default.
 - The daily frontier cap: each sensitive completion adds a claims-stage call, so the workstation runs with 40.
-- `presence_penalty` for Qwen (R5) is still open; the output cap is done (2026-10-03), so a request can no longer run unbounded ([walter/README.md](../walter/README.md#output-cap-no-unbounded-generations)).
+- `presence_penalty` for Qwen (R5) is tuned: 1.5 on `coder-fast` (fewer runaway-reasoning cutoffs), 0 on `coder` and `big` ([BENCHMARKS](../walter/llama-swap/BENCHMARKS.md)); the output cap (2026-10-03) still bounds every request ([walter/README.md](../walter/README.md#output-cap-no-unbounded-generations)).
 
 **Open questions:** which checkpoints justify a frontier call; whether C2 escalations should also reach a phone; whether medium findings that outlive a session should become repo issues.
