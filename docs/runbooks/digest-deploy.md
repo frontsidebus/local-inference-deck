@@ -172,12 +172,21 @@ sudo covenant/deploy.sh --dry-run
 #        + nginx -t, + systemctl reload nginx, + certbot certonly ... -d <digest host> --key-type ecdsa ...
 #   5/7: link sites-enabled/60-digest -> sites-available/60-digest once step 4 has issued the cert
 #   6/7: oauth2-proxy-digest config + unit staged
+#   The dry run shows a diff only for files that already exist, so it never shows the new digest
+#   cfg. Check its client_id by rendering the template yourself (render.sh refuses it while
+#   DIGEST_GROUP is unset, because that default lives in deploy.sh):
+#     ( export DIGEST_GROUP=${DIGEST_GROUP:-digest-viewers}
+#       envsubst '${DIGEST_GROUP} ${OAUTH2_PROXY_DIGEST_CLIENT_ID} ${SPARK_DIGEST_HOST} ${SPARK_ID_HOST}' \
+#         <covenant/oauth2-proxy/oauth2-proxy-digest.cfg.tmpl | grep '^client_id' )
+#     expected: client_id = "<the id that the step 3 /meta probe answers 200 for>"
 # 6b. deploy: stub -> cert -> full site in one run
 sudo covenant/deploy.sh
 #   4/7: the same lines, then certbot's "Successfully received certificate"
 #   5/7: link /etc/nginx/sites-enabled/60-digest -> /etc/nginx/sites-available/60-digest
 #        remove /etc/nginx/sites-available/60-digest-acme
 #   expected warning: oauth2-proxy-digest NOT started: /etc/oauth2-proxy-digest/client-secret missing
+#   From here until 6c the full site is public and answers 500 (its auth subrequest cannot reach
+#   :4181; fail-closed). Run 6c right away.
 readlink /etc/nginx/sites-enabled/60-digest                                     # expected: /etc/nginx/sites-available/60-digest
 sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST" | grep 'Key Type'   # expected: Key Type: ECDSA
 # 6c. re-check the client id first (step 3: the /meta probe must answer 200). A wrong id is
