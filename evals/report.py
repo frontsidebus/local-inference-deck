@@ -74,7 +74,7 @@ def summarize(run_dir: Path) -> Dict[str, Any]:
     for rid, r in resp.items():
         s = suites.setdefault(r["suite"], {
             "n_items": 0, "n_scored": 0, "passed": 0, "value_sum": 0.0, "api_errors": 0, "truncated": 0,
-            "unparsed": 0, "item_or_grader_errors": 0, "latency_sum": 0.0, "n_latency": 0,
+            "unparsed": 0, "item_or_grader_errors": 0, "final_answer_prompts": 0, "latency_sum": 0.0, "n_latency": 0,
             "completion_tokens": 0, "prompt_tokens": 0, "gen_seconds": 0.0, "scorers": {}, "model_graded": False,
             "cost_usd": 0.0, "n_err_metric": 0, "err_sum": 0.0,
         })
@@ -105,6 +105,8 @@ def summarize(run_dir: Path) -> Dict[str, Any]:
             continue
         if st == "unparsed":
             s["unparsed"] += 1
+        if sc.get("final_answer_prompt"):
+            s["final_answer_prompts"] += 1
         s["n_scored"] += 1
         s["passed"] += 1 if sc.get("passed") else 0
         if sc.get("scorer") in ERROR_METRICS:  # an error (lower is better), not a score: kept apart
@@ -160,6 +162,7 @@ def rows(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "mean_score": st["mean_value"], "mae": st["mae"], "mean_latency_s": st["mean_latency_s"],
                 "tokens_per_s": st["tokens_per_s"], "api_errors": st["api_errors"], "truncated": st["truncated"],
                 "unparsed": st["unparsed"], "item_or_grader_errors": st["item_or_grader_errors"],
+                "final_answer_prompts": st.get("final_answer_prompts", 0),
                 "model_graded": st["model_graded"], "cost_usd": st["cost_usd"],
             })
     return out
@@ -180,8 +183,8 @@ def render_markdown(summaries: List[Dict[str, Any]], title: str = "Eval report")
     graded = False
     for suite in sorted({n for s in summaries for n in s["suites"]}):
         lines += [f"## {suite}", "",
-                  "| Run | n | Passed | Accuracy | 95% CI | Mean score | Latency (s) | Tok/s | api / trunc / unparsed / item |",
-                  "|---|---|---|---|---|---|---|---|---|"]
+                  "| Run | n | Passed | Accuracy | 95% CI | Mean score | Latency (s) | Tok/s | api / trunc / unparsed / item | final-answer prompts |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
         for row in [x for x in rows(summaries) if x["suite"] == suite]:
             acc = "-" if row["accuracy"] is None else f"{row['accuracy']:.1%}"
             ci = "-" if row["accuracy"] is None else f"{row['ci95_lo']:.1%} – {row['ci95_hi']:.1%}"
@@ -196,7 +199,8 @@ def render_markdown(summaries: List[Dict[str, Any]], title: str = "Eval report")
                 graded = True
             lines.append(f"| {row['run']} | {row['n']} | {row['passed']} | {acc} | {ci} | {ms} | "
                          f"{_fmt(row['mean_latency_s'], '.2f')} | {_fmt(row['tokens_per_s'], '.1f')} | "
-                         f"{row['api_errors']} / {row['truncated']} / {row['unparsed']} / {row['item_or_grader_errors']} |")
+                         f"{row['api_errors']} / {row['truncated']} / {row['unparsed']} / {row['item_or_grader_errors']} | "
+                         f"{row.get('final_answer_prompts', 0)} |")
         lines.append("")
     lines += ["## Notes", ""]
     if graded:

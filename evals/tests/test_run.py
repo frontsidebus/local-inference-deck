@@ -60,6 +60,8 @@ class FakeGateway:
         user = body["messages"][-1]["content"]
         if "Candidate answer" in user:  # grader call
             return '{"grade": "PASS", "score": 7, "reason": "ok"}'
+        if user.startswith("Stop here. Reply with only your final answer"):  # final-answer follow-up
+            return "Answer: A"
         if "Strict-Transport-Security" in user:
             return "Answer: B"
         return "Answer: no idea"
@@ -86,7 +88,7 @@ def env(tmp_path):
 
 def base_args(env, gw, *extra):
     return ["--key-file", env["key"], "--site-env", env["site"], "--results", env["results"],
-            "--base-url", gw.url, "--backoff", "0", "--run-name", "t1", *extra]
+            "--base-url", gw.url, "--backoff", "0", "--run-name", "t1", "--no-final-answer", *extra]
 
 
 def run_dir(env, name):
@@ -413,3 +415,39 @@ def test_data_dir_layout_skips_samples_and_records_provenance(tmp_path):
     assert ds[0]["provenance"]["ctibench-mcq"]["license"] == "CC-BY-NC-SA-4.0"
     # a sample file can still be named explicitly
     assert RUN.resolve_suite_paths([str(tmp_path / "ctibench-mcq.sample50.jsonl")])
+
+
+def test_final_answer_followup_for_unparsable_mcq(env):
+    """An mcq reply with no parsable letter gets one short follow-up asking for the answer line; the item is
+    scored on it and flagged, and the report counts it."""
+    gw = FakeGateway()
+    try:
+        args = ["--key-file", env["key"], "--site-env", env["site"], "--results", env["results"],
+                "--base-url", gw.url, "--backoff", "0", "--run-name", "fa",
+                "--suite", str(SAMPLES / "mcq.jsonl"), "--model", "coder-fast", "--limit", "3"]
+        assert RUN.main(args) == 0
+    finally:
+        gw.close()
+    followups = [r for r in gw.requests
+                 if r["messages"][-1]["content"].startswith("Stop here. Reply with only your final answer")]
+    assert followups, "expected at least one final-answer follow-up"
+    for r in followups:
+        assert r["max_tokens"] == 32
+        assert r["messages"][-2]["role"] == "assistant"
+    scores = [json.loads(l) for l in (run_dir(env, "fa-coder-fast") / "scores.jsonl").read_text().splitlines()]
+    flagged = [s for s in scores if s.get("final_answer_prompt")]
+    assert len(flagged) == len(followups)
+    assert all(s["status"] != "unparsed" for s in flagged)
+    summary = json.loads((run_dir(env, "fa-coder-fast") / "summary.json").read_text())
+    assert summary["totals"]["final_answer_prompts"] == len(followups)
+    assert "final-answer prompts" in (run_dir(env, "fa-coder-fast") / "report.md").read_text()
+
+
+def test_final_answer_followup_off_and_not_for_frontier_or_freeform(env):
+    gw = FakeGateway()
+    try:
+        assert RUN.main(base_args(env, gw, "--suite", str(SAMPLES / "freeform.jsonl"), "--model", "coder-fast",
+                                  "--limit", "2", "--no-grade")) == 0
+    finally:
+        gw.close()
+    assert not [r for r in gw.requests if r["messages"][-1]["content"].startswith("Stop here.")]

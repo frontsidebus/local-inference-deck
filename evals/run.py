@@ -652,12 +652,42 @@ class Run:
             "raw": data,
         })
 
+    FINAL_ANSWER_PROMPT = ("Stop here. Reply with only your final answer as a single line of the form "
+                           "'Answer: X'. No explanation.")
+
+    def final_answer(self, item: Dict[str, Any], rec: Dict[str, Any], scorer_table) -> None:
+        """One short follow-up for an mcq/classify reply that was cut off or had no parsable answer (the model
+        ran out of tokens while reasoning in the open). The original reply is kept in ``content_before_final``;
+        the follow-up's line is appended to ``content``, and the item is flagged ``final_answer_prompt`` so
+        reports can show how many scores depended on it. Local models only; off with --no-final-answer."""
+        if self.frontier or self.args.no_final_answer or item["type"] not in ("mcq", "classify") or rec.get("error"):
+            return
+        sc = S.score_item(rec.get("content") or "", item, scorer_table)
+        if rec.get("finish_reason") != "length" and sc.status != "unparsed":
+            return
+        msgs = build_messages(item) + [{"role": "assistant", "content": rec.get("content") or ""},
+                                       {"role": "user", "content": self.FINAL_ANSWER_PROMPT}]
+        body = self.request_body(item, msgs)
+        body["max_tokens"] = 32
+        try:
+            data = self.client.chat(body)
+            ans = ((data["choices"][0].get("message") or {}).get("content") or "").strip()
+        except Exception as exc:  # the original reply stands; the item is scored as it was
+            rec["final_answer_error"] = str(exc)[:200]
+            return
+        rec["content_before_final"] = rec.get("content") or ""
+        rec["final_answer"] = ans
+        rec["final_answer_prompt"] = True
+        rec["content"] = (rec.get("content") or "") + "\n" + ans
+
     def score(self, rec: Dict[str, Any], scorer_table) -> Dict[str, Any]:
         item = self.by_id[rec["id"]]
         sc = S.score_item(rec.get("content") or "", item, scorer_table)
         d = {"id": rec["id"], "suite": rec["suite"], "scorer": item["scorer"], **sc.to_dict()}
         if item["scorer"] == "llm_judge":
             d["model_graded"] = sc.status == "ok"
+        if rec.get("final_answer_prompt"):
+            d["final_answer_prompt"] = True
         return d
 
     def generate(self) -> Dict[str, int]:
@@ -673,6 +703,7 @@ class Run:
             if self.frontier and self.args.frontier_max_usd and self.cost_usd >= self.args.frontier_max_usd:
                 self.stop.set()
             rec = self.call(it)
+            self.final_answer(it, rec, table)
             self._append("responses.jsonl", rec)
             if not rec.get("error") and it["scorer"] != "llm_judge":
                 self._append("scores.jsonl", self.score(rec, table))
@@ -728,6 +759,7 @@ class Run:
         tot = {k: sum(s[k] for s in summ["suites"].values()) for k in
                ("n_items", "n_scored", "passed", "api_errors", "truncated", "unparsed", "item_or_grader_errors",
                 "completion_tokens", "prompt_tokens")}
+        tot["final_answer_prompts"] = sum(s.get("final_answer_prompts", 0) for s in summ["suites"].values())
         tot["cost_usd"] = round(sum(s["cost_usd"] for s in summ["suites"].values()), 4)
         out = {"schema": SCHEMA, "run_dir": self.dir.name, "model": self.model, "thinking": self.config["thinking"],
                "started": self.config["started"], "ended": self.config["ended"], "totals": tot,
@@ -834,6 +866,8 @@ def parse_args(argv: Optional[List[str]] = None):
     g.add_argument("--grader-model", default="big", help="gateway alias that grades llm_judge items (default big)")
     g.add_argument("--grader-prompt", default=str(GRADER_PROMPT))
     g.add_argument("--no-grade", action="store_true", help="leave llm_judge items ungraded")
+    g.add_argument("--no-final-answer", action="store_true",
+                   help="do not ask for a final answer line after a cut-off or unparsable mcq/classify reply")
     g.add_argument("--grader-max-chars", type=int, default=12000, help="candidate text sent to the grader")
     f = ap.add_argument_group("frontier baseline (off unless --model claude)")
     f.add_argument("--yes-frontier", action="store_true", help="confirm the estimated frontier cost")
