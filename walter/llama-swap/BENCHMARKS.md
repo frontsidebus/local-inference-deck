@@ -22,3 +22,32 @@ Correctness, checked with n-max 2:
 - Anthropic `/v1/messages` streaming with thinking: first event after 0.32 s, with both a thinking block and a text block, and the event sequence was well formed.
 
 Decision: **keep MTP with `--spec-type draft-mtp --spec-draft-n-max 2`**. Decode speed went up 74-83%, with no correctness regression and the full 131072 context kept, at a cost of about 1.3 GB of VRAM (about 1.9 GB headroom left). n-max 3 was within noise on the mean (about 1.5%). It was worse on the low-acceptance cases (prose, and refactor with thinking on) and used more VRAM, so n-max 2 is the better choice.
+
+## 2026-10-05: tensor split for `hermes` and `vision` (after the x8/x8 riser)
+
+Setup: llama.cpp b11277 (pinned digest), both 3090s at PCIe Gen4 x8 on CPU root ports, no P2P (GeForce under vfio), so NCCL uses its SHM transport through host memory. Each run used a transient container on `127.0.0.1:18080`, with the production args and image; llama-swap had everything unloaded. Only the split flags differed: `-sm layer -ts 1,1` against `-sm tensor` plus `--shm-size 2g`. Throughput comes from raw `/completion` with exact token-id prompts of Python stdlib source, `cache_prompt=false`, temperature 0, `ignore_eos`, 128 generated tokens and one warm-up request first. The values are llama-server `timings`, in tokens/s.
+
+| model | split | pp 512 | pp 8k | pp 32k | tg @512 | tg @8k | tg @32k | VRAM GPU0 / GPU1 (MiB) |
+|---|---|---|---|---|---|---|---|---|
+| vision (gemma-4-31b + mmproj) | layer | 1198 | 1990 | 1800 | 39.5 | 36.1 | 29.7 | 14 448 / 13 366 |
+| vision | **tensor** | 1398 (+17 %) | 1592 (−20 %) | 1405 (−22 %) | **54.7 (+39 %)** | **51.3 (+42 %)** | **43.6 (+47 %)** | 14 634 / 13 336 |
+| hermes (hermes-4.3-36b) | layer | 1156 | 1587 | — | 34.4 | 27.0 | — | 15 550 / 15 318 |
+| hermes | **tensor** | 1342 (+16 %) | 1225 (−23 %) | — | **50.4 (+47 %)** | **41.4 (+53 %)** | — | 15 338 / 15 338 |
+| hermes, riser test (same day) | layer / tensor | 1182 / 1461 | 1625 / 1270 | 1044 / 874 | 34.5 / 50.7 | 27.2 / 41.9 | 16.0 / 26.1 | 60k needle: pp 728 / 643, tg 10.8 / 18.0 |
+
+Load time, measured from `docker run` to the first `/health` 200:
+
+| model | split | warm page cache | cold (`drop_caches`) |
+|---|---|---|---|
+| vision | layer | 4.5 s | 10.4 s |
+| vision | tensor | 3.4, 4.6, 4.4, 4.9 s | 11.6 s |
+| hermes | layer | 4.3, 5.7 s | 12.1 s |
+| hermes | tensor | 4.8, 4.8, 4.6, 4.8 s | 12.4 s |
+
+Correctness and stability:
+- Tensor split was loaded 3 times per model. Every load answered `17*23` and `TENSOR-OK` correctly, and wrote an `is_prime` that passed 10 test values.
+- Vision also passed the image test every time. The image was an 800×500 PNG with "TENSOR-OK 57" above a green triangle, a red circle and a blue square, and the model returned the exact text and the shapes, colours and order correctly. Image requests took 3.0–3.3 s, against 3.9 s with layer split, with 205 prompt tokens and tg 52–55 t/s against 39.9.
+- A 32k needle test on vision with tensor split was correct.
+- The container logs had no error lines. Walter's `dmesg` had no new Xid, NVRM or AER lines, only docker veth messages.
+
+Decision: **`hermes` and `vision` use `-sm tensor`**. `vision` traffic is mostly short prompts with an image and a long, thinking-heavy answer, so decode dominates. The prompt-processing loss shows only on prompts of 8k tokens and above. `big` stays on layer split: tensor gave −7 to +8 % decode and −15 % prompt processing on its 3B-active MoE (riser test). Row split (`-sm row`) does not load on b11277 ("does not support split buffers"). Tensor split is experimental upstream, so re-run this check after every image bump. The fallback is in the comments above each model in `config.yaml.tmpl`.

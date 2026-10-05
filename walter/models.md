@@ -24,5 +24,8 @@ Notes
 - `coder` uses llama.cpp's built-in MTP head (`--spec-type draft-mtp --spec-draft-n-max 2`). The
   Qwen3.8 GGUF embeds it, so no separate draft model is needed. See `llama-swap/BENCHMARKS.md`.
 - Qwen and Gemma think by default. A small `max_tokens` can return empty content.
+- Split modes: `big` uses layer split (`-sm layer -ts 1,1`); `hermes` and `vision` use llama.cpp's experimental
+  tensor split (`-sm tensor`, plus `--shm-size 2g` for the container through the `${tp}` macro), which gave them
+  +39–67 % decode. Numbers and the fallback are in `llama-swap/BENCHMARKS.md`.
 - The llama.cpp image is pinned by digest in `config.yaml.tmpl` (build 11277). Change model
   files and the image together and re-run the checks in `BENCHMARKS.md`.

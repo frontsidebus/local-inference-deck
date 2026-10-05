@@ -12,4 +12,4 @@ The host that runs Walter is managed outside this repo, by a separate (private) 
 | BIOS set to power on after AC loss | Unattended recovery; see [power-loss runbook](../docs/runbooks/power-loss-recovery.md). |
 | A libvirt NAT bridge (`${HYPERVISOR_BRIDGE_IP}`) | Walter's LAN path, and where the optional workstation `hermes-gateway` listens. |
 
-Lessons from the current hardware: one GPU sits in a chipset PCIe x1 slot and there's no NVLink, so tensor parallelism is ruled out. Models are placed one per GPU or layer-split. See [ARCHITECTURE](../ARCHITECTURE.md).
+Lessons from the current hardware: since the x8/x8 bifurcation riser (2026-10-05) both GPUs are PCIe Gen4 x8 on CPU root ports (before it, the second GPU sat in a chipset x1 slot). There is no NVLink and no P2P between GeForce cards under vfio, so llama.cpp's experimental tensor split goes through host shared memory; it pays off only for the dense split models. Models are placed one per GPU, layer-split or tensor-split. See [ARCHITECTURE](../ARCHITECTURE.md).

@@ -146,15 +146,15 @@ internet | Covenant (ufw, fail2ban, nginx allowlist + limits) | wg0 | Walter (DO
 
 ## llama-swap matrix and GPU placement
 
-GPU0 sits on the CPU's x16 slot; GPU1 sits on a chipset x1 slot. Single-GPU models are pinned with `--gpus device=N -sm none`; split models use `-sm layer -ts 1,1`. Every model runs `--fit off -ngl all -np 1 -fa on -ctk q8_0 -ctv q8_0 --jinja --metrics`, so a model that does not fit fails at load instead of shrinking.
+Both GPUs are PCIe Gen4 x8 on CPU root ports (x8/x8 bifurcation riser, since 2026-10-05; before it GPU1 was on a chipset x1 slot). Single-GPU models are pinned with `--gpus device=N -sm none`. `big` uses `-sm layer -ts 1,1`. The dense split models `hermes` and `vision` use llama.cpp's experimental tensor split, `-sm tensor`, plus the `${tp}` macro (`--shm-size 2g`) on the docker side: with no P2P, NCCL allreduces through host shared memory, and Docker's default 64 MB `/dev/shm` crashes it. Tensor split gave them +39–67 % decode for 12–23 % slower prompt processing on long prompts ([BENCHMARKS](walter/llama-swap/BENCHMARKS.md)). To fall back, drop `${tp}` and put back `-sm layer -ts 1,1`. Every model runs `--fit off -ngl all -np 1 -fa on -ctk q8_0 -ctv q8_0 --jinja --metrics`, so a model that does not fit fails at load instead of shrinking.
 
 | Model ID | Alias | GPU | Context | Extra |
 |---|---|---|---|---|
 | `qwen3.8-27b` | `coder` | 0 | 131072 | MTP: `--spec-type draft-mtp --spec-draft-n-max 2` (22.6 GB) |
 | `qwen3.6-35b-a3b` | `coder-fast` | 1 | 131072 | |
 | `qwen3-coder-next` | `big` | 0+1 | 131072 | `ttl` 1800 s, evict cost 5 |
-| `gemma-4-31b` | `vision` | 0+1 | 131072 | `--mmproj`, `--ctx-checkpoints 8`, `ttl` 1800 s |
-| `hermes-4.3-36b` | `hermes` | 0+1 | 65536 | `ttl` 1800 s |
+| `gemma-4-31b` | `vision` | 0+1 | 131072 | `-sm tensor`, `--mmproj`, `--ctx-checkpoints 8`, `ttl` 1800 s |
+| `hermes-4.3-36b` | `hermes` | 0+1 | 65536 | `-sm tensor`, `ttl` 1800 s |
 
 Matrix sets (which models may be resident together):
 
@@ -165,7 +165,7 @@ Matrix sets (which models may be resident together):
 | `vision` | `vision` | Evicts the pair. |
 | `hermes` | `hermes` | Evicts the pair. |
 
-The `big` model has an eviction cost of 5 because loading it moves about 40 GB, half of it over the x1 link. After a split model unloads, the next `coder` or `coder-fast` request reloads the pair (about 9 s and 16 s).
+The `big` model has an eviction cost of 5 because loading it reads about 40 GB: about 20 s from a cold page cache, 7 s warm. After a split model unloads, the next `coder` or `coder-fast` request reloads the pair (about 10 s and 12 s cold).
 
 Each model runs as a llama.cpp `server-cuda` container pinned by digest. Containers start through `spark-docker-run.sh`, which waits until the previous container of the same name is gone. Without it, a config reload raced the old container's removal and left both models down until the next request. `cmdStop` uses `docker rm -f` because it is synchronous.
 
@@ -226,7 +226,8 @@ How to act on the report: [docs/runbooks/upgrade.md](docs/runbooks/upgrade.md).
 - Qwen and Gemma think by default. A small `max_tokens` returns empty content; clients need a bigger budget or `enable_thinking: false`.
 - Output is never unbounded: the gateway sets `max_tokens` 16384 when a request has none and clamps larger values to the model's maximum (32768 or 16384). A long thinking answer can end with `finish_reason: length`; ask for more explicitly, up to the maximum.
 - The startup preload logs `status 404` for each model, yet both models load and stay warm. Harmless; cause unknown.
-- Loads over the x1 link are slow: `coder-fast` ~16 s, `big` ~20 s.
+- Cold loads are disk-bound (about 2.8 GB/s): `coder-fast` ~12 s, `hermes` and `vision` ~10–12 s, `big` ~20 s. The 112 GB of models do not fit in Walter's page cache, so cycling through every set keeps loads cold; swapping back to a set just used takes 4–7 s.
+- `hermes` and `vision` run llama.cpp's **experimental** tensor split. If either misbehaves after an image bump (crash at the first request, `ncclGroupEnd` errors, wrong output), fall back to layer split as described in [the matrix section](#llama-swap-matrix-and-gpu-placement).
 
 **LiteLLM**
 - In LiteLLM 1.103.x, `openai/` deployments route `/v1/messages` through the Responses adapter, which drops llama-server's reasoning. Every alias therefore sets `model_info.supported_endpoints: ["/v1/chat/completions","/v1/responses","/v1/messages"]`, so Messages pass straight through to llama-server. Keep this on new aliases.

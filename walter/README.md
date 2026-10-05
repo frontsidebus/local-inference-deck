@@ -67,7 +67,8 @@ Templates of installed docs (`*.md.tmpl`) render to the host copy of the doc.
 ## Prerequisites
 
 - Fresh Ubuntu 24.04 VM, two NVIDIA GPUs passed through (live: 2x RTX 3090, 16 vCPU, 80 GiB RAM).
-  GPU0 should be the faster PCIe link: single-GPU models are pinned by index in `config.yaml.tmpl`.
+  Single-GPU models are pinned by index in `config.yaml.tmpl`. Live, both GPUs are PCIe Gen4 x8 on CPU root
+  ports. If one link is slower, make it GPU1. Tensor split (hermes, vision) needs a reasonably fast link on both GPUs.
 - A second disk for models and backups (live: a raw NVMe given to the VM as `virtio-models-990pro`).
   Format it once, by stable path, and put its UUID in `site.env`:
   ```bash

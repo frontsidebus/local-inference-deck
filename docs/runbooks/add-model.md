@@ -4,8 +4,8 @@ The path is: GGUF on disk → llama-swap entry → matrix set → LiteLLM alias 
 
 ## 0. Will it fit?
 
-- **One GPU (24 GB):** weights + KV cache + compute buffers must fit with about 1–2 GB headroom. With `-ctk q8_0 -ctv q8_0`, KV is about half of f16. Every entry runs `--fit off`, so a model that does not fit fails at load instead of quietly shrinking its context. Prefer GPU0 (x16) for a model that will be loaded and unloaded often; GPU1 is on an x1 link and loads slowly.
-- **Both GPUs (48 GB):** use `-sm layer -ts 1,1`. Never tensor parallel (`-sm row`): there is no NVLink or P2P and GPU1 is on x1.
+- **One GPU (24 GB):** weights + KV cache + compute buffers must fit with about 1–2 GB headroom. With `-ctk q8_0 -ctv q8_0`, KV is about half of f16. Every entry runs `--fit off`, so a model that does not fit fails at load instead of quietly shrinking its context. Both GPUs are on PCIe Gen4 x8 links, so either loads at 10–13 GB/s; cold loads are limited by the models disk, not the link.
+- **Both GPUs (48 GB):** start with `-sm layer -ts 1,1`. For a **dense** model, also benchmark `-sm tensor` (experimental in llama.cpp) with `--shm-size 2g` on the docker side, as `hermes` and `vision` do: it gave them +39–67 % decode at the cost of 12–22 % prompt processing on long prompts. It does nothing for a 3B-active MoE such as `big`. Without the larger `/dev/shm` the container crashes at the first allreduce. `-sm row` does not load at all on the pinned build ("does not support split buffers").
 - Ampere has no FP8. Use GGUF quants (Q4_K_M, UD-Q4_K_XL, IQ4_NL and so on).
 - The model's chat template must work with `--jinja` and tool calling, or harnesses will fail. Check the model card for llama.cpp support.
 
@@ -27,7 +27,7 @@ Use a lowercase, version-specific `<model-id>` (e.g. `qwen3.8-27b`). It becomes 
 Edit the llama-swap config in [walter/](../../walter/README.md) (deployed to `/etc/llama-swap/config.yaml`). Copy the closest existing entry and change:
 
 - `name`, `aliases` (only if it takes over an existing alias), the `-m` path and `--mmproj` if any;
-- `--gpus "\"device=N\""` and `-sm none` for one GPU, or `device=0,1` and `-sm layer -ts 1,1` for a split;
+- `--gpus "\"device=N\""` and `-sm none` for one GPU, or `device=0,1` and `-sm layer -ts 1,1` for a split (or `${tp}` before `${image}` plus `-sm tensor`, see above);
 - `-c` (context), sampling defaults from the model card;
 - `capabilities` (`in`, `tools`, `context`);
 - `ttl: 1800` for a split model, so it frees both GPUs when idle.
@@ -40,7 +40,7 @@ Add a variable under `routing.router.settings.matrix.vars` and put it in a set:
 
 - a single-GPU model that should coexist with the coding pair needs a set that does not over-commit that GPU (e.g. `"c & n"` if it replaces `coder-fast` on GPU1);
 - a split model gets its own set (e.g. `newbig: "n"`), which evicts the pair;
-- add an `evict_costs` entry if it is slow to load (large weights over the x1 link).
+- add an `evict_costs` entry if it is slow to load (large weights: about 2.8 GB/s from a cold models disk).
 
 ## 4. Reload and test llama-swap
 
