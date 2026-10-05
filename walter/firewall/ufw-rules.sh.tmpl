@@ -1,5 +1,6 @@
 #!/bin/sh
-# ufw-rules.sh -- Walter's host firewall (INPUT). Idempotent: ufw skips rules that exist.
+# ufw-rules.sh -- Walter's host firewall (INPUT). Idempotent and safe to re-run: ufw skips rules
+# that exist, and the legacy SSH rule is deleted only while it is present.
 # Installed to /usr/local/sbin/ufw-rules.sh and run by walter/deploy.sh.
 #
 # Docker-published ports (3000 Open WebUI, 1411 Pocket-ID, 4000 LiteLLM) never reach INPUT
@@ -12,8 +13,31 @@ ufw --force default allow outgoing
 ufw --force default deny routed
 ufw logging low
 
-# SSH (LAN / hypervisor bridge access for the operator)
-ufw allow 22/tcp
+# SSH: only from the hypervisor bridge subnet (the workstation) and from the edge over wg0.
+# sshd itself keeps listening on all addresses; this firewall scoping is the control.
+# Order matters for lockout safety: the scoped allows are added first, and the legacy
+# "allow 22/tcp" (from anywhere, v4 + v6) is deleted only after both exist.
+# The LAN subnet is the kernel route of BACKEND_LAN_IF (e.g. 192.168.122.0/24), so it follows
+# the bridge without a separate setting. If it cannot be found, or it does not contain
+# HYPERVISOR_BRIDGE_IP (the workstation), the script stops here and changes no SSH rule.
+SSH_LAN_IF='${BACKEND_LAN_IF}'
+SSH_WORKSTATION_IP='${HYPERVISOR_BRIDGE_IP}'
+ssh_lan_net=$(ip -4 -o route show dev "$SSH_LAN_IF" scope link proto kernel | awk 'NR==1 {print $1}')
+if [ -z "$ssh_lan_net" ]; then
+  echo "ufw-rules: no IPv4 subnet on $SSH_LAN_IF; refusing to change the SSH rules" >&2
+  exit 1
+fi
+if ! python3 -c 'import ipaddress, sys; sys.exit(ipaddress.ip_address(sys.argv[1]) not in ipaddress.ip_network(sys.argv[2]))' \
+     "$SSH_WORKSTATION_IP" "$ssh_lan_net"; then
+  echo "ufw-rules: $SSH_WORKSTATION_IP is not in $ssh_lan_net ($SSH_LAN_IF); refusing to change the SSH rules" >&2
+  exit 1
+fi
+ufw allow in on "$SSH_LAN_IF" proto tcp from "$ssh_lan_net" to any port 22 comment 'ssh: hypervisor bridge (workstation)'
+ufw allow in on wg0 proto tcp from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 22 comment 'ssh: covenant over wg0 (break-glass)'
+# Legacy rule from earlier versions: remove it once, after the scoped allows above exist.
+if ufw show added | grep -qx 'ufw allow 22/tcp'; then
+  ufw --force delete allow 22/tcp
+fi
 
 # LiteLLM containers (gateway compose network, pinned subnet) -> llama-swap on the WG address
 ufw allow proto tcp from ${GATEWAY_DOCKER_SUBNET} to ${BACKEND_WG_IP} port 8080 comment 'litellm gateway -> llama-swap'
