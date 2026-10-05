@@ -254,18 +254,17 @@
 
     const p = g.pcie;
     const pc = f("pcie");
+    // label/level/title are decided server-side (main.py pcie_describe); nothing is assumed about the slot here.
     if (p) {
-      const gen = p.gen ? `Gen${p.gen} ` : "";
-      let txt = `PCIe ${gen}x${p.width}`;
-      let title = `Link: ${p.speed} x${p.width} (device max Gen${p.max_gen} x${p.max_width}).`;
-      if (p.width < p.max_width) {
-        txt += " · chipset slot";
-        title += " Slot is x1 by design (chipset lane); expected, not a fault.";
-      }
-      if (p.gen && p.max_gen && p.gen < p.max_gen) title += " Link speed drops at idle (power saving) and rises under load.";
-      setText(pc, txt);
-      pc.title = title;
-    } else setText(pc, "PCIe n/a");
+      setText(pc, p.label || `PCIe ${p.gen ? `Gen${p.gen} ` : ""}x${p.width}`);
+      pc.title = p.title || "PCIe link";
+      pc.classList.toggle("chip-note", p.level === "info");
+      pc.classList.toggle("chip-warn", p.level === "warn");
+    } else {
+      setText(pc, "PCIe n/a");
+      pc.title = "PCIe link: not readable";
+      pc.classList.remove("chip-note", "chip-warn");
+    }
 
     const mw = f("models");
     const ids = (g.models || []).map((id) => {
