@@ -15,7 +15,11 @@ Every item has a status:
   --needs-human          only HIGH items no human has closed: open or agent-acked (implies --items)
   --min-severity LEVEL   low|medium|high (default low)
   --since HOURS          only findings created in the last HOURS (default 168; 0 = all)
-  --json                 machine-readable output (each item gets "acked", "status" and "ack")
+  --json                 machine-readable output (each item gets "acked", "status" and "ack"; R8 items keep
+                         their "failure_scenario")
+An R8 code-defect item (verdict `defect`) is listed as "verdict=DEFECT (code defect)" with its defect (claim),
+code (the quoted diff lines), failure scenario and recommendation; the one-line summary adds "defect:<n>" to a
+finding that has any.
 Runner health (#41), printed to stderr first: a WARNING when the oldest ready review request has waited longer
 than JUDGE_STALL_MINUTES (default 15) with no runner busy, and when `systemctl --user is-failed` reports a
 judge-review unit failed (skipped when JUDGE_CHECK_UNITS=0 or systemctl is missing). Both print the fix command.
@@ -39,6 +43,13 @@ COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 SEV_COLOR = {"high": "31;1", "medium": "33", "low": "36"}
 STATUS_COLOR = {"open": "1", "agent-acked": "35", "closed": "32"}
 GROUPS = (("open", "open"), ("agent-acked", "agent-acked: awaiting a human"), ("closed", "closed"))
+DEFECT_COLOR = "35;1"
+
+
+def is_defect(it):
+    """An R8 code-correctness item (verdict `defect`, or rubric R8)."""
+    return (str(it.get("verdict") or "").strip().lower() == "defect"
+            or str(it.get("rubric") or "").strip().upper() == "R8")
 
 
 def paint(text, code):
@@ -179,10 +190,18 @@ def main(argv):
                 continue
             print(paint(f"== {title} ({len(group)}) ==", STATUS_COLOR[status]))
             for rid, f, it in group:
-                print(f"  {rid} {it.get('id')} {sev(it.get('severity'))} {it.get('rubric')} "
-                      f"verdict={it.get('verdict')}  [{f.get('mode')} {f.get('judge')}]")
-                print(f"     claim: {it.get('claim')}")
-                print(f"     evidence: {it.get('evidence')}")
+                if is_defect(it):
+                    print(f"  {rid} {it.get('id')} {sev(it.get('severity'))} {it.get('rubric')} "
+                          f"{paint('verdict=DEFECT (code defect)', DEFECT_COLOR)}  [{f.get('mode')} {f.get('judge')}]")
+                    print(f"     defect: {it.get('claim')}")
+                    print(f"     code: {it.get('evidence')}")
+                    if str(it.get("failure_scenario") or "").strip():
+                        print(f"     failure scenario: {it.get('failure_scenario')}")
+                else:
+                    print(f"  {rid} {it.get('id')} {sev(it.get('severity'))} {it.get('rubric')} "
+                          f"verdict={it.get('verdict')}  [{f.get('mode')} {f.get('judge')}]")
+                    print(f"     claim: {it.get('claim')}")
+                    print(f"     evidence: {it.get('evidence')}")
                 print(f"     recommendation: {it.get('recommendation')}")
                 if it.get("ack"):
                     print(describe_ack(it))
@@ -203,7 +222,9 @@ def main(argv):
         by_status = {s: sum(1 for i in items if i["status"] == s) for s, _ in GROUPS}
         parts = " ".join(paint(f"{s[0].upper()}:{counts[s]}", SEV_COLOR[s] if counts[s] else "") for s in counts)
         st = " ".join(paint(f"{s}:{n}", STATUS_COLOR[s] if n and s != "closed" else "") for s, n in by_status.items())
-        print(f"{rid:<44} {f.get('mode', '?'):<15} {parts}  {st}")
+        defects = sum(1 for i in items if is_defect(i))
+        extra = "  " + paint(f"defect:{defects}", DEFECT_COLOR) if defects else ""
+        print(f"{rid:<44} {f.get('mode', '?'):<15} {parts}  {st}{extra}")
     return 0
 
 

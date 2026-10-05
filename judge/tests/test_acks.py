@@ -237,3 +237,66 @@ def test_judge_findings_groups_and_needs_human(env):
     nh = json.loads(cli(env, FINDINGS, "--needs-human", "--json").stdout)
     assert nh[0]["items"] == []
     assert "(no items)" in cli(env, FINDINGS, "--needs-human").stdout
+
+
+# ------------------------------------------------------------------ R8 code-defect items
+R8RID = "20261003T040000Z-fdc8ec-completion"
+SCN = "POST /run returns id A; the files are written as id B; GET /runs/A then returns 404."
+
+
+def r8_item(iid="D1", sev="medium"):
+    return {"id": iid, "rubric": "R8", "severity": sev, "claim": "run id differs between main and pipeline",
+            "evidence": "app/main.py:178: `run_id = make_id(now())`", "verdict": "defect",
+            "failure_scenario": SCN, "recommendation": "pass the id through"}
+
+
+@pytest.fixture
+def r8env(env):
+    q.write_finding({"request": R8RID, "judge": "m", "created": q.utc_now_iso(), "mode": "frontier",
+                     "items": [r8_item("D1"), r8_item("D2", "high"), item("M9", "medium")]})
+    return env
+
+
+def test_finding_md_shows_failure_scenario(r8env):
+    md = (r8env["review"] / "findings" / f"{R8RID}.md").read_text()
+    assert "verdict defect" in md and f"**Failure scenario:** {SCN}" in md
+    assert md.index("**Failure scenario:**") < md.index("**Recommendation:** pass the id through")
+    assert md.count("**Failure scenario:**") == 2  # not for the R1 item
+
+
+def test_judge_findings_r8_item(r8env):
+    out = cli(r8env, FINDINGS, R8RID, extra_env={"NO_COLOR": "1"}).stdout
+    d1 = out[out.index(f"{R8RID} D1"):]
+    d1 = d1[:d1.index("recommendation:")]
+    assert "R8 verdict=DEFECT (code defect)" in d1
+    assert "defect: run id differs" in d1 and "code: app/main.py:178: `run_id = make_id(now())`" in d1
+    assert f"failure scenario: {SCN}" in d1 and "claim:" not in d1
+    m9 = out[out.index(f"{R8RID} M9"):]
+    assert "verdict=false" in m9 and "claim: claim M9" in m9 and "failure scenario" not in m9
+    # compact: 5 lines per R8 item (header, defect, code, scenario, recommendation)
+    assert len(out[out.index(f"{R8RID} D1"):out.index(f"{R8RID} M9")].strip().splitlines()) in (5, 6)
+    summary = cli(r8env, FINDINGS, extra_env={"NO_COLOR": "1"}).stdout
+    line = next(ln for ln in summary.splitlines() if ln.startswith(R8RID))
+    assert line.rstrip().endswith("defect:2")
+    assert "defect:" not in next(ln for ln in summary.splitlines() if ln.startswith(RID))
+    data = json.loads(cli(r8env, FINDINGS, R8RID, "--json").stdout)
+    assert {i["id"]: i.get("failure_scenario") for i in data[0]["items"]} == {"D1": SCN, "D2": SCN, "M9": None}
+
+
+def test_judge_findings_colors_defect_on_tty_only(r8env):
+    out = cli(r8env, FINDINGS, R8RID).stdout  # stdout is a pipe: no colors
+    assert "\033[" not in out and "verdict=DEFECT" in out
+
+
+def test_judge_ack_defect_items(r8env, human_shell):
+    r = cli(r8env, ACK, "--agent", R8RID, "D1", "fixed the run id")
+    assert r.returncode == 0 and "acknowledged" in r.stdout
+    r = cli(r8env, ACK, "--agent", R8RID, "D2", "fixed too")
+    assert r.returncode == 0 and "stays open until a human" in r.stdout
+    data = json.loads(cli(r8env, FINDINGS, R8RID, "--json").stdout)
+    st = {i["id"]: i["status"] for i in data[0]["items"]}
+    assert st == {"D1": "closed", "D2": "agent-acked", "M9": "open"}
+    assert cli(r8env, ACK, R8RID, "D2", "human checked").returncode == 0
+    data = json.loads(cli(r8env, FINDINGS, R8RID, "--json").stdout)
+    assert {i["id"]: i["status"] for i in data[0]["items"]}["D2"] == "closed"
+    assert cli(r8env, ACK, R8RID, "D9", "x").returncode == 2

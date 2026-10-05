@@ -900,8 +900,13 @@ finding/item, 64 usage.
 **`bin/judge-findings`**: `--items` and `<request-id>` views print `== open (n) ==`,
 `== agent-acked: awaiting a human (n) ==`, `== closed (n) ==`, each item with `ack: <actor> <ts>: <reason>`.
 `--needs-human` = only `high` items no human has closed (implies `--items`); `--unacked` = no ack at all. The
-summary line ends `open:N agent-acked:N closed:N`. `--json` items gain `status` and `ack`
-(`{"actor","reason","ts"[,"claimed_actor","legacy"]}` or null); `acked` (any ack) is kept.
+summary line ends `open:N agent-acked:N closed:N`, plus `defect:N` when the finding has R8 items. `--json` items
+gain `status` and `ack` (`{"actor","reason","ts"[,"claimed_actor","legacy"]}` or null); `acked` (any ack) is kept,
+and so is an R8 item's `failure_scenario`. In the item views an R8 item (verdict `defect`, or rubric `R8`) prints as
+`<rid> <id> <SEV> R8 verdict=DEFECT (code defect)  [<mode> <judge>]` followed by `defect: <claim>`,
+`code: <evidence>`, `failure scenario: <failure_scenario>` (when present) and `recommendation:`; other items print
+`claim:`, `evidence:` and `recommendation:`. `judge-ack` and the closure rules make no distinction by verdict.
+`lib/queue.render_finding_md` adds `**Failure scenario:**` before the recommendation, as `run_judge.render_md` does.
 
 ## C5 injection (`hooks/inject.py`)
 Injects unacknowledged items at or above `JUDGE_INJECT_MIN_SEVERITY` (default `medium`) from findings created in
@@ -914,6 +919,27 @@ Items of `mode=local` findings are skipped unless `JUDGE_INJECT_LOCAL=1` (env or
 count goes to `inject.log` only when it changes for the session. `mode=frontier-claims` findings
 (`findings/<id>.claims.json`) are injected like `frontier` ones. The footer names
 `judge-ack --agent <request-id> <item-id> "<reason>"` and says a HIGH item stays open until the human reviews it.
+
+Item format. Each field is flattened to one line (invisible characters removed) and truncated with `…`:
+
+    - [<SEV>] <rubric> finding <request-id> <item-id> (verdict: <verdict>)
+      Claim: <claim, 220>
+      Evidence: <evidence, 260>
+      Recommendation: <recommendation, 220>
+
+An R8 code-correctness item (verdict `defect`, or rubric `R8`) is labelled as a code defect instead:
+
+    - [<SEV>] code defect (R8) finding <request-id> <item-id> (verdict: defect)
+      Defect: <claim, 220>
+      Code: <evidence: the file:line and backticked diff lines, 320>
+      Failure scenario: <failure_scenario, 300; line omitted when the item has none>
+      Recommendation: <recommendation, 200>
+
+R8 items default to `medium`, so the default floor injects them; `JUDGE_INJECT_MIN_SEVERITY=high` leaves out all
+but the security/data-loss ones. The threat scan covers every line, the failure scenario included: a match
+replaces the item's body with `(text withheld: it matched injection pattern <ids>; the human can read
+findings/<rid>.json)`. Quoted code can match a pattern too (for example `curl ... $API_KEY`); it is withheld the
+same way.
 
 **Refusal reminder (bug #39).** With `JUDGE_INJECT_REFUSAL_REMINDER=1` (env or site.env; default `1`), when the
 session's LATEST `gate.log` decision (`approve` or `block`) is a refused one (a `block`, or an `approve` whose call
