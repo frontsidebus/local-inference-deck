@@ -10,6 +10,7 @@ covenant/    edge: nginx sites/snippets, oauth2-proxy, fail2ban, ufw, wireguard,
 clients/     workstation harness wrappers/configs (claude/codex/hermes/opencode) + hermes-gateway
 judge/       agent judge: gates, evidence collector and reviewer for a local agent (self-contained; see judge/CONTRACT.md)
 hypervisor/  requirements for the host layer (managed in a separate IaC project)
+evals/       security eval harness (run.py, scorers, report); benchmark data and results are gitignored
 docs/        decisions, agent-judge design, runbooks, history (old Ollama-era docs live in docs/history/)
 scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh
 site.env.example
