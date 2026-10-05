@@ -749,7 +749,24 @@ exit 64, no execution.
   entirely in `not_secret_names`. Otherwise it passes. The reason names the secret-shaped word, never content.
   Words of the command line that occur only inside grep/egrep/fgrep/zgrep/rg patterns, sed scripts or awk
   programs (`_pattern_args`, also inside `$(...)` and `bash -c`) are not mentions (#36): occurrence counts are
-  compared, so the same word used elsewhere in the line still counts.
+  compared, so the same word used elsewhere in the line still counts. #46 extends this:
+  - a **jq filter** (`gate.jq_operands`) is a program, not a path (`jq -r '"\(.key)"' "$f"` names no `*.key`),
+    unless it matches `secret_grep_pattern` (`jq -r .client_secret "$f"` still escalates);
+  - a word that only occurs as an argument or `<` redirect of a **display-only** command
+    (`gate._display_only_args`: `echo`, `printf` without `-v`, `stat`, `ls`, `wc`, `test`/`[ ]`, `[[ ]]`, `file`,
+    `du`, `true`, `:`, `cmp` without `-l`/`-b`, `diff -q`) is not a mention when that command is at the top level
+    (not inside `$(...)`, `<(...)` or `bash -c`), its stdout is not piped and not redirected to a file (`>&2` is
+    fine), and the word is not a configured `secret_paths` match. So an `echo "=== secrets ==="` label or `stat`/`wc
+    -c`/`test -s` of a staged throwaway `cookie-secret` no longer turns an unrelated unresolved read into an
+    escalation, while `ls ~/.config/spark/; cat "$KEY_FILE"`, `echo <key> | xargs cat`, `f=$(ls <dir>); cat "$f"`
+    and `printf -v f %s <key>; cat "$f"` still escalate.
+- **Metadata-only commands** (#46) print no file content and are not read checks: `stat` (any format), `ls`, `wc`
+  (also on stdin), `test`/`[ ]`/`[[ ]]`, `file`, `du`, plain `cmp` and `cmp -s` (an offset or nothing), and
+  `diff -q`/`--brief` ("Files A and B differ"; plain `diff` is a print command). `cmp -l`/`-b`/`--verbose`/
+  `--print-bytes` print the differing bytes and go through the read check like a print command (before #46 they
+  passed). `jq` operands are parsed by `jq_operands`: `--arg`/`--argjson`/`--slurpfile`/`--rawfile` take two values
+  and the `--slurpfile`/`--rawfile` file is read (before #46, `jq -n --rawfile k <key> '$k'` passed); with
+  `-f`/`--from-file` every positional is a file, the program file first.
 - **Not seen by the gate** (known limits): values built at run time (`f=$(printf '%s/%s' ~/.config spark)/k`
   without any secret-shaped word, base64-decoded names, `$IFS` tricks); copies or symlinks made in an earlier tool
   call (`cp key /tmp/x`, then `cat /tmp/x` next turn); secrets read by programs that are not print commands and
