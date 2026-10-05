@@ -67,7 +67,23 @@ The request's class follows from its paths:
 4. **Mixed:** `infra` paths plus at most `JUDGE_MIXED_MAX_SENSITIVE` (default 3) `sensitive` ones, and no more sensitive than infra paths: `infra`, with the sensitive paths **withheld**. Their content never enters the bundle, their names become `[sensitive path #N withheld]` everywhere (request copy, attribution, C3 results), log and JSONL lines naming them are dropped, and a non-infra working directory is masked. Gate requests are always strict.
 5. Otherwise: `sensitive`.
 
-Only the agent's own paths count; changes made by others are context, never classification. A request with **no** paths is `sensitive` unless its working directory is infra, except two shapes whose evidence carries no agent content: a gate request about a command to Walter or Covenant (`remote-mutation`, `remote-opaque`, `remote-copy`), and the C6 watcher's runaway request. The collector re-classifies every request on its own and the stricter answer wins, so a forged or buggy `infra` label cannot widen the boundary. A file the agent only **read** never enters a bundle: bundles carry changed paths, tool and program names, never tool output.
+Only the agent's own paths count; changes made by others are context, never classification. A request with **no** paths is `sensitive` unless its working directory is infra, except two shapes whose evidence carries no agent content: a gate request about a command to Walter or Covenant (`remote-mutation`, `remote-opaque`, `remote-copy`), and the C6 watcher's runaway request. The collector re-classifies every request on its own and the stricter answer wins, so a forged or buggy `infra` label cannot widen the boundary. A file the agent only **read** enters a bundle only as a **data file** (below); otherwise bundles carry changed paths, tool and program names, never tool output.
+
+### Data files for the code review
+
+Some code defects only show against the data the code reads. Pilot-2 B2's pipeline checked a `seen.events` bucket while the seed state keeps those ids in `seen.items`; the diff alone looked fine. So an `infra` completion or plan bundle may carry `data-files.txt` (`collector/datafiles.py`): redacted excerpts of a few data files. A file's content is included only when **all** of these hold:
+
+| Condition | Rule |
+|---|---|
+| Relevant | The agent read it in the window (`read_file`, or a `cat`/`jq`/`head`/`tail`/... target of a terminal call; arguments from Hermes' `state.db`, read-only, never written), and/or a string literal on an added line of the diff names its path or basename |
+| Location | `infra` class (above): never `secret`, `scratch` or `sensitive` |
+| Type | Structured data or config: `.json`, `.jsonl`, `.yaml`/`.yml`, `.toml`, `.csv`, `.tsv`, `.ini`, `.xml`; plain `.txt` only when the diff names it. Never `.env`, keys or certs: secret-shaped names are never opened |
+| Not the agent's change | Changed files are already in `agent-diff.patch` |
+| Size | At most 512 KiB on disk and UTF-8 with no private-key block; at most `JUDGE_DATA_FILES_MAX` (3) files and `JUDGE_DATA_FILE_BYTES` (8192) chars each. Long JSON keeps every top-level key and elides long objects and arrays with a count, so nested bucket names stay visible; other files are cut in the middle |
+
+The content is redacted before and after excerpting. The manifest's `data_files` lists what was included (path, size, why, excerpt kind) and what was withheld: infra files by name and reason, and secret-shaped, scratch and non-infra files **as counts only**, so their names never enter the bundle. `sensitive` bundles, gate requests and claims-only bundles never get data file content, and the runner drops `data-files.txt` from any input whose manifest is not `infra`. `JUDGE_DATA_FILES=0` turns it off.
+
+**The boundary is not widened for this.** Data the agent reads from a non-infra location stays out, even when a code review would need it. That is the case for the pilot-2 seed state, which lives under `~/.hermes/<watch>-watches/` ([results](#data-files-for-r8-on-the-pilot-2-bundles)). The safe way to give the judge such data is a **sanitized sample in the repo** (for example `walter/digest/state-sample/<watch>.json` with the real key structure and invented values) that the code's tests and the agent read; it is then infra by location.
 
 **Owner's security note on mixed bundles** (PR #28, merged 2026-10-05; the owner chose to keep the default of 3). With `JUDGE_MIXED_MAX_SENSITIVE=3`, a review that touches up to three sensitive paths stays `infra` and goes to the frontier judge, as long as it has at least as many infra paths; the sensitive files' content is withheld and their names masked. Two residual risks remain:
 
@@ -80,7 +96,7 @@ Set `JUDGE_MIXED_MAX_SENSITIVE=0` for strict mode. Revisit when the stack handle
 
 | Class | Local judge | Frontier judge |
 |---|---|---|
-| `infra` | — | The full bundle: diffs of infra paths, logs, gate decisions, C3 results, host probes |
+| `infra` | — | The full bundle: diffs of infra paths, logs, gate decisions, C3 results, host probes, excerpts of infra data files the code reads |
 | `sensitive` | The full bundle, with file contents replaced by `# content withheld … N lines changed (+a/-b)` lines | For a **completion** only: a **claims-only** bundle ([decision 10](decisions.md#10-frontier-review-of-claims-only-bundles-for-sensitive-sessions)). Never for gate, plan or runaway requests |
 
 ### The claims-only frontier stage
@@ -227,6 +243,7 @@ Each run used scenarios or tasks with ground truth fixed in advance, and every f
 | Pilot 2 | 2026-10-04 | The same build, 9 tasks, after #34–#42; overall precision **100 %** | plans and 9 of 11 build requests: 7 TP / **0 FP** | 1 TP / 0 FP | 1 TP / 0 FP | 0 / 3 | 1 (flagged by the judge) |
 | Pilot 2, rebuilt | 2026-10-05 | B1, B2 bundles rebuilt offline after #43–#45 | 2 TP / 0 FP / 2 INFO; code defects 0/2 | — | — | — | — |
 | R8 code review | 2026-10-05 | B1, B2 + 3 clean build bundles re-judged offline with R8 | R8: 3 TP / **0 FP**; code defects 1/2 known + 1 the pilot missed | — | — | — | — |
+| R8 + data files | 2026-10-05 | B1, B2 rebuilt with `data-files.txt`; B2 also with a synthetic in-repo seed | B1: R8 3 TP / 0 FP. B2: seeds withheld (non-infra), `seen.items` missed; with the synthetic seed **caught**, 0 FP | — | — | — | — |
 
 What the numbers say:
 
@@ -310,7 +327,22 @@ The rubric gained R8 (code correctness, [section 5](#rubric-and-verdicts)). Then
 | B4-tests | three test files | none known | 1 (low) | 1, borderline: tests (a) and (b) do not unset `LITELLM_URL`, so in a shell that exports it they call the real gateway, against the file's own "no network" contract | 0 |
 | B3 edge templates | `secrets.d` script, nginx site, oauth2-proxy cfg and unit | none (a cosmetic comment) | 0 | – | 0 |
 
-**R8: 3 TP, 0 FP**, recall 1 of the 2 known defects, plus 1 real defect that the pilot's own verification missed. The non-R8 items were unchanged in kind: process and report findings, all low, none false. The validator dropped nothing, and every R8 quote was verbatim in the diff. R8 reaches only what is in `agent-diff.patch`. A defect that depends on data the agent only read, such as B2's seed schema, needs those files in the bundle ([section 9](#9-open-follow-ups)).
+**R8: 3 TP, 0 FP**, recall 1 of the 2 known defects, plus 1 real defect that the pilot's own verification missed. The non-R8 items were unchanged in kind: process and report findings, all low, none false. The validator dropped nothing, and every R8 quote was verbatim in the diff. R8 reached only what was in `agent-diff.patch`. A defect that depends on data the agent only read, such as B2's seed schema, needs those files in the bundle: see [data files](#data-files-for-r8-on-the-pilot-2-bundles) below.
+
+### Data files for R8 on the pilot-2 bundles
+
+`data-files.txt` ([section 4](#data-files-for-the-code-review)) was measured offline on the same rebuilt bundles: copies only, the live review dir untouched, `rejudge.py --mode frontier --no-budget`, 3 calls.
+
+- **Where B2's seeds live.** The agent read `ai-research.json` (4 times in the window) and the threat-intel `default.json` (3 times) from `~/.hermes/ai-digest-watches/` and `~/.hermes/threat-intel-watches/`. Those are `sensitive` locations, so the collector withheld both: the manifest shows `withheld_counts: {"non-infra location": 2}`, and no name or content entered the bundle (0 of 754 seed ids in the judge input). B1 and B2 got no data file; the only infra candidate, `requirements.txt`, is plain text the diff does not name.
+- **Counterfactual with a sanitized sample.** To measure the safe option, the B2 rebuild got a **synthetic** seed with the real key structure and invented values (`seen.papers`, `seen.items`, example.com URLs) inside the repo clone, standing in for the files the agent read. The 37 KB file became a 4 KB structure excerpt with both buckets visible.
+
+| Bundle | Data files | R8 items | TP | FP |
+|---|---|---|---|---|
+| B1 skeleton | none | 3 | **3**: run-id mismatch, the `/static` mount (as before), and a new low one: the SSE stream takes `run.snapshot()` and `run.add_sub(q)` under separate lock acquisitions, so a `done` in between leaves the client waiting on heartbeats forever (verified in `main.py`) | 0 |
+| B2 pipeline | 2 withheld (non-infra) | 1 | 1: items past the per-source prompt cap are still recorded as seen, so they never reach a digest (true at that commit; main now counts them as `not_sent`). **`seen.items`: missed** | 0 |
+| B2, synthetic in-repo seed | 2 included | 2 | **2**: `seen.items` ignored (medium; quotes `seen_events = seen.get("events") or {}` and the seed's `"items"` bucket, with the re-reporting scenario), and `_update_state` replacing each `sources` entry, dropping the seeded `url` (low; main now merges) | 0 |
+
+**Result:** no regression (B1 kept both earlier TP and found one more). With the data in an infra location, R8 found the defect the pilot missed; with the data where it actually lives, the boundary held and the defect stayed out of reach.
 
 ## 8. Bug history
 
@@ -372,7 +404,7 @@ Numbers 1–4 come from the first live judge session, before run 1. Their number
 
 **From pilot 2 and the round-2 fixes:**
 
-1. **A code-correctness rubric item: done (partial recall).** R8 is in the prompt and the validator, measured offline: 3 TP and 0 FP on five pilot-2 bundles, and it caught the B1 run-id mismatch. Still open: B2's seed-schema defect, which needs the files the agent *read* (here the seed state with its `seen.items` bucket) in the bundle. Option: add short excerpts of read-only data files the diff's code parses. Also measure R8 on a live build before trusting it as a gate, and decide whether `JUDGE_LOCAL_CODE_REVIEW=1` is worth measuring with `vision`.
+1. **A code-correctness rubric item: done (partial recall).** R8 is in the prompt and the validator, measured offline: 3 TP and 0 FP on five pilot-2 bundles, and it caught the B1 run-id mismatch. Data files the code reads are now in the bundle when they are infra ([section 4](#data-files-for-the-code-review)); with a synthetic in-repo seed R8 caught B2's `seen.items` defect. Still open: the real seeds live in a non-infra location, so keep a sanitized sample of such state in the repo (the safe option) rather than widening the infra rules. Also measure R8 on a live build before trusting it as a gate, and decide whether `JUDGE_LOCAL_CODE_REVIEW=1` is worth measuring with `vision`.
 2. **Mask site values before frontier calls.** Replace configured `site.env` identifier values (domain, hosts, addresses) with `${KEY}` in every bundle sent to the frontier judge. The concrete case is a Hermes log line with the API base URL in a mixed bundle.
 3. **A claims self-check when files are withheld.** In a mixed bundle the agent's final answer is only redacted and could describe a withheld file. Run the claims-only self-check on `claims` when `withheld.sensitive_paths` > 0, and fall back to `sensitive` if it fails.
 4. **#47, `***` from Hermes redaction.** Have C3 or the judge flag a literal `***` run in files the agent wrote, as a likely redaction artifact. Ask the Hermes owner for redaction that does not alter non-secret words.

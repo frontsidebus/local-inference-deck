@@ -67,6 +67,7 @@ CLAIMS_PREAMBLE_PATH = RUNNER_DIR / "prompt-claims.md"
 COLLECTOR = JUDGE_DIR / "collector" / "collect.py"
 PROBE = JUDGE_DIR / "probes" / "probe.py"
 MAX_PROBES = 4
+DATA_FILES = "data-files.txt"  # collector/datafiles.py ARTIFACT
 OWN_FILES = {"judge-raw.txt", "judge-input.txt", "claims-input.txt", "claims-raw.txt"}
 CLAIMS_MODE = "frontier-claims"
 CLAIMS_SUFFIX = ".claims"  # findings/<id>.claims.json
@@ -617,7 +618,8 @@ def bundle_text(evidence_dir: Path, max_chars: int) -> str:
     files are included whole and what they leave goes to the large ones, up to the total cap; at least
     MIN_PER_FILE each when the cap allows. agent-diff.patch is cut by fit_diff (whole hunks, code before static
     assets), the context lines in the middle, any other file at its end. Files that no longer fit at all are
-    listed as omitted."""
+    listed as omitted. data-files.txt (excerpts of the data files the changed code reads, for R8) is shown only
+    when the manifest says data_class=infra."""
     files = [p for p in sorted(evidence_dir.rglob("*")) if p.is_file() and p.name not in OWN_FILES]
     files.sort(key=lambda p: (p.name != "manifest.json", str(p)))
     if not files:
@@ -630,10 +632,14 @@ def bundle_text(evidence_dir: Path, max_chars: int) -> str:
         except OSError as exc:
             texts[rel] = f"(unreadable: {exc.strerror})"
     session = ""
+    man: Any = {}
     try:
-        session = str((json.loads(texts.get("manifest.json") or "{}").get("request") or {}).get("session") or "")
+        man = json.loads(texts.get("manifest.json") or "{}")
+        session = str((man.get("request") or {}).get("session") or "")
     except (ValueError, AttributeError):
         session = ""
+    if DATA_FILES in texts and not (isinstance(man, dict) and man.get("data_class") == "infra"):
+        del texts[DATA_FILES]  # data file content is for infra bundles only (defence in depth: never sent otherwise)
 
     priority: Dict[str, str] = {}
     if "gate-decisions.jsonl" in texts:
