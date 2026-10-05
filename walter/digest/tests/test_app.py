@@ -60,3 +60,19 @@ def test_post_refuses_cross_site(client, site, want):
 def test_post_without_fetch_metadata_is_allowed(client):
     # curl on Walter (the CLI trigger) sends no Sec-Fetch-Site
     assert client.post("/api/runs/ai-security/now").status_code == 202
+
+
+def test_every_asset_referenced_by_the_page_is_served(client):
+    """index.html and app.css load /static/... (CSS, JS, fonts); each must return 200 (the first live
+    deploy served them only at /, so the page rendered unstyled with no JS)."""
+    import re
+    from pathlib import Path
+    static = Path(__file__).resolve().parent.parent / "build" / "app" / "static"
+    refs = set(re.findall(r'(?:href|src)="(/static/[^"]+)"', (static / "index.html").read_text()))
+    refs |= set(re.findall(r'url\("(/static/[^"]+)"\)', (static / "app.css").read_text()))
+    assert {"/static/app.css", "/static/app.js"} <= refs
+    for ref in sorted(refs):
+        r = client.get(ref)
+        assert r.status_code == 200, ref
+        assert r.headers.get("x-content-type-options") == "nosniff", ref
+    assert client.get("/").status_code == 200
