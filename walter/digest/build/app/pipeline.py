@@ -50,7 +50,8 @@ ARXIV_SOURCES = {f"arxiv_{c}": c for c in ARXIV_CATS}
 # round-robin over sources), in batches of at most CHUNK_MAX_ITEMS items / CHUNK_MAX_CHARS
 # characters, further limited so the worst-case answer fits the max_tokens ceiling (see
 # _chunk_items_limit). Batch outputs are merged. Items over the budget are counted in the run's
-# coverage note and stay in the run JSON.
+# coverage note, kept in the run JSON, and deferred: run_watch leaves them out of `seen` and
+# pins their sources' cutoffs to the oldest deferred item so they are re-sent on the next run.
 MAX_TOTAL_ITEMS = 150
 CHUNK_MAX_ITEMS = 40
 CHUNK_MAX_CHARS = 16000
@@ -123,6 +124,11 @@ def _new_run_id() -> str:
 
 def _utcnow_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _iso_z(dt) -> str:
+    """An aware datetime as the pipeline's ISO 8601 UTC format (_utcnow_iso's format)."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -388,6 +394,17 @@ def _dedupe(watch: str, sources: dict, state: dict) -> list[dict]:
 # ---------------------------------------------------------------------------------------------
 # curation: item selection and prompt budget
 # ---------------------------------------------------------------------------------------------
+def _item_id(it: dict) -> str:
+    """An item's identity, matching the key used for it in the state's `seen` buckets:
+    the CVE id for kind "cve", the arXiv id for "paper", the title key for "news"."""
+    kind = it.get("kind")
+    if kind == "cve":
+        return it.get("cve") or ""
+    if kind == "paper":
+        return it.get("arxiv_id") or ""
+    return it.get("key") or ""
+
+
 def _item_ts(it: dict) -> float:
     dt = _parse_date(it.get("date") or it.get("date_added") or "")
     return dt.timestamp() if dt else float("-inf")
@@ -950,6 +967,10 @@ async def curate_with_llm(watch: str, deduped: list[dict], gaps: list[str]) -> d
         "new_items": len(deduped),
         "sent": len(sent),
         "not_sent": len(deduped) - len(sent),
+        # Identities of the items actually sent to the LLM (cve / arxiv_id / key, by kind).
+        # run_watch marks only these as seen; the rest are deferred to the next run. Not
+        # rendered into the markdown.
+        "sent_keys": [_item_id(it) for it in sent],
         "batches": len(chunks),
         "calls": llm.calls,
         "repairs": stats["repairs"],
@@ -999,7 +1020,7 @@ def _render_curated(watch: str, curated: dict) -> list[str]:
             note += f", in {c['batches']} batches"
         if c.get("not_sent"):
             note += (f"; {c['not_sent']} older items were over the prompt budget and not sent "
-                     "(they are in the run JSON)")
+                     "(kept for the next run; they are in the run JSON)")
         lines += [note + "._", ""]
     if watch == "ai-research":
         for t in curated.get("topics", []):
@@ -1145,14 +1166,42 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
         #    source succeeded; each source ALSO gets its own cutoff that
         #    advances only when THAT source succeeded, so a failed source keeps
         #    its old cutoff and its in-window items are not dropped next run.
+        #    Deferred items (new but not sent to the LLM, see below) pin their
+        #    source's cutoff to the oldest one of them, so the next run's
+        #    collection window and date filter still reach them.
         now = _utcnow_iso()
         old_global = state.get("cutoff")
+        # What curate_fn reports it sent (item identities, one per sent item). When it
+        # reports nothing (the test fakes) or curation failed, the fallback digest lists
+        # every item, so all of `deduped` counts as reaching a digest.
+        sent_keys = set((curated or {}).get("curation", {}).get("sent_keys") or [])
+        if uncurated or not sent_keys:
+            to_record = deduped
+        else:
+            to_record = [it for it in deduped if _item_id(it) in sent_keys]
+        deferred = [it for it in deduped if it not in to_record]
+        defer_dates: dict[str, list] = {}
+        for it in deferred:
+            dt = _parse_date(it.get("date") or it.get("date_added") or "")
+            if dt is not None:
+                defer_dates.setdefault(it.get("source", ""), []).append(dt)
         src_state = state.setdefault("sources", {})
         for name, s in sources.items():
             entry = src_state.setdefault(name, {})
             entry["ok"] = bool(s.get("ok"))
             if s.get("ok") and s.get("via") != "fallback":
                 entry["cutoff"] = now
+                # A deferred item must stay new: hold the cutoff to the oldest deferred
+                # item's date (the _dedupe filter is `date < cutoff`, so it survives).
+                # Never later than the run time (`now`, the same value the ok sources and the
+                # watch-level cutoff get): a feed with wrong-timezone dates could
+                # otherwise pin the cutoff in the future and the next run's date filter
+                # would drop genuinely new items published up to that future time.
+                # Undated deferred items are id-deduped and never date-filtered, so they
+                # need no cutoff change.
+                dts = defer_dates.get(name)
+                if dts:
+                    entry["cutoff"] = _iso_z(min(min(dts), _parse_date(now)))
             else:
                 # Failed, or served only by a fallback with partial coverage: keep the old cutoff.
                 # The source has no per-source cutoff yet: pin it to the OLD watch-level
@@ -1170,7 +1219,7 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
         if watch == "default":
             cves = seen.setdefault("cves", {})
             events = seen.setdefault("events", {})
-            for it in deduped:
+            for it in to_record:
                 if it["kind"] == "cve" and it.get("cve"):
                     cves.setdefault(it["cve"], {
                         "first_seen": now,
@@ -1188,7 +1237,7 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
         else:
             papers = seen.setdefault("papers", {})
             items = seen.setdefault("items", {})
-            for it in deduped:
+            for it in to_record:
                 if it["kind"] == "paper":
                     papers.setdefault(it["arxiv_id"], {
                         "first_seen": now, "title": it["title"], "link": it["link"],

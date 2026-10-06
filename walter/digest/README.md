@@ -137,7 +137,8 @@ One run of a watch (`pipeline.run_watch`):
    - by date: items older than the source's **cutoff** are dropped (except arXiv papers, which
      are deduped by id only: arXiv stamps a daily batch with one announcement date that can
      precede the batch reaching the feed). Cutoffs are per source:
-     - a source that succeeded gets cutoff = this run's time;
+     - a source that succeeded gets cutoff = this run's time, or the date of its oldest item that
+       was over the curation budget (deferred), whichever is earlier;
      - a source that failed keeps its previous cutoff, so its window stays open until it delivers;
      - a source that has never succeeded has cutoff `null` (no date filter, only id dedupe). This
        includes a first run with no seeded state;
@@ -152,8 +153,11 @@ One run of a watch (`pipeline.run_watch`):
      items / 16 000 characters, and only as many items per batch as the `max_tokens` ceiling can
      answer in the worst case. Each call's `max_tokens` is sized from its item count and never
      exceeds `DIGEST_MAX_TOKENS` (default 8192, clamped to 1024..16384). Batch results are
-     merged. Items over the budget are counted in the digest's coverage line and stay in the
-     run JSON;
+     merged. Items over the budget are counted in the digest's coverage line, stay in the run
+     JSON and are **deferred**: they are not added to `seen`, and their source's cutoff is held at
+     the oldest deferred item's date (never later than the run time), so the next run offers them
+     again. In a feed that keeps delivering more than the per-source cap, deferred items can still
+     fall out of the collector's newest-first window;
    - **grammar-constrained output:** `response_format` `json_schema`, built per watch and per
      batch, so the reply is always valid JSON of the right shape. The model cites items by id
      (an enum of the batch's ids), and every free-text field has a `maxLength`. If the server
@@ -183,7 +187,9 @@ One run of a watch (`pipeline.run_watch`):
    markdown, `uncurated`, `curation_error`, and `curation`: model, mode, items sent/not sent,
    batches, calls, repairs, tokens).
 5. **Advance state** atomically: per-source cutoffs as above, the watch-level cutoff when any
-   source succeeded, and every reported id added to `seen`.
+   source succeeded, and every reported id added to `seen`: the items sent to the LLM
+   (`curation.sent_keys`), or every new item when curation failed (the uncurated listing shows
+   them all). Deferred items stay out of `seen`.
 
 Progress goes to the run's subscribers over SSE: `collecting` -> `curating` -> `done` (or `error`).
 
