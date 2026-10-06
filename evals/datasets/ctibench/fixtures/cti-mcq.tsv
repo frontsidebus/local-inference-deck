@@ -1,0 +1,3 @@
+URL	Question	Option A	Option B	Option C	Option D	Prompt	GT
+https://attack.mitre.org/techniques/T0000/	Which control best limits lateral movement between network segments?	Antivirus	Network segmentation	Screen locks	Password hints	(official prompt omitted in fixture)	B
+https://cwe.mitre.org/data/definitions/0.html	Which weakness class covers reading memory after it was freed?	Use after free	Integer overflow	Path traversal		(prompt)	a

@@ -1,0 +1,2 @@
+URL	Platform	Description	Prompt	GT
+https://attack.mitre.org/software/S9999/	Enterprise	ExampleTool talks to its server over HTTP and lists files.	Extract ATT&CK technique IDs. Text: ExampleTool talks to its server over HTTP and lists files.	T1083, T1071, T1071

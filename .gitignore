@@ -30,3 +30,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 site.env.bak-*
+
+# evals: converted benchmark data and run results (regenerate with evals/datasets/*/fetch.py)
+evals/data/
+evals/results/

@@ -1,0 +1,24 @@
+{
+  "questions": [
+    {
+      "question": "What does the C in the CIA triad stand for?",
+      "answers": {
+        "A": "Control",
+        "B": "Confidentiality",
+        "C": "Compliance",
+        "D": "Cost"
+      },
+      "solution": "B"
+    },
+    {
+      "question": "Which port does HTTPS use by default?",
+      "answers": {
+        "B": "80",
+        "A": "443",
+        "D": "22",
+        "C": "25"
+      },
+      "solution": "A"
+    }
+  ]
+}
