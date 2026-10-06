@@ -1193,14 +1193,15 @@ async def run_watch(watch: str, state_dir: Path, progress, run_id: str | None = 
                 entry["cutoff"] = now
                 # A deferred item must stay new: hold the cutoff to the oldest deferred
                 # item's date (the _dedupe filter is `date < cutoff`, so it survives).
-                # Never later than the run time: a feed with wrong-timezone dates could
+                # Never later than the run time (`now`, the same value the ok sources and the
+                # watch-level cutoff get): a feed with wrong-timezone dates could
                 # otherwise pin the cutoff in the future and the next run's date filter
                 # would drop genuinely new items published up to that future time.
                 # Undated deferred items are id-deduped and never date-filtered, so they
                 # need no cutoff change.
                 dts = defer_dates.get(name)
                 if dts:
-                    entry["cutoff"] = _iso_z(min(min(dts), datetime.now(timezone.utc)))
+                    entry["cutoff"] = _iso_z(min(min(dts), _parse_date(now)))
             else:
                 # Failed, or served only by a fallback with partial coverage: keep the old cutoff.
                 # The source has no per-source cutoff yet: pin it to the OLD watch-level

@@ -7,6 +7,7 @@ fixed feed (as test_state_sample.run_with does); state starts from the sanitized
 import asyncio
 import json
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -132,10 +133,11 @@ def test_default_deferred_stay_unseen_and_pin_cutoff(tmp_path, monkeypatch):
     for name in ("CISA_KEV", "SANS_ISC", "TheHackerNews"):
         oldest = min(pipeline._parse_date(it.get("date") or it.get("date_added"))
                      for it in out["items"] if it["source"] == name and _item_id(it) not in sent_ids)
-        if oldest <= pipeline.datetime.now(pipeline.timezone.utc):
+        run_time = pipeline._parse_date(saved["cutoff"])
+        if oldest <= run_time:
             assert saved["sources"][name]["cutoff"] == oldest.strftime("%Y-%m-%dT%H:%M:%SZ")
         else:  # future-dated deferrals are clamped to the run time
-            assert saved["sources"][name]["cutoff"] <= now_before
+            assert saved["sources"][name]["cutoff"] == saved["cutoff"]
         assert saved["sources"][name]["cutoff"] <= saved["cutoff"]
     # the failed source keeps its old cutoff
     assert saved["sources"]["CISA_Advisories"]["cutoff"] == "2026-01-03T12:00:00Z"
@@ -277,14 +279,22 @@ def test_research_deferred_papers_and_news_come_back(tmp_path, monkeypatch):
     assert all_ids <= set(saved3["seen"]["papers"]) | set(saved3["seen"]["items"])
 
 
+def ahead_news(n, source, base, step_minutes=10):
+    """News items dated from `base` on (relative to the real clock, so the test never ages)."""
+    return [{"kind": "news", "key": f"k{source}{i}", "title": f"{source} story {i}", "source": source,
+             "date": pipeline._iso_z(base + timedelta(minutes=step_minutes * i)),
+             "link": f"https://e.example/{source}/{i}", "desc": "d"} for i in range(n)]
+
+
 def test_deferred_future_dates_do_not_pin_cutoff_ahead(tmp_path, monkeypatch):
     """Regression: a feed with dates ahead of the run time must not pin the source's cutoff
     in the future, or the next run's date filter would drop genuinely new items published
-    between the run and that future time."""
+    between the run and that future time. Dates are relative to the real clock."""
+    wall = pipeline.datetime.now(pipeline.timezone.utc)
+    ahead = wall + timedelta(days=5)
     d = seeded_dir(tmp_path, "default")
     feed = feed_default()
-    feed["SANS_ISC"] = {"ok": True, "items": news(12, "F", day=11)}   # 2026-10-11: ahead of the run time
-    now_before = pipeline._iso_z(pipeline.datetime.now(pipeline.timezone.utc))
+    feed["SANS_ISC"] = {"ok": True, "items": ahead_news(12, "F", ahead)}   # 5 days ahead of the run
     with FakeLLM([tier_all()]) as f:
         llm_env(tmp_path, monkeypatch, f)
         out1, saved1 = run_llm(tmp_path, monkeypatch, "default", d, feed,
@@ -293,14 +303,14 @@ def test_deferred_future_dates_do_not_pin_cutoff_ahead(tmp_path, monkeypatch):
     deferred = [it for it in out1["items"]
                 if it["source"] == "SANS_ISC" and _item_id(it) not in sent1]
     assert deferred and out1["curation"]["not_sent"] > 0
-    # the cutoff is pinned at or before the run time, never at the deferred items' future date
-    assert saved1["sources"]["SANS_ISC"]["cutoff"] <= now_before
-    assert saved1["sources"]["SANS_ISC"]["cutoff"] < "2026-10-11T00:00:00Z"
+    # the cutoff is clamped to the run time (the watch-level cutoff), never the deferred items' date
+    assert saved1["sources"]["SANS_ISC"]["cutoff"] == saved1["cutoff"]
+    assert pipeline._parse_date(saved1["sources"]["SANS_ISC"]["cutoff"]) < ahead
 
     # next runs: a new item dated after the first run (but before the deferred items' dates)
     # is eventually reported (with the bug it would be dropped by the future cutoff); the
     # future-dated deferrals, being newest, take the budget first, so it is sent on a later run
-    n_item = news(1, "N", day=9)[0]   # 2026-10-09
+    n_item = ahead_news(1, "N", pipeline._parse_date(saved1["cutoff"]) + timedelta(days=1))[0]
     feed["SANS_ISC"]["items"].append(n_item)
     n_key = pipeline._norm_key(n_item["title"])
     with FakeLLM([tier_all()]) as f:
