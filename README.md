@@ -148,6 +148,7 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [judge/CONTRACT.md](judge/CONTRACT.md) | The binding interfaces between the judge's parts. |
 | [judge/runner/units/README.md](judge/runner/units/README.md) | The judge's systemd user units. |
 | [hypervisor/README.md](hypervisor/README.md) | What the host layer must provide. |
+| [evals/README.md](evals/README.md) | Security eval harness: running suites against the local models (and an optional frontier baseline), scorers, reports with confidence intervals, adding a suite, GPU disruption. |
 | **Runbooks** | |
 | [power-loss-recovery.md](docs/runbooks/power-loss-recovery.md) | Bringing everything back after an outage. |
 | [rotate-secrets.md](docs/runbooks/rotate-secrets.md) | Rotating keys and secrets. |
