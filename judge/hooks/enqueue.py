@@ -27,6 +27,12 @@ Events (configure each in $HERMES_HOME/config.yaml `hooks:`):
                      a claim word (done/fixed/blocked/ran/verified/escalated/...) or a gate.log decision of
                      the session in the window; never the answer already enqueued for an earlier turn.
                      Such a request carries detail.text_only {chars, claim_words, gate_decisions, rule}.
+                     #51 (interrupted_noop, JUDGE_SKIP_INTERRUPTED_NOOP=1 default): an interrupted/failed/
+                     timed-out turn is NOT enqueued when it changed nothing, its tools (agent.log and
+                     events.jsonl) were only read_file/search_files and all ran, the gate logged no decision
+                     and lib/refusals finds no refusal in the window, and the final answer is short with no
+                     claim word; one line goes to enqueue.log. When in doubt (no agent.log, any error) the
+                     turn is reviewed.
                      changed_paths = only what the agent touched: snapshot changes named by the session's
                      tool events (lib/snapshot.agent_touched) plus this turn's write_file/patch targets.
                      Every other snapshot change goes to detail.changed_by_others (paths only) and does not
@@ -259,6 +265,19 @@ def on_session_end(payload, cfg, root):
             snapshot.save_meta(d, meta)
             return None
 
+    if text_only is None and not changed_paths and not touched:
+        skip = interrupted_noop(extra, claims, cfg, root, session, since, now, d, cwd, log, tz, recent_events)
+        if skip is not None:
+            # #51: an interrupted/failed turn that changed nothing, used only read-only tools, had no gate
+            # decision or refusal and left no substantive answer: nothing to review, so no judge run.
+            _log(root, "enqueue.log", f"session {session}: interrupted turn with no change not reviewed (#51): "
+                                      + ", ".join(f"{k}={v}" for k, v in skip.items()))
+            meta["last_end"] = q.utc_now_iso(now)
+            meta["last_changed"] = changed
+            meta["last_skipped"] = {"at": meta["last_end"], **skip}
+            snapshot.save_meta(d, meta)
+            return None
+
     detail = {k: extra.get(k) for k in ("task_id", "turn_id", "completed", "failed", "interrupted",
                                          "turn_exit_reason", "model", "platform", "reason") if k in extra}
     detail.update({"cwd": cwd, "tool_activity": activity, "snapshot_late": bool(meta.get("late")),
@@ -386,6 +405,88 @@ def text_only_reason(claims: str, cfg, root, session: str, since: datetime, now:
         return None
     return {"chars": len(text), "claim_words": words[:12], "gate_decisions": gates,
             "rule": "claims" if words else ("gate" if gates else "min_chars")}
+
+
+# ---------------------------------------------------------------- interrupted turns with no change (#51)
+# Tools that only read: a turn that used nothing else changed nothing through a tool. read_file of a secret-shaped
+# path is gated (C2), so such a read leaves a gate decision and is reviewed.
+READ_ONLY_TOOLS = frozenset({"read_file", "search_files"})
+_ABORT_RE = re.compile(r"timeout|timed[_ ]out|interrupt|cancel|abort|kill|signal|exhaust|max_iterations|budget", re.I)
+_REASON_SAFE_RE = re.compile(r"[^A-Za-z0-9_().:/-]")
+
+
+def ended_badly(extra) -> bool:
+    """The turn was interrupted, failed or timed out (Hermes on_session_end: interrupted/failed flags, or
+    completed=False with an abort-like turn_exit_reason/reason)."""
+    if not isinstance(extra, dict):
+        return False
+    if extra.get("interrupted") is True or extra.get("failed") is True:
+        return True
+    why = f"{extra.get('turn_exit_reason') or ''} {extra.get('reason') or ''}"
+    return extra.get("completed") is False and bool(_ABORT_RE.search(why))
+
+
+def _hermes_refusals(session, since, until, cfg, events, log, tz, cwd) -> int:
+    """Refused calls in the window (lib/refusals: state.db, events.jsonl status, agent.log BLOCKED lines)."""
+    from lib import hermeslog, refusals
+    lines = (hermeslog.session_lines(log, session, since, until, tz, include_untagged=False)
+             if log and os.path.isfile(log) else [])
+    return len(refusals.refusals(session, since, until, hermes_home=str(cfg.get("HERMES_HOME") or ""),
+                                 events=events, log_lines=lines, tz=tz, cwd=cwd or "/"))
+
+
+def interrupted_noop(extra, claims, cfg, root, session, since, now, d, cwd, log, tz, recent_events):
+    """Why an interrupted turn with no agent change needs no review (a dict for enqueue.log), or None (review it).
+
+    All of: JUDGE_SKIP_INTERRUPTED_NOOP=1 (default); the turn was interrupted/failed/timed out (ended_badly); the
+    caller saw no changed or written path; agent.log is readable and the window's tools are all READ_ONLY_TOOLS,
+    and so are the window's events.jsonl calls; every such call ran (no blocked/denied status); no gate.log
+    decision of the session in the window; no refusal (lib/refusals); and the final answer is shorter than
+    JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS (200) with no claim word. Any error -> None: when in doubt, review."""
+    try:
+        if _setting(cfg, "JUDGE_SKIP_INTERRUPTED_NOOP", "1") != "1" or not ended_badly(extra):
+            return None
+        if not log or not os.path.isfile(log):
+            return None  # no tool log: cannot tell what ran
+        from lib import hermeslog, snapshot
+        until = now + timedelta(seconds=5)
+        tools = hermeslog.tools_used(log, session, since, until, tz)
+        if tools - READ_ONLY_TOOLS:
+            return None
+        for ev in recent_events:
+            if ev.get("tool") not in READ_ONLY_TOOLS or not snapshot.ran(ev):
+                return None
+        if gate_decisions_in_window(root, session, since, until):
+            return None
+        if _hermes_refusals(session, since, until, cfg, snapshot.events(d), log, tz, cwd):
+            return None
+        text = (claims or "").strip()
+        try:
+            min_chars = max(0, int(_setting(cfg, "JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS", "200")))
+        except ValueError:
+            min_chars = 200
+        if text and (len(text) >= min_chars or claim_words(text)):
+            return None
+    except Exception:
+        return None
+    why = _REASON_SAFE_RE.sub("", str(extra.get("turn_exit_reason") or extra.get("reason") or
+                                      ("interrupted" if extra.get("interrupted") else "failed")))[:60]
+    return {"reason": why or "interrupted", "tools": "+".join(sorted(tools)) or "none",
+            "events": len(recent_events), "answer_chars": len(text)}
+
+
+def _log(root, name: str, msg: str) -> None:
+    """Append one line to <review dir>/<name> (mode 600); never raises."""
+    try:
+        p = Path(root) / name
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            os.write(fd, f"{ts} enqueue: {msg}\n".encode("utf-8", errors="replace"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
 
 
 def _new_changes(meta, changed) -> bool:

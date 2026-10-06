@@ -58,6 +58,9 @@ Public API:
     evidence_dir(request_id, root=None, create=False) -> Path
     snapshot_dir(session, root=None, create=False) -> Path
     atomic_write(path, data, mode=0o600) / atomic_write_json(path, obj) / ensure_dir(path) / ensure_dirs(root)
+    workspace_key(cwd, home=None) -> dict | None   #50: {"kind": "git"|"dir", "worktree", "repo"} of a cwd (files
+                                              only; None for /, ~, /tmp); workspace_relation(a, b) -> "worktree" |
+                                              "repo" | None (C5 related-session injection)
 """
 from __future__ import annotations
 
@@ -1010,3 +1013,82 @@ def items_by_status(root=None) -> Dict[str, List[Tuple[Dict[str, Any], Dict[str,
         for it in f.get("items") or []:
             out[item_status(f["request"], it, root, paths)].append((f, it))
     return out
+
+
+# ---------------------------------------------------------------- workspace identity (#50, C5 related sessions)
+WORKSPACE_SCOPES = ("worktree", "repo")
+
+
+def _broad_dirs(home: Optional[str] = None) -> set:
+    """Directories too broad to relate two sessions by: /, the home dir, /tmp, /var/tmp (resolved)."""
+    out = {"/", "/tmp", "/var/tmp"}
+    h = home or os.path.expanduser("~")
+    if h:
+        out.add(os.path.realpath(h))
+    return {os.path.realpath(p) for p in out}
+
+
+def _git_top_common(start: str) -> Optional[Tuple[str, str]]:
+    """(toplevel, common git dir) of the checkout holding *start*, from files only (same walk as
+    lib/version._git_dirs, kept here so the C5 hook does not import lib/version)."""
+    d = start
+    while True:
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            gitdir = g
+        elif os.path.isfile(g):
+            with open(g, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(4096).strip()
+            if not text.startswith("gitdir:"):
+                return None
+            gitdir = text[len("gitdir:"):].strip()
+            gitdir = os.path.realpath(gitdir if os.path.isabs(gitdir) else os.path.join(d, gitdir))
+        else:
+            parent = os.path.dirname(d)
+            if parent == d:
+                return None
+            d = parent
+            continue
+        common = gitdir
+        try:
+            with open(os.path.join(gitdir, "commondir"), encoding="utf-8", errors="replace") as fh:
+                cd = fh.read(4096).strip()
+        except OSError:
+            cd = ""
+        if cd:
+            common = cd if os.path.isabs(cd) else os.path.join(gitdir, cd)
+        return os.path.realpath(d), os.path.realpath(common)
+
+
+def workspace_key(cwd: Any, home: Optional[str] = None) -> Optional[Dict[str, str]]:
+    """{"kind": "git"|"dir", "worktree", "repo"} for a session's cwd, or None (no cwd, not absolute, or too
+    broad: /, ~, /tmp, a git checkout rooted there). Files only, no subprocess (_git_top_common):
+    `worktree` = the checkout's toplevel, `repo` = its common git dir (shared by every worktree of a repo).
+    Outside git, both are the resolved cwd itself (only the same directory relates)."""
+    if not isinstance(cwd, str) or not cwd.strip() or not os.path.isabs(cwd.strip()):
+        return None
+    real = os.path.realpath(cwd.strip())
+    broad = _broad_dirs(home)
+    try:
+        found = _git_top_common(real)
+    except OSError:
+        found = None
+    if found:
+        top, common = found
+        if top in broad:
+            return None
+        return {"kind": "git", "worktree": top, "repo": common}
+    if real in broad:
+        return None
+    return {"kind": "dir", "worktree": real, "repo": real}
+
+
+def workspace_relation(a: Optional[Dict[str, str]], b: Optional[Dict[str, str]]) -> Optional[str]:
+    """"worktree" (same checkout or same directory), "repo" (another worktree of the same git repo) or None."""
+    if not a or not b:
+        return None
+    if a.get("worktree") and a.get("worktree") == b.get("worktree"):
+        return "worktree"
+    if a.get("kind") == b.get("kind") == "git" and a.get("repo") and a.get("repo") == b.get("repo"):
+        return "repo"
+    return None

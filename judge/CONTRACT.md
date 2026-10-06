@@ -75,6 +75,9 @@ inject.log                       C5: one line when the count of skipped local-mo
 .inject-local-skips.json         C5 state for inject.log ({session: last logged count}, at most 200 sessions)
 .inject-refusals.json            C5 state of the refusal reminder ({session: last reminded decision}; #39)
 .inject-stall.json               C5 state of the runner stall warning ({session: oldest stalled request id}; #41)
+.inject-related.json             C5 state of related-session items ({session: [<request-id>.<item-id> shown]}, at most
+                                 200 sessions x 500 keys; #50)
+enqueue.log                      enqueue.py: one line per interrupted turn with no change that was not enqueued (#51)
 hook-errors.log                  errors of the fail-open hooks (enqueue, verify, inject)
 runner.log                       runner messages; judge-alert@.service appends `ALERT: judge unit ... failed` lines
 usage.json (+ usage.json.lock)   frontier calls and reported cost of the current UTC day
@@ -158,6 +161,29 @@ environment > site.env > default by enqueue.py itself. The request is an ordinar
 `detail.text_only = {"chars", "claim_words" (≤ 12), "gate_decisions", "rule": "claims|gate|min_chars"}`; merge
 and dedupe apply unchanged.
 
+**Interrupted turns with no change** (#51, `hooks/enqueue.py::interrupted_noop`). A one-shot that times out or is
+interrupted after only reading files still cost a frontier run that had nothing to judge (pilot 3 T1: 9
+`read_file` + 1 `search_files`, no edit, no answer, 0 items, $0.11). `on_session_end` does **not** enqueue the
+turn (no request at all; chosen over "local-only" because a sensitive completion still gets the frontier claims
+stage, and there is nothing to judge) when ALL of these hold, and reviews it as before otherwise:
+- `JUDGE_SKIP_INTERRUPTED_NOOP=1` (env or site.env; default `1`; `0` = review as before);
+- the turn ended badly (`ended_badly`): `interrupted` or `failed` is true, or `completed` is false with a
+  `turn_exit_reason`/`reason` like a timeout, interrupt, cancel, abort, kill, signal, exhausted budget or
+  `max_iterations`;
+- no agent change: no changed path attributed to the agent and no `write_file`/`patch` target in the window;
+- only read-only tools: `agent.log` is readable (no log: reviewed) and every tool it shows for the session in the
+  window is in `READ_ONLY_TOOLS` (`read_file`, `search_files`), and so is every `events.jsonl` call in the window;
+- nothing refused or gated: every such call ran (no blocked/denied/... status), `gate.log` has no decision of
+  the session in the window, and `lib/refusals.refusals` (state.db, events, `agent.log` BLOCKED lines) finds no
+  refusal. A `read_file` of a secret-shaped path is gated (C2), so a read that matters for the data boundary
+  leaves a gate decision and the turn is reviewed;
+- no substantive answer: the final answer is shorter than `JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS` (200) and has no
+  `CLAIM_WORDS` match (a short "Fixed." is reviewed).
+
+Any error while deciding means "review it". A skipped turn appends `<ts> enqueue: session <id>: interrupted turn
+with no change not reviewed (#51): reason=<exit reason>, tools=<names>, events=<n>, answer_chars=<n>` to
+`enqueue.log` (no paths), sets `last_skipped` in the snapshot meta and moves `last_end` as for any skipped turn.
+
 ## Hook I/O
 Every hook reads one Hermes shell-hook payload on stdin,
 `{"hook_event_name", "tool_name", "tool_input", "session_id", "cwd", "profile", "extra"}`, and writes one JSON
@@ -168,7 +194,7 @@ object on stdout. Hermes keys consent on `(event, command)`.
 | `gate.py` | `pre_tool_call` (`terminal\|write_file\|patch\|read_file`), `timeout: 10`, `fail_closed: true` | `tool_name`, `tool_input` (`command`/`workdir`; `path`/`content`; patch replace or V4A mode; `read_file` `path`), `session_id`, `cwd`, `extra.tool_call_id` | `{}` pass (exit 0); `{"action": "approve", "message", "rule_key"}` escalate to the human (exit 0); `{"action": "block", "message"}` refuse (exit 2, message also on stderr) | **Fails closed:** an internal error or malformed stdin gives the block JSON and exit 2. Every non-pass decision appends to `gate.log` and writes a `gate` request. `--explain` prints the decision and every rule hit with no side effects. |
 | `verify.py` | `pre_verify`, `timeout: 60` | `extra.attempt`, `extra.final_response`, `extra.changed_paths`, `session_id`, `cwd` | `{"action": "continue", "message"}` once when a verifier failed on attempt 0; else `{}` | Fails open: errors go to `hook-errors.log`, output `{}`. Attempt 0 writes a `completion` request (deduplicated); attempt > 0 only records results. |
 | `enqueue.py` | `post_tool_call` (`write_file\|patch\|terminal\|memory\|skill_manage\|read_file`), `on_session_start`, `on_session_end` | `tool_name`, `tool_input`, `extra` (`tool_call_id`, `status`, `turn_id`, ...), `session_id`, `cwd` | always `{}` | Fails open (`hook-errors.log`), never exits non-zero. Writes snapshots, `events.jsonl` and `plan`/`completion` requests; after every event releases due deferred requests. |
-| `inject.py` | `pre_llm_call`, `timeout: 10` | `session_id` only | `{"context": "<block>"}` or `{}` | Fails open (`hook-errors.log`, output `{}`). |
+| `inject.py` | `pre_llm_call`, `timeout: 10` | `session_id`, `cwd` (related sessions, #50) | `{"context": "<block>"}` or `{}` | Fails open (`hook-errors.log`, output `{}`). |
 | `watch/runaway.py` | not a hook: a user service | llama-server `/slots` through the `slots` probe | `watch.log`, stdout, desktop notification, a `runaway` request | Never cancels or unloads. |
 
 ## Request (schema/request.schema.json)
@@ -1078,7 +1104,8 @@ and so is an R8 item's `failure_scenario`. In the item views an R8 item (verdict
 
 ## C5 injection (`hooks/inject.py`)
 Injects unacknowledged items at or above `JUDGE_INJECT_MIN_SEVERITY` (default `medium`) from findings created in
-the last `JUDGE_INJECT_WINDOW_HOURS` (default 24) for this session or for no session, framed as reviewer findings
+the last `JUDGE_INJECT_WINDOW_HOURS` (default 24) for this session or for no session (and, #50, for related
+sessions on the same worktree: see below), framed as reviewer findings
 (data, not instructions) and capped at `JUDGE_INJECT_MAX_CHARS` (default 2000). Every item, and then the whole
 block, is checked with Hermes's own threat patterns (`tools/threat_patterns.py`, loaded by file path from
 `JUDGE_HERMES_AGENT_DIR` or `$HERMES_HOME/hermes-agent`; a small built-in set when absent): a matching item is shown
@@ -1087,6 +1114,34 @@ Items of `mode=local` findings are skipped unless `JUDGE_INJECT_LOCAL=1` (env or
 count goes to `inject.log` only when it changes for the session. `mode=frontier-claims` findings
 (`findings/<id>.claims.json`) are injected like `frontier` ones. The footer names
 `judge-ack --agent <request-id> <item-id> "<reason>"` and says a HIGH item stays open until the human reviews it.
+
+**Related sessions (#50).** Each `hermes chat --oneshot` is a new session, so a chain of one-shot tasks on the
+same work would never see the previous task's findings. With `JUDGE_INJECT_RELATED=1` (env or site.env; default
+`1`, `0` = off), items of OTHER sessions' findings are injected too when all of these hold:
+- this session has an id and a workspace: `lib/queue.workspace_key(cwd)` of the payload `cwd` (else `cwd` in
+  `snapshots/<session>/meta.json`), from files only (no `git` call): `worktree` = the git toplevel, `repo` = the
+  common git dir (shared by linked worktrees); outside git both are the resolved directory. `/`, `~`, `/tmp`,
+  `/var/tmp` and a checkout rooted there have no workspace, so sessions started there never relate;
+- the finding's request is on file (queue/ or done/), and its session's cwd (`detail.cwd`, else that session's
+  snapshot meta: gate requests carry none) is the **same worktree** (or directory).
+  `JUDGE_INJECT_RELATED_SCOPE=repo` (default `worktree`) also admits another worktree of the same repo, but only
+  for `data_class: infra` requests: a finding of a sensitive (or unclassified) bundle is never carried to
+  another checkout;
+- the finding is no older than `JUDGE_INJECT_RELATED_HOURS` (default 6; `0` = off) and than
+  `JUDGE_INJECT_WINDOW_HOURS`;
+- the same item rules as for the session's own findings: severity floor, non-empty evidence, no ack (any ack
+  stops it), `mode=local` skipped unless `JUDGE_INJECT_LOCAL=1`;
+- the item was not shown to this session before (`.inject-related.json`): a related item is injected **once per
+  session**, and only items that made it into an injected block are recorded (one cut by the size cap or a block
+  withheld by the threat scan comes again next turn). The session's own items are re-injected every turn until
+  acked, as before.
+
+Related items come after the session's own (same ordering within each group), share the size cap and the
+threat scan, and their head line ends with `[from an earlier session on this worktree]` (`[from an earlier
+session on another worktree of this repository]` with the repo scope). With the first one, one line goes after
+the header: `Items marked "from an earlier session" were found in the work of an earlier session in the same
+workspace (for example an earlier one-shot task). That work may have changed since; check the item against the
+files before acting on it.` Cost: one `request_for` per finding (as before) plus a few `stat()`s per distinct cwd.
 
 Item format. Each field is flattened to one line (invisible characters removed) and truncated with `…`:
 

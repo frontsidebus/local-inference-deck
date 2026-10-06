@@ -2,18 +2,30 @@
 """C5: Hermes `pre_llm_call` shell hook. Injects unacknowledged judge findings as context.
 
 stdin : Hermes shell-hook payload {"hook_event_name", "tool_name", "tool_input", "session_id", "cwd",
-        "profile", "extra"}. Only `session_id` is used (Hermes promotes it to the top level).
+        "profile", "extra"}. `session_id` (Hermes promotes it to the top level) and `cwd` (related sessions)
+        are used.
 stdout: {"context": "<block>"} or {}.
 
 Selects finding items that are
   - severity >= JUDGE_INJECT_MIN_SEVERITY (default medium),
   - not acknowledged (acks/<request-id>.<item-id> absent),
   - from a finding created in the last JUDGE_INJECT_WINDOW_HOURS (default 24),
-  - for this session, or for no specific session (request without a session),
+  - for this session, or for no specific session (request without a session), or (#50) for a RELATED session,
   - not from a local-mode finding (finding.mode == "local"), unless JUDGE_INJECT_LOCAL=1; the number
     skipped this way is logged to $JUDGE_REVIEW_DIR/inject.log,
 and renders them as a block framed as reviewer findings (data, not instructions), capped at
 JUDGE_INJECT_MAX_CHARS (default 2000).
+
+Related sessions (#50, JUDGE_INJECT_RELATED=1, the default; 0 = off): each `hermes chat --oneshot` is a new
+session, so a chain of one-shot tasks would never see the previous task's findings. Items of another session's
+finding are injected too when that session's cwd (request detail.cwd, else its snapshot meta) is in the same
+worktree as this session's cwd (payload cwd, else snapshot meta): lib/queue.workspace_key, the git toplevel (or
+the directory itself outside git; never /, ~, /tmp), and the finding is no older than JUDGE_INJECT_RELATED_HOURS
+(default 6). JUDGE_INJECT_RELATED_SCOPE=repo also admits other worktrees of the same repo, for infra-class
+requests only: a finding of a sensitive bundle never leaves its worktree. Same floor, ack, local-mode, threat-scan
+and size rules; related items come after the session's own, labelled "[from an earlier session on this
+worktree]", and each is shown once per session ($JUDGE_REVIEW_DIR/.inject-related.json; only items that made it
+into an injected block are recorded).
 
 An R8 code-correctness item (verdict `defect`, severity medium unless security/data loss, so the default floor
 lets it through) is rendered under the label "code defect (R8)" with its quoted code lines (the item's
@@ -122,32 +134,105 @@ def ack_command() -> str:
     return str(JUDGE_DIR / "bin" / "judge-ack")
 
 
-def _request_session(common, rid: str) -> Optional[str]:
-    """The request's session, or None for "no specific session" (empty/null session in the request).
-    Without the request file, the 6-char session part of the request id is used."""
-    req = common.request_for(rid)
-    if req is not None and "session" in req:
-        sess = req.get("session")
-        return sess if isinstance(sess, str) and sess.strip() else None
-    return common.request_session_short(rid) or None
+RELATED_STATE = ".inject-related.json"
+RELATED_MAX_PER_SESSION = 500  # remembered item keys per session (oldest dropped first)
+RELATED_LABEL = {"worktree": "from an earlier session on this worktree",
+                 "repo": "from an earlier session on another worktree of this repository"}
+
+
+def _snapshot_cwd(common, session: str) -> str:
+    """cwd recorded by on_session_start in snapshots/<session>/meta.json ('' when there is none)."""
+    if not session or "/" in session or session.startswith("."):
+        return ""
+    try:
+        meta = common.read_json(common.review_dir() / "snapshots" / session / "meta.json")
+    except Exception:
+        return ""
+    cwd = meta.get("cwd") if isinstance(meta, dict) else None
+    return cwd if isinstance(cwd, str) else ""
+
+
+def _request_cwd(common, req: Optional[Dict[str, Any]]) -> str:
+    """The cwd of the session that produced a request: detail.cwd (plan/completion requests), else the cwd in
+    that session's snapshot meta (gate requests carry none)."""
+    if not isinstance(req, dict):
+        return ""
+    det = req.get("detail")
+    cwd = det.get("cwd") if isinstance(det, dict) else None
+    if isinstance(cwd, str) and cwd.strip():
+        return cwd
+    return _snapshot_cwd(common, str(req.get("session") or ""))
+
+
+def related_config(common, session_id: str, cwd: str) -> Optional[Dict[str, Any]]:
+    """Settings of the related-session injection (#50), or None when it is off or cannot apply (no session, no
+    usable workspace for this session's cwd)."""
+    if common.setting("JUDGE_INJECT_RELATED", "1").strip() == "0" or not session_id:
+        return None
+    try:
+        from lib import queue as q
+    except Exception:
+        return None
+    key = q.workspace_key(cwd or _snapshot_cwd(common, session_id))
+    if key is None:
+        return None
+    try:
+        hours = float(common.setting("JUDGE_INJECT_RELATED_HOURS", "6"))
+    except ValueError:
+        hours = 6.0
+    if hours <= 0:
+        return None
+    scope = common.setting("JUDGE_INJECT_RELATED_SCOPE", "worktree").strip().lower()
+    return {"q": q, "key": key, "window": timedelta(hours=hours),
+            "scope": scope if scope in ("worktree", "repo") else "worktree",
+            "seen": set(_read_related_state(common).get(session_id) or []), "cache": {}}
+
+
+def _relation(common, rel: Dict[str, Any], req: Optional[Dict[str, Any]]) -> Optional[str]:
+    """How the finding's session relates to ours ("worktree" | "repo"), within the configured scope, else None.
+    A finding of a sensitive (or unclassified) request relates only through the same worktree/directory."""
+    cwd = _request_cwd(common, req)
+    if not cwd:
+        return None
+    cache = rel["cache"]
+    if cwd not in cache:
+        cache[cwd] = rel["q"].workspace_key(cwd)
+    how = rel["q"].workspace_relation(rel["key"], cache[cwd])
+    if how == "repo" and rel["scope"] != "repo":
+        return None
+    if how is not None and how != "worktree" and str((req or {}).get("data_class") or "sensitive") != "infra":
+        return None  # never carry findings of a sensitive bundle to another checkout
+    return how
 
 
 def select_items(common, session_id: str, min_sev: str, window: timedelta,
-                 inject_local: bool = True, skipped: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
-    """Eligible items, highest severity first. Items of local-mode findings are left out unless
-    *inject_local*; their count goes to skipped["local"]."""
+                 inject_local: bool = True, skipped: Optional[Dict[str, int]] = None,
+                 related: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """Eligible items: this session's (and no-session ones) first, then, with *related* (related_config), items
+    of other sessions on the same worktree (#50), each group highest severity first. Items of local-mode findings
+    are left out unless *inject_local*; their count goes to skipped["local"]. A related item already shown to
+    this session (related["seen"]) is left out."""
     floor = common.SEVERITY_RANK.get(min_sev, 2)
     out: List[Dict[str, Any]] = []
     for path, finding in common.iter_findings():
         if not common.finding_age_ok(finding, path, window):
             continue
         rid = str(finding.get("request") or path.stem)
-        sess = _request_session(common, rid)
+        req = common.request_for(rid)
+        if req is not None and "session" in req:
+            s = req.get("session")
+            sess = s if isinstance(s, str) and s.strip() else None
+        else:
+            sess = common.request_session_short(rid) or None
+        how = None
         if sess:  # session-specific: must be ours (full id, or the 6-char short form in request ids)
-            if not session_id:
-                continue
-            if sess != session_id and not (len(sess) <= 6 and session_id.endswith(sess)):
-                continue
+            mine = bool(session_id) and (sess == session_id or (len(sess) <= 6 and session_id.endswith(sess)))
+            if not mine:
+                if (related is None or req is None or not common.finding_age_ok(finding, path, related["window"])):
+                    continue
+                how = _relation(common, related, req)
+                if how is None:
+                    continue
         for it in finding.get("items") or []:
             if not isinstance(it, dict) or not str(it.get("evidence") or "").strip():
                 continue
@@ -156,15 +241,40 @@ def select_items(common, session_id: str, min_sev: str, window: timedelta,
             iid = str(it.get("id") or "")
             if not iid or common.is_acked(rid, iid):  # any ack (human or agent) stops re-injection
                 continue
+            if how is not None and f"{rid}.{iid}" in related["seen"]:
+                continue  # a related item is shown once per session
             if not inject_local and str(finding.get("mode") or "").strip().lower() == "local":
                 if skipped is not None:
                     skipped["local"] = skipped.get("local", 0) + 1
                 continue
-            out.append({**it, "_request": rid, "_created": str(finding.get("created") or "")})
-    # highest severity first, newest first within a severity (stable sorts)
+            out.append({**it, "_request": rid, "_created": str(finding.get("created") or ""),
+                        **({"_related": how} if how else {})})
+    # own items before related ones; highest severity first, newest first within a severity (stable sorts)
     out.sort(key=lambda it: it["_created"], reverse=True)
     out.sort(key=lambda it: -common.SEVERITY_RANK.get(str(it.get("severity")), 0))
+    out.sort(key=lambda it: 1 if it.get("_related") else 0)
     return out
+
+
+def _read_related_state(common) -> Dict[str, List[str]]:
+    st = _read_state(common, RELATED_STATE)
+    return {k: v for k, v in st.items() if isinstance(v, list)}
+
+
+def mark_related_shown(common, session_id: str, keys: List[str]) -> None:
+    """Remember the related items shown to *session_id* (at most 200 sessions, RELATED_MAX_PER_SESSION keys)."""
+    if not keys or not session_id:
+        return
+    state = _read_related_state(common)
+    cur = [k for k in state.pop(session_id, []) if isinstance(k, str)]
+    cur = list(dict.fromkeys(cur + keys))[-RELATED_MAX_PER_SESSION:]
+    state[session_id] = cur  # re-inserted last: the most recently used sessions are kept
+    if len(state) > 200:
+        state = dict(list(state.items())[-200:])
+    try:
+        common.write_json(common.review_dir() / RELATED_STATE, state)
+    except Exception:
+        pass
 
 
 SCENARIO_CAP = 300  # characters of an R8 failure_scenario shown (the prompt asks for < 400, validate caps at 1000)
@@ -194,6 +304,8 @@ def render_item(it: Dict[str, Any], scan: Callable[[str], List[str]]) -> str:
         body = (f"\n  Claim: {clean(it.get('claim'), 220)}"
                 f"\n  Evidence: {clean(it.get('evidence'), 260)}"
                 f"\n  Recommendation: {clean(it.get('recommendation'), 220)}")
+    if it.get("_related") in RELATED_LABEL:
+        head += f" [{RELATED_LABEL[it['_related']]}]"
     hits = scan(head + body)
     if hits:
         body = (f"\n  (text withheld: it matched injection pattern {', '.join(sorted(set(hits)))[:80]}; "
@@ -201,24 +313,39 @@ def render_item(it: Dict[str, Any], scan: Callable[[str], List[str]]) -> str:
     return head + body + "\n"
 
 
+RELATED_NOTE = ("Items marked \"from an earlier session\" were found in the work of an earlier session in the "
+                "same workspace (for example an earlier one-shot task). That work may have changed since; check the "
+                "item against the files before acting on it.\n")
+
+
 def build_block(items: List[Dict[str, Any]], scan: Callable[[str], List[str]], cap: int) -> str:
+    return build_block_shown(items, scan, cap)[0]
+
+
+def build_block_shown(items: List[Dict[str, Any]], scan: Callable[[str], List[str]],
+                      cap: int) -> Tuple[str, List[Dict[str, Any]]]:
+    """(block, the items shown in it) within *cap* characters."""
     footer = ("If you have handled an item or disagree with it, you may acknowledge it with: "
               f"{ack_command()} --agent <request-id> <item-id> \"<reason>\"\n"
               "Your acknowledgement stops this reminder. A HIGH item stays open until the human reviews it.")
-    parts, used, shown = [HEADER], len(HEADER) + len(footer) + 80, 0
+    parts, used, shown, noted = [HEADER], len(HEADER) + len(footer) + 80, [], False
     for it in items:
         chunk = render_item(it, scan)
-        if used + len(chunk) > cap:
+        extra = len(RELATED_NOTE) if it.get("_related") and not noted else 0  # the note comes with the first one
+        if used + extra + len(chunk) > cap:
             break
+        if extra:
+            parts.insert(1, RELATED_NOTE)
+            noted = True
         parts.append(chunk)
-        used += len(chunk)
-        shown += 1
-    if shown == 0:
-        return ""
-    if shown < len(items):
-        parts.append(f"({len(items) - shown} more not shown here; the human can list them with judge-findings.)\n")
+        used += extra + len(chunk)
+        shown.append(it)
+    if not shown:
+        return "", []
+    if len(shown) < len(items):
+        parts.append(f"({len(items) - len(shown)} more not shown here; the human can list them with judge-findings.)\n")
     parts.append(footer)
-    return "".join(parts)
+    return "".join(parts), shown
 
 
 def log_local_skips(common, session_id: str, n: int) -> None:
@@ -393,7 +520,12 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
     inject_local = common.setting("JUDGE_INJECT_LOCAL", "0").strip() == "1"
     remind = common.setting("JUDGE_INJECT_REFUSAL_REMINDER", "1").strip() == "1"
     skipped: Dict[str, int] = {}
-    items = select_items(common, session_id, min_sev, timedelta(hours=hours), inject_local, skipped)
+    related = None
+    try:
+        related = related_config(common, session_id, str(payload.get("cwd") or ""))
+    except Exception as exc:  # the related lookup must never cost the session's own findings
+        common.log_error("hook-errors.log", f"inject: related sessions: {type(exc).__name__}: {exc}")
+    items = select_items(common, session_id, min_sev, timedelta(hours=hours), inject_local, skipped, related)
     if skipped.get("local"):
         log_local_skips(common, session_id, skipped["local"])
     scan = None
@@ -401,15 +533,15 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
     if remind and session_id:
         scan, _src = load_scanner()
         reminder = refusal_reminder(common, session_id, timedelta(hours=hours), scan)
-    block = ""
+    block, shown = "", []
     if items:
         if scan is None:
             scan, _src = load_scanner()
-        block = build_block(items, scan, cap)
+        block, shown = build_block_shown(items, scan, cap)
         hits = scan(block) if block else []
         if hits:
             common.log_error("hook-errors.log", f"inject: block matched injection pattern(s) {hits}; not injected")
-            block = ""
+            block, shown = "", []
     stall = None
     try:
         stall = stall_warning(common, session_id)
@@ -421,6 +553,8 @@ def run(payload: Dict[str, Any]) -> Dict[str, Any]:
         mark_reminded(common, session_id, reminder[0])
     if stall is not None:
         _mark(common, STALL_STATE, session_id, stall[0])
+    if block:
+        mark_related_shown(common, session_id, [f"{it['_request']}.{it.get('id')}" for it in shown if it.get("_related")])
     return {"context": "\n".join(p for p in ((stall or ("", ""))[1], (reminder or ("", ""))[1], block) if p)}
 
 
