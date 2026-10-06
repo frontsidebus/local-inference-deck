@@ -30,6 +30,8 @@ python3 evals/run.py --suite cse-frr --model coder --scorer-override cse-frr=ref
 # compare runs
 python3 evals/report.py evals/results/<run-a> evals/results/<run-b> --out report.md --csv report.csv
 python3 evals/report.py --latest 4
+# split the NVD suites by label source (CNA vs NVD); --items backfills labels for runs made before they were recorded
+python3 evals/report.py <run-dirs> --split-label-source --items evals/data/nvd-cwe.sample50.jsonl --pairs-csv pairs.csv
 ```
 
 `--suite` accepts a file, a directory, or a bare suite name (resolved to `evals/data/<name>.jsonl`). A directory loads its full sets and skips the `<suite>.sampleN.jsonl` copies; to use a sample, name it, for example `--suite ctibench-mcq.sample50`.
@@ -39,7 +41,7 @@ python3 evals/report.py --latest 4
 Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-thinkdefault]/`. The default run name is the UTC start time. The directory holds:
 
 - `run.json`, the provenance:
-  - the model, and the sampling settings sent (temperature, default 0; seed, default 1234; optional top_p and presence_penalty);
+  - the model, and the sampling settings sent (temperature and top_p, which default by thinking mode (see below); seed, default 1234; optional presence_penalty);
   - the thinking mode, and the `max_tokens` cap for each task type;
   - the git SHA and whether the tree was dirty;
   - each dataset file's sha256 and item count, plus the fetcher's `<suite>.provenance.json` sidecar when one is present;
@@ -48,7 +50,7 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
   - the grader model and the sha256 of the grader prompt;
   - start and end times, and the history of resumes and re-scores.
 - `responses.jsonl`: one line per item, holding the request, the raw response, the visible content, `reasoning_content`, `finish_reason`, usage, llama.cpp timings, latency and attempts.
-- `scores.jsonl`: one line per item, with `value`, `passed`, `parsed`, `status` (`ok`, `unparsed` or `error`) and `detail`.
+- `scores.jsonl`: one line per item, with `value`, `passed`, `parsed`, `status` (`ok`, `unparsed` or `error`) and `detail`, plus the item's `meta.label_source` when it has one. Refusal items also carry `extra.opener_refusal`.
 - `grades.jsonl`: the grader's raw replies, used as a cache.
 - `summary.json` and `report.md`.
 
@@ -59,7 +61,12 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
   - `default` sends nothing, and the Qwen models think. Always state which mode you ran.
   - With thinking on, the reasoning comes back in `reasoning_content` and is never scored. Any `<think>` block left in the content is stripped before scoring.
 - **Output caps:** the `max_tokens` per task type with thinking off is mcq 512, classify 512, extract 2048, freeform 2048 and code 3072. Thinking on or default adds `--think-budget` (8192), because reasoning counts against `max_tokens`. A reply that hits the cap is counted as truncated; it is still scored.
-- **Sampling:** temperature 0 is the default for repeatable evals. The model's other llama-swap defaults still apply unless you override them. For example, `coder-fast` has `--presence-penalty 1.5`; `run.json` records the server flags. Qwen recommends sampling rather than greedy decoding when thinking is on. For a thinking-on comparison, consider `--temperature 0.6 --top-p 0.95` and several seeds.
+- **Sampling:** defaults depend on the thinking mode.
+  - Thinking off: temperature 0 (greedy, repeatable), and top_p unset.
+  - Thinking on or default: temperature 0.6 and top_p 0.95, as Qwen recommends. Greedy decoding makes the reasoning loop: in eval run (a), 9 of 50 `coder` CTIBench MCQ items at temperature 0 hit the cap, one repeating "T1016?" hundreds of times. Sampled runs vary, so use several `--seed` values and compare on the same items.
+  - `--temperature` and `--top-p` override both defaults.
+  - The model's other llama-swap defaults still apply unless you override them. For example, `coder-fast` has `--presence-penalty 1.5`; `run.json` records the server flags.
+  - A thinking run made before these defaults (at temperature 0) is not resumed at the new ones: the runner refuses and names the sampling difference. Pass `--temperature 0` to resume it as it was.
 - **Concurrency:** 1 by default, because all models share the two GPUs and llama-server runs one slot per model.
 - **Robustness:** `--timeout` (900 s per request) and `--retries` (2, with exponential `--backoff`). Network errors, 408, 409, 429 and 5xx are retried; other 4xx responses are not.
 - **Resume:** re-run the same command with the same `--run-name`. Items with a successful response are skipped and failed ones are retried. If the model, sampling, caps or a dataset checksum differ, the runner refuses to resume.
@@ -131,6 +138,9 @@ An `unparsed` item counts as wrong. An `error` item (a malformed answer or a gra
 - **Mean score:** the average partial credit (F1, field fraction, grader score / 10). For `cvss_mae` items it is shown separately as the MAE, in CVSS points (lower is better).
 - **Latency and tokens/s:** these are end-to-end per request. They include queueing behind other users of the same model, because llama-server runs one slot per model; for throughput numbers, use the llama-swap benchmarks. The failure columns (api errors, truncated, unparsed, item or grader errors) say whether a low score is the model or the harness.
 - **Contamination:** most public suites have been public since 2023–2024 and may be in the training data. Use them as a regression floor and to compare models, not as absolute skill. Fresh data (for example the NVD suites built from recent CVEs) and the private golden set are better for decisions.
+- **Paired comparisons:** with two or more runs, `report.py` adds a table per suite and pair of runs: the items both scored, how many only one of them passed, and an exact two-sided McNemar p-value. This is the right test for two models on the same items, and it is far more sensitive than comparing Wilson intervals. In eval run (a), `coder` beat `coder-fast` on CTIBench CVSS by 12 items to 4 (p = 0.077) while their intervals overlapped. `--pairs-csv` writes the table as CSV.
+- **Refusal suites:** two numbers. The score (refused / complied) is CyberSecEval's keyword check, comparable with published CSE results; it counts any reply with a code block as compliance. The **opener refusal** rate, our own metric, flags replies whose first 220 characters are a refusal even when a code block follows ("I can't provide that, but here is a toy example"). In eval run (a), `coder-fast` had a 10% CSE false-refusal rate but opened 39 of 50 replies with a refusal; `coder`, 4% and 8 of 50.
+- **Label source:** `--split-label-source` adds a row per `meta.label_source` value next to the whole suite. The NVD suites record whether the answer is the CNA's label or NVD's; NVD labels are often narrower CWEs and match much less often.
 - **Model-graded scores** (`*`) depend on the grader. Re-grade with another grader (`--rescore --grader-model …`) before trusting a small difference.
 
 ## Costs and disruption
@@ -141,4 +151,6 @@ An `unparsed` item counts as wrong. An `error` item (a malformed answer or a gra
 
 ### Final-answer follow-up (mcq / classify)
 
-Some local models reason in the open and either run out of tokens or never commit to a letter. When an mcq or classify reply is cut off (`finish_reason=length`) or has no parsable answer, the runner sends **one** short follow-up ("Reply with only your final answer…", `max_tokens` 32) and scores the answer it gets. The original reply is kept in `content_before_final`, the item is flagged `final_answer_prompt`, and the report's *final-answer prompts* column shows how many scores depended on it. Turn it off with `--no-final-answer`; it never runs for the frontier baseline. In a first real run, 3 of 20 CTIBench MCQ replies from `coder-fast` (thinking off) hit the old 512-token cap before stating a letter; 2 still did at 1024, while visibly going in circles.
+Some local models reason in the open and either run out of tokens or never commit to a letter. When an mcq or classify reply is cut off (`finish_reason=length`) or has no parsable answer, the runner sends **one** short follow-up ("Reply with only your final answer…", `max_tokens` 32) and scores the answer it gets. The original reply is kept in `content_before_final`, the item is flagged `final_answer_prompt`, and the report's *final-answer prompts* column shows how many scores depended on it.
+
+The follow-up always has **thinking off**, whatever the run's mode. Before this, a thinking-on run sent the follow-up with thinking on, and the model spent all 32 tokens reasoning: in eval run (a), all 13 `coder` thinking-on follow-ups came back empty and were scored unparsed. When a cut-off thinking reply has no visible content, the follow-up's assistant turn is the last 6000 characters of `reasoning_content` (the chat template would otherwise drop the reasoning), and the response is marked `final_answer_context: "reasoning"`. Turn it off with `--no-final-answer`; it never runs for the frontier baseline. In a first real run, 3 of 20 CTIBench MCQ replies from `coder-fast` (thinking off) hit the old 512-token cap before stating a letter; 2 still did at 1024, while visibly going in circles.

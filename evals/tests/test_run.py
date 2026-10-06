@@ -24,6 +24,7 @@ class FakeGateway:
         self.requests = []
         self.plan = {}
         self.auth = []
+        self.think_only = False
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -42,8 +43,12 @@ class FakeGateway:
                     self.wfile.write(b'{"error": "injected"}')
                     return
                 content = outer.answer(body)
+                msg = {"role": "assistant", "content": content}
+                if outer.think_only and not body["messages"][-1]["content"].startswith("Stop here."):
+                    # a thinking reply cut off before the answer: no content, all of it in reasoning_content
+                    msg = {"role": "assistant", "content": "", "reasoning_content": "step one... " * 5 + "so B?"}
                 data = {"model": body["model"], "system_fingerprint": "b0-test",
-                        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+                        "choices": [{"finish_reason": "length" if outer.think_only else "stop", "message": msg}],
                         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
                 raw = json.dumps(data).encode()
                 self.send_response(200)
@@ -451,3 +456,111 @@ def test_final_answer_followup_off_and_not_for_frontier_or_freeform(env):
     finally:
         gw.close()
     assert not [r for r in gw.requests if r["messages"][-1]["content"].startswith("Stop here.")]
+
+
+def test_final_answer_followup_has_thinking_off_and_sees_the_reasoning(env):
+    """Eval run (a) bug: with thinking on, the follow-up reused enable_thinking: true, spent its 32 tokens
+    reasoning and came back empty. It must always send thinking off, and when the cut-off reply has no content,
+    pass the tail of the reasoning as the assistant turn so the model can still state its answer."""
+    gw = FakeGateway()
+    gw.think_only = True
+    try:
+        args = ["--key-file", env["key"], "--site-env", env["site"], "--results", env["results"],
+                "--base-url", gw.url, "--backoff", "0", "--run-name", "fat", "--thinking", "on",
+                "--suite", str(SAMPLES / "mcq.jsonl"), "--model", "coder", "--limit", "2"]
+        assert RUN.main(args) == 0
+    finally:
+        gw.close()
+    followups = [r for r in gw.requests if r["messages"][-1]["content"].startswith("Stop here.")]
+    assert len(followups) == 2
+    for r in followups:
+        assert r["chat_template_kwargs"] == {"enable_thinking": False} and r["max_tokens"] == 32
+        assert r["messages"][-2] == {"role": "assistant", "content": "step one... " * 5 + "so B?"}
+    resp = [json.loads(l) for l in (run_dir(env, "fat-coder-think") / "responses.jsonl").read_text().splitlines()]
+    assert all(r["final_answer"] == "Answer: A" and r["final_answer_context"] == "reasoning" for r in resp)
+    scores = [json.loads(l) for l in (run_dir(env, "fat-coder-think") / "scores.jsonl").read_text().splitlines()]
+    assert all(s["status"] == "ok" and s["final_answer_prompt"] for s in scores)
+
+
+def test_sampling_defaults_by_thinking_mode(gw, env):
+    """Thinking off is greedy; thinking on/default use 0.6 / top_p 0.95 (temperature 0 made thinking loop)."""
+    rc = RUN.main(base_args(env, gw, "--suite", str(SAMPLES / "mcq.jsonl"), "--model", "coder",
+                            "--limit", "1", "--thinking", "off,on,default"))
+    assert rc == 0
+    got = [(r["temperature"], r.get("top_p")) for r in gw.requests]
+    assert got == [(0.0, None), (0.6, 0.95), (0.6, 0.95)]
+    run = json.loads((run_dir(env, "t1-coder-think") / "run.json").read_text())
+    assert run["sampling"] == {"temperature": 0.6, "seed": 1234, "top_p": 0.95}
+    assert "top_p" not in json.loads((run_dir(env, "t1-coder") / "run.json").read_text())["sampling"]
+
+
+def test_explicit_sampling_flags_win(gw, env):
+    rc = RUN.main(base_args(env, gw, "--suite", str(SAMPLES / "mcq.jsonl"), "--model", "coder", "--limit", "1",
+                            "--thinking", "off,on", "--temperature", "0.2", "--top-p", "0.8"))
+    assert rc == 0
+    assert [(r["temperature"], r["top_p"]) for r in gw.requests] == [(0.2, 0.8), (0.2, 0.8)]
+
+
+def test_resume_of_an_old_thinking_run_refuses_new_sampling_defaults(gw, env):
+    """A thinking-on run made at temperature 0 must not be resumed silently at the new 0.6 default."""
+    args = base_args(env, gw, "--suite", str(SAMPLES / "mcq.jsonl"), "--model", "coder", "--limit", "1",
+                     "--thinking", "on")
+    assert RUN.main(args + ["--temperature", "0"]) == 0
+    with pytest.raises(SystemExit, match="sampling"):
+        RUN.main(args)
+
+
+def test_scores_record_label_source(gw, env, tmp_path):
+    it = json.loads((SAMPLES / "mcq.jsonl").read_text().splitlines()[0])
+    it["meta"] = dict(it.get("meta") or {}, label_source="nvd")
+    f = tmp_path / "lab.jsonl"
+    f.write_text(json.dumps(it) + "\n")
+    assert RUN.main(base_args(env, gw, "--suite", str(f), "--model", "coder-fast")) == 0
+    sc = json.loads((run_dir(env, "t1-coder-fast") / "scores.jsonl").read_text().splitlines()[0])
+    assert sc["label_source"] == "nvd"
+
+
+def _fake_run(d, model, scores, thinking="off"):
+    d.mkdir()
+    (d / "run.json").write_text(json.dumps({"model": model, "thinking": thinking}))
+    (d / "responses.jsonl").write_text("".join(json.dumps({"id": s["id"], "suite": s["suite"]}) + "\n"
+                                               for s in scores))
+    (d / "scores.jsonl").write_text("".join(json.dumps(s) + "\n" for s in scores))
+    return d
+
+
+def test_mcnemar_exact():
+    assert R.mcnemar_exact(0, 0) == 1.0
+    assert R.mcnemar_exact(12, 4) == pytest.approx(0.0768, abs=1e-4)
+    assert R.mcnemar_exact(2, 8) == pytest.approx(0.1094, abs=1e-4)
+    assert R.mcnemar_exact(5, 5) == 1.0
+
+
+def test_report_paired_comparisons_split_and_opener(tmp_path):
+    ids = [f"i{k}" for k in range(6)]
+    a_pass = [True, True, True, False, False, True]
+    b_pass = [True, False, False, False, True, True]
+    labs = ["cna", "cna", "nvd", "nvd", "cna", "nvd"]
+    a = _fake_run(tmp_path / "a", "m1", [{"id": i, "suite": "s", "scorer": "exact", "passed": p, "value": float(p),
+                                          "status": "ok", "label_source": l} for i, p, l in zip(ids, a_pass, labs)])
+    # b predates label_source in scores.jsonl: its labels come from --items
+    b = _fake_run(tmp_path / "b", "m2", [{"id": i, "suite": "s", "scorer": "exact", "passed": p, "value": float(p),
+                                          "status": "ok"} for i, p in zip(ids, b_pass)])
+    items = tmp_path / "s.jsonl"
+    items.write_text("".join(json.dumps({"id": i, "meta": {"label_source": l}}) + "\n" for i, l in zip(ids, labs)))
+    frr = _fake_run(tmp_path / "f", "m1", [
+        {"id": "r1", "suite": "frr", "scorer": "refusal", "passed": True, "value": 1.0, "status": "ok",
+         "extra": {"expected": "comply", "opener_refusal": True}},
+        {"id": "r2", "suite": "frr", "scorer": "refusal", "passed": True, "value": 1.0, "status": "ok",
+         "extra": {"expected": "comply", "opener_refusal": False}}])
+    out, pcsv = tmp_path / "r.md", tmp_path / "p.csv"
+    assert R.main([str(a), str(b), str(frr), "--split-label-source", "--items", str(items),
+                   "--out", str(out), "--pairs-csv", str(pcsv)]) == 0
+    md = out.read_text()
+    assert "## s [label_source=cna]" in md and "## s [label_source=nvd]" in md
+    assert "| s | m1 (think off) | m2 (think off) | 6 | 4 | 3 | 2 | 1 | 1.000 |" in md
+    assert "| s [label_source=nvd] | m1 (think off) | m2 (think off) | 3 | 2 | 1 | 1 | 0 | 1.000 |" in md
+    assert "- m1 (think off): 1/2 = 50.0%" in md
+    assert pcsv.read_text().splitlines()[0] == ",".join(R.PAIR_COLUMNS)
+    # no split: no label rows
+    assert "label_source=" not in R.render_markdown([R.summarize(a)])
