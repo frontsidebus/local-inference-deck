@@ -38,9 +38,15 @@ Window: [request.since, min(request.created + JUDGE_WINDOW_GRACE_SECONDS, next t
 the host find, the gate decisions and the C3 results, no matter when the bundle is collected. The next turn's
 start comes from the session's `agent.turn_context: conversation turn:` log lines; only when the log has none,
 from the `since` of the session's next request (see window_info).
-Attribution: a request's changed_paths count as the agent's only when a session tool event (events.jsonl) names
-them; the others are listed in manifest attribution.rejected_request_paths. Hermes bookkeeping files
-(lib/snapshot.NOISE_GLOBS) never count.
+Attribution: a request's changed_paths count as the agent's only when the session's own tool events confirm them
+(up to the window end): a write_file/patch target, a terminal write target (cp/mv/install destination, output
+redirection, tee; lib/snapshot.confirmed_writes) or a snapshot change attributed to the agent. The others are
+"claimed but not confirmed": moved to the manifest request copy's detail.unconfirmed_paths, listed in manifest
+attribution.unconfirmed_paths (alias rejected_request_paths), never in agent-diff.patch or data-files.txt, and
+left out of classification (except a secret-shaped one, and every path of a gate request). Hermes bookkeeping
+files (lib/snapshot.NOISE_GLOBS) never count.
+Code version: manifest code_versions = {request: the request's code_version stamp, collector: lib/version of this
+code}; a difference is notes.code_version (a warning, never a failure).
 data_class=sensitive (from the request, or from re-classifying the agent-attributed paths: the stricter wins):
 agent diff carries one `# content withheld (data_class=sensitive): <path> — N lines changed (+a/-b)` line per
 changed path (no file contents).  Hosts that cannot be reached are recorded, never fatal.
@@ -68,7 +74,7 @@ JUDGE_DIR = Path(__file__).resolve().parent.parent
 if str(JUDGE_DIR) not in sys.path:
     sys.path.insert(0, str(JUDGE_DIR))
 
-from lib import config, hermeslog, snapshot  # noqa: E402
+from lib import config, hermeslog, snapshot, version  # noqa: E402
 from lib import queue as q  # noqa: E402
 from lib.redact import redact  # noqa: E402
 
@@ -382,18 +388,26 @@ def _mtime(path: str) -> Optional[datetime]:
 
 
 def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) -> Dict[str, List[str]]:
-    """Split the session's snapshot changes (as of now) into the agent's and others'.
+    """Split the session's snapshot changes (as of now) into the agent's and others', and the request's
+    changed_paths into confirmed and unconfirmed ones.
 
-    agent:    changed paths named by the session's tool events up to the window end (or under a HERMES_HOME
-              dir of a self-write tool the session ran)
-    accepted: request changed_paths backed by such an event (or self-write prefix); they join the agent set
-    rejected: request changed_paths NO tool event of the session backs: never attributed to the agent (a
-              legacy or forged request, or an operator's change the hook misread)
-    noise:    request changed_paths that are Hermes bookkeeping (snapshot.NOISE_GLOBS): ignored
-    others:   changed paths that no agent tool event of the session names, last modified by the window end
-    later:    changed paths the agent touched only after the window, or others' changes after it (omitted)"""
-    res: Dict[str, List[str]] = {"agent": [], "others": [], "later": [], "accepted": [], "rejected": [],
+    agent:       changed paths named by the session's tool events up to the window end (or under a HERMES_HOME
+                 dir of a self-write tool the session ran)
+    accepted:    request changed_paths the session's own tool events CONFIRM (up to the window end): a
+                 write_file/patch target, a terminal write target (cp/mv/install destination #45, output
+                 redirection, tee: snapshot.confirmed_writes), or a snapshot change attributed to the agent
+                 (`agent`); they join the agent set
+    unconfirmed: request changed_paths nothing confirms (a legacy, buggy or forged request, a path a command
+                 only named or read, an operator's change the hook misread): never the agent's, no content,
+                 left out of classification (collect.class_detail), listed in the manifest
+    rejected:    the same list as unconfirmed (older name, kept for readers of the manifest's
+                 attribution.rejected_request_paths)
+    noise:       request changed_paths that are Hermes bookkeeping (snapshot.NOISE_GLOBS): ignored
+    others:      changed paths that no agent tool event of the session names, last modified by the window end
+    later:       changed paths the agent touched only after the window, or others' changes after it (omitted)"""
+    res: Dict[str, List[str]] = {"agent": [], "others": [], "later": [], "accepted": [], "unconfirmed": [],
                                  "noise": []}
+    res["rejected"] = res["unconfirmed"]
     d = q.snapshot_dir(req["session"], root)
     meta = snapshot.load_meta(d)
     noise = snapshot.noise_globs(cfg, meta)
@@ -401,7 +415,7 @@ def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) 
     res["noise"] = [p for p in req_paths if snapshot.is_noise(p, noise)]
     req_paths = [p for p in req_paths if p not in res["noise"]]
     if not meta:
-        res["rejected"] = req_paths
+        res["unconfirmed"][:] = req_paths
         return res
     changed = [p for _, p in snapshot.changed_files(d, cfg)]
     tz = hermeslog.log_tz(cfg)
@@ -415,11 +429,16 @@ def attribution(req: Dict, cfg: Mapping[str, str], root: Path, until: datetime) 
     def tools(end: datetime):
         return hermeslog.tools_used(log, req["session"], started, end, tz) if log.is_file() else set()
 
-    keys, prefixes = snapshot.agent_touched(d, cfg, until=until, tools=tools(until))
-    res["accepted"], res["rejected"] = snapshot.attribute(req_paths, keys, prefixes)
+    commands = snapshot.terminal_commands(cfg.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+                                          str(meta.get("session") or req["session"]))
+    keys, prefixes = snapshot.agent_touched(d, cfg, until=until, tools=tools(until), commands=commands)
     agent, rest = snapshot.attribute(changed, keys, prefixes)
+    wkeys, wprefixes = snapshot.confirmed_writes(d, cfg, until=until, commands=commands)
+    res["accepted"], unconfirmed = snapshot.attribute(req_paths, wkeys | {snapshot._key(p) for p in agent},
+                                                      wprefixes)
+    res["unconfirmed"][:] = unconfirmed
     keys_any, prefixes_any = snapshot.agent_touched(
-        d, cfg, tools=tools(datetime.now(timezone.utc) + timedelta(days=1)))
+        d, cfg, tools=tools(datetime.now(timezone.utc) + timedelta(days=1)), commands=commands)
     later_agent, others = snapshot.attribute(rest, keys_any, prefixes_any)
     late = [p for p in others if (_mtime(p) or until) > until]
     res["agent"] = agent
@@ -438,8 +457,8 @@ def agent_diff(req: Dict, cfg: Mapping[str, str], sensitive: bool, root: Path, p
     if snapshot.load_meta(d) and not paths:
         text += "# no changed path is attributed to the agent (other changes, if any: others-changed.txt)\n"
     if rejected:
-        text += (f"# {len(rejected)} path(s) listed by the request are NOT attributed to the agent: no tool event "
-                 "of this session names them (see manifest attribution.rejected_request_paths)\n")
+        text += (f"# {len(rejected)} path(s) listed by the request are NOT attributed to the agent: claimed but not "
+                 "confirmed, no tool event of this session wrote them (see manifest attribution.unconfirmed_paths)\n")
     return text if sensitive else redact(text)
 
 
@@ -640,13 +659,16 @@ def _watch_runaway(req: Dict) -> bool:
             and not req.get("changed_paths") and not detail.get("cwd"))
 
 
-def class_detail(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> Dict:
+def class_detail(req: Dict, cfg: Mapping[str, str], agent_paths=(), unconfirmed=()) -> Dict:
     """effective_class plus lib/config.classify_detail's per-path lists (#43) of the paths considered.
 
     The stricter of the request's own data_class and the collector's independent classification of the
     agent-attributed paths (request changed_paths + *agent_paths*, Hermes bookkeeping noise excluded).
-    Request paths rejected by attribution still count here: they can only make the bundle stricter (a
-    secret one makes it sensitive; a sensitive one is withheld or makes it sensitive).
+    *unconfirmed* request paths (no tool event of the session confirms them, see attribution) are LEFT OUT:
+    a forged or buggy request cannot steer the class, e.g. add infra paths so that a sensitive one is only
+    withheld (#43 mixed rule). Two exceptions keep it strict: a secret-shaped unconfirmed path still makes the
+    bundle sensitive (#42), and a `gate` request keeps all its paths (its evidence is the gated command itself,
+    whether or not it ran). The request's own data_class still applies (the stricter wins).
 
     With no paths, only a host-rule gate request keeps the hook's answer (its evidence is the redacted
     command), and a C6 watcher runaway request keeps its own (slot telemetry, no agent content: it should
@@ -656,28 +678,36 @@ def class_detail(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> Dict:
     strictly (no withheld sensitive paths: its evidence is the command itself)."""
     cwd = (req.get("detail") or {}).get("cwd") or None
     noise = snapshot.noise_globs(cfg)
-    paths = sorted(p for p in set(req.get("changed_paths") or []) | set(agent_paths or [])
+    gate = req.get("kind") == "gate"
+    drop = set() if gate else {p for p in unconfirmed or () if isinstance(p, str)}
+    paths = sorted(p for p in (set(req.get("changed_paths") or []) - drop) | set(agent_paths or [])
                    if isinstance(p, str) and p.strip() and not snapshot.is_noise(p, noise))
-    strict = 0 if req.get("kind") == "gate" else None
+    strict = 0 if gate else None
     det = config.classify_detail(paths, cfg, cwd, max_mixed=strict)
-    if not paths and (_host_rule_gate(req) or _watch_runaway(req)):
+    if not paths and not drop and (_host_rule_gate(req) or _watch_runaway(req)):
         det["class"], det["reason"] = req.get("data_class"), "request class (no paths)"
+    secret_unconfirmed = sorted(p for p in drop if config.is_secret_path(p, cfg))
+    if secret_unconfirmed:
+        det["class"], det["reason"] = "sensitive", "secret-shaped unconfirmed request path"
+        det["secret"] = sorted(set(det.get("secret") or []) | set(secret_unconfirmed))
     mine = det["class"]
     det["class"] = "infra" if req.get("data_class") == "infra" and mine == "infra" else "sensitive"
     if det["class"] != mine:
         det["reason"] = f"request data_class={req.get('data_class')!r}"
+    det["unconfirmed_excluded"] = len(drop)
     return det
 
 
-def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=()) -> str:
+def effective_class(req: Dict, cfg: Mapping[str, str], agent_paths=(), unconfirmed=()) -> str:
     """'infra' | 'sensitive' for the bundle: see class_detail."""
-    return class_detail(req, cfg, agent_paths)["class"]
+    return class_detail(req, cfg, agent_paths, unconfirmed)["class"]
 
 
 # ---------------------------------------------------------------- per-path withholding in infra bundles (#43)
 SENSITIVE_LABEL = "[sensitive path #{n} withheld]"
 LINE_WITHHELD = "line withheld: it names a sensitive path (#43)"
 NONINFRA_CWD_LABEL = "[non-infra cwd withheld]"
+UNCONFIRMED_LABEL = "[unconfirmed path #{n} withheld]"
 
 
 class Withholding:
@@ -745,6 +775,22 @@ class Withholding:
     @property
     def count(self) -> int:
         return len(self.labels)
+
+
+def _annotate_request(req: Dict, unconfirmed) -> Dict:
+    """The request copy for the manifest: *unconfirmed* changed_paths (no tool event of the session confirms
+    them) moved out of changed_paths into detail.unconfirmed_paths (+ detail.unconfirmed_paths_total), so the
+    judge sees them as claimed but not confirmed, never as the agent's changes. Unchanged without any."""
+    if not unconfirmed:
+        return req
+    out = json.loads(json.dumps(req))
+    drop = set(unconfirmed)
+    out["changed_paths"] = [p for p in out.get("changed_paths") or [] if p not in drop]
+    det = out.get("detail") if isinstance(out.get("detail"), dict) else {}
+    det["unconfirmed_paths"] = sorted(drop)
+    det["unconfirmed_paths_total"] = len(drop)
+    out["detail"] = det
+    return out
 
 
 def _scrub_request(req: Dict, wh: "Withholding") -> Dict:
@@ -871,11 +917,15 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     since, until = win["since"], win["until"]
     since_s, until_s, now_s = q.utc_now_iso(since), q.utc_now_iso(until), q.utc_now_iso(now)
     att = attribution(req, cfg, root, until)
-    cdet = class_detail(req, cfg, att["agent"])
+    cdet = class_detail(req, cfg, att["agent"], att["unconfirmed"])
     data_class = cdet["class"]
     sensitive = data_class == "sensitive"
     req_cwd = (req.get("detail") or {}).get("cwd") or None
     wh = Withholding(cfg, req_cwd, [] if sensitive else cdet.get("sensitive") or [])
+    if not sensitive:  # unconfirmed non-infra paths no longer decide the class: never name them either
+        for n, p in enumerate(x for x in att["unconfirmed"] if wh.kind(x) != "infra"):
+            if snapshot._key(p) not in wh.labels:
+                wh.add_form(p, UNCONFIRMED_LABEL.format(n=n + 1))
     if wh.count and req_cwd and not config.is_infra_path(os.path.join(req_cwd, ".judge-cwd-probe"), cfg, req_cwd):
         wh.add_form(req_cwd, NONINFRA_CWD_LABEL)  # a mixed bundle names no non-infra location (#43)
     ev = q.evidence_dir(request_id, root, create=True)
@@ -904,7 +954,7 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     except Exception as e:  # the refusal section must never break the bundle
         notes["refusals.jsonl"] = f"not collected: {e.__class__.__name__}"
     agent_paths = sorted(set(att["agent"]) | set(att["accepted"]))
-    _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["rejected"], wh))
+    _write(ev / "agent-diff.patch", agent_diff(req, cfg, sensitive, root, agent_paths, until, att["unconfirmed"], wh))
     _write(ev / "others-changed.txt", others_changed(req, cfg, root, att, sensitive, until))
     df_text, df_rec = None, {"included": [], "withheld": [], "withheld_counts": {}}
     try:
@@ -939,16 +989,27 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
             f"{wh.count} non-infra path(s) next to the infra ones (#43): content withheld and names replaced by "
             "`[sensitive path #N withheld]` labels everywhere in this bundle; each has a `# content withheld` "
             "line with a line-count stat in agent-diff.patch when it changed. They are NOT reviewed here.")
+    n_unconf_masked = sum(1 for lb in wh.extra_labels if lb.startswith("[unconfirmed path #"))
+    if n_unconf_masked:
+        withheld["unconfirmed_paths"] = (
+            f"{n_unconf_masked} non-infra request path(s) claimed but not confirmed by any tool event: names replaced "
+            "by `[unconfirmed path #N withheld]` labels everywhere in this bundle; no content, not the agent's")
     scratch = sorted(set(wh.scratch) | set(cdet.get("scratch") or []))
     if scratch:
         withheld["scratch_paths"] = (
             f"{len(scratch)} agent scratch/cache path(s) (#43; manifest attribution.scratch_paths): metadata only, "
             "never content; they do not decide data_class")
-    if att["rejected"]:
+    if att["unconfirmed"]:
         notes["attribution"] = (
-            f"{len(att['rejected'])} request changed_path(s) rejected: no tool event of this session names them "
-            + ("(the gated call never ran, or ran after the window)" if req.get("kind") == "gate" else
-               "(legacy/forged request or another actor's change)") + "; they are NOT the agent's changes")
+            f"{len(att['unconfirmed'])} request changed_path(s) claimed but not confirmed (rejected): no tool event "
+            "of this session wrote them (write_file/patch target, cp/mv/install/redirect/tee target, or a snapshot "
+            "change attributed to the agent) "
+            + ("(the gated call never ran, ran after the window, or wrote nothing confirmable)"
+               if req.get("kind") == "gate" else "(legacy/buggy/forged request, a path a command only named, or "
+               "another actor's change)")
+            + "; they are NOT the agent's changes, their content is not in this bundle"
+            + ("" if req.get("kind") == "gate" else " and they did not decide data_class")
+            + " (manifest attribution.unconfirmed_paths, request detail.unconfirmed_paths)")
     if att["noise"]:
         notes["noise"] = f"{len(att['noise'])} request changed_path(s) are Hermes bookkeeping files; ignored"
     for host in config.HOSTS:
@@ -988,14 +1049,24 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
     if snap_rec.get("truncated_roots") or snap_rec.get("skipped_roots"):
         notes["snapshot"] = ("some opted-in dirs were truncated or not snapshotted at session start (see "
                              "manifest snapshot); changes there may be missing from agent-diff.patch")
-    _write_manifest(ev, req if sensitive else _scrub_request(req, wh), data_class, {
+    req_copy = _annotate_request(req, att["unconfirmed"])
+    scrubbed = req_copy if sensitive else _scrub_request(req_copy, wh)
+    cur_version = version.code_version()
+    vnote = version.mismatch_note(req.get("code_version"), cur_version, "request", "collector")
+    if vnote:
+        notes["code_version"] = vnote
+    unconfirmed_shown = (sorted(att["unconfirmed"]) if sensitive else
+                         sorted(p for p in att["unconfirmed"] if config.is_infra_path(p, cfg, cwd)))
+    _write_manifest(ev, scrubbed, data_class, {
         "collected": now_s,
         "classification": {"reason": cdet.get("reason"),
                            "infra_paths": len(cdet.get("infra") or []),
                            "withheld_sensitive_paths": 0 if sensitive else wh.count,
                            "secret_paths": len(cdet.get("secret") or []),
-                           "scratch_paths": len(scratch)},
-        "masked_request": bool(not sensitive and (wh.count or req != _scrub_request(req, wh))),
+                           "scratch_paths": len(scratch),
+                           "unconfirmed_paths_excluded": cdet.get("unconfirmed_excluded", 0)},
+        "masked_request": bool(scrubbed != req),
+        "code_versions": {"request": req.get("code_version"), "collector": cur_version},
         "window": window_rec,
         "windowed": windowed,
         "snapshot": snap_rec,
@@ -1014,16 +1085,16 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
                                              "the window end carries a NOTE line"}} if df_text else {}),
         },
         "data_files": df_rec,
-        "attribution": {"agent_paths": sorted(att["agent"]) if sensitive else
-                        sorted(wh.name(p) for p in att["agent"]),
+        "attribution": {"agent_paths": agent_paths if sensitive else sorted(wh.name(p) for p in agent_paths),
                         "scratch_paths": scratch,
                         "changed_by_others": sorted(att["others"]) if sensitive else
                         sorted(p for p in att["others"]
                                if config.is_infra_path(p, cfg, cwd)),
                         "omitted_after_window": len(att["later"]),
-                        "rejected_request_paths": sorted(att["rejected"]) if sensitive else
-                        sorted(p for p in att["rejected"] if config.is_infra_path(p, cfg, cwd)),
-                        "rejected_request_paths_total": len(att["rejected"]),
+                        "unconfirmed_paths": unconfirmed_shown,
+                        "unconfirmed_paths_total": len(att["unconfirmed"]),
+                        "rejected_request_paths": unconfirmed_shown,
+                        "rejected_request_paths_total": len(att["unconfirmed"]),
                         "ignored_noise_paths": len(att["noise"])},
         "notes": notes,
         "request_data_class": req.get("data_class"),
@@ -1031,7 +1102,7 @@ def collect(request_id: str, cfg: Optional[Mapping[str, str]] = None, runner=Non
                           ("redacted content diffs of infra paths; sensitive and scratch paths withheld (#43)"
                            if wh.count or scratch else "redacted content diffs"),
     })
-    if not sensitive and wh.count:
+    if not sensitive and (wh.count or wh.extra_labels):
         _scrub_bundle(ev, wh)
     return ev
 
@@ -1110,7 +1181,10 @@ def add_probe(request_id: str, name: str, args: List[str], cfg: Optional[Mapping
         man = {}
     agent = [p for p in (man.get("attribution") or {}).get("agent_paths") or ()
              if isinstance(p, str) and not p.startswith("[")]  # labels of withheld paths (#43) are not paths
-    data_class = effective_class(req, cfg, agent)
+    # request paths collect() did not attribute (unconfirmed, or labelled in a mixed bundle) do not re-decide the
+    # class here either: a probe must not flip a bundle collect() classified
+    unconfirmed = [p for p in req.get("changed_paths") or [] if p not in set(agent)]
+    data_class = effective_class(req, cfg, agent, unconfirmed)
     if man.get("data_class") == "sensitive":  # never relax what collect() decided
         data_class = "sensitive"
     if man.get("masked_request") and isinstance(man.get("request"), dict):

@@ -22,7 +22,8 @@ Public API:
     new_request_id(kind, session, now=None, root=None) -> str   unique in queue/ and done/ (bumps seconds)
     make_request(kind, session, since, *, changed_paths=(), claims="", plan=None, data_class="sensitive",
                  source_event, detail=None, created=None, request_id=None, root=None) -> dict (not written)
-    write_request(req, root=None) -> Path     validates; raises ValidationError
+    write_request(req, root=None) -> Path     stamps code_version (lib/version) when missing, validates; raises
+                                              ValidationError
     read_request(request_id, root=None) -> dict   from queue/, queue/deferred/ or done/
     list_pending(root=None) -> list[dict]     queue/*.json + queue/deferred/*.json (every request not judged
                                               yet), oldest first (invalid files skipped)
@@ -291,7 +292,12 @@ def pending_path(request_id: str, root=None) -> Optional[Path]:
 
 def write_request(req: Dict[str, Any], root=None) -> Path:
     """Validate and write a new request: to queue/deferred/ when its not_before lies ahead (#40), else to
-    queue/ (which starts judge-review.path)."""
+    queue/ (which starts judge-review.path). A request without `code_version` is stamped with the writing
+    code's version (lib/version.code_version: files only, no subprocess, cached per process); *req* is
+    updated in place."""
+    if isinstance(req, dict) and not isinstance(req.get("code_version"), dict):
+        from . import version
+        req["code_version"] = version.code_version()
     errs = validate_request(req)
     if errs:
         raise ValidationError(errs)
