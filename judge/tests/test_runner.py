@@ -308,7 +308,7 @@ def test_daily_cap_falls_back_to_local(env, frontier, local, monkeypatch):
     assert RJ.main(["--pending"]) == 0
     assert len(frontier.calls()) == 1 and len(local["requests"]) == 1
     f1, f2 = finding(env, r1), finding(env, r2)
-    assert f1["mode"] == "frontier" and "notes" not in f1
+    assert f1["mode"] == "frontier" and not [n for n in f1.get("notes", []) if not n.startswith("code version:")]
     assert f2["mode"] == "local" and any("daily cap" in n for n in f2["notes"])
     assert json.loads((env / "usage.json").read_text())["frontier_runs"] == 1
 

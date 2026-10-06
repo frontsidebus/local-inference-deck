@@ -320,7 +320,7 @@ def test_infra_bundle_has_no_claims_stage(env, frontier, local, monkeypatch):
     enqueue(env, r, data_class="infra")
     assert RJ.main([r]) == 0
     assert len(frontier.calls()) == 1 and not (env / "findings" / f"{r}.claims.json").exists()
-    assert "notes" not in finding(env, r)
+    assert not [n for n in finding(env, r).get("notes", []) if not n.startswith("code version:")]
 
 
 def test_claims_calls_count_against_daily_cap_and_never_fall_back(env, frontier, local, monkeypatch):

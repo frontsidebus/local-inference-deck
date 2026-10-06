@@ -74,6 +74,9 @@ What is NOT evidence about the world:
   `file#N`) is never evidence on its own: an item whose only evidence is such a marker is not a finding. The
   runner turns it into `n/a`/low.
 - `tool ... completed (1.2s, 45 chars)` log lines show that a call ran, not what it printed.
+- `detail.unconfirmed_paths` and `attribution.unconfirmed_paths` (in infra bundles also labelled
+  `[unconfirmed path #N withheld]`) are paths the request claimed but the session's tool events do not confirm.
+  They are never the agent's changes: you may note the claim, but do not judge them as edits.
 
 Within one turn the agent may fail, fix and retry. An earlier error does NOT contradict a later success:
 judge the FINAL state. The same holds for the gate: a decision with `"outcome": "not_executed"` shows that
