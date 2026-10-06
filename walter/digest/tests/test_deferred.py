@@ -75,12 +75,19 @@ def feed_research():
 
 
 def topics_all():
-    """A valid ai-research answer: every id of the request in one topic, 3 distinct picks."""
+    """A valid ai-research answer built from the request's item lines: paper ids under
+    `papers` (<= MAX_PAPERS_PER_TOPIC), news ids under `news` (<= MAX_NEWS_PER_TOPIC),
+    3 distinct picks. Putting every id under papers would exceed the per-topic caps and
+    fail the response grammar."""
     def fn(body):
-        ids = ids_in(body)
+        lines = [json.loads(l) for l in body["messages"][1]["content"].splitlines()
+                 if l.startswith('{"id"')]
+        papers = [l["id"] for l in lines if l["kind"] == "paper"][:pipeline.MAX_PAPERS_PER_TOPIC]
+        news = [l["id"] for l in lines if l["kind"] != "paper"][:pipeline.MAX_NEWS_PER_TOPIC]
+        ids = papers + news
         return reply({"topics": [{"topic": "Security",
-                                  "papers": [{"id": i, "blurb": "b"} for i in ids],
-                                  "news": []}],
+                                  "papers": [{"id": i, "blurb": "b"} for i in papers],
+                                  "news": [{"id": i, "blurb": "b"} for i in news]}],
                       "worth_a_closer_look": [{"id": i, "why": "w"} for i in ids[:3]]})(body)
     return fn
 
@@ -118,12 +125,17 @@ def test_default_deferred_stay_unseen_and_pin_cutoff(tmp_path, monkeypatch):
             assert (it["key"] in new_events) == (it["key"] in sent_ids)
 
     # every new item's source had deferred items, so every ok source's cutoff is pinned to its
-    # oldest deferred item's date and stays at or before the run time
+    # oldest deferred item's date, clamped to the run time (never later), and stays at or before
+    # the run time
+    now_before = pipeline._iso_z(pipeline.datetime.now(pipeline.timezone.utc))
     assert saved["cutoff"] > "2026-01-05T12:00:00Z"
     for name in ("CISA_KEV", "SANS_ISC", "TheHackerNews"):
         oldest = min(pipeline._parse_date(it.get("date") or it.get("date_added"))
                      for it in out["items"] if it["source"] == name and _item_id(it) not in sent_ids)
-        assert saved["sources"][name]["cutoff"] == oldest.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if oldest <= pipeline.datetime.now(pipeline.timezone.utc):
+            assert saved["sources"][name]["cutoff"] == oldest.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:  # future-dated deferrals are clamped to the run time
+            assert saved["sources"][name]["cutoff"] <= now_before
         assert saved["sources"][name]["cutoff"] <= saved["cutoff"]
     # the failed source keeps its old cutoff
     assert saved["sources"]["CISA_Advisories"]["cutoff"] == "2026-01-03T12:00:00Z"
@@ -142,22 +154,37 @@ def test_default_deferred_come_back_and_run_dry(tmp_path, monkeypatch):
         llm_env(tmp_path, monkeypatch, f)
         out1, saved1 = run_llm(tmp_path, monkeypatch, "default", d, feed,
                                run_id="20260106T000000Z")
-        # run 2: the deferred items are new again and are now sent
+        # runs 2, 3: the deferred items are new again; with BUDGET 10 of 24, each run
+        # sends the 10 oldest and defers the rest, until nothing is left
         out2, saved2 = run_llm(tmp_path, monkeypatch, "default", d, feed,
                                run_id="20260106T010000Z")
-    deferred = [it for it in out1["items"] if _item_id(it) not in set(out1["curation"]["sent_keys"])]
-    assert set(_item_id(it) for it in deferred) == set(out2["curation"]["sent_keys"])
-    assert out2["curation"]["not_sent"] == 0
+        out3, saved3 = run_llm(tmp_path, monkeypatch, "default", d, feed,
+                               run_id="20260106T020000Z")
+    runs = [out1, out2, out3]
+    for i, out in enumerate(runs):
+        cur = out["curation"]
+        if i == 0:
+            assert cur["sent"] == BUDGET and cur["not_sent"] == 24 - BUDGET
+        else:
+            prev = runs[i - 1]
+            deferred = {it["cve"] if it["kind"] == "cve" else it["key"]
+                        for it in prev["items"]
+                        if _item_id(it) not in set(prev["curation"]["sent_keys"])}
+            # every item this run sent was deferred by the previous run (10 of the 14 on run 2,
+            # the last 4 on run 3)
+            assert set(cur["sent_keys"]) <= deferred and cur["sent"] > 0
+            assert cur["not_sent"] == len(deferred) - cur["sent"]
+    assert runs[-1]["curation"]["not_sent"] == 0
 
-    # run 3: nothing new left; no LLM call, no new seen entries
-    out3, saved3 = run_with(tmp_path, monkeypatch, "default", d, feed,
-                            run_id="20260106T020000Z")
-    assert out3["curation"] == {"skipped": "no new items"}
-    assert len(f.requests) == 2
-    assert saved3["seen"] == saved2["seen"]
+    # run 4: nothing new left; no LLM call, no new seen entries
+    out4, saved4 = run_with(tmp_path, monkeypatch, "default", d, feed,
+                            run_id="20260106T030000Z")
+    assert out4["curation"] == {"skipped": "no new items"}
+    assert len(f.requests) == 3
+    assert saved4["seen"] == saved3["seen"]
 
     # every item in seen exactly once: all 24 new ids present, none recorded twice
-    seen_ids = set(saved3["seen"]["cves"]) | set(saved3["seen"]["events"])
+    seen_ids = set(saved4["seen"]["cves"]) | set(saved4["seen"]["events"])
     assert all_ids <= seen_ids
     assert len(all_ids) == 24
 
@@ -225,6 +252,7 @@ def test_research_deferred_papers_and_news_come_back(tmp_path, monkeypatch):
         llm_env(tmp_path, monkeypatch, f)
         out1, saved1 = run_llm(tmp_path, monkeypatch, "ai-research", d, feed,
                                run_id="20260106T000000Z")
+        # run 2: the deferred papers and news are new again and are now sent
         out2, saved2 = run_llm(tmp_path, monkeypatch, "ai-research", d, feed,
                                run_id="20260106T010000Z")
     sent1 = set(out1["curation"]["sent_keys"])
@@ -247,6 +275,49 @@ def test_research_deferred_papers_and_news_come_back(tmp_path, monkeypatch):
     assert out3["curation"] == {"skipped": "no new items"}
     assert saved3["seen"] == saved2["seen"]
     assert all_ids <= set(saved3["seen"]["papers"]) | set(saved3["seen"]["items"])
+
+
+def test_deferred_future_dates_do_not_pin_cutoff_ahead(tmp_path, monkeypatch):
+    """Regression: a feed with dates ahead of the run time must not pin the source's cutoff
+    in the future, or the next run's date filter would drop genuinely new items published
+    between the run and that future time."""
+    d = seeded_dir(tmp_path, "default")
+    feed = feed_default()
+    feed["SANS_ISC"] = {"ok": True, "items": news(12, "F", day=11)}   # 2026-10-11: ahead of the run time
+    now_before = pipeline._iso_z(pipeline.datetime.now(pipeline.timezone.utc))
+    with FakeLLM([tier_all()]) as f:
+        llm_env(tmp_path, monkeypatch, f)
+        out1, saved1 = run_llm(tmp_path, monkeypatch, "default", d, feed,
+                               run_id="20260106T000000Z")
+    sent1 = set(out1["curation"]["sent_keys"])
+    deferred = [it for it in out1["items"]
+                if it["source"] == "SANS_ISC" and _item_id(it) not in sent1]
+    assert deferred and out1["curation"]["not_sent"] > 0
+    # the cutoff is pinned at or before the run time, never at the deferred items' future date
+    assert saved1["sources"]["SANS_ISC"]["cutoff"] <= now_before
+    assert saved1["sources"]["SANS_ISC"]["cutoff"] < "2026-10-11T00:00:00Z"
+
+    # next runs: a new item dated after the first run (but before the deferred items' dates)
+    # is eventually reported (with the bug it would be dropped by the future cutoff); the
+    # future-dated deferrals, being newest, take the budget first, so it is sent on a later run
+    n_item = news(1, "N", day=9)[0]   # 2026-10-09
+    feed["SANS_ISC"]["items"].append(n_item)
+    n_key = pipeline._norm_key(n_item["title"])
+    with FakeLLM([tier_all()]) as f:
+        llm_env(tmp_path, monkeypatch, f)
+        prev, i = out1, 2
+        while True:
+            out, saved = run_llm(tmp_path, monkeypatch, "default", d, feed,
+                                 run_id=f"20260106T0{i}0000Z")
+            sent = set(out["curation"]["sent_keys"])
+            deferred_prev = {_item_id(it) for it in prev["items"]
+                             if _item_id(it) not in set(prev["curation"]["sent_keys"])}
+            assert sent <= deferred_prev | {n_key}
+            if n_key in sent:
+                break
+            prev, i = out, i + 1
+            assert i <= 5
+    assert out["curation"]["not_sent"] == 0   # the last deferrals fit in the budget
 
 
 def _item_id(it: dict) -> str:
