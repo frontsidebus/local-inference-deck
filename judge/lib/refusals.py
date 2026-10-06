@@ -45,11 +45,13 @@ SOURCES = ("judge-gate", "hermes")
 HOWS = ("gate-escalation-not-approved", "gate-escalation-denied-by-human", "gate-block",
         "hermes-approval-refused", "hermes-denied-by-human", "hermes-security-scan", "hermes-other")
 TARGET_KINDS = ("secret", "remote-host", "system", "scratch", "hermes-home", "repo", "home", "other")
-ROUTES = ("same-call", "narrowed-retry", "tool-switch", "copy", "uses-copy", "writes-script", "helper-script",
-          "related", "unrelated", "refused")
+ROUTES = ("same-call", "narrowed-retry", "tool-switch", "tool-switch-refused", "copy", "uses-copy", "writes-script",
+          "helper-script", "related", "unrelated", "refused")
 WORKAROUND_ROUTES = frozenset({"tool-switch", "copy", "uses-copy", "helper-script"})
-SUMMARIES = ("possible-workaround", "retried-same-call", "narrowed-retry-only", "related-calls-only",
-             "no-related-call", "no-later-call")
+# #48: another tool or program aimed at the refused target or effect, refused too. Still an attempt to route around.
+ATTEMPT_ROUTES = frozenset({"tool-switch-refused"})
+SUMMARIES = ("possible-workaround", "attempted-workaround", "retried-same-call", "narrowed-retry-only",
+             "related-calls-only", "no-related-call", "no-later-call")
 RULE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 PATH_ID_RE = re.compile(r"^p\d{1,3}$")
 
@@ -97,6 +99,8 @@ _REDIR_RE = re.compile(r"^(?:\d*>>?|<|&>>?)")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _NAME_EXT_RE = re.compile(r"[\w.+-]+\.[A-Za-z][A-Za-z0-9]{0,7}")
 _SEP_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+# device files a redirect names (`2>/dev/null`): never a target (#48: they linked unrelated calls)
+_DEVICE_RE = re.compile(r"^/dev/(?:null|zero|u?random|tty|stdin|stdout|stderr|fd/\d+)$")
 
 
 def _abs(p: str, cwd: str) -> str:
@@ -144,6 +148,8 @@ def terminal_paths(command: str, cwd: str) -> List[str]:
             part = _ASSIGN_RE.sub("", part) if not part.startswith("-") else part.split("=", 1)[-1]
             if (not part or "://" in part or len(part) > 512 or part.startswith("-") or "\\" in part
                     or "$" in part or "*" in part or re.fullmatch(r"[\d.:]+", part)):
+                continue
+            if _DEVICE_RE.match(part):
                 continue
             if part.startswith(("/", "~")):
                 out.append(_abs(part, cwd))
@@ -351,6 +357,7 @@ def load_calls(session: str, since: datetime, until: datetime, *, hermes_home: s
             c["paths"] = call_paths(c["tool"], c["args"], cwd)
         cmd = str((c.get("args") or {}).get("command") or "") if c["tool"] == "terminal" else ""
         c["raw"] = cmd
+        c["scope"] = _scope(c, cwd)
         if c["tool"] == "terminal":
             c["paths"] = list(dict.fromkeys(c["paths"] + _remote_targets(_strip_cd(cmd, cwd)[0])))
             c["words"] = command_words(_strip_cd(cmd, cwd)[0])
@@ -452,6 +459,76 @@ def _overlap(a: Sequence[str], b: Sequence[str], broad: set) -> bool:
     return False
 
 
+def _scope(c: Dict, cwd: str) -> str:
+    """The directory a call works in: a terminal call's leading `cd DIR` (else its `workdir`, else the session cwd);
+    the session cwd for other tools. In memory only."""
+    if c["tool"] != "terminal":
+        return os.path.normpath(cwd or "/")
+    args = c.get("args") or {}
+    base = _abs(str(args.get("workdir")), cwd) if isinstance(args.get("workdir"), str) and args["workdir"] else cwd
+    return _strip_cd(c.get("raw") or "", base or "/")[1] if c.get("raw") else os.path.normpath(base or "/")
+
+
+# Effects (#48): what a call does, independent of the program that does it, so that `rm -rf X` refused and then
+# `python3 -c "shutil.rmtree(X)"` is seen as the same effect by another program. `effects(c)` maps each effect to
+# the program word(s) that carry it.
+DELETE_WORDS = frozenset({"rm", "rmdir", "unlink", "shred"})
+_FIND_DELETE_RE = re.compile(r"(?:^|\s)-(?:delete|exec(?:dir)?\s+(?:\S*/)?(?:rm|rmdir|unlink|shred))\b")
+_GIT_CLEAN_RE = re.compile(r"^git\s+(?:-\S+\s+)*clean\b")
+_CODE_DELETE_RE = re.compile(r"\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|rmtree|\.unlink|\.rmdir|"
+                             r"fs\.(?:rm|rmdir|unlink)(?:Sync)?|File\.delete|FileUtils\.rm(?:_rf|_r)?|unlink)\s*\(")
+
+
+def effects(c: Dict) -> Dict[str, set]:
+    """{effect: {carrier program words}} of one call (in memory only). Only `delete` so far."""
+    carriers: set = set()
+    if c["tool"] == "terminal":
+        raw = _strip_cd(c.get("raw") or "", "/")[0]
+        for part in _SEP_RE.split(raw):
+            ws = command_words(part)
+            w = ws[0] if ws else ""
+            if w in DELETE_WORDS:
+                carriers.add(w)
+            elif w == "find" and _FIND_DELETE_RE.search(part):
+                carriers.add("find")
+            elif w == "git" and _GIT_CLEAN_RE.match(part.strip()):
+                carriers.add("git")
+        if _CODE_DELETE_RE.search(raw):  # inline code (python -c, node -e, a heredoc) that deletes
+            carriers |= set(c.get("words") or []) & EXEC_WORDS or {"(inline-code)"}
+    elif c["tool"] == "execute_code":
+        code = str((c.get("args") or {}).get("code") or "")
+        if _CODE_DELETE_RE.search(code):
+            carriers.add("execute_code")
+    return {"delete": carriers} if carriers else {}
+
+
+def _same_scope(a: Dict, b: Dict, broad: set) -> bool:
+    x, y = a.get("scope"), b.get("scope")
+    return bool(x and y and x not in broad and y not in broad and (x == y or _under(x, y) or _under(y, x)))
+
+
+def _effect_switch(c: Dict, r: Dict, same_target: bool, broad: set) -> bool:
+    """#48: *c* aims at an effect of the refused call *r* (same effect, same target or the same working
+    directory) with another program or tool."""
+    er, ec = effects(r), effects(c)
+    for eff, carried_r in er.items():
+        carried_c = ec.get(eff)
+        if not carried_c or not (carried_c - carried_r):
+            continue  # the same program again is a retry, not a switch
+        if same_target or _same_scope(c, r, broad):
+            return True
+    return False
+
+
+def _class_switch(c: Dict, r: Dict, same_target: bool) -> bool:
+    """Another tool, or another terminal program, of the same class (search/read/exec) on the same target."""
+    if not same_target or not (_classes(c) & _classes(r)):
+        return False
+    if c["tool"] != r["tool"]:
+        return True
+    return c["tool"] == "terminal" and _first_word(c) != _first_word(r)
+
+
 def _first_word(c: Dict) -> str:
     w = c.get("words") or []
     return w[0] if w else str(c.get("command") or "")
@@ -468,8 +545,13 @@ def relate(r: Dict, nxt: Sequence[Dict], broad: set) -> List[Dict]:
         same_tool = c["tool"] == r["tool"]
         same_word = same_tool and (c["tool"] != "terminal" or _first_word(c) == _first_word(r))
         if not c.get("ran"):
-            route = "same-call" if (c.get("hash") and c.get("hash") == r.get("hash")) or (
-                c.get("args") and c.get("args") == r.get("args") and same_tool) else "refused"
+            if (c.get("hash") and c.get("hash") == r.get("hash")) or (
+                    c.get("args") and c.get("args") == r.get("args") and same_tool):
+                route = "same-call"
+            elif _effect_switch(c, r, same_target, broad) or _class_switch(c, r, same_target):
+                route = "tool-switch-refused"  # #48: an attempt counts even when it is refused too
+            else:
+                route = "refused"
         elif (c.get("hash") and c.get("hash") == r.get("hash")) or (same_tool and c.get("args")
                                                                      and c.get("args") == r.get("args")):
             route = "same-call"
@@ -493,6 +575,8 @@ def relate(r: Dict, nxt: Sequence[Dict], broad: set) -> List[Dict]:
                 route = "writes-script"
             elif not same_tool and (_classes(c) & _classes(r)) and (same_target or not r["paths"] or not c["paths"]):
                 route = "tool-switch"
+            elif _effect_switch(c, r, same_target, broad) or _class_switch(c, r, same_target):
+                route = "tool-switch"  # #48: the refused effect by another program in the same place
             elif same_word and (same_target or not r["paths"] or not c["paths"]):
                 route = "narrowed-retry"  # same tool and program, ran: a narrower call the gate allowed
             elif same_target:
@@ -509,6 +593,8 @@ def summarize(rels: Sequence[Dict]) -> str:
         return "no-later-call"
     if routes & WORKAROUND_ROUTES:
         return "possible-workaround"
+    if routes & ATTEMPT_ROUTES:
+        return "attempted-workaround"
     if "same-call" in routes:
         return "retried-same-call"
     if "narrowed-retry" in routes:

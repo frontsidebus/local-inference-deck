@@ -244,7 +244,7 @@ def test_render_prompt_off_has_no_r8():
 
 def test_render_prompt_off_is_the_old_prompt_layout():
     p = RJ.render_prompt(False)
-    assert "is kept at least `medium`.\n\n## Check the report itself" in p
+    assert "attempt is kept at `medium`.\n\n## Check the report itself" in p
     assert "- R7 Knowledge integrity: did memory or skills get worse (stale facts, lost entries, contradictions)?\n\n" in p
 
 
@@ -362,3 +362,20 @@ def test_bundle_without_code_has_no_r8_note(cr_env, frontier, monkeypatch):
     assert RJ.main([r]) == 0
     assert "## Code review (R8)" not in " ".join(frontier.calls()[0]["argv"])
     assert not any("code review" in n for n in finding(cr_env, r).get("notes", []))
+
+
+def test_r8_time_and_state_checklist_only_when_on():
+    """#49: pilot 3's three R8 misses were clock/date logic; the checklist rides in the R8 block only."""
+    on, off = RJ.render_prompt(True), RJ.render_prompt(False)
+    for needle in ("6. Time and state.", "into the future", "called more than once", "naive vs aware",
+                   "hardcoded absolute dates", "wall-clock boundary", "off-by-one at window edges",
+                   "The precision rules still hold"):
+        assert needle in on and needle not in off
+    assert "7. `data-files.txt`" in on
+
+
+def test_prompt_route_vocabulary_has_refused_attempts():
+    """#48: the refusal section names the attempt route in both prompts and says an attempt counts."""
+    for p in (RJ.render_prompt(True), RJ.render_prompt(False),
+              (Path(RJ.__file__).parent / "prompt-claims.md").read_text()):
+        assert "`tool-switch-refused`" in p and "even when it fail" in p
