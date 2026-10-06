@@ -278,6 +278,21 @@ def build_messages(item: Dict[str, Any]) -> List[Dict[str, str]]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user_content(item)}]
 
 
+THINK_OFF_TEMPERATURE = 0.0
+THINK_TEMPERATURE = 0.6
+THINK_TOP_P = 0.95
+
+
+def sampling_for(args, thinking: str) -> Tuple[float, Optional[float]]:
+    """(temperature, top_p) for one run. Explicit --temperature/--top-p always win. Otherwise thinking off is greedy
+    (repeatable), and thinking on/default uses Qwen's recommended 0.6 / 0.95: at temperature 0 the reasoning can
+    loop until max_tokens (eval run (a): 9 of 50 coder mcq items)."""
+    thinks = thinking in ("on", "default")
+    temp = args.temperature if args.temperature is not None else (THINK_TEMPERATURE if thinks else THINK_OFF_TEMPERATURE)
+    top_p = args.top_p if args.top_p is not None else (THINK_TOP_P if thinks else None)
+    return temp, top_p
+
+
 def max_tokens_for(item: Dict[str, Any], args, thinking: str) -> int:
     if args.max_tokens:
         return min(args.max_tokens, HARD_MAX_TOKENS)
@@ -470,6 +485,7 @@ class Run:
         suffix = "" if self.frontier or thinking == "off" else ("-think" if thinking == "on" else "-thinkdefault")
         self.dir = Path(args.results) / f"{run_name}-{slug}{suffix}"
         self.client = client
+        self.temperature, self.top_p = sampling_for(args, thinking)
         self.lock = threading.Lock()
         self.cost_usd = 0.0
         self.stop = threading.Event()
@@ -477,9 +493,9 @@ class Run:
 
     def _config(self, datasets, site, grader_cfg) -> Dict[str, Any]:
         a = self.args
-        sampling: Dict[str, Any] = {"temperature": a.temperature, "seed": a.seed}
-        if a.top_p is not None:
-            sampling["top_p"] = a.top_p
+        sampling: Dict[str, Any] = {"temperature": self.temperature, "seed": a.seed}
+        if self.top_p is not None:
+            sampling["top_p"] = self.top_p
         if a.presence_penalty is not None:
             sampling["presence_penalty"] = a.presence_penalty
         if self.frontier:
@@ -569,9 +585,9 @@ class Run:
         a = self.args
         body: Dict[str, Any] = {"model": self.model, "messages": messages, "stream": False,
                                 "max_tokens": max_tokens_for(item, a, self.thinking),
-                                "temperature": a.temperature, "seed": a.seed}
-        if a.top_p is not None:
-            body["top_p"] = a.top_p
+                                "temperature": self.temperature, "seed": a.seed}
+        if self.top_p is not None:
+            body["top_p"] = self.top_p
         if a.presence_penalty is not None:
             body["presence_penalty"] = a.presence_penalty
         if self.thinking in ("on", "off"):
@@ -652,6 +668,7 @@ class Run:
             "raw": data,
         })
 
+    FINAL_ANSWER_REASONING_CHARS = 6000
     FINAL_ANSWER_PROMPT = ("Stop here. Reply with only your final answer as a single line of the form "
                            "'Answer: X'. No explanation.")
 
@@ -659,16 +676,25 @@ class Run:
         """One short follow-up for an mcq/classify reply that was cut off or had no parsable answer (the model
         ran out of tokens while reasoning in the open). The original reply is kept in ``content_before_final``;
         the follow-up's line is appended to ``content``, and the item is flagged ``final_answer_prompt`` so
-        reports can show how many scores depended on it. Local models only; off with --no-final-answer."""
+        reports can show how many scores depended on it. The follow-up always has thinking off. Local models only;
+        off with --no-final-answer."""
         if self.frontier or self.args.no_final_answer or item["type"] not in ("mcq", "classify") or rec.get("error"):
             return
         sc = S.score_item(rec.get("content") or "", item, scorer_table)
         if rec.get("finish_reason") != "length" and sc.status != "unparsed":
             return
-        msgs = build_messages(item) + [{"role": "assistant", "content": rec.get("content") or ""},
+        # A thinking reply cut off at max_tokens often has empty content and all its work in reasoning_content,
+        # which the chat template drops from history; send the tail of the reasoning as the assistant turn instead.
+        prior = rec.get("content") or ""
+        if not prior.strip() and rec.get("reasoning_content"):
+            prior = rec["reasoning_content"][-self.FINAL_ANSWER_REASONING_CHARS:]
+            rec["final_answer_context"] = "reasoning"
+        msgs = build_messages(item) + [{"role": "assistant", "content": prior},
                                        {"role": "user", "content": self.FINAL_ANSWER_PROMPT}]
         body = self.request_body(item, msgs)
         body["max_tokens"] = 32
+        # Always thinking off: with thinking on, the model spends all 32 tokens reasoning and returns no answer.
+        body["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             data = self.client.chat(body)
             ans = ((data["choices"][0].get("message") or {}).get("content") or "").strip()
@@ -684,6 +710,9 @@ class Run:
         item = self.by_id[rec["id"]]
         sc = S.score_item(rec.get("content") or "", item, scorer_table)
         d = {"id": rec["id"], "suite": rec["suite"], "scorer": item["scorer"], **sc.to_dict()}
+        label_source = (item.get("meta") or {}).get("label_source")
+        if label_source:
+            d["label_source"] = label_source
         if item["scorer"] == "llm_judge":
             d["model_graded"] = sc.status == "ok"
         if rec.get("final_answer_prompt"):
@@ -841,9 +870,12 @@ def parse_args(argv: Optional[List[str]] = None):
                     help="score a suite with another scorer, e.g. cse-frr=refusal (keyword false-refusal check, "
                          "no grader model needed); repeatable; recorded in run.json")
     ap.add_argument("--limit", type=int, help="first N items per suite (smoke runs)")
-    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--temperature", type=float,
+                    help=f"default {THINK_OFF_TEMPERATURE} with thinking off, {THINK_TEMPERATURE} with thinking on/default "
+                         "(Qwen's recommendation: greedy decoding makes thinking loop)")
     ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--top-p", type=float)
+    ap.add_argument("--top-p", type=float,
+                    help=f"default: unset (server default) with thinking off, {THINK_TOP_P} with thinking on/default")
     ap.add_argument("--presence-penalty", type=float,
                     help="unset = the llama-swap server default (coder-fast has 1.5); 0 turns it off")
     ap.add_argument("--max-tokens", type=int, help="override the per-type output caps")
