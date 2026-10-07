@@ -55,8 +55,14 @@ def stub_repo(tmp_path):
 def env_for(repo, tmp_path, **extra):
     e = dict(os.environ, REPO=str(repo), EVAL_RUN="evaltest", EVAL_STATE_DIR=str(tmp_path / "state"),
              STUB_LOG=str(tmp_path / "calls.log"), NO_GUARD="1", SITE_ENV=str(tmp_path / "none.env"))
-    e.pop("DISPLAY", None)
-    e.pop("DBUS_SESSION_BUS_ADDRESS", None)  # no desktop notifications from tests
+    # Never reach the real desktop: unsetting DBUS_SESSION_BUS_ADDRESS is not enough (notify-send falls back to
+    # $XDG_RUNTIME_DIR/bus), so a stub notify-send that records its arguments goes first on PATH.
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "notify-send"
+    stub.write_text(f'#!/bin/sh\necho "$@" >> {tmp_path / "notify.log"}\n')
+    stub.chmod(0o755)
+    e["PATH"] = f"{bindir}:{e['PATH']}"
     e.update({k: str(v) for k, v in extra.items()})
     return e
 
@@ -86,6 +92,8 @@ def test_plan_runs_phases_in_order(stub_repo, tmp_path):
     out = subprocess.run(["bash", str(stub_repo / "evals/tools/status.sh")], env=env_for(stub_repo, tmp_path),
                          capture_output=True, text=True, timeout=30).stdout
     assert "big-off" in out and "exit 0" in out and "pending" not in out
+    notes = (tmp_path / "notify.log").read_text()
+    assert "Eval evaltest started" in notes and "Eval evaltest complete" in notes
 
 
 def test_plan_stops_after_a_failed_step_and_refuses_over_stop(stub_repo, tmp_path):
