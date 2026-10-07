@@ -38,6 +38,14 @@ The counts are from the real fetch on 2026-10-05. SEvenLLM also has 650 Chinese 
 
 A suggested first pass: run `--sample 50` (or 100) for each suite. That is about 700 to 1300 calls in total. Then run the full sets of the cheaper MCQ suites.
 
+## Derived sets (`make_subsets.py`)
+
+`make_subsets.py` builds sets from data that has already been fetched. It needs no network, and the same input and seed give byte-identical files.
+- **`label`:** every item with one `meta.label_source`, as its own suite. For example, `--suite nvd-cwe --label nvd` gives `nvd-cwe-nvdlab`: the CVEs whose CWE comes from NVD's own analysis rather than the CNA. Ids are renamed to match, and the original is kept in `meta.source_id`, so the set can run next to its parent suite.
+- **`subset`:** a stratified subset of an existing file, for example `--from ctibench-mcq.sample200 --n 100` gives `ctibench-mcq.sample200in100`. Use it to run a slower model on a subset of the same items, which keeps paired comparisons valid.
+
+Both use the fetchers' stratified sampler, which is proportional per `meta.category` and keeps the source order. [`../plans/run-b-day1.sh`](../plans/run-b-day1.sh) `prepare` shows real use.
+
 ## Evaluated and not converted
 
 | Candidate | Why not |
