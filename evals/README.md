@@ -143,6 +143,18 @@ An `unparsed` item counts as wrong. An `error` item (a malformed answer or a gra
 - **Label source:** `--split-label-source` adds a row per `meta.label_source` value next to the whole suite. The NVD suites record whether the answer is the CNA's label or NVD's; NVD labels are often narrower CWEs and match much less often.
 - **Model-graded scores** (`*`) depend on the grader. Re-grade with another grader (`--rescore --grader-model …`) before trusting a small difference.
 
+## Long runs: plans, the GPU guard, stop and status
+
+For runs that take hours, use a plan script in [`plans/`](plans/README.md) instead of hand-typed commands:
+- **Plans** record the exact suites, sizes, seeds and phase order, and resume after a stop.
+- **`tools/gpu-guard.sh`** polls the backend's GPUs over SSH (`BACKEND_SSH_USER@BACKEND_LAN_IP` from `site.env`, or `EVAL_GPU_SSH`) every 30 s and logs each sample.
+  - It stops the run cleanly on high core temperature, a hardware protection, sustained over-limit power, a dead fan, or lost readings.
+  - It notifies on warnings.
+- **`tools/stop.sh`** stops a run by hand; **`tools/status.sh`** shows its progress and the GPU readings.
+- **`datasets/make_subsets.py`** builds derived sets deterministically from fetched data:
+  - label-source suites, such as NVD's own labels;
+  - stratified subsets of existing samples.
+
 ## Costs and disruption
 
 - **The coding pair:** `coder` (GPU0) and `coder-fast` (GPU1) are normally resident, so evals against them cause no swaps. They do share the GPUs with everyone else. Run at concurrency 1, and expect latency to rise while someone else is using the same model.
