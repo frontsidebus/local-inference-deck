@@ -507,7 +507,7 @@ class Run:
             "model": self.model,
             "backend": "claude-cli" if self.frontier else "gateway",
             "frontier_model": self.frontier_model if self.frontier else None,
-            "gateway": None if self.frontier else "https://${SPARK_API_HOST}/v1",
+            "gateway": None if self.frontier else (a.base_url or "https://${SPARK_API_HOST}/v1"),
             "thinking": "n/a" if self.frontier else self.thinking,
             "sampling": sampling,
             "max_tokens": None if self.frontier else caps,
@@ -959,6 +959,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
 
     api_host = setting("SPARK_API_HOST", site)
+    # EVAL_BASE_URL (environment or site.env) routes around the edge, e.g. through an SSH tunnel to the
+    # backend's LiteLLM (evals/tools/gateway-tunnel.sh); --base-url still wins.
+    a.base_url = a.base_url or setting("EVAL_BASE_URL", site) or None
     need_gateway = (local_models and not a.rescore) or (n_judge and not a.no_grade)
     client = None
     if need_gateway:

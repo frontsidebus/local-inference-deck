@@ -65,3 +65,17 @@ eval_stop() {
   for _ in $(seq 1 12); do pgrep -f "$RUN_PATTERN" >/dev/null || return 0; sleep 5; done
   pkill -TERM -f "$RUN_PATTERN" || true
 }
+
+# eval_gateway_up: EVAL_GATEWAY=tunnel (default) starts gateway-tunnel.sh and exports EVAL_BASE_URL so run.py
+# talks to the backend's LiteLLM over SSH; EVAL_GATEWAY=edge uses https://$SPARK_API_HOST as before.
+eval_gateway_up() {
+  if [ "${EVAL_GATEWAY:-tunnel}" = tunnel ]; then
+    local out
+    out="$("$EVAL_TOOLS_DIR/gateway-tunnel.sh" start)" || return 1
+    export "${out?}"
+    eval_log "gateway: SSH tunnel ($EVAL_BASE_URL)"
+  else
+    eval_log "gateway: edge (https://\$SPARK_API_HOST)"
+  fi
+}
+eval_gateway_down() { [ "${EVAL_GATEWAY:-tunnel}" = tunnel ] && "$EVAL_TOOLS_DIR/gateway-tunnel.sh" stop; return 0; }

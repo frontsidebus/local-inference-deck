@@ -40,6 +40,7 @@ def stub_repo(tmp_path):
     (repo / "evals" / "data").mkdir(parents=True)
     shutil.copytree(TOOLS, repo / "evals" / "tools")
     shutil.copytree(PLAN.parent, repo / "evals" / "plans")
+    (repo / "evals" / "results").mkdir()
     for name in ("run.py", "report.py"):
         (repo / "evals" / name).write_text(STUB_RUN)
     for stem in ["ctibench-mcq", "ctibench-rcm", "ctibench-vsp", "nvd-cwe", "nvd-cvss", "cse-frr", "nvd-cwe-nvdlab",
@@ -54,7 +55,8 @@ def stub_repo(tmp_path):
 
 def env_for(repo, tmp_path, **extra):
     e = dict(os.environ, REPO=str(repo), EVAL_RUN="evaltest", EVAL_STATE_DIR=str(tmp_path / "state"),
-             STUB_LOG=str(tmp_path / "calls.log"), NO_GUARD="1", SITE_ENV=str(tmp_path / "none.env"))
+             STUB_LOG=str(tmp_path / "calls.log"), NO_GUARD="1", SITE_ENV=str(tmp_path / "none.env"),
+             EVAL_GATEWAY="edge")
     # Never reach the real desktop: unsetting DBUS_SESSION_BUS_ADDRESS is not enough (notify-send falls back to
     # $XDG_RUNTIME_DIR/bus), so a stub notify-send that records its arguments goes first on PATH.
     bindir = tmp_path / "bin"
@@ -235,3 +237,66 @@ def test_guard_reads_the_host_from_site_env(stub_repo, tmp_path):
                        text=True, timeout=30)
     assert r.returncode == 0
     assert "op@192.0.2.10" in (tmp_path / "ssh-args").read_text()
+
+
+def test_day2_plan_runs_hermes_then_vision_then_grades_and_reports_both_days(stub_repo, tmp_path):
+    results = stub_repo / "evals" / "results"
+    for d in ("evalb-big", "evalb-coder", "evalb-coder-fast"):   # day 1 dirs the report should include
+        (results / d).mkdir()
+        (results / d / "run.json").write_text("{}")
+    env = env_for(stub_repo, tmp_path, EVAL_RUN="evaltest2", DAY1_RUN="evalb")
+    r = subprocess.run(["bash", str(stub_repo / "evals/plans/run-b-day2.sh")], env=env, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    c = calls(tmp_path)
+    assert [("hermes" in x, "vision" in x) for x in c[:4]] == [(True, False)] * 2 + [(False, True)] * 2
+    assert "--suite ctibench-mcq.sample200in100" in c[0] and "--run-name evaltest2 " in c[0] + " "
+    assert "--rescore --grader-model big" in c[4] and "--model hermes,vision" in c[4]
+    assert "evals/results/evalb-big" in c[5] and "evals/results/evalb-coder-fast" in c[5]
+    assert "evaltest2-hermes" not in c[5]   # the stub made no results dirs for day 2, so none are listed
+
+
+def _fake_tunnel_ssh(tmp_path):
+    """An ssh stand-in that listens on the -L local port (the forward), so the tunnel tool sees it come up."""
+    bindir = tmp_path / "tbin"
+    bindir.mkdir(exist_ok=True)
+    (bindir / "ssh").write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env python3
+        import socket, sys
+        open({str(tmp_path / 'ssh-args')!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")
+        spec = sys.argv[sys.argv.index("-L") + 1]
+        port = int(spec.split(":")[1])
+        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port)); s.listen()
+        while True:
+            c, _ = s.accept(); c.close()
+        """))
+    (bindir / "ssh").chmod(0o755)
+    return bindir
+
+
+def test_gateway_tunnel_starts_restarts_and_stops(stub_repo, tmp_path):
+    site = tmp_path / "site.env"
+    site.write_text("BACKEND_SSH_USER=op\nBACKEND_LAN_IP=192.0.2.10\nBACKEND_WG_IP=198.51.100.2\nLITELLM_PORT=4000\n")
+    env = env_for(stub_repo, tmp_path, SITE_ENV=str(site), EVAL_TUNNEL_PORT="14999")
+    env["PATH"] = f"{_fake_tunnel_ssh(tmp_path)}:{env['PATH']}"
+    tool = str(stub_repo / "evals/tools/gateway-tunnel.sh")
+    r = subprocess.run(["bash", tool, "start"], env=env, capture_output=True, text=True, timeout=30)
+    try:
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "EVAL_BASE_URL=http://127.0.0.1:14999/v1"
+        args = (tmp_path / "ssh-args").read_text()
+        assert "-L 127.0.0.1:14999:198.51.100.2:4000 op@192.0.2.10" in args and "ExitOnForwardFailure=yes" in args
+        # a dropped connection is re-established by the supervisor
+        fake = f"^python3 {tmp_path / 'tbin' / 'ssh'} "   # anchored: never match a shell that mentions the path
+        subprocess.run(["pkill", "-f", fake], check=False)
+        deadline = time.time() + 15
+        while time.time() < deadline and (tmp_path / "ssh-args").read_text().count("\n") < 2:
+            time.sleep(0.2)
+        assert (tmp_path / "ssh-args").read_text().count("\n") >= 2
+        assert "restarting" in (tmp_path / "state" / "gateway-tunnel.log").read_text()
+    finally:
+        subprocess.run(["bash", tool, "stop"], env=env, timeout=30)
+    time.sleep(0.5)
+    assert subprocess.run(["pgrep", "-f", f"^python3 {tmp_path / 'tbin' / 'ssh'} "], capture_output=True).returncode == 1
+    assert not (tmp_path / "state" / "gateway-tunnel.pid").exists()
