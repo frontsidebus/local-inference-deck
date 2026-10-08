@@ -1,4 +1,5 @@
 import json
+import shutil
 import os
 import stat
 import sys
@@ -558,9 +559,38 @@ def test_report_paired_comparisons_split_and_opener(tmp_path):
                    "--out", str(out), "--pairs-csv", str(pcsv)]) == 0
     md = out.read_text()
     assert "## s [label_source=cna]" in md and "## s [label_source=nvd]" in md
-    assert "| s | m1 (think off) | m2 (think off) | 6 | 4 | 3 | 2 | 1 | 1.000 |" in md
-    assert "| s [label_source=nvd] | m1 (think off) | m2 (think off) | 3 | 2 | 1 | 1 | 0 | 1.000 |" in md
-    assert "- m1 (think off): 1/2 = 50.0%" in md
+    assert "| s | m1 (think off) [a] | m2 (think off) | 6 | 4 | 3 | 2 | 1 | 1.000 |" in md
+    assert "| s [label_source=nvd] | m1 (think off) [a] | m2 (think off) | 3 | 2 | 1 | 1 | 0 | 1.000 |" in md
+    assert "- m1 (think off) [f]: 1/2 = 50.0%" in md
     assert pcsv.read_text().splitlines()[0] == ",".join(R.PAIR_COLUMNS)
+    # two different runs of the same model and mode get their dir names, so the rows can be told apart
     # no split: no label rows
     assert "label_source=" not in R.render_markdown([R.summarize(a)])
+
+
+def test_eval_base_url_setting_routes_requests_and_is_recorded(gw, env, monkeypatch):
+    monkeypatch.setenv("EVAL_BASE_URL", gw.url)
+    args = ["--key-file", env["key"], "--site-env", env["site"], "--results", env["results"], "--backoff", "0",
+            "--run-name", "bu", "--no-final-answer", "--suite", str(SAMPLES / "mcq.jsonl"), "--model", "coder",
+            "--limit", "1"]
+    assert RUN.main(args) == 0
+    assert len(gw.requests) == 1
+    assert json.loads((run_dir(env, "bu-coder") / "run.json").read_text())["gateway"] == gw.url
+
+
+def test_report_labels_runs_that_differ_only_by_seed(tmp_path):
+    dirs = []
+    for seed in (1234, 1235):
+        d = tmp_path / f"s{seed}"
+        d.mkdir()
+        (d / "run.json").write_text(json.dumps({"model": "m", "thinking": "on", "sampling": {"seed": seed}}))
+        (d / "responses.jsonl").write_text(json.dumps({"id": "a", "suite": "s"}) + "\n")
+        (d / "scores.jsonl").write_text(json.dumps({"id": "a", "suite": "s", "scorer": "exact", "passed": True,
+                                                    "value": 1.0, "status": "ok"}) + "\n")
+        dirs.append(d)
+    same = tmp_path / "same"
+    shutil.copytree(dirs[0], same)
+    out = tmp_path / "r.md"
+    assert R.main([str(d) for d in dirs + [same]] + ["--out", str(out)]) == 0
+    md = out.read_text()
+    assert "m (think on) seed 1235" in md and "m (think on) seed 1234 [s1234]" in md and "[same]" in md

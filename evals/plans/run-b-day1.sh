@@ -7,7 +7,7 @@
 #   EVAL_RUN=evalb evals/tools/status.sh  # watch
 #   EVAL_RUN=evalb evals/tools/stop.sh "reason"           # stop cleanly; resume: rm STOP, start again
 #
-# Env: NO_GUARD=1 (no GPU guard), CODER_SEEDS ("1234"), FAST_SEEDS ("1234 1235 1236"), EVAL_STATE_DIR, and the
+# Env: EVAL_GATEWAY=tunnel|edge (default tunnel: SSH to the backend's LiteLLM), NO_GUARD=1 (no GPU guard), CODER_SEEDS ("1234"), FAST_SEEDS ("1234 1235 1236"), EVAL_STATE_DIR, and the
 # guard's thresholds (evals/tools/gpu-guard.sh).
 #
 # Phases
@@ -92,7 +92,8 @@ if [ "${NO_GUARD:-0}" != 1 ]; then
   "$EVAL_TOOLS_DIR/gpu-guard.sh" >/dev/null 2>&1 &
   GUARD_PID=$!
 fi
-trap '[ -n "$GUARD_PID" ] && kill "$GUARD_PID" 2>/dev/null' EXIT
+trap '[ -n "$GUARD_PID" ] && kill "$GUARD_PID" 2>/dev/null; eval_gateway_down' EXIT
+eval_gateway_up || fail "gateway tunnel"
 
 eval_log "plan run-b-day1 ($EVAL_RUN): $(git rev-parse --short HEAD 2>/dev/null), state $EVAL_STATE_DIR, guard ${GUARD_PID:-off}"
 eval_notify normal "Eval $EVAL_RUN started" "Phase 1: big"

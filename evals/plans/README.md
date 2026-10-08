@@ -65,6 +65,31 @@ The times are estimates from run (a), ±30%. `big` evicts `coder` and `coder-fas
 
 GeForce cards don't report memory-junction or hotspot temperatures through `nvidia-smi`, so the guard can't watch them directly.
 
+## run-b-day2.sh
+
+This runs hermes and vision on the same 100-item subsets `big` used on day 1, so all five models can be compared on shared items.
+- `big` then grades their `sevenllm-qa` answers.
+- The report covers days 1 and 2. It reads day 1's dirs, named with `DAY1_RUN`, which defaults to `evalb`.
+- Each model takes both GPUs. Coder and coder-fast are evicted for the whole run, which takes about 7 h.
+- Thinking is off, and `--timeout` is 600 s, because these models decode at about 35–55 tok/s.
+
+```bash
+nohup evals/plans/run-b-day2.sh >/dev/null 2>&1 &
+EVAL_RUN=evalb2 evals/tools/status.sh
+```
+
+## Gateway route: SSH tunnel (default)
+
+Both plans start [`tools/gateway-tunnel.sh`](../tools/gateway-tunnel.sh) and point `run.py` at it through `EVAL_BASE_URL`, so eval traffic does not go through the public edge.
+
+- **Why:** on day 1 of run (b), one request sat for 5 minutes on a dead TCP connection through the edge until `--timeout` fired.
+- **How it reaches LiteLLM:** LiteLLM listens only on the backend's WireGuard address (`BACKEND_WG_IP:LITELLM_PORT`). The tunnel SSHes to the backend (`BACKEND_SSH_USER@BACKEND_LAN_IP`) and forwards a local port, by default `127.0.0.1:14000`, to that address.
+  - Nothing changes on either firewall.
+  - Requests still need the LiteLLM key, which travels inside SSH.
+  - A small supervisor restarts ssh if the connection drops.
+- **Opting out:** `EVAL_GATEWAY=edge` uses `https://$SPARK_API_HOST` as before.
+- **Provenance:** `run.json` records the route actually used in its `gateway` field.
+
 ## Writing a plan
 - Source `../tools/lib.sh` with `EVAL_RUN` set.
 - Run every step with `eval_step NAME python3 -B evals/run.py … --run-name "$EVAL_RUN[-suffix]"`. The stop and the guard match exactly that command line.

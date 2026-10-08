@@ -230,6 +230,25 @@ def paired(summaries: List[Dict[str, Any]], passes: List[Dict[str, Dict[str, boo
     return out
 
 
+def unique_labels(summaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Runs that differ only by seed (or by anything else) get distinct labels: '... seed N', then the dir name."""
+    def dups():
+        seen: Dict[str, int] = {}
+        for s in summaries:
+            seen[s["label"]] = seen.get(s["label"], 0) + 1
+        return {k for k, v in seen.items() if v > 1}
+    d = dups()
+    for s in summaries:
+        seed = (s["run"].get("sampling") or {}).get("seed")
+        if s["label"] in d and seed is not None:
+            s["label"] = f"{s['label']} seed {seed}"
+    d = dups()
+    for s in summaries:
+        if s["label"] in d:
+            s["label"] = f"{s['label']} [{s['run_dir']}]"
+    return summaries
+
+
 def run_label(run: Dict[str, Any]) -> str:
     model = run.get("model", "?")
     think = run.get("thinking")
@@ -380,7 +399,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"not a run dir (no run.json): {', '.join(missing)}", file=sys.stderr)
         return 2
     labels = load_labels(a.items) if a.items else None
-    summaries = [summarize(d, a.split_label_source, labels) for d in dirs]
+    summaries = unique_labels([summarize(d, a.split_label_source, labels) for d in dirs])
     pairs = paired(summaries, [item_passes(d, a.split_label_source, labels) for d in dirs]) if len(dirs) > 1 else []
     md = render_markdown(summaries, a.title, pairs)
     if a.out:
