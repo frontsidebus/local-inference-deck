@@ -18,6 +18,7 @@ Total is about 117 GB (about 109 GiB), plus 83.6 GB for the experimental `flash`
 | `hermes` | `hermes-4.3-36b` | 0+1 | `NousResearch/Hermes-4.3-36B-GGUF` (?) | `hermes-4_3_36b-Q4_K_M.gguf` | 21762145216 | **UNKNOWN**: copied from an earlier manual download; the repo is a best guess |
 | `flash` (experimental) | `qwen3.8-flash-next` | 0+1 (+CPU experts) | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` @ `ed59f92` | `IQ3_S/…-IQ3_S-00001-of-00002.gguf` | 54817524224 | sha256 checked against HF LFS `4c1eb2ce…` |
 | `flash` (n-gram table) | `qwen3.8-flash-next` | on disk, read on demand | same | `IQ3_S/…-IQ3_S-00002-of-00002.gguf` | 28800138432 | sha256 checked against HF LFS `316b46f3…` |
+| `flash` (MTP draft head) | `qwen3.8-flash-next` | 1 | `unsloth/Qwen3.8-Flash-Next-GGUF` @ `766911a` | `MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | 4137429120 | sha256 checked against HF LFS `58a47d6a…` |
 
 "verified" means the repo and file names come from the recorded `fetch.sh <repo> <file>` invocations
 used to populate the live disk. Sizes are from the live files.
@@ -37,10 +38,10 @@ Notes
   - **Image:** it runs on its own pinned llama.cpp image (`${image-next}`, build 11459), because qwen4exp needs fixes after 11277. Every other model stays on `${image}`.
   - **Placement:**
     - layer split over both GPUs;
-    - the routed experts of 14 of its 48 layers run on the CPU from RAM, about 15 GB (`-ot`);
+    - the routed experts of 16 of its 48 layers run on the CPU from RAM, about 17 GB (`-ot`), leaving GPU1 room for an MTP draft head (`--spec-type draft-mtp`, unsloth's self-contained Q8_0 file): decode 45–47 tok/s, against 38–40 without MTP (`llama-swap/BENCHMARKS.md`);
     - the 28.8 GB n-gram table (`per_layer_token_embd`, shard 2) stays on disk and is read on demand (`-lm mmap -lzm on`).
   - **Eviction:** it takes both GPUs, so it evicts the coding pair, as `big` does.
-  - **Status:** being evaluated with the eval harness (`evals/plans/`). Keep it hidden in Open WebUI until a routing decision. MTP (`--spec-type draft-mtp`, a separate MTP GGUF) is a later step.
+  - **Status:** being evaluated with the eval harness (`evals/plans/`). Keep it hidden in Open WebUI until a routing decision. Eval run (c) measured it on the shared 100-item subsets (`evals/`).
   - **Background:** this came out of looking at the Strata server. It runs the same GGUF family in stock llama.cpp, so the model can be judged apart from the engine.
 - Row split (`-sm row`) does not load on the pinned build ("does not support split buffers").
 - The llama.cpp image is pinned by digest in `config.yaml.tmpl` (build 11277). Change model

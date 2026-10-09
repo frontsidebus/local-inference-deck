@@ -23,6 +23,36 @@ Correctness, checked with n-max 2:
 
 Decision: **keep MTP with `--spec-type draft-mtp --spec-draft-n-max 2`**. Decode speed went up 74-83%, with no correctness regression and the full 131072 context kept, at a cost of about 1.3 GB of VRAM (about 1.9 GB headroom left). n-max 3 was within noise on the mean (about 1.5%). It was worse on the low-acceptance cases (prose, and refactor with thinking on) and used more VRAM, so n-max 2 is the better choice.
 
+## 2026-10-09: `flash` (Qwen3.8-Flash-Next IQ3_S) expert placement and MTP
+
+Method:
+- Transient containers on b11459, with llama-swap's models unloaded.
+- Each variant answered three requests (temperature 0, thinking off): a 1.5k-token prompt with 300 output tokens, a short prompt with up to 120, and a second 1.5k prompt with 300.
+- VRAM was read right after the load.
+- "CPU layers" means the routed experts of those layers run on the CPU (`-ot`).
+
+| Variant | CPU expert layers | MTP | Load | VRAM GPU0 / GPU1 (MiB) | Prompt t/s (1.5k) | Decode t/s (1.5k / short / 1.5k) |
+|---|---|---|---|---|---|---|
+| V0, the first deploy | 14 (blk 0-6, 24-30) | no | 6 s warm, 23 s cold | 20402 / 22394 | 353 / 336 | 35.7 / 35.1 / 35.5 |
+| V1 | 11 (blk 0-4, 24-29) | no | 6 s | 22330 / 23232 | 402 / 377 | 38.5 / 39.7 / 38.3 |
+| V6 | 17 (blk 0-9, 24-30) | no | 6 s | 17640 / 22394 | 309 / 297 | 32.7 / 31.7 / 34.5 |
+| V5 | 17 | Q8_0 head on GPU0, n 2 | 6 s | 21798 / 22488 | 275 / 285 | 41.8 / 32.5 / 44.8 (acceptance 76 %, 50 %, 80 %) |
+| V8 | 17 | Q8_0 head on GPU0, n 3 | 6 s | 21858 / 22540 | 299 / 292 | 43.4 / 32.7 / 44.6 (69 %, 39 %, 75 %) |
+| **V7 (chosen)** | **16 (blk 0-5, 24-33)** | **Q8_0 head on GPU1, n 2** | 7 s | 21472 / 23450 | 288 / 302 | **45.0 / 40.9 / 46.6** (79 %, 67 %, 85 %) |
+
+Results:
+- **MTP head files:**
+  - With 14 CPU layers, the Q8_0 head doesn't fit: GPU0 runs out of memory allocating the draft's 430 MiB compute buffer.
+  - The `shared-Q8_0` head does not load on mainline. It borrows the main model's embedding and output tensors, which only unsloth's fork supports.
+- **Exactness:** speculative decoding is not bit-exact here. On 8 greedy prompts:
+  - V7 with and without MTP agreed on 4 of 8 answers;
+  - two placements without MTP also agreed on only 4 of 8;
+  - the same config on two fresh loads agreed on 8 of 8.
+
+  So the text depends on the GPU/CPU split and on MTP's batched verification (floating-point order), while each config is deterministic. An accuracy check on the eval subsets is the real test.
+
+Decision: **V7**. Decode is about 17 % faster than the best no-MTP placement (V1), and prompt processing about 25 % slower. Eval and chat traffic is decode-heavy. GPU1 is left with about 1.1 GB, so it is the tightest card; re-measure after any image bump. The fallback without MTP is noted in `config.yaml.tmpl`.
+
 ## 2026-10-05: x8/x8 riser, layer-split baseline
 
 After the bifurcation riser (both 3090s Gen4 x8 on CPU root ports; GPU1 was x1 behind the chipset before), with the production config (all split models still on `-sm layer -ts 1,1`). Same method as the tensor-split section below: raw `/completion`, exact token-id prompts of Python stdlib source, `cache_prompt=false`, temperature 0, `ignore_eos`, 128 generated tokens, one warm-up; tokens/s from llama-server `timings`.
