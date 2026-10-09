@@ -11,7 +11,8 @@ set -u
 DEST=${MODELS_DIR}/gguf
 LOGDIR=${MODELS_DIR}/logs
 
-# alias | HF repo | file | dest subdir | expected bytes
+# alias | HF repo[@revision] | file (path in the repo) | dest subdir | expected bytes
+# A file in a repo subfolder is saved under its base name; @revision pins a commit (default main).
 MODELS='
 coder|unsloth/Qwen3.8-27B-GGUF|Qwen3.8-27B-UD-Q4_K_XL.gguf|qwen3.8-27b|17559178144
 coder-fast|unsloth/Qwen3.6-35B-A3B-GGUF|Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf|qwen3.6-35b-a3b|19500506080
@@ -19,6 +20,8 @@ big|unsloth/Qwen3-Coder-Next-GGUF|Qwen3-Coder-Next-UD-IQ4_NL.gguf|qwen3-coder-ne
 vision|unsloth/gemma-4-31B-it-qat-GGUF|gemma-4-31B-it-qat-UD-Q4_K_XL.gguf|gemma-4-31b-qat|17287670048
 vision|unsloth/gemma-4-31B-it-qat-GGUF|mmproj-BF16.gguf|gemma-4-31b-qat|1200726496
 hermes|NousResearch/Hermes-4.3-36B-GGUF|hermes-4_3_36b-Q4_K_M.gguf|hermes-4.3-36b|21762145216
+flash|ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f92082b1e93c0e96d60a8b11aab089b52f09|IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf|qwen3.8-flash-next|54817524224
+flash|ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f92082b1e93c0e96d60a8b11aab089b52f09|IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf|qwen3.8-flash-next|28800138432
 '
 # NOTE: the hermes repo is UNVERIFIED. The live file was copied from an earlier manual
 # download whose source was not recorded; check the repo's file list before relying on it.
@@ -29,11 +32,12 @@ AUTH=()
 [[ -n $TOK ]] && AUTH=(-H "Authorization: Bearer $TOK")
 
 fetch() { # repo file dir size
-  local repo=$1 file=$2 dir=$DEST/$3 size=$4 out
-  mkdir -p "$dir"; out=$dir/$file
+  local repo=$1 file=$2 dir=$DEST/$3 size=$4 out rev=main
+  [[ $repo == *@* ]] && { rev=${repo#*@}; repo=${repo%@*}; }
+  mkdir -p "$dir"; out=$dir/$(basename "$file")
   if [[ -f $out && $(stat -c %s "$out") == "$size" ]]; then echo "OK (present) $out"; return 0; fi
   for try in 1 2 3 4 5; do
-    curl -fL --retry 5 -C - "${AUTH[@]}" -o "$out" -s -S "https://huggingface.co/$repo/resolve/main/$file" \
+    curl -fL --retry 5 -C - "${AUTH[@]}" -o "$out" -s -S "https://huggingface.co/$repo/resolve/$rev/$file" \
       && { local got; got=$(stat -c %s "$out")
            if [[ $got == "$size" ]]; then echo "OK $out $got"; return 0; fi
            echo "WARN $out is $got bytes, expected $size (upstream file changed?)"; return 0; }

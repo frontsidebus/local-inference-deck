@@ -17,6 +17,9 @@ apiKeys:
 
 macros:
   "image": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:7149a45c80596644320de1d565db1b3b8e70b22c66fed612e69b73f6b1e0d746"
+  # build 11459, used ONLY by the experimental flash entry (qwen4exp needs fixes after 11277: #29751 decode +13-55 %,
+  # #29761 MTP, #29825 indexer memory, #29994 race). Every other model stays on ${image}.
+  "image-next": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:fff6185edd2fbc4093aa5970bf6db53ed11c283e3a1c52a3e244cf27047264f4"
   # spark-docker-run.sh waits for a same-named container (from a reload) to be gone, then execs docker run --name <id>
   "run": "/usr/local/sbin/spark-docker-run.sh ${MODEL_ID} --rm --init --label llama-swap=1 --runtime nvidia -p 127.0.0.1:${PORT}:8080 -v ${MODELS_DIR}:/models:ro"
   # common llama-server args: everything on GPU, fail loudly instead of auto-shrinking, one slot, q8_0 KV
@@ -115,6 +118,28 @@ models:
     ttl: 1800
     capabilities: { in: [text], out: [text], tools: true, context: 65536 }
 
+  # EXPERIMENTAL (2026-10-08): Qwen3.8-Flash-Next, 125B MoE (6B active, 512 experts, 48 layers: 12x [3 Gated DeltaNet +
+  # 1 sparse attention]), ISTA-DASLab GSQ-RCO IQ3_S (model-card task average 93.26 vs 93.12 BF16). Being evaluated
+  # (evals/plans) before any routing decision; hidden in Open WebUI until then.
+  # Placement: layer split over both GPUs; the 28.8 GB n-gram table (per_layer_token_embd, shard 2) stays on the CPU
+  # and is read from disk on demand (-lm mmap -lzm on); the routed experts of 7 layers per GPU half (blk 0-6 and
+  # 24-30) run on the CPU from RAM (~15 GB). Tune that count from VRAM headroom after the first load.
+  # KV is small: only the 12 attention layers have a KV cache (~1.7 GB at 128K, q8_0).
+  "qwen3.8-flash-next":
+    name: "Qwen3.8-Flash-Next 125B-A6B IQ3_S (GPU0+GPU1+CPU experts, experimental)"
+    aliases: ["flash"]
+    cmd: |
+      ${run} --gpus "\"device=0,1\"" ${image-next}
+      -m /models/gguf/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
+      ${common} -c 131072 -n 32768 -sm layer -ts 1,1 -lm mmap -lzm on
+      -ot "per_layer_token_embd=CPU,blk\.([0-6]|2[4-9]|30)\.ffn_.*_exps\.=CPU"
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    ttl: 1800
+    capabilities: { in: [text], out: [text], tools: true, context: 131072 }
+
 routing:
   router:
     use: matrix
@@ -126,13 +151,16 @@ routing:
           b: qwen3-coder-next
           v: gemma-4-31b
           h: hermes-4.3-36b
+          x: qwen3.8-flash-next
         evict_costs:
           b: 5     # ~40 GB read from disk: about 20 s when the page cache is cold, 7 s when warm
+          x: 5     # ~55 GB of weights to read (the n-gram table is read on demand); slower than big
         sets:
           coding: "c & f"   # one per GPU, the default working pair
           big: "b"
           vision: "v"
           hermes: "h"
+          flash: "x"
 
 hooks:
   on_startup:

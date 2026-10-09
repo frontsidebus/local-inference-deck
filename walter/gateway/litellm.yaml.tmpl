@@ -60,6 +60,27 @@ model_list:
       supports_vision: false
       input_cost_per_token: 0
       output_cost_per_token: 0
+  # EXPERIMENTAL (2026-10-08): Qwen3.8-Flash-Next on llama-swap's flash entry, being evaluated; hidden in Open WebUI
+  - model_name: flash
+    litellm_params:
+      model: openai/flash
+      api_base: http://${BACKEND_WG_IP}:8080/v1
+      api_key: os.environ/LLAMA_SWAP_KEY
+      timeout: 900
+      stream_timeout: 900
+    model_info:
+      mode: chat
+      # native passthrough: /v1/messages is forwarded untranslated to llama-server /v1/messages
+      # (keeps thinking blocks + streaming); chat/responses still use the openai/ provider
+      supported_endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      max_tokens: 32768
+      supports_function_calling: true
+      supports_tool_choice: true
+      supports_vision: false
+      input_cost_per_token: 0
+      output_cost_per_token: 0
   - model_name: vision
     litellm_params:
       model: openai/vision
