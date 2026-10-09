@@ -124,9 +124,10 @@ def test_both_chat_fields_each_clamped():
 # --- model name resolution -----------------------------------------------------
 
 @pytest.mark.parametrize("model,expected", [
-    ("coder", 32768), ("coder-fast", 32768), ("big", 32768), ("vision", 16384), ("hermes", 16384),
+    ("coder", 32768), ("coder-fast", 32768), ("big", 32768), ("vision", 16384), ("hermes", 16384), ("flash", 32768),
     ("claude-sonnet-4-5-20250929", 32768),          # safety-net route -> coder
     ("local/qwen3.8-27b", 32768), ("local/gemma-4-31b", 16384), ("local/hermes-4.3-36b", 16384),
+    ("local/qwen3.8-flash-next", 32768),
     ("local/something-new", 16384), ("unknown", 16384), (None, 16384),
 ])
 def test_model_max_output(model, expected):

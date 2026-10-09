@@ -55,7 +55,7 @@ ALIASES = dict(
     kv.split("=", 1)
     for kv in os.environ.get(
         "MODEL_ALIASES",
-        "qwen3.8-27b=coder,qwen3.6-35b-a3b=coder-fast,qwen3-coder-next=big,gemma-4-31b=vision,hermes-4.3-36b=hermes",
+        "qwen3.8-27b=coder,qwen3.6-35b-a3b=coder-fast,qwen3-coder-next=big,gemma-4-31b=vision,hermes-4.3-36b=hermes,qwen3.8-flash-next=flash",
     ).split(",")
     if "=" in kv
 )
@@ -65,7 +65,7 @@ STATIC_GPUS = {
         kv.split("=", 1)
         for kv in os.environ.get(
             "MODEL_GPUS",
-            "qwen3.8-27b=0,qwen3.6-35b-a3b=1,qwen3-coder-next=0+1,gemma-4-31b=0+1,hermes-4.3-36b=0+1",
+            "qwen3.8-27b=0,qwen3.6-35b-a3b=1,qwen3-coder-next=0+1,gemma-4-31b=0+1,hermes-4.3-36b=0+1,qwen3.8-flash-next=0+1",
         ).split(",")
         if "=" in kv
     )

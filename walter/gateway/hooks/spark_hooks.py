@@ -204,6 +204,7 @@ MODEL_MAX_OUTPUT = {
     "big": 32768,
     "vision": 16384,
     "hermes": 16384,
+    "flash": 32768,
 }
 # local/<llama-swap model ID> -> the alias that ID serves
 LOCAL_ID_ALIAS = {
@@ -212,6 +213,7 @@ LOCAL_ID_ALIAS = {
     "qwen3-coder-next": "big",
     "gemma-4-31b": "vision",
     "hermes-4.3-36b": "hermes",
+    "qwen3.8-flash-next": "flash",
 }
 # anything else (unknown local/* IDs): the smallest maximum
 FALLBACK_MAX_OUTPUT = min(MODEL_MAX_OUTPUT.values())

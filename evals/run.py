@@ -59,7 +59,7 @@ RESULTS_DIR = EVALS_DIR / "results"
 GRADER_PROMPT = EVALS_DIR / "prompts" / "llm_judge.md"
 LLAMA_SWAP_TEMPLATE = REPO_DIR / "walter" / "llama-swap" / "config.yaml.tmpl"
 FRONTIER_PREFIX = "claude"
-SWAPPING_ALIASES = {"big", "vision", "hermes"}   # these take both GPUs and evict the coding pair
+SWAPPING_ALIASES = {"big", "vision", "hermes", "flash"}   # these take both GPUs and evict the coding pair
 
 DEFAULT_SYSTEM = {
     "mcq": ("You are a security expert answering a multiple-choice question. Choose the single best option. "
