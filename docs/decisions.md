@@ -167,3 +167,21 @@ Short records of the choices behind gen3. Each says what was decided, why, and w
 - **Site values are masked before every frontier call**, for full infra bundles and the claims stage alike. Each configured `site.env` identifier (the domain and hosts, addresses, SSH users and aliases, bucket names, the site name) becomes a `${KEY}` placeholder. The reverse map is kept only in the runner's memory, and the judge's reply is validated against the masked bundle before the finding is unmasked, so the owner and Hermes see real names and Claude never does. The local judge is not masked: nothing leaves the machine, and its probes need the real names.
 - **In a mixed bundle, the agent's free text** (its final answer and gate excerpts) is masked further and must pass the claims self-check. A piece that fails is withheld with a marker naming the problem kinds; the rest of the bundle still goes to the frontier judge. This was preferred to falling back to the local judge, which would lose the code review for a slip in one field.
 - **Residual risk:** values that are not in `site.env` (another site's address, the workstation account in home paths) are not masked; a final answer can still paraphrase a withheld file in plain words that no rule detects. Spec: `judge/CONTRACT.md` ("Runner: site values masked", "Runner: agent free text of mixed bundles").
+
+---
+
+## 12. Model routing for security work
+
+**Date:** 2026-10-10 · **Status:** accepted
+
+**Context.** Four eval runs (2026-10-06 to 2026-10-09) compared six local models on public security benchmarks and recent NVD CVEs. All six ran on the same items and were compared with paired tests. Until then, the choice of model for security tasks was a guess.
+
+**Decision.** `coder` stays the default for security work in Open WebUI and Hermes. `flash` is the model for CVSS and CWE triage batches. `coder-fast` is for quick lookups, not defensive tooling. `big` is not used for security work. [model-guide.md](model-guide.md) has the full routing and the evidence.
+
+**Why.**
+- `coder` leads written analysis and CWE mapping, and rarely refuses.
+- `flash` has the lowest CVSS error.
+- `coder-fast` opens 84% of benign defensive requests with a refusal, and a defensive system prompt does not change that.
+
+**Revisit when** a model, quant or llama.cpp image changes. Re-run the shared subsets (`evals/plans/`). Also revisit if Phase 3 (GPU sharing) makes the two-GPU models cheap to keep loaded.
+

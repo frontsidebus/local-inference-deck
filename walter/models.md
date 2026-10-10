@@ -1,5 +1,7 @@
 # Models served by llama-swap
 
+Which model to use for which security task, with the eval evidence, is in [`docs/model-guide.md`](../docs/model-guide.md).
+
 All files live under `${MODELS_DIR}/gguf/<subdir>/` on the host. Inside the llama-server
 containers that directory is always mounted at `/models`, so `llama-swap/config.yaml.tmpl`
 keeps the in-container paths `/models/gguf/...` unchanged whatever `MODELS_DIR` is.
