@@ -1,0 +1,305 @@
+{
+  "version": "families-v3",
+  "about": "Model lineage for judge independence. Effective families = families (brand/vendor) + base (base-model lineage). Two models overlap when they share any effective family. Unknown fails closed. Fine-tune brands (patterns with brand=true) resolve to unknown unless an explicit models/files entry gives their base lineage. Patterns match the weight-file basename or the alias. Served identity is resolved first: sha256 (when pinned; an unpinned sha with a non-empty table is a conflict) -> files -> models -> patterns. Read by evals/grading.py (family_overlap) and evals/run.py, evals/report.py.",
+  "source": "model IDs and weight files in walter/llama-swap/config.yaml.tmpl; vendor model cards for lineage",
+  "models": {
+    "coder": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ],
+      "model_id": "qwen3.8-27b"
+    },
+    "coder-fast": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ],
+      "model_id": "qwen3.6-35b-a3b"
+    },
+    "big": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ],
+      "model_id": "qwen3-coder-next"
+    },
+    "flash": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ],
+      "model_id": "qwen3.8-flash-next"
+    },
+    "local/qwen3.8-flash-next": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ],
+      "model_id": "qwen3.8-flash-next"
+    },
+    "vision": {
+      "families": [
+        "gemma"
+      ],
+      "base": [
+        "gemma"
+      ],
+      "model_id": "gemma-4-31b"
+    },
+    "hermes": {
+      "families": [
+        "hermes"
+      ],
+      "base": [
+        "seed-oss"
+      ],
+      "model_id": "hermes-4.3-36b",
+      "lineage_source": "believed: Nous Hermes 4.3 36B is a fine-tune of ByteDance Seed-OSS-36B; not verified offline (TODO at freeze)"
+    },
+    "claude": {
+      "families": [
+        "claude"
+      ],
+      "base": [
+        "claude"
+      ],
+      "model_id": "claude (frontier CLI default)"
+    }
+  },
+  "patterns": [
+    {
+      "regex": "hermes[-_ ]?4[-_ ]14b",
+      "lineage": true,
+      "families": [
+        "hermes"
+      ],
+      "base": [
+        "qwen"
+      ],
+      "lineage_source": "Nous Hermes 4 14B: Qwen3-14B base (model card)"
+    },
+    {
+      "regex": "hermes[-_ ]?4[-_ ](70|405)b",
+      "lineage": true,
+      "families": [
+        "hermes"
+      ],
+      "base": [
+        "llama"
+      ],
+      "lineage_source": "Nous Hermes 4 70B/405B: Llama-3.1 base (model card)"
+    },
+    {
+      "regex": "hermes[-_ ]?4[-_.]3[-_ ]36b",
+      "lineage": true,
+      "families": [
+        "hermes"
+      ],
+      "base": [
+        "seed-oss"
+      ],
+      "lineage_source": "see models.hermes (unverified)"
+    },
+    {
+      "regex": "hermes[-_ ]?3[-_ ]llama",
+      "lineage": true,
+      "families": [
+        "hermes"
+      ],
+      "base": [
+        "llama"
+      ],
+      "lineage_source": "Hermes 3: Llama-3.1 base (in the name)"
+    },
+    {
+      "regex": "hermes",
+      "brand": true
+    },
+    {
+      "regex": "nous",
+      "brand": true
+    },
+    {
+      "regex": "dolphin",
+      "brand": true
+    },
+    {
+      "regex": "nemotron",
+      "brand": true
+    },
+    {
+      "regex": "openthinker",
+      "brand": true
+    },
+    {
+      "regex": "openhermes",
+      "brand": true
+    },
+    {
+      "regex": "wizardlm",
+      "brand": true
+    },
+    {
+      "regex": "tulu",
+      "brand": true
+    },
+    {
+      "regex": "airoboros",
+      "brand": true
+    },
+    {
+      "regex": "openchat",
+      "brand": true
+    },
+    {
+      "regex": "zephyr",
+      "brand": true
+    },
+    {
+      "regex": "vicuna",
+      "brand": true
+    },
+    {
+      "regex": "orca",
+      "brand": true
+    },
+    {
+      "regex": "starling",
+      "brand": true
+    },
+    {
+      "regex": "neural-chat",
+      "brand": true
+    },
+    {
+      "regex": "^claude(:|-|$)",
+      "families": [
+        "claude"
+      ]
+    },
+    {
+      "regex": "qwen|qwq",
+      "families": [
+        "qwen"
+      ]
+    },
+    {
+      "regex": "gemma",
+      "families": [
+        "gemma"
+      ]
+    },
+    {
+      "regex": "llama",
+      "families": [
+        "llama"
+      ]
+    },
+    {
+      "regex": "mistral|mixtral|devstral|magistral",
+      "families": [
+        "mistral"
+      ]
+    },
+    {
+      "regex": "deepseek",
+      "families": [
+        "deepseek"
+      ]
+    },
+    {
+      "regex": "seed-oss",
+      "families": [
+        "seed-oss"
+      ]
+    },
+    {
+      "regex": "^gpt|^o[1-9]",
+      "families": [
+        "gpt"
+      ]
+    },
+    {
+      "regex": "gemini",
+      "families": [
+        "gemini"
+      ]
+    },
+    {
+      "regex": "phi-?[0-9]",
+      "families": [
+        "phi"
+      ]
+    },
+    {
+      "regex": "glm",
+      "families": [
+        "glm"
+      ]
+    }
+  ],
+  "files": {
+    "Qwen3.8-27B-UD-Q4_K_XL.gguf": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ]
+    },
+    "Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ]
+    },
+    "Qwen3-Coder-Next-UD-IQ4_NL.gguf": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ]
+    },
+    "gemma-4-31B-it-qat-UD-Q4_K_XL.gguf": {
+      "families": [
+        "gemma"
+      ],
+      "base": [
+        "gemma"
+      ]
+    },
+    "hermes-4_3_36b-Q4_K_M.gguf": {
+      "families": [
+        "hermes"
+      ],
+      "base": [
+        "seed-oss"
+      ],
+      "lineage_source": "see models.hermes"
+    },
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf": {
+      "families": [
+        "qwen"
+      ],
+      "base": [
+        "qwen"
+      ]
+    }
+  },
+  "sha256": {},
+  "sha256_todo": "Pin each served weight file's sha256 here at freeze (sha -> families); empty until then."
+}
