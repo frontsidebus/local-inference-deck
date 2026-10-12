@@ -30,7 +30,7 @@ Each finding was fixed and turned into a regression test. The hardened harness (
 |---|---|---|
 | NVD's own CVSS vector and the vendor's (CNA) vector for the same CVE match exactly only **3.9%** of the time | n = 410 CVEs; mean score gap 1.22 | CVSS "accuracy" mostly measures agreement with one labeller's habits, not ground truth |
 | CWE accuracy depends on whether the description names the weakness: **73–98%** when it does, **27–41%** when it doesn't | `nvd-cwe`, 200 items, all six models | Much of the apparent CWE skill is name lookup |
-| On `nvd-cvss`, `big`, `coder` and `coder-fast` have higher score error than a **constant 7.5** or a bag-of-words classifier | MAE 1.61–1.97 vs 1.41 (constant) and 1.52 (classifier) | Don't trust these models' CVSS scores on their own |
+| On `nvd-cvss`, `big`, `coder` and `coder-fast` have higher score error than a **constant 7.5**, and none of them beats a bag-of-words classifier | MAE 1.61–1.97 vs 1.33–1.41 for the constant on the same items | Don't trust these models' CVSS scores on their own |
 | The LLM judge used for free-text grading favours longer answers | judge review, rounds 1–2 | Judge-graded rankings (SEvenLLM) are exploratory only |
 | Several statements in the current model guide are not supported once corrections and baselines are applied | round-4 re-analysis | Model-guide corrections are a separate, pending PR |
 
