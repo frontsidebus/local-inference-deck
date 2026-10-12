@@ -33,10 +33,16 @@ def read(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def label_subset(items: list[dict], suite: str, label: str, n: int, seed: int) -> list[dict]:
+def label_subset(items: list[dict], suite: str, label: str, n: int, seed: int, rigor: bool = False,
+                 cap: int = 2) -> list[dict]:
+    """With rigor=True the derived suite is re-annotated on its own (clusters within the subset) and the sample
+    is drawn from its dedup pool (dedupe-kept, not sealed held-out)."""
     new_suite = f"{suite}-{label}lab"
     picked = [dict(it, suite=new_suite) for it in items
               if (it.get("meta") or {}).get("label_source") == label]
+    if rigor:
+        import audit  # noqa: PLC0415
+        picked = audit.pool(audit.annotate(new_suite, picked, cap=cap, seed=seed))
     out = []
     for it in c.stratified_sample(picked, n, seed=seed):
         it = dict(it, meta=dict(it.get("meta") or {}))
@@ -65,20 +71,33 @@ def main(argv: list[str] | None = None) -> int:
     for p in (lab, sb):
         p.add_argument("--n", type=int, required=True)
         p.add_argument("--seed", type=int, default=c.DEFAULT_SEED)
+        p.add_argument("--rigor", action="store_true",
+                       help="sample only the dedup pool (meta.rigor.dedupe_keep, not held-out); file name gets .dedup")
+        p.add_argument("--dedupe-cap", type=int, default=2)
     a = ap.parse_args(argv)
+    tag = ".dedup" if a.rigor else ""
     d = Path(a.data_dir)
     if a.cmd == "label":
         src = d / f"{a.suite}.jsonl"
-        out_items = label_subset(read(src), a.suite, a.label, a.n, a.seed)
+        out_items = label_subset(read(src), a.suite, a.label, a.n, a.seed, rigor=a.rigor, cap=a.dedupe_cap)
         if not out_items:
             print(f"{src.name}: no items with label_source={a.label!r}", file=sys.stderr)
             return 1
-        out = d / f"{a.suite}-{a.label}lab.sample{a.n}.jsonl"
+        out = d / f"{a.suite}-{a.label}lab{tag}.sample{a.n}.jsonl"
     else:
         src = d / f"{a.source}.jsonl"
         items = read(src)
+        if a.rigor:
+            if not all("rigor" in (it.get("meta") or {}) for it in items):
+                print(f"{src.name}: --rigor needs a file built with --rigor (meta.rigor missing)", file=sys.stderr)
+                return 1
+            import audit  # noqa: PLC0415
+            items = audit.pool(items)
         out_items = c.stratified_sample(items, a.n, seed=a.seed)
-        out = d / f"{subset_name(a.source, len(items), a.n)}.jsonl"
+        name = subset_name(a.source, len(items), a.n)
+        if tag and tag not in name:
+            name = name.replace(".sample", tag + ".sample", 1)
+        out = d / f"{name}.jsonl"
     c.validate(out_items)
     data = c.to_jsonl(out_items)
     out.write_bytes(data)

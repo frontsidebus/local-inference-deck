@@ -26,6 +26,9 @@ API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 DEFAULT_START = "2026-08-01T00:00:00.000"
 DEFAULT_END = "2026-08-31T23:59:59.999"
 PAGE = 2000
+# Prospective confirmatory arm (PROTOCOL): fetch only after the window has closed and settled.
+PROSPECTIVE_START = "2026-10-01T00:00:00.000"
+PROSPECTIVE_END = "2026-10-31T23:59:59.999"
 # sha256 of the converted JSONL for the default window (first real fetch: 2026-10-05).
 PINNED = {
     "nvd-cwe": "c5c2c88b726d618a1ec5ec5d2afa03ad65d993256aacfe18ab7341e085d3538f",
@@ -58,32 +61,102 @@ def _desc(cve: dict) -> str:
     return ""
 
 
-def pick_cwe(cve: dict) -> tuple[str, str] | None:
-    """(CWE id, label source) or None. NVD's own label wins; a CNA label is used
-    only when NVD has none. Ambiguous (more than one CWE) records are skipped."""
-    nvd, cna = set(), set()
+# Label precedence (R3-4). Each tier is a set of source roles; the first tier with any label wins, and a tier
+# with more than one distinct value makes the record ambiguous (skipped). "legacy" is the pinned behaviour:
+# NVD, then every other source lumped together (CNA and CISA ADP).
+PRECEDENCE = {
+    "legacy": (("nvd",), ("cna", "adp")),
+    "nvd,cna,adp": (("nvd",), ("cna",), ("adp",)),
+    "nvd,adp,cna": (("nvd",), ("adp",), ("cna",)),
+    "nvd-only": (("nvd",),),
+}
+
+
+def _pick(entries: list[tuple[str, str]], precedence: str) -> tuple[str, str] | None:
+    """entries = [(role, value)]. Returns (value, label source) or None."""
+    for tier in PRECEDENCE[precedence]:
+        vals = {v for r, v in entries if r in tier}
+        if vals:
+            if len(vals) != 1:
+                return None
+            # legacy keeps its historical names: "nvd", or "cna" for every other source (ADP included)
+            src = ("nvd" if tier == ("nvd",) else "cna") if precedence == "legacy" else tier[0]
+            return vals.pop(), src
+    return None
+
+
+def pick_cwe(cve: dict, precedence: str = "legacy") -> tuple[str, str] | None:
+    """(CWE id, label source) or None. With the default (legacy) precedence NVD's own label wins and any other
+    source's label is used only when NVD has none. Ambiguous (more than one CWE) records are skipped."""
+    entries = [(source_role(w.get("source", ""), cve), d["value"]) for w in cve.get("weaknesses", [])
+               for d in w.get("description", []) if d.get("value", "").startswith("CWE-")]
+    return _pick(entries, precedence)
+
+
+def pick_cvss(cve: dict, precedence: str = "legacy") -> tuple[str, str] | None:
+    entries = [(source_role(m.get("source", ""), cve), m["cvssData"]["vectorString"])
+               for m in cve.get("metrics", {}).get("cvssMetricV31", [])]
+    return _pick(entries, precedence)
+
+
+ADP_CISA = "134c704f-9b21-4f2e-91b3-4a467353bcc0"  # CISA ADP (Vulnrichment)
+
+
+def source_role(source: str, cve: dict) -> str:
+    """nvd = NVD's own analysis; adp = CISA ADP; cna = anything else (normally the record's sourceIdentifier)."""
+    if source == NVD:
+        return "nvd"
+    if source == ADP_CISA:
+        return "adp"
+    return "cna"
+
+
+def label_fields(cve: dict, cve5: dict | None = None, ref_dates: dict | None = None) -> dict:
+    """Both label sources of a record, kept apart (NVD primary vs CNA secondary), plus per-entry provenance
+    (role, source, NVD type Primary/Secondary) for every CVSS metric and CWE weakness, and the first-public date.
+    Added to meta.labels under --rigor (not in the pinned output). The legacy cwe_cna/cvss_cna lists keep the
+    pinned picker's meaning: every non-NVD source (so they include ADP entries; see *_adp)."""
+    import audit  # noqa: PLC0415  (lazy: audit imports _common)
+    cwe_nvd, cwe_cna, cwe_adp = set(), set(), set()
+    weaknesses = []
     for w in cve.get("weaknesses", []):
-        vals = {d["value"] for d in w.get("description", []) if d.get("value", "").startswith("CWE-")}
-        (nvd if w.get("source") == NVD else cna).update(vals)
-    if nvd:
-        return (nvd.pop(), "nvd") if len(nvd) == 1 else None
-    if len(cna) == 1:
-        return cna.pop(), "cna"
-    return None
+        vals = sorted({d["value"] for d in w.get("description", []) if d.get("value", "").startswith("CWE-")})
+        role = source_role(w.get("source", ""), cve)
+        weaknesses.append({"role": role, "source": w.get("source", ""), "type": w.get("type"), "cwes": vals})
+        (cwe_nvd if role == "nvd" else cwe_cna).update(vals)
+        if role == "adp":
+            cwe_adp.update(vals)
+    metrics = []
+    for key, ms in sorted(cve.get("metrics", {}).items()):
+        if not key.startswith("cvssMetric"):
+            continue
+        for m in ms:
+            metrics.append({"role": source_role(m.get("source", ""), cve), "source": m.get("source", ""),
+                            "type": m.get("type"), "version": (m.get("cvssData") or {}).get("version"),
+                            "vector": (m.get("cvssData") or {}).get("vectorString")})
+    v31 = [m for m in metrics if m["version"] == "3.1"]
+    date, basis = audit.first_public_date(cve.get("published"), cve5, ref_dates)
+    if cve5 is None and not ref_dates:
+        basis += " (pending refetch: CVE5 datePublic and reference dates not fetched)"
+    return {"cna": cve.get("sourceIdentifier", ""),
+            "last_modified": cve.get("lastModified", "")[:10],
+            "cwe_nvd": sorted(cwe_nvd), "cwe_cna": sorted(cwe_cna), "cwe_adp": sorted(cwe_adp),
+            "cvss_nvd": sorted({m["vector"] for m in v31 if m["role"] == "nvd"}),
+            "cvss_cna": sorted({m["vector"] for m in v31 if m["role"] != "nvd"}),
+            "cvss_adp": sorted({m["vector"] for m in v31 if m["role"] == "adp"}),
+            "metrics": metrics, "weaknesses": weaknesses,
+            "first_public": {"date": date, "basis": basis}}
 
 
-def pick_cvss(cve: dict) -> tuple[str, str] | None:
-    ms = cve.get("metrics", {}).get("cvssMetricV31", [])
-    nvd = {m["cvssData"]["vectorString"] for m in ms if m.get("source") == NVD}
-    cna = {m["cvssData"]["vectorString"] for m in ms if m.get("source") != NVD}
-    if nvd:
-        return (nvd.pop(), "nvd") if len(nvd) == 1 else None
-    if len(cna) == 1:
-        return cna.pop(), "cna"
-    return None
+def add_label_fields(suites: dict[str, list[dict]], vulns: list[dict]) -> dict[str, list[dict]]:
+    by_id = {v["cve"]["id"]: v["cve"] for v in vulns}
+    return {s: [dict(it, meta={**it["meta"], "labels": label_fields(by_id[it["meta"]["cve"]])}) for it in items]
+            for s, items in suites.items()}
 
 
-def convert(vulns: list[dict]) -> dict[str, list[dict]]:
+def convert(vulns: list[dict], precedence: str = "legacy", prospective: bool = False) -> dict[str, list[dict]]:
+    """Defaults give the pinned output. prospective=True names the suites nvd-cwe-prospective /
+    nvd-cvss-prospective and the ids nvdp-cwe-NNNN / nvdp-cvss-NNNN (R3-4)."""
     cves = sorted((v["cve"] for v in vulns), key=lambda x: x["id"])
     cwe_rows, cvss_rows = [], []
     for cve in cves:
@@ -94,24 +167,26 @@ def convert(vulns: list[dict]) -> dict[str, list[dict]]:
             continue
         base = {"source": SOURCE, "license": LICENSE, "cve": cve["id"],
                 "published": cve.get("published", "")[:10], "vuln_status": cve.get("vulnStatus", "")}
-        cw = pick_cwe(cve)
+        cw = pick_cwe(cve, precedence)
         # Skip descriptions that state the answer outright.
         if cw and cw[0].lower() not in desc.lower():
             cwe_rows.append((cve, desc, cw, base))
-        cv = pick_cvss(cve)
+        cv = pick_cvss(cve, precedence)
         if cv and "CVSS:3" not in desc and "AV:" not in desc:
             cvss_rows.append((cve, desc, cv, base))
+    s_cwe, s_cvss = ("nvd-cwe-prospective", "nvd-cvss-prospective") if prospective else ("nvd-cwe", "nvd-cvss")
+    p_cwe, p_cvss = ("nvdp-cwe", "nvdp-cvss") if prospective else ("nvd-cwe", "nvd-cvss")
     out_cwe = [{
-        "id": c.make_id("nvd-cwe", i, len(cwe_rows)), "suite": "nvd-cwe", "type": "classify",
+        "id": c.make_id(p_cwe, i, len(cwe_rows)), "suite": s_cwe, "type": "classify",
         "prompt": CWE_PROMPT.format(desc=desc), "answer": cw[0], "scorer": "cwe_match",
         "meta": {**base, "category": cw[0], "label_source": cw[1]},
     } for i, (cve, desc, cw, base) in enumerate(cwe_rows, 1)]
     out_cvss = [{
-        "id": c.make_id("nvd-cvss", i, len(cvss_rows)), "suite": "nvd-cvss", "type": "extract",
+        "id": c.make_id(p_cvss, i, len(cvss_rows)), "suite": s_cvss, "type": "extract",
         "prompt": CVSS_PROMPT.format(desc=desc), "answer": cv[0], "scorer": "cvss_mae",
         "meta": {**base, "category": cv[0].split("/")[1], "label_source": cv[1]},
     } for i, (cve, desc, cv, base) in enumerate(cvss_rows, 1)]
-    return {"nvd-cwe": out_cwe, "nvd-cvss": out_cvss}
+    return {s_cwe: out_cwe, s_cvss: out_cvss}
 
 
 def fetch_window(start: str, end: str, cache: Path, offline: bool, refresh: bool) -> tuple[list[dict], list[dict]]:
@@ -154,11 +229,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--refresh", action="store_true", help="re-download pages even if cached")
     p.add_argument("--accept-drift", action="store_true",
                    help="write output even if it no longer matches the pinned checksum")
+    p.add_argument("--prospective", action="store_true",
+                   help=f"the sealed prospective arm: window {PROSPECTIVE_START[:10]}..{PROSPECTIVE_END[:10]} unless "
+                        "--start/--end are given, suites nvd-*-prospective, ids nvdp-*; never pinned")
+    p.add_argument("--label-precedence", choices=[k for k in PRECEDENCE if k != "nvd-only"], default="legacy",
+                   help="which source's label wins (legacy = NVD, then any other source; the pinned behaviour)")
+    p.add_argument("--label-mode", choices=["any", "nvd-only"], default="any",
+                   help="nvd-only keeps only records NVD itself labelled")
     args = p.parse_args(argv)
+    precedence = "nvd-only" if args.label_mode == "nvd-only" else args.label_precedence
+    if args.prospective and (args.start, args.end) == (DEFAULT_START, DEFAULT_END):
+        args.start, args.end = PROSPECTIVE_START, PROSPECTIVE_END
     vulns, pages = fetch_window(args.start, args.end, Path(args.cache_dir) / "nvd-recent",
                                 args.offline, args.refresh)
-    pinned_window = (args.start, args.end) == (DEFAULT_START, DEFAULT_END)
-    suites = convert(vulns)
+    pinned_window = ((args.start, args.end) == (DEFAULT_START, DEFAULT_END) and not args.prospective
+                     and precedence == "legacy")
+    suites = convert(vulns, precedence, args.prospective)
     drift = {}
     for suite, items in suites.items():
         got = c.sha256_bytes(c.to_jsonl(items))
@@ -170,11 +256,14 @@ def main(argv: list[str] | None = None) -> int:
         print("Upstream NVD data changed (or the cache is from another fetch). Rerun with "
               "--accept-drift to use it, and record the new checksum.", file=sys.stderr)
         return 2
+    if args.rigor:
+        suites = add_label_fields(suites, vulns)
     for suite, items in suites.items():
         c.write_outputs(suite, items, args, pages, LICENSE,
                         {"window": {"start": args.start, "end": args.end},
                          "cves_in_window": len(vulns), "pinned": pinned_window,
-                         "drift_accepted": suite in drift})
+                         "drift_accepted": suite in drift, "label_precedence": precedence,
+                         "prospective": args.prospective})
     return 0
 
 

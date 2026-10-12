@@ -31,7 +31,7 @@ DATA_DIR = REPO_ROOT / "evals" / "data"
 TYPES = {"mcq", "extract", "classify", "freeform", "code"}
 SCORERS = {
     "mcq_letter", "exact", "exact_set", "f1_tokens", "regex", "numeric_tol",
-    "json_fields", "cwe_match", "cvss_mae", "llm_judge",
+    "json_fields", "cwe_match", "cvss_mae", "llm_judge", "refusal",
 }
 USER_AGENT = "local-inference-deck-evals/1.0 (+dataset fetch; stdlib urllib)"
 DEFAULT_SEED = 20261005
@@ -167,6 +167,9 @@ def stratified_sample(items: list[dict], n: int, seed: int = DEFAULT_SEED,
 def write_outputs(suite: str, items: list[dict], args: argparse.Namespace,
                   sources: list[dict], license_: str, extra: dict | None = None) -> dict:
     """Validate, write <suite>.jsonl (+ sample) and the provenance sidecar."""
+    rigor_stats = None
+    if getattr(args, "rigor", False):
+        items, rigor_stats = rigor_annotate(suite, items, args)
     validate(items)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -189,12 +192,35 @@ def write_outputs(suite: str, items: list[dict], args: argparse.Namespace,
         (out_dir / f"{suite}.sample{args.sample}.jsonl").write_bytes(sdata)
         prov["sample"] = {"n": len(sub), "seed": args.seed, "jsonl_sha256": sha256_bytes(sdata),
                           "file": f"{suite}.sample{args.sample}.jsonl"}
+    if rigor_stats is not None:
+        import audit  # noqa: PLC0415  (lazy: audit imports this module)
+        prov["rigor"] = {"leak_action": args.leak, "dedupe_cap": args.dedupe_cap,
+                         "key_overrides": args.key_overrides, "stats": rigor_stats}
+        if args.sample:
+            sub = stratified_sample(audit.pool(items), args.sample, args.seed)
+            sdata = to_jsonl(sub)
+            name = f"{suite}.dedup.sample{args.sample}.jsonl"
+            (out_dir / name).write_bytes(sdata)
+            prov["rigor"]["sample"] = {"n": len(sub), "seed": args.seed, "file": name,
+                                       "jsonl_sha256": sha256_bytes(sdata),
+                                       "pool": "dedupe_keep and not heldout"}
     (out_dir / f"{suite}.provenance.json").write_text(json.dumps(prov, indent=2) + "\n")
     msg = f"{suite}: {len(items)} items  sha256={prov['jsonl_sha256']}"
     if args.sample:
         msg += f"  (+sample{args.sample}: {prov['sample']['n']} items)"
     print(msg)
     return prov
+
+
+def rigor_annotate(suite: str, items: list[dict], args: argparse.Namespace) -> tuple[list[dict], dict]:
+    """Apply the rigor layer (evals/datasets/audit.py) as a builder option: meta.rigor flags, leak handling,
+    optional human key overrides. Returns (items, per-suite stats)."""
+    import audit  # noqa: PLC0415
+    overrides = audit.load_key_overrides(Path(args.key_overrides)) if args.key_overrides else []
+    items = audit.annotate(suite, items, leak=args.leak, cap=args.dedupe_cap, seed=args.seed,
+                           cutoffs=audit.load_cutoffs(Path(args.cutoffs)),
+                           heldout=audit.load_heldout(Path(args.heldout)), overrides=overrides)
+    return items, audit.suite_stats(items)
 
 
 def base_parser(description: str) -> argparse.ArgumentParser:
@@ -206,4 +232,16 @@ def base_parser(description: str) -> argparse.ArgumentParser:
     p.add_argument("--cache-dir", default=str(DATA_DIR / ".cache"),
                    help="download cache (default evals/data/.cache)")
     p.add_argument("--offline", action="store_true", help="use cached downloads only")
+    here = Path(__file__).resolve().parent
+    g = p.add_argument_group("rigor layer (audit.py); off by default so pinned outputs stay byte-identical")
+    g.add_argument("--rigor", action="store_true",
+                   help="add meta.rigor (dedupe clusters, has_signal, leak flags, label provenance, dates, "
+                        "post_cutoff, heldout) and, with --sample, also write <suite>.dedup.sample<N>.jsonl")
+    g.add_argument("--leak", choices=["default", "keep", "flag", "strip"], default="default",
+                   help="leak handling: default = strip for nvd-*, flag for public benchmarks")
+    g.add_argument("--dedupe-cap", type=int, default=2, help="max items per template cluster in the dedup pool")
+    g.add_argument("--key-overrides", default=None, metavar="PATH",
+                   help="apply human key overrides (e.g. evals/datasets/key_overrides.json); off by default")
+    g.add_argument("--cutoffs", default=str(here / "model_cutoffs.json"))
+    g.add_argument("--heldout", default=str(here / "heldout" / "heldout-v1.json"))
     return p
