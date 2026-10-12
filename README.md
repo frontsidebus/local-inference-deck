@@ -136,6 +136,7 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Topology, the four request paths, ports, model placement, the gateway hook, the judge in brief, deploy model, secrets, backups, monitoring, security model, known issues. |
 | [CONVENTIONS.md](CONVENTIONS.md) | Public-repo rules, `site.env` names, templating, secrets, sanitization checks, PR flow. |
 | [docs/decisions.md](docs/decisions.md) | Why llama.cpp and not vLLM, why nginx, why LiteLLM, why Pocket-ID, and more. |
+| [docs/evals-roadmap.md](docs/evals-roadmap.md) | What the security evals have shown so far, the options for developing them further (routing, upgrade gate, triage vetting, a methods write-up), the work each needs, and the recommended order. |
 | [docs/agent-judge.md](docs/agent-judge.md) | Why and how a judge reviews the local agent; rubric, data boundary, pilot results. |
 | **Components** | |
 | [walter/README.md](walter/README.md) | Backend VM: layout, pinned versions, deploy, OIDC bootstrap, secrets, output cap, verify, rollback. |

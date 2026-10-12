@@ -2,6 +2,8 @@
 
 A small, stdlib-only harness that scores the local models (`coder`, `coder-fast`, `big`, `vision`, `hermes`) on security tasks through the LiteLLM gateway. It can also score a frontier baseline through the `claude` CLI, which is off by default. Use it to compare models, thinking modes and future fine-tunes on the same items, with confidence intervals.
 
+Findings so far, options for further development and the roadmap: [docs/evals-roadmap.md](../docs/evals-roadmap.md).
+
 | Path | What it is |
 |---|---|
 | `run.py` | The runner: suites × models → `evals/results/<run>/` |
