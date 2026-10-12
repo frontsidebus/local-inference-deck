@@ -1,0 +1,1191 @@
+{
+ "schema": 2,
+ "protocol": "C1",
+ "title": "Protocol C1 comparisons (evals/PROTOCOL.md, Part 2). Generated with the register table in PROTOCOL.md; evals/tests/test_run.py checks that the two agree.",
+ "alpha": 0.05,
+ "contestants": [
+  "coder",
+  "coder-fast",
+  "big",
+  "vision",
+  "hermes",
+  "local/qwen3.8-flash-next"
+ ],
+ "runs": {
+  "run_name": "c1",
+  "thinking_off": "--seed 1234 -> c1-<model>",
+  "thinking_on": "--seeds 1234,1235,1236 -> c1-<model>-think-seed<N>",
+  "d6_system_prompt": "c1sys-coder-fast (--intervention D6-defensive-system-prompt)",
+  "d8_untuned_flash": "c1pre-local_qwen3.8-flash-next (--intervention D8-untuned-flash)",
+  "d8_tuned_flash": "c1-local_qwen3.8-flash-next (--intervention D8-tuned-flash)",
+  "reruns": "an invalid run is rerun with the SAME run name under a new --results root (evals/results/c1-rerun<k>/), so the dir names in this file stay valid"
+ },
+ "interventions": "evals/plans/c1-interventions.json",
+ "run_interventions": {
+  "c1": [
+   "D8-tuned-flash"
+  ],
+  "c1sys": [
+   "D6-defensive-system-prompt",
+   "D8-tuned-flash"
+  ],
+  "c1pre": [
+   "D8-untuned-flash"
+  ]
+ },
+ "defaults": {
+  "metric": "accuracy",
+  "min_n": 30,
+  "primary": {
+   "errors": "fail",
+   "cvss_impute": "baseline",
+   "cvss_constant": 7.5
+  }
+ },
+ "analysis": {
+  "min_n": 30,
+  "n_boot": 4000,
+  "n_perm": 10000,
+  "seed": 20261011,
+  "alpha": 0.05,
+  "note": "also pinned in freeze-C1.json (analysis); report.py refuses 'pre-registered' if it runs with other settings"
+ },
+ "notes": [
+  "Exactly one primary per comparison: metric, exclusions (ops), error policy, CVSS imputation and constant.",
+  "cvss_constant 7.5: the median, the mode and the MAE-optimal constant of the FULL NVD CVSS pool (all fetched nvd-cvss items, not the evaluated subset); fixed in R2 before any sealed output exists. Disclosed: chosen with round-1 dev results known (a constant 7.4 guess beat three models on dev MAE).",
+  "Margins are decision costs (PROTOCOL C1.10), not power: 0.05 for D4 (owner decision 2026-10-11), D5, D8 and the exploratory D7; 0.10 for D6.full, a prompt choice whose other effect (D6.refuse) is tested separately.",
+  "assumed: planning priors for evals/tools/power.py: p_b = B's accuracy, psi = the share of items where A and B disagree, sd_diff = SD of per-item MAE differences (all from round-1 development runs where they exist; D6 and the prospective n are guesses), delta = the smallest effect the decision needs (directional rows).",
+  "planned_n: the C1 pool AFTER the primary exclusions (sealed, minus dev_neardup_exposed, minus the declared exclusions; computed from the r4 annotated data (out-r4), text and metadata only); the prospective n is a guess.",
+  "Exclusion ops are those report.py knows. Confirmatory pools additionally drop sealed items with meta.rigor.dev_neardup_exposed at selection (the freeze manifest's id lists), before any run.",
+  "exploratory_families (D1, D7): pre-specified, never confirmatory; report.py and power.py read only 'families', so they are in no gate, no Holm correction and no power row (owner decisions 2026-10-11).",
+  "arms: the approved robustness arms (b) 2x token budget and (c) MCQ option shift, with their decision rules (PROTOCOL C1.13). Arms are exploratory runs; they never change a verdict's direction."
+ ],
+ "planned_n": {
+  "ctibench-mcq": 694,
+  "ctibench-vsp": 210,
+  "nvd-cwe": 1136,
+  "nvd-cvss": 2545,
+  "cse-frr": 163,
+  "sevenllm-qa": 159,
+  "nvd-cwe-prospective": 1000
+ },
+ "arms": {
+  "about": "Approved robustness arms (owner decision 2026-10-11; PROTOCOL C1.13). Subset per sealed suite: C1 pool ids with int(sha256('c1-arm|' + id)[:8], 16) % k == 0, k = max(1, floor(n_pool / 200)) (about 200 items per suite and model), pinned in freeze-C1.json (arms) by make_c1.py freeze. Prospective suites are not in any arm.",
+  "not_run": {
+   "a": "vendor samplers: not approved; disclosed as a limitation (C1.0, C1.16)",
+   "d": "prompt paraphrase: not approved; disclosed as a limitation (C1.16)",
+   "e": "sampled thinking-off: served only D7, which is exploratory; not run",
+   "f": "contamination probes: not in the 2026-10-11 approval; not run in C1 unless approved by a dated amendment before freeze"
+  },
+  "rule": "An arm never changes a verdict's direction. It marks a confirmed or equivalence verdict 'not robust to arm X' when, on the arm subset, the arm's estimate falls on the other side of zero (directional) or outside the margin (equivalence) AND its 95% interval excludes the primary's estimate on the same subset. An arm with fewer than min_n items for a comparison is 'not evaluable' for it.",
+  "arms": {
+   "b": {
+    "name": "budget-2x",
+    "run_names": {
+     "c1": "c1armb",
+     "c1sys": "c1sysarmb",
+     "c1pre": "c1prearmb"
+    },
+    "budget_multiplier": 2,
+    "change": "every answer_tokens value and think_budget of the frozen BUDGET_POLICY doubled (run.py --budget-policy; the policy and its sha256 are pinned in freeze-C1.json arms.b)",
+    "seeds": "thinking off: 1234; thinking on (D2's coder side): seed 1234 only (a single-seed arm)",
+    "applies_to": "every confirmatory comparison on a sealed suite (prospective rows excluded)",
+    "decision_rule": "the arm rule, per comparison; plus, per model x suite, the 1x and 2x truncation rates and the paired change of the primary metric. A cell whose primary metric improves at 2x by more than the comparison's margin (0.05 for rates without one; 0.3 MAE points) with a 95% interval excluding zero is labelled 'budget-limited', and every verdict that uses it is reported as holding 'at the frozen budget' only."
+   },
+   "c": {
+    "name": "mcq-option-shift",
+    "run_names": {
+     "c1": "c1armc",
+     "c1pre": "c1prearmc"
+    },
+    "change": "options cyclically shifted by one so every option and the key move (evals/tools/contam_probes.py perm), thinking off, seed 1234",
+    "applies_to": [
+     "D5.ctibench-mcq",
+     "D8.mcq"
+    ],
+    "decision_rule": "the arm rule, per comparison (A and B both on shifted options vs the primary on the same subset); plus, per model, the paired accuracy change shifted - original (exact McNemar, Newcombe 95% interval) and the stale-letter rate. A model whose interval lies wholly below -0.05 is labelled 'option-order sensitive' and its MCQ results carry that label. Never excludes items."
+   }
+  }
+ },
+ "families": [
+  {
+   "name": "D2",
+   "test": "holm",
+   "decision": "coder with thinking on for CWE mapping where accuracy matters.",
+   "comparisons": [
+    {
+     "id": "D2.sealed",
+     "suite": "nvd-cwe",
+     "metric": "accuracy_either",
+     "direction": "a>b",
+     "a": [
+      "c1-coder-think-seed1234",
+      "c1-coder-think-seed1235",
+      "c1-coder-think-seed1236"
+     ],
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak",
+       "no_name_in_text"
+      ]
+     },
+     "sensitivity": [
+      "name_in_text",
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "p_b": 0.6,
+      "psi": 0.154,
+      "delta": 0.05,
+      "source": "round-1 development runs"
+     },
+     "sensitivity_metrics": [
+      "accuracy_onehop"
+     ]
+    },
+    {
+     "id": "D2.prospective",
+     "suite": "nvd-cwe-prospective",
+     "metric": "accuracy_either",
+     "direction": "a>b",
+     "a": [
+      "c1-coder-think-seed1234",
+      "c1-coder-think-seed1235",
+      "c1-coder-think-seed1236"
+     ],
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak",
+       "no_name_in_text"
+      ]
+     },
+     "sensitivity": [
+      "name_in_text",
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "p_b": 0.6,
+      "psi": 0.154,
+      "delta": 0.05,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     },
+     "sensitivity_metrics": [
+      "accuracy_onehop"
+     ]
+    }
+   ]
+  },
+  {
+   "name": "D3",
+   "test": "iut",
+   "decision": "flash for CVSS triage ('lowest CVSS error of the six'): flash's MAE must be lower than EACH other contestant's on both CVSS suites (intersection-union test).",
+   "comparisons": [
+    {
+     "id": "D3.vsp-coder",
+     "suite": "ctibench-vsp",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 1.14,
+      "delta": 0.3,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D3.vsp-fast",
+     "suite": "ctibench-vsp",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 1.12,
+      "delta": 0.3,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D3.vsp-big",
+     "suite": "ctibench-vsp",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-big",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 1.54,
+      "delta": 0.3,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D3.vsp-hermes",
+     "suite": "ctibench-vsp",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-hermes",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 0.99,
+      "delta": 0.3,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D3.vsp-vision",
+     "suite": "ctibench-vsp",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-vision",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 0.94,
+      "delta": 0.3,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D3.cvss-coder",
+     "suite": "nvd-cvss",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 1.14,
+      "delta": 0.3,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     }
+    },
+    {
+     "id": "D3.cvss-fast",
+     "suite": "nvd-cvss",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 1.12,
+      "delta": 0.3,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     }
+    },
+    {
+     "id": "D3.cvss-big",
+     "suite": "nvd-cvss",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-big",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 1.54,
+      "delta": 0.3,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     }
+    },
+    {
+     "id": "D3.cvss-hermes",
+     "suite": "nvd-cvss",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-hermes",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 0.99,
+      "delta": 0.3,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     }
+    },
+    {
+     "id": "D3.cvss-vision",
+     "suite": "nvd-cvss",
+     "metric": "mae",
+     "direction": "a<b",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-vision",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak"
+      ],
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "impute_none",
+      "impute_max",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "sd_diff": 0.94,
+      "delta": 0.3,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     }
+    }
+   ]
+  },
+  {
+   "name": "D4",
+   "test": "holm",
+   "decision": "flash is fit for CWE triage ('matching coder'): equivalent within the margin. Margin 0.05 = OWNER DECISION 2026-10-11 (PROTOCOL C1.10): the batching saving does not justify accepting more than 5 points of CWE accuracy.",
+   "comparisons": [
+    {
+     "id": "D4.sealed",
+     "suite": "nvd-cwe",
+     "metric": "accuracy_either",
+     "direction": "equivalent",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak",
+       "no_name_in_text"
+      ]
+     },
+     "sensitivity": [
+      "name_in_text",
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "p_b": 0.6,
+      "psi": 0.177,
+      "source": "round-1 development runs"
+     },
+     "sensitivity_metrics": [
+      "accuracy_onehop"
+     ],
+     "margin": 0.05
+    },
+    {
+     "id": "D4.prospective",
+     "suite": "nvd-cwe-prospective",
+     "metric": "accuracy_either",
+     "direction": "equivalent",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak",
+       "no_name_in_text"
+      ]
+     },
+     "sensitivity": [
+      "name_in_text",
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "p_b": 0.6,
+      "psi": 0.177,
+      "source": "round-1 development runs of the sealed-suite counterpart"
+     },
+     "sensitivity_metrics": [
+      "accuracy_onehop"
+     ],
+     "margin": 0.05
+    }
+   ]
+  },
+  {
+   "name": "D5",
+   "test": "holm",
+   "decision": "coder-fast for quick knowledge lookups ('ties on multiple-choice knowledge'). CyberMetric has 0 sealed items and is not in C1.",
+   "comparisons": [
+    {
+     "id": "D5.ctibench-mcq",
+     "suite": "ctibench-mcq",
+     "metric": "accuracy",
+     "direction": "equivalent",
+     "a": "c1-coder-fast",
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "no_leak"
+      ]
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "no_key_longest",
+      "letter_balanced"
+     ],
+     "assumed": {
+      "p_b": 0.67,
+      "psi": 0.186,
+      "source": "round-1 development runs"
+     },
+     "margin": 0.05
+    }
+   ]
+  },
+  {
+   "name": "D6",
+   "test": "holm",
+   "decision": "the defensive system prompt for coder-fast: fewer outright refusals (the old CSE 'compliance' claim = 1 - refuse tier) while full compliance (no refusal opener; the old opener claim = 1 - full) is unchanged.",
+   "comparisons": [
+    {
+     "id": "D6.refuse",
+     "suite": "cse-frr",
+     "metric": "refusal_refuse",
+     "direction": "a<b",
+     "a": "c1sys-coder-fast",
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D6-defensive-system-prompt",
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "no_frr_exclude"
+      ]
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "trunc_best",
+      "trunc_worst",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.1,
+      "psi": 0.15,
+      "delta": 0.05,
+      "source": "guess"
+     }
+    },
+    {
+     "id": "D6.full",
+     "suite": "cse-frr",
+     "metric": "refusal_full",
+     "direction": "equivalent",
+     "a": "c1sys-coder-fast",
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D6-defensive-system-prompt",
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "no_frr_exclude"
+      ]
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "trunc_best",
+      "trunc_worst",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.16,
+      "psi": 0.15,
+      "source": "guess"
+     },
+     "margin": 0.1
+    }
+   ]
+  },
+  {
+   "name": "D8",
+   "test": "holm",
+   "decision": "flash speed tuning (MTP + CPU expert layers) did not change accuracy: tuned equivalent to untuned. Action (owner decision 2026-10-11): revert only if a D8 row is 'different' with tuned worse (interval wholly beyond -0.05); otherwise keep the tuning.",
+   "comparisons": [
+    {
+     "id": "D8.mcq",
+     "suite": "ctibench-mcq",
+     "metric": "accuracy",
+     "direction": "equivalent",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1pre-local_qwen3.8-flash-next",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-untuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "no_leak"
+      ]
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "no_key_longest",
+      "letter_balanced"
+     ],
+     "assumed": {
+      "p_b": 0.69,
+      "psi": 0.123,
+      "source": "round-1 development runs"
+     },
+     "margin": 0.05
+    },
+    {
+     "id": "D8.cwe",
+     "suite": "nvd-cwe",
+     "metric": "accuracy_either",
+     "direction": "equivalent",
+     "a": "c1-local_qwen3.8-flash-next",
+     "b": "c1pre-local_qwen3.8-flash-next",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-untuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak",
+       "no_name_in_text"
+      ]
+     },
+     "sensitivity": [
+      "name_in_text",
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "p_b": 0.64,
+      "psi": 0.123,
+      "source": "round-1 development runs"
+     },
+     "sensitivity_metrics": [
+      "accuracy_onehop"
+     ],
+     "margin": 0.05
+    }
+   ]
+  }
+ ],
+ "exploratory_families": [
+  {
+   "name": "D1",
+   "test": "iut",
+   "decision": "coder is the default for analysis and write-ups ('best on SEvenLLM free text'). EXPLORATORY (owner decision 2026-10-11): in no confirmatory family, not run in C1 (no judge calibration, no extra generation); kept here, as written, so a later protocol can register it unchanged. Pre-specified as an intersection-union test.",
+   "comparisons": [
+    {
+     "id": "D1.big",
+     "suite": "sevenllm-qa",
+     "metric": "accuracy",
+     "direction": "a>b",
+     "a": "c1-coder",
+     "b": "c1-big",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": []
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.85,
+      "psi": 0.134,
+      "delta": 0.1,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D1.fast",
+     "suite": "sevenllm-qa",
+     "metric": "accuracy",
+     "direction": "a>b",
+     "a": "c1-coder",
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": []
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.75,
+      "psi": 0.199,
+      "delta": 0.1,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D1.hermes",
+     "suite": "sevenllm-qa",
+     "metric": "accuracy",
+     "direction": "a>b",
+     "a": "c1-coder",
+     "b": "c1-hermes",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": []
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.75,
+      "psi": 0.156,
+      "delta": 0.1,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D1.vision",
+     "suite": "sevenllm-qa",
+     "metric": "accuracy",
+     "direction": "a>b",
+     "a": "c1-coder",
+     "b": "c1-vision",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": []
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.69,
+      "psi": 0.283,
+      "delta": 0.1,
+      "source": "round-1 development runs"
+     }
+    },
+    {
+     "id": "D1.flash",
+     "suite": "sevenllm-qa",
+     "metric": "accuracy",
+     "direction": "a>b",
+     "a": "c1-coder",
+     "b": "c1-local_qwen3.8-flash-next",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": []
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy"
+     ],
+     "assumed": {
+      "p_b": 0.75,
+      "psi": 0.177,
+      "delta": 0.1,
+      "source": "round-1 development runs"
+     }
+    }
+   ]
+  },
+  {
+   "name": "D7",
+   "test": "holm",
+   "decision": "thinking off by default. EXPLORATORY (owner decision 2026-10-11): in no confirmatory family; thinking stays off by default whatever the result; the thinking runs are still made under the frozen harness (run-c1.sh step c1-think-d7) and reported in the exploratory section with this pre-specified analysis.",
+   "comparisons": [
+    {
+     "id": "D7.fast-mcq",
+     "suite": "ctibench-mcq",
+     "metric": "accuracy",
+     "direction": "equivalent",
+     "a": [
+      "c1-coder-fast-think-seed1234",
+      "c1-coder-fast-think-seed1235",
+      "c1-coder-fast-think-seed1236"
+     ],
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "no_leak"
+      ]
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "no_key_longest",
+      "letter_balanced"
+     ],
+     "assumed": {
+      "p_b": 0.68,
+      "psi": 0.238,
+      "source": "round-1 development runs"
+     },
+     "margin": 0.05
+    },
+    {
+     "id": "D7.fast-cwe",
+     "suite": "nvd-cwe",
+     "metric": "accuracy_either",
+     "direction": "equivalent",
+     "a": [
+      "c1-coder-fast-think-seed1234",
+      "c1-coder-fast-think-seed1235",
+      "c1-coder-fast-think-seed1236"
+     ],
+     "b": "c1-coder-fast",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "has_signal",
+       "no_leak",
+       "no_name_in_text"
+      ]
+     },
+     "sensitivity": [
+      "name_in_text",
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "cna_cluster",
+      "post_cutoff"
+     ],
+     "assumed": {
+      "p_b": 0.55,
+      "psi": 0.259,
+      "source": "round-1 development runs"
+     },
+     "sensitivity_metrics": [
+      "accuracy_onehop"
+     ],
+     "margin": 0.05
+    },
+    {
+     "id": "D7.coder-mcq",
+     "suite": "ctibench-mcq",
+     "metric": "accuracy",
+     "direction": "equivalent",
+     "a": [
+      "c1-coder-think-seed1234",
+      "c1-coder-think-seed1235",
+      "c1-coder-think-seed1236"
+     ],
+     "b": "c1-coder",
+     "interventions": {
+      "a": [
+       "D8-tuned-flash"
+      ],
+      "b": [
+       "D8-tuned-flash"
+      ]
+     },
+     "primary": {
+      "exclude": [
+       "no_leak"
+      ]
+     },
+     "sensitivity": [
+      "no_dev_exposed",
+      "drop_truncated",
+      "cluster_bootstrap",
+      "legacy",
+      "no_key_longest",
+      "letter_balanced"
+     ],
+     "assumed": {
+      "p_b": 0.67,
+      "psi": 0.175,
+      "source": "round-1 development runs"
+     },
+     "margin": 0.05
+    }
+   ]
+  }
+ ]
+}

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# LEGACY (round 1, exploratory): kept to reproduce eval run (b). It grades with `big`, a contestant, which run.py now
+# refuses unless --allow-self-grade is given (added below, so it reproduces the round-1 grading as it was). Its runs
+# predate the explicit sampling profiles: resuming one needs --legacy-sampling. Not a template for new runs: use the
+# protocol C1 plan (evals/PROTOCOL.md C1.14) with an independent judge.
 # Eval run (b), day 1: the coding pair on 200-item samples, big on 100-item subsets of the same items, thinking
 # on/off, and big grading the free-text answers. About 10 h on two RTX 3090s; see evals/plans/README.md.
 #
@@ -112,7 +116,7 @@ wait $F; RC_F=$?
 
 # 3. big grades sevenllm-qa for all three models in one pass
 eval_step grade "${PY[@]}" --suite sevenllm-qa.sample100 --model big,coder,coder-fast --thinking off \
-  --run-name "$EVAL_RUN-qa" --rescore --grader-model big || fail "phase 3 (grading)"
+  --run-name "$EVAL_RUN-qa" --rescore --grader-model big --allow-self-grade || fail "phase 3 (grading)"
 
 # 4. report
 R=evals/results

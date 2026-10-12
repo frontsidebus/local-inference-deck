@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# LEGACY (round 1, exploratory): kept to reproduce eval run (b). It grades with `big`, a contestant, which run.py now
+# refuses unless --allow-self-grade is given (added below, so it reproduces the round-1 grading as it was). Its runs
+# predate the explicit sampling profiles: resuming one needs --legacy-sampling. Not a template for new runs: use the
+# protocol C1 plan (evals/PROTOCOL.md C1.14) with an independent judge.
 # Eval run (b), day 2: hermes and vision on the same 100-item subsets big used on day 1, so all five models can be
 # compared on shared items; big then grades their sevenllm-qa answers, and the report covers days 1 and 2.
 # About 7 h on two RTX 3090s; both models take both GPUs, so coder and coder-fast are evicted for the whole run.
@@ -67,7 +71,7 @@ eval_step vision-qa "${PY[@]}" "${QA[@]}" --model vision || fail "phase 2 (visio
 
 # 3. big grades both in one pass
 eval_step grade "${PY[@]}" --suite sevenllm-qa.sample100 --model hermes,vision --thinking off \
-  --run-name "$EVAL_RUN-qa" --rescore --grader-model big || fail "phase 3 (grading)"
+  --run-name "$EVAL_RUN-qa" --rescore --grader-model big --allow-self-grade || fail "phase 3 (grading)"
 
 # 4. report across both days (day 1 dirs that exist)
 R=evals/results

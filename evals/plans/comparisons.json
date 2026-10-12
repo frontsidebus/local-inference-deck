@@ -1,0 +1,387 @@
+{
+  "schema": 1,
+  "title": "Confirmatory comparisons behind docs/model-guide.md (2026-10 eval runs)",
+  "notes": [
+    "Written from the guide's recommendations, before re-running any statistics on the stored results.",
+    "One family per decision the guide makes. Holm is applied within each family; the report also shows Holm across every family (the guide as a whole) and BH within the family.",
+    "A comparison names its runs by run dir; a list of run dirs is a seed group, compared on the per-item mean pass over seeds.",
+    "direction: 'a>b' or 'a<b' (on the metric's own scale; for mae lower is better) uses a two-sided test and counts as confirmed only if the adjusted p < alpha and the estimate has the declared sign. 'equivalent' is a TOST within +/- margin.",
+    "Margins are fixed a priori: 0.10 (10 percentage points) for accuracy and refusal rates, the smallest gap that would change a model choice on 100-item subsets; 0.5 CVSS points for MAE.",
+    "Descriptive single-model statements in the guide (for example 'hermes never refused', 'vision 79% complied') are not comparisons and are not in any family.",
+    "Amended 2026-10-11 (round 2, see the stats AMENDMENTS log): each comparison now has a declared primary analysis (defaults.primary: the PROTOCOL C1.4 exclusions has_signal / no_leak / no_frr_exclude, errors as fail, CVSS items without a parsed prediction imputed at the constant-7.5 baseline error) and pre-registered sensitivity analyses (defaults.sensitivity) that can downgrade a verdict. D1 is an intersection-union family ('best of k'). This round-1 plan is post hoc by construction: its runs are development runs, so the report labels it exploratory.",
+    "Amended 2026-10-11 (round 4): a declared exclusion whose flag is missing on any item makes a comparison not evaluable, so the exclusions are now declared per suite where the flag exists (has_signal on nvd-cwe and ctibench-vsp, frr_exclude on cse-frr, no_leak everywhere) instead of as plan-wide defaults. Same exclusions in effect as before; no result was consulted."
+  ],
+  "alpha": 0.05,
+  "defaults": {
+    "metric": "accuracy",
+    "margin": 0.1,
+    "primary": {
+      "exclude": [],
+      "errors": "fail",
+      "cvss_impute": "baseline",
+      "cvss_constant": 7.5
+    },
+    "sensitivity": [
+      "drop_truncated",
+      "errors_excluded",
+      "followup_fail",
+      "no_name_in_text"
+    ]
+  },
+  "families": [
+    {
+      "name": "D1-analysis-default",
+      "decision": "Default to coder for security analysis and write-ups: 'Best on SEvenLLM free text'. 'Best' needs coder ahead of each of the other five models. Tested as an intersection-union family: the claim holds only if coder wins every pairwise comparison at alpha (no adjustment inside the family).",
+      "comparisons": [
+        {
+          "id": "D1.big",
+          "suite": "sevenllm-qa",
+          "a": "evalb-qa-coder",
+          "b": "evalb-qa-big",
+          "direction": "a>b",
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D1.fast",
+          "suite": "sevenllm-qa",
+          "a": "evalb-qa-coder",
+          "b": "evalb-qa-coder-fast",
+          "direction": "a>b",
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D1.hermes",
+          "suite": "sevenllm-qa",
+          "a": "evalb-qa-coder",
+          "b": "evalb2-qa-hermes",
+          "direction": "a>b",
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D1.vision",
+          "suite": "sevenllm-qa",
+          "a": "evalb-qa-coder",
+          "b": "evalb2-qa-vision",
+          "direction": "a>b",
+          "claim": "beats vision 20/4 (p 0.002)",
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D1.flash",
+          "suite": "sevenllm-qa",
+          "a": "evalb-qa-coder",
+          "b": "evalc-qa-local_qwen3.8-flash-next",
+          "direction": "a>b",
+          "claim": "beats flash 12/2 (p 0.013)",
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        }
+      ],
+      "test": "iut"
+    },
+    {
+      "name": "D2-cwe-thinking",
+      "decision": "Use coder with thinking on where CWE accuracy matters: NVD CWE 60% off vs 65% on.",
+      "comparisons": [
+        {
+          "id": "D2.coder-think",
+          "suite": "nvd-cwe",
+          "a": "evalb-think-s1234-coder-think",
+          "b": "evalb-coder",
+          "direction": "a>b",
+          "claim": "65% vs 60%, 8/18, p 0.08",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D3-cvss-flash",
+      "decision": "Use flash for CVSS scoring: 'Lowest CVSS error of the six' (MAE against each of the other five) and the cited pass-rate win over coder.",
+      "comparisons": [
+        {
+          "id": "D3.pass-coder",
+          "suite": "ctibench-vsp",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb-coder",
+          "direction": "a>b",
+          "claim": "73% vs 59%, 17/3, p 0.003",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D3.mae-big",
+          "suite": "ctibench-vsp",
+          "metric": "mae",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb-big",
+          "direction": "a<b",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D3.mae-coder",
+          "suite": "ctibench-vsp",
+          "metric": "mae",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb-coder",
+          "direction": "a<b",
+          "claim": "MAE 0.75 vs 1.27",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D3.mae-fast",
+          "suite": "ctibench-vsp",
+          "metric": "mae",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb-coder-fast",
+          "direction": "a<b",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D3.mae-hermes",
+          "suite": "ctibench-vsp",
+          "metric": "mae",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb2-hermes",
+          "direction": "a<b",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D3.mae-vision",
+          "suite": "ctibench-vsp",
+          "metric": "mae",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb2-vision",
+          "direction": "a<b",
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D4-cwe-flash",
+      "decision": "flash is fit for CWE triage batches: 'NVD CWE 64%, matching coder'.",
+      "comparisons": [
+        {
+          "id": "D4.cwe-match",
+          "suite": "nvd-cwe",
+          "a": "evalc-local_qwen3.8-flash-next",
+          "b": "evalb-coder",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D5-lookups-coder-fast",
+      "decision": "coder-fast for quick knowledge lookups: 'Ties on multiple-choice knowledge (CyberMetric, CTIBench MCQ)' with the default model.",
+      "comparisons": [
+        {
+          "id": "D5.cybermetric",
+          "suite": "cybermetric-500",
+          "a": "evalb-coder-fast",
+          "b": "evalb-coder",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D5.ctibench-mcq",
+          "suite": "ctibench-mcq",
+          "a": "evalb-coder-fast",
+          "b": "evalb-coder",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D6-defensive-system-prompt",
+      "decision": "A defensive system prompt raises coder-fast compliance (90% -> 98%) but leaves refusal openers unchanged (81% -> 86%).",
+      "comparisons": [
+        {
+          "id": "D6.compliance",
+          "suite": "cse-frr",
+          "a": "evalsys-coder-fast",
+          "b": "evalb-coder-fast",
+          "direction": "a>b",
+          "primary": {
+            "exclude": [
+              "no_leak",
+              "no_frr_exclude"
+            ]
+          }
+        },
+        {
+          "id": "D6.openers",
+          "suite": "cse-frr",
+          "metric": "opener_refusal",
+          "a": "evalsys-coder-fast",
+          "b": "evalb-coder-fast",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "claim": "unchanged, p 0.11",
+          "primary": {
+            "exclude": [
+              "no_leak",
+              "no_frr_exclude"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D7-thinking-off-by-default",
+      "decision": "Leave thinking off by default: apart from coder's CWE mapping it 'showed no gain larger than seed-to-seed noise'.",
+      "comparisons": [
+        {
+          "id": "D7.fast-mcq",
+          "suite": "ctibench-mcq",
+          "a": [
+            "evalb-think-s1234-coder-fast-think",
+            "evalb-think-s1235-coder-fast-think",
+            "evalb-think-s1236-coder-fast-think"
+          ],
+          "b": "evalb-coder-fast",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D7.fast-cwe",
+          "suite": "nvd-cwe",
+          "a": [
+            "evalb-think-s1234-coder-fast-think",
+            "evalb-think-s1235-coder-fast-think",
+            "evalb-think-s1236-coder-fast-think"
+          ],
+          "b": "evalb-coder-fast",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D7.coder-mcq",
+          "suite": "ctibench-mcq",
+          "a": "evalb-think-s1234-coder-think",
+          "b": "evalb-coder",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "D8-flash-tuning",
+      "decision": "flash speed tuning (MTP + CPU expert layers) 'did not measurably change accuracy' (re-check before vs after).",
+      "comparisons": [
+        {
+          "id": "D8.mcq",
+          "suite": "ctibench-mcq",
+          "a": "evalc2-local_qwen3.8-flash-next",
+          "b": "evalc-local_qwen3.8-flash-next",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "no_leak"
+            ]
+          }
+        },
+        {
+          "id": "D8.cwe",
+          "suite": "nvd-cwe",
+          "a": "evalc2-local_qwen3.8-flash-next",
+          "b": "evalc-local_qwen3.8-flash-next",
+          "direction": "equivalent",
+          "margin": 0.1,
+          "primary": {
+            "exclude": [
+              "has_signal",
+              "no_leak"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

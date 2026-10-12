@@ -294,6 +294,15 @@ def test_plan_validation_and_yaml(tmp_path):
     assert R.load_comparisons(y)["families"][0]["comparisons"][0]["id"] == "x"
 
 
+def test_repo_plan_file_is_valid():
+    plan = R.load_comparisons(R.EVALS_DIR / "plans" / "comparisons.json")
+    ids = [c["id"] for f in plan["families"] for c in f["comparisons"]]
+    assert len(ids) == len(set(ids)) and len(ids) >= 10
+    for f in plan["families"]:
+        for c in f["comparisons"]:
+            if c.get("direction") == "equivalent":
+                assert c.get("margin", plan["defaults"].get("margin")) > 0
+
 
 def test_render_markdown_backward_compatible(tmp_path):
     a = make_run(tmp_path / "a", "m", [sc(0, 1), sc(1, 0)])
@@ -907,6 +916,11 @@ def test_longest_option_ties_share_credit_and_small_strata_hide_gap():
         {"run": "m", "t": 1.0, "nt": 3, "f": 0.5, "nf": 40}]}]})
     assert any("- (n < 5)" in l for l in lines)
 
+
+def test_report_non_waivable_list_covers_run_py():
+    import run as RUN
+    assert all(R._non_waivable(c) for c in RUN.NON_WAIVABLE)
+    assert R._non_waivable("GIT_DIRTY ") and R._non_waivable("Sealed_Only")      # r4 F9: case and spaces
 
 
 def test_decline_kinds_and_suite_status_warning(tmp_path):
