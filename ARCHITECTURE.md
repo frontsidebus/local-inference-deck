@@ -381,6 +381,7 @@ What leaves the house for the frontier judge is decided per path (`secret`, `scr
 - Walter: Ollama is retired but installed. A drop-in (`ConditionPathExists=/etc/ollama-enabled`) stops other units' `Wants=` from starting it at boot.
 - Walter: nvidia-persistenced must start before anything GPU-bound; services that raced the driver at boot came up CPU-only.
 - Hypervisor: `nvidia-cdi-refresh.{path,service}` is masked because both GPUs belong to `vfio-pci` and `nvidia-smi` cannot run there. Unmask it if a GPU ever returns to the host.
+- Hypervisor: the NVIDIA userspace stays installed, and its `10_nvidia.json` EGL vendor file sorts before Mesa's, so GPU-drawn desktop apps (Spotify, App Center) try NVIDIA first and crash with `GPU process isn't usable`. `/etc/environment.d/90-host-no-nvidia.conf` pins the desktop to Mesa on the AMD iGPU (`__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json`, `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json`) and takes effect at the next login. Delete it if a GPU ever returns to the host.
 - Hypervisor: refer to the models NVMe by `/dev/disk/by-id/...`, never `/dev/nvmeXn1`; the kernel names have swapped between boots. Moving a GPU between slots changes its host PCI address, so Walter's `hostdev` entries must be updated before the VM starts.
 - Covenant: Ubuntu 24.04 names the SSH unit `ssh.service`, so the stock fail2ban `sshd` jail matches nothing without a `journalmatch` override.
 
