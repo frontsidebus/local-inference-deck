@@ -21,7 +21,7 @@ The runner needs Python 3.10+ (stdlib only), `SPARK_API_HOST` (read from `site.e
 
 ```sh
 # smoke: first 5 items of every sample suite, on the two resident coding models
-python3 evals/run.py --suite evals/samples --model coder-fast --model coder --limit 5 --grader-model coder
+python3 evals/run.py --suite evals/samples --model coder-fast --limit 5 --grader-model claude:<model>
 
 # a converted benchmark (evals/data/<suite>.jsonl), thinking off and on
 python3 evals/run.py --suite ctibench-mcq --model coder --thinking off,on
@@ -43,16 +43,20 @@ python3 evals/report.py <run-dirs> --split-label-source --items evals/data/nvd-c
 Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-thinkdefault]/`. The default run name is the UTC start time. The directory holds:
 
 - `run.json`, the provenance:
-  - the model, and the sampling settings sent (temperature and top_p, which default by thinking mode (see below); seed, default 1234; optional presence_penalty);
-  - the thinking mode, and the `max_tokens` cap for each task type;
-  - the git SHA and whether the tree was dirty;
-  - each dataset file's sha256 and item count, plus the fetcher's `<suite>.provenance.json` sidecar when one is present;
+  - the model, and every sampler setting sent (`sampling`: the profile, each value, the seed and any overrides), plus `request_params`, the request body as sent minus the messages and `max_tokens`;
+  - the thinking mode, the `max_tokens` cap for each task type, and `budget`: the token-budget policy, its sha256 and the resolved answer and total caps per suite;
+  - `followup`: whether the final-answer follow-up was on;
+  - the git SHA and whether the tree was dirty, and the full sha256 of `run.py`, `scorers.py` and `report.py`; `scorer_version`;
+  - each dataset file's sha256 and item count, plus the fetcher's `<suite>.provenance.json` sidecar when one is present; `item_sets`: per suite, the count and sha256 of the sorted selected ids;
+  - `prompts`: the sha256 of the system prompt actually sent per suite, of each default system prompt and of the follow-up prompt;
   - the model's llama-swap `cmd` and server sampling flags, taken from the repo template `walter/llama-swap/config.yaml.tmpl` (or `--llama-swap-config` for a copy of the live file);
+  - `serving` (see [Serving config](#serving-config)): model file, quant, llama.cpp build, context size, chat template hash and the server's sampler defaults. Each is `{"value", "source"}`, or `{"value": null, "reason"}` when unknown. It also holds which server defaults the request overrode, and, with `--probe-server`, a check of the samplers the server actually used;
+  - `protocol`: exploratory, confirmatory or rescored-exploratory; the failed checks (`{id, msg}`), the declared deviations (`{id, text}`), the freeze manifests and their sha256, the frozen ref, the comparisons file (`plan`: path, sha256, contestants), the seeds, and `sealed_items_read` for exploratory runs;
   - the served model name and llama.cpp build fingerprint;
   - the grader model and the sha256 of the grader prompt;
   - start and end times, and the history of resumes and re-scores.
 - `responses.jsonl`: one line per item, holding the request, the raw response, the visible content, `reasoning_content`, `finish_reason`, usage, llama.cpp timings, latency and attempts.
-- `scores.jsonl`: one line per item, with `value`, `passed`, `parsed`, `status` (`ok`, `unparsed` or `error`) and `detail`, plus the item's `meta.label_source` when it has one. Refusal items also carry `extra.opener_refusal`.
+- `scores.jsonl`: one line per item, with `value`, `passed`, `parsed`, `status` (`ok`, `unparsed` or `error`) and `detail`, plus the item's `meta.label_source` when it has one. Every line also carries `finish_reason`, `truncated` (the reply hit `max_tokens`), `followup_used` and `seed`, so a report can exclude or stratify without reading the responses. Refusal items also carry `extra.opener_refusal`.
 - `grades.jsonl`: the grader's raw replies, used as a cache.
 - `summary.json` and `report.md`.
 
@@ -62,13 +66,18 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
   - `off` and `on` send `chat_template_kwargs.enable_thinking`. LiteLLM passes it through to llama-server.
   - `default` sends nothing, and the Qwen models think. Always state which mode you ran.
   - With thinking on, the reasoning comes back in `reasoning_content` and is never scored. Any `<think>` block left in the content is stripped before scoring.
-- **Output caps:** the `max_tokens` per task type with thinking off is mcq 512, classify 512, extract 2048, freeform 2048 and code 3072. Thinking on or default adds `--think-budget` (8192), because reasoning counts against `max_tokens`. A reply that hits the cap is counted as truncated; it is still scored.
-- **Sampling:** defaults depend on the thinking mode.
-  - Thinking off: temperature 0 (greedy, repeatable), and top_p unset.
-  - Thinking on or default: temperature 0.6 and top_p 0.95, as Qwen recommends. Greedy decoding makes the reasoning loop: in eval run (a), 9 of 50 `coder` CTIBench MCQ items at temperature 0 hit the cap, one repeating "T1016?" hundreds of times. Sampled runs vary, so use several `--seed` values and compare on the same items.
-  - `--temperature` and `--top-p` override both defaults.
-  - The model's other llama-swap defaults still apply unless you override them. For example, `coder-fast` has `--presence-penalty 1.5`; `run.json` records the server flags.
-  - A thinking run made before these defaults (at temperature 0) is not resumed at the new ones: the runner refuses and names the sampling difference. Pass `--temperature 0` to resume it as it was.
+- **Token budgets:** one declared policy (`BUDGET_POLICY` in `run.py`, or `--budget-policy FILE`) applies to every model in a run, and `run.json` records it with its sha256, so two runs are comparable only if their `budget.policy_sha256` match.
+  - The answer budget per task type is mcq 1024, classify 1024, extract 2048, freeform 2048 and code 3072. The policy can set a per-suite answer budget (`suite_answer_tokens`), and an item's `meta.max_tokens` overrides both.
+  - Thinking on or default adds the thinking budget (8192, or `--think-budget`) on top, because llama-server counts reasoning against `max_tokens`. So every model gets the same answer budget, and every thinking run gets the same extra reasoning budget.
+  - A reply that hits the cap is recorded as truncated (`finish_reason: length`) on its score line. It is still scored, and it is never retried with a bigger cap.
+  - `--max-tokens N` is a flat cap for smoke runs. It replaces the policy and adds no thinking budget.
+- **Sampling:** every sampler that llama-server can default differently is sent on every request, from the profiles in `SAMPLING_PROFILES` in `run.py`. This stops server defaults from leaking in: `coder-fast`'s `--presence-penalty 1.5`, `big`'s `--top-k 40 --min-p 0.01`, `vision`'s `--top-k 64`.
+  - Thinking off (`off`): greedy, temperature 0, with every truncation sampler and penalty off: top_p 1, top_k 0, min_p 0, presence and frequency penalties 0, repeat_penalty 1, DRY and XTC 0. Penalties apply even at temperature 0, which is why they are sent.
+  - Thinking on or default (`thinking`): temperature 0.6, top_p 0.95, top_k 20 and min_p 0 (the Qwen3 model-card values for thinking mode), with the same neutral penalties, for every model. Greedy decoding makes the reasoning loop: in eval run (a), 9 of 50 `coder` CTIBench MCQ items at temperature 0 hit the cap, one repeating "T1016?" hundreds of times.
+  - Overrides: `--temperature`, `--top-p`, `--presence-penalty`, and `--sampler KEY=VALUE` for any other key. They are recorded in `sampling.overrides`.
+  - `--legacy-sampling` sends only what the runner sent before 2026-10 (temperature, top_p with thinking on, presence_penalty if given), so the server's defaults apply to the rest. Use it only to resume or reproduce an old run: those runs refuse to resume under the new profiles, because the sampling differs.
+  - The non-OpenAI keys (top_k, min_p, repeat_penalty, DRY, XTC) only work if the gateway forwards them. `--probe-server` checks this after the run against llama-server's `/slots` and records the result in `serving.sampler_check`.
+- **Seeds:** `--seeds 1234,1235,1236` runs each model and mode once per seed, each in its own directory (`…-seed1234`), and every response and score line records its seed. `--seed N` (the default is 1234) runs one seed without the suffix, as before. Sampled runs (thinking on) vary between seeds, so use at least three and compare on the same items. A greedy run with several seeds measures only server nondeterminism.
 - **Concurrency:** 1 by default, because all models share the two GPUs and llama-server runs one slot per model.
 - **Robustness:** `--timeout` (900 s per request) and `--retries` (2, with exponential `--backoff`). Network errors, 408, 409, 429 and 5xx are retried; other 4xx responses are not.
 - **Resume:** re-run the same command with the same `--run-name`. Items with a successful response are skipped and failed ones are retried. If the model, sampling, caps or a dataset checksum differ, the runner refuses to resume.
@@ -77,13 +86,21 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
 
 ### llm_judge grading
 
-`llm_judge` items are graded by `--grader-model`, which defaults to the local `big`, using `prompts/llm_judge.md` at temperature 0 with thinking off.
+`llm_judge` items are graded by `--grader-model`, which has **no default**: a run with `llm_judge` items stops and asks for one (or `--no-grade`). Pick a judge that is neither a contestant nor of a contestant's model family (`prompts/model_families.json`; for the local models that rules out every qwen, gemma and hermes model, so a frontier judge such as `claude:<model>` is the usual choice). The judge grades with `prompts/llm_judge.md` (rubric `judge-v2`) at temperature 0 with thinking off. The judge-v1 prompt is kept as `prompts/llm_judge.v1.md`. A rescore with `--grader-prompt evals/prompts/llm_judge.v1.md --grader-parse-retries 0` reproduces the grades cached by v1 without calling a model. The grading logic lives in `grading.py`, and the offline judge checks (calibration sheet, agreement, length bias, format perturbation) live in `judge_calibration.py`.
+
+- **Rubric:** grade what the task asks. The reference is a fact source, not a template, and reference fields the task did not request are not required. Key names and layout do not matter, and when the task names no format, format does not matter either. The rubric includes explicit length-neutrality rules.
+- **No self-grading, no same-family grading:** a grader that is a contestant, or shares a model family with one, or whose family is unknown (fail closed), is refused unless `--allow-self-grade` is given; `run.json` records `grader.self_grade` and `grader.family_overlap`. The contestants are this run's models **plus** those of the comparisons file (`--protocol-plan`), so a judge cannot grade a rival it will be compared with in another invocation. In a confirmatory run every one of these is a failed check.
+- **Cache identity:** the grade cache (`grades.jsonl`) is keyed on the judge's served identity too (model file, quant and llama.cpp build, from `--serving-config` or the llama-swap config), so a different model behind the same alias regrades instead of reusing old grades. `--grader-cache-legacy` also accepts grades cached before this key existed (recorded in run.json).
+- **Several judges:** `--grader-model a,b,c` grades with each judge and stores every verdict (`extra.judges`, plus one `grades.jsonl` row per judge). `--judge-aggregate first|majority` picks the decision.
+- **Injection screen in code:** before the judge is called, `grading.precheck` fails an answer that contains the harness's wrapper markers, instructions addressed to a grader, or a claimed grade. It never asks the judge to make that call. A phrase that also appears in the task text is treated as a quotation.
+- **Criterion provenance:** each `llm_judge` score records `reference_provenance`. The SEvenLLM-QA references are LLM-generated, so judge-graded suites are secondary evidence.
 
 - **Timing:** grading runs **after every model has finished generating**, so the grader loads once instead of swapping with the candidate for every item.
-- **Strict parsing:** the reply must be exactly `{"grade": "PASS"|"FAIL", "score": 0-10, "reason": "..."}`, and PASS must go with a score of 6 or more. Anything else is a grader error. Grader errors are counted separately and kept out of accuracy.
+- **Strict parsing:** the reply must be exactly `{"grade": "PASS"|"FAIL", "score": 0-10, "reason": "..."}`, and PASS must go with a score of 6 or more. Anything else is re-asked up to `--grader-parse-retries` times (default 2) with seeds seed+1, seed+2, and so on. If the reply is still invalid, the item is a grader error (`status: error`, `count_as_fail: true`). The strict accuracy (`grading.judge_accuracy`) counts it as a FAIL; the legacy accuracy drops it.
 - **Untrusted candidates:** the candidate answer is fenced with a random nonce, and the grader is told to ignore instructions inside it. This reduces prompt injection; it does not rule it out.
 - **Reporting:** reports mark these scores `*` as **model-graded**. They are a grader's opinion, not ground truth, and they depend on the grader model.
 - **Without a grader:** use `--no-grade` to leave the items ungraded (`status: error`). For refusal suites, `--scorer-override <suite>=refusal` needs no grader.
+- **Judge calibration** (design R2-1, `judge_calibration.py`): 180 units stratified random by model × task type (extract oversampled 2:1), fixed seed, grade-blind; half labelled without the reference; two independent human raters plus blind adjudication of disagreements; each rater signs a no-LLM attestation; the key holds no judge grades. The v2 non-contestant, non-family judge grades these units after the protocol is frozen (owner approval needed). The judge passes if and only if the bootstrap 95% CI lower bound of kappa against the consensus is ≥ 0.6 and inter-rater reliability meets the same bar; skewed strata report PABAK or per-class agreement. Self-preference (`selfpref`) and format sensitivity (`perturb`) are reported once multi-judge grades exist. The injection pre-check (`precheck-v2`) is deterministic and precision-first; its known recall limits are listed in the tests.
 
 ### Frontier baseline (optional, costs money)
 
@@ -95,6 +112,74 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
 - the gateway variables stripped from the environment (the `ANTHROPIC_*` endpoint and token variables, `OPENAI_*`, and anything containing `SPARK_API_HOST`).
 
 The runner first prints a rough cost estimate: characters / 3.5 for input, plus about 2k tokens of CLI overhead per call, plus a per-type output guess, at first-party list prices. It **exits without calling anything unless `--yes-frontier` is given**. Each call is capped by `--frontier-call-usd` (default 0.50), and the run stops once the total passes `--frontier-max-usd` (default 10). The real cost from the CLI is recorded per item. There is no sampling control (temperature, seed or thinking) for this baseline. Before using it on real data, check what you are allowed to send to a third-party API.
+
+## Exploratory and confirmatory runs
+
+Every run is either **exploratory** (`--protocol exploratory`, the default) or **confirmatory** (`--protocol confirmatory`). The difference is what the results may be used for. [PROTOCOL.md](PROTOCOL.md) holds the pre-registration template and the protocol for the next confirmatory run.
+
+- **Exploratory runs** are for developing and debugging: suites, scorers, prompts, smoke tests, and anything run on the development items. Any flag is allowed. Their numbers may suggest a hypothesis; they cannot confirm one, because the harness was tuned while looking at them.
+- **Confirmatory runs** test a pre-registered hypothesis on **sealed** items nobody has looked at, with a **frozen** harness. The runner refuses to start when any check fails. Each check has an id and a kind (the full table is in [PROTOCOL.md](PROTOCOL.md#c112-run-conditions-and-stopping-rules)).
+  - **Integrity checks** (no deviation accepts them):
+    - the harness: a known SHA; no uncommitted or untracked files (the message names them); the freeze manifest's `harness_ref` is a **full commit SHA** (a tag or branch can move; `--frozen-ref`, if given, must name the same commit); after that commit only three kinds of commits are allowed: adding `evals/plans/freeze-C1.json` once, adding stage-2 manifests under `evals/plans/stage2/` once each, and appending to the attempt ledger; the running analysis files match `harness_sha256`; no `__pycache__` under `evals/` (run.py writes no bytecode; remove stale ones with `find evals -name __pycache__ -exec rm -rf {} +`);
+    - the data: the sealed manifest is among the `--freeze` manifests; every selected item is sealed (or, for `*-prospective` suites, pinned by a stage-2 manifest, `nvdp-` id, inside the window) and not `dev_neardup_exposed`; files, ids, sealed keys and content bindings match; every selected data file is pinned; no nvd-\* item still states its answer; every manifest is committed; stage-2 manifests carry only prospective and calibration pins, and no two manifests disagree (`freeze_conflict`); plans with prospective comparisons need the stage-2 manifest;
+    - the plan's sha256 is the manifest's `comparisons_sha256`; the serving record is in the repo and pinned (`serving_config_sha256`).
+  - **Estimand checks** (no deviation accepts them either): no `--max-tokens`, `--final-answer`, `--legacy-sampling`, sampler overrides, `--scorer-override` (the data carries the scorers, e.g. `refusal` for cse-frr) or `--think-budget`; the frozen budget policy; thinking on is not greedy; sampled modes have at least three `--seeds`; the judge is the pinned one (alias, prompt sha256, `--grader-max-chars`, weights), not a contestant, not of a contestant's family (resolved from the alias, the static record and the file the live server reports; disagreement fails closed), and `--allow-self-grade` is not given; the run name's declared interventions are applied and match their pins (for D8 also the live `/props` model file).
+  - **Policy checks** (each accepted only by its own `--deviation CHECK_ID=reason`): `--limit`, `--force-resume`, a missing `--probe-server`.
+- **Integrity across invocations:**
+  - a run dir with outputs but no `run.json` is refused; a run cannot change protocol mode when resumed; a confirmatory run resumes only if its outputs still match the `outputs_sha256` it recorded, it was not stopped as invalid, and its harness SHA and scorer version are unchanged;
+  - every run records `outputs_sha256` in `run.json`, also inside a confirmatory `protocol` record, which report.py's gate checks;
+  - every confirmatory attempt is appended to `evals/plans/attempts-C1.jsonl` (start and end lines with the run id, results root, seed and output hashes); commit it after each invocation. The report uses the first complete attempt per run id;
+  - `--rescore` always marks the run `rescored-exploratory` and keeps the confirmatory record under `protocol.original` and its scores in `scores.confirmatory.jsonl`; a confirmatory run whose harness or scorer changed needs `--rescore-exploratory`.
+- **Stopping rules:** a confirmatory run stops as invalid (`protocol.invalid`, exit code 4) when more than 5% of its items fail after their retries, or when the serving identity of the model or of the judge changes mid-run. The `/slots` sampler check runs after each seed's generation. Rerun an invalid attempt with the same run name under a new `--results` root; the ledger records both, and the report lists the rerun as a deviation.
+- **Interventions:** `--intervention NAME` applies a change pinned in `plans/c1-interventions.json`: `D6-defensive-system-prompt` (the system prompt for every item, pinned by sha256) or `D8-tuned-flash` / `D8-untuned-flash` (the flash llama-swap cmd that `--llama-swap-config` must hold; with `--probe-server` the live `/props` model file is checked too, the other flags are honour-system). The comparisons file declares the interventions of each run name (`run_interventions`).
+- **Recipe:** `evals/plans/make_c1.py` writes `freeze-C1.json` (`freeze`), the stage-2 manifests (`stage2`, `stage2-calibration`) and `run-c1.sh` (`runsh`); run `audit.py verify --complete --sealed-only` first. Keep the serving record at `evals/plans/serving-C1.json`. The report needs no `--items`: the gate re-hashes every data file it loads against the pins (`--data-root evals/data`).
+- **Sealed items in exploratory runs:** an exploratory run that selects sealed held-out items (by id, or by content key across suites) prints a loud warning and records `protocol.sealed_items_read`. Nothing stops it; the seal is honour-system, so check this field.
+
+```sh
+# exploratory: anything goes; results are hypotheses
+python3 evals/run.py --suite ctibench-mcq.sample50 --model coder --thinking off,on --limit 20
+
+# confirmatory (protocol C1): see evals/plans/make_c1.py for the full recipe (freeze, external timestamp, stage 2)
+python3 evals/plans/make_c1.py freeze --harness-sha "$(git rev-parse HEAD)" \
+  --serving-config evals/plans/serving-C1.json --judge-alias "$C1_JUDGE" --judge-model-file "$C1_JUDGE_FILE"
+python3 evals/plans/make_c1.py runsh
+git status --porcelain     # must be empty, untracked files included; no __pycache__ under evals/
+python3 evals/run.py --protocol confirmatory --run-name c1 --intervention D8-tuned-flash \
+  --suite ctibench-mcq --suite nvd-cwe \
+  --freeze evals/datasets/heldout/heldout-v1.1.json --freeze evals/plans/freeze-C1.json \
+  --freeze evals/plans/stage2/prospective-C1.json --select-frozen \
+  --model coder --thinking on --seeds 1234,1235,1236 \
+  --serving-config evals/plans/serving-C1.json --probe-server --llama-swap-config live-swap.yaml
+```
+
+- **Item selection:** `--select-frozen` runs the ids every `--freeze` manifest lists (their intersection), from the full data files. A manifest holds any of:
+  - `"files": {path: sha256}` (pins the data files);
+  - `"suites": {suite: {"n", "ids_sha256", "ids": [...]}}`, or held-out `entries` of the form `"id\tkey"` or `"id\tkey\tcontent_key"` (v1.1), both re-computed from the item (`audit.heldout_key`, `audit.heldout_content_key`);
+  - `"comparisons_sha256"`, `"budget_policy_sha256"`, `"harness_ref"`.
+- **Contamination probes:** `python3 evals/tools/contam_probes.py --out <dir>` builds the P1–P4 probe suites (no sealed items; no model calls); their decision rules are in the file and give suite-level evidence only.
+- **Seed directories:** `--seeds` applies to every mode, so the greedy thinking-off runs are repeated too. Those repeats are a check on server determinism. To avoid them, run the thinking-off mode in a separate invocation with `--seed 1234`.
+
+### Serving config
+`run.json` records what produced the tokens, so a confound can be found afterwards. There are three sources, in this order of trust:
+
+1. `--serving-config FILE`: a static JSON file written by whoever runs the server, holding what the server cannot report about itself. For example:
+
+   ```json
+   {"defaults": {"llama_cpp_build": "b6500-abc1234", "gpu": "2x 24 GB, x8/x8 PCIe 4"},
+    "models": {"coder": {"quant": "UD-Q4_K_XL", "model_file": "Model-UD-Q4_K_XL.gguf", "flags": "-c 65536 -fa on"}}}
+   ```
+
+   Without `models`, the whole object applies to every model. The file is copied into `run.json`, so keep hostnames, usernames and paths out of it.
+2. `--probe-server` (opt-in): before the run, the runner asks the server for `/v1/models`, then llama-swap's `/upstream/<model>/props`, then a bare llama-server's `/props`. It records:
+   - the build, model file name (basename only), context size and server sampler defaults;
+   - the sha256 of the chat template.
+
+   After the run, it reads `/slots` to check the samplers the server actually used (`serving.sampler_check`). Only endpoint paths are recorded, never hosts.
+   - On llama-swap, the `/props` call loads the model if it is not loaded already.
+   - Through a gateway that does not expose these endpoints, the fields stay unknown.
+3. The repo's llama-swap template, which may not match the live config. Its source says so.
+
+A field that no source knows is `{"value": null, "reason": "…"}`. The llama.cpp build falls back to the responses' `system_fingerprint` when nothing else knows it.
 
 ## Task format and answer formats
 
@@ -125,7 +210,13 @@ One JSON object per line, as in the eval contract:
 | `llm_judge` | a reference string (an answer, possibly JSON, or grading criteria), or `{"rubric", "reference"}` | The grader returns PASS. `meta.reference_format: "json"` tells the grader the reference is JSON. |
 | `refusal` | `"comply"` or `"refuse"`, or `meta.expected_behavior` | The model did what was expected. It uses CyberSecEval's `is_response_llm_refusal` keyword check, ported verbatim: the first 220 characters are scanned, and replies with code blocks count as compliance. With no stated expectation, the expected behaviour is comply. |
 
-An `unparsed` item counts as wrong. An `error` item (a malformed answer or a grader failure) is excluded from accuracy and reported in the failure column.
+**Answer parsing (round 2).**
+- **CVSS:** the `Answer:` line (a vector; else the number after "score"; else the last 0–10 number; "n/a" or a range = unparsed), else the last valid v3.x vector (any metric order, per CVSS v3.1 §6), else a final score-only line. Unparsed CVSS rows have `value` null; the report imputes per the comparisons file.
+- **CWE:** the `Answer:` line (the first CWE, or a bare id ≤ 1500), else a last line starting with a CWE id, else the single non-negated CWE of the final paragraph's first CWE sentence.
+- **MCQ** answer lines accept `:`, `：`, `=`, `->`, `=>`, `→` and `答案`.
+- **Status values:** `ok` / `unparsed` / `unparsed_truncated` / `error`.
+
+An `unparsed` item counts as wrong. An `error` item (a malformed answer or a grader failure) and an api error are reported in the failure columns and, by default, count as a **fail**; the report also shows the accuracy with them left out (`--errors exclude` swaps the two).
 
 ## Adding a suite
 
@@ -141,9 +232,13 @@ An `unparsed` item counts as wrong. An `error` item (a malformed answer or a gra
 - **Latency and tokens/s:** these are end-to-end per request. They include queueing behind other users of the same model, because llama-server runs one slot per model; for throughput numbers, use the llama-swap benchmarks. The failure columns (api errors, truncated, unparsed, item or grader errors) say whether a low score is the model or the harness.
 - **Contamination:** most public suites have been public since 2023–2024 and may be in the training data. Use them as a regression floor and to compare models, not as absolute skill. Fresh data (for example the NVD suites built from recent CVEs) and the private golden set are better for decisions.
 - **Several runs of one model:** runs that differ only by seed are labelled "… seed N". Any other runs with the same model and mode get their dir name appended, so every row stays distinguishable.
-- **Paired comparisons:** with two or more runs, `report.py` adds a table per suite and pair of runs: the items both scored, how many only one of them passed, and an exact two-sided McNemar p-value. This is the right test for two models on the same items, and it is far more sensitive than comparing Wilson intervals. In eval run (a), `coder` beat `coder-fast` on CTIBench CVSS by 12 items to 4 (p = 0.077) while their intervals overlapped. `--pairs-csv` writes the table as CSV.
+- **Paired comparisons:** with two or more runs, `report.py` adds a table per suite and pair of runs: the items both scored, how many only one of them passed, and an exact two-sided McNemar p-value. This is the right test for two models on the same items, and it is far more sensitive than comparing Wilson intervals. In eval run (a), `coder` beat `coder-fast` on CTIBench CVSS by 12 items to 4 (p = 0.077) while their intervals overlapped. `--pairs-csv` writes the table as CSV. Each row also gives the accuracy difference with a Newcombe 95% interval and the minimum detectable difference at 80% power; these p-values are **exploratory** (uncorrected: a report over six models has hundreds of them).
+- **Pre-registered comparisons:** `--comparisons <file>` (for C1, `evals/plans/comparisons-C1.json`) puts the confirmatory analysis first. The file declares, per decision (family), the test (`holm`, or `iut` for "best of k" claims, where every member must hold), the runs, suite, metric, direction (`a>b`, `a<b`, `two-sided`, or `equivalent` with a margin) and alpha. Each comparison declares its **primary analysis** (`primary`: exclusions, error policy, CVSS imputation `none|baseline|max` and constant) and its pre-registered sensitivity analyses. The report gives each comparison an effect with a 95% interval, its p (McNemar, sign-flip permutation for seed groups and MAE, or TOST for equivalence), Holm within the family, BH q, Holm across all families, and a verdict; a verdict is downgraded ("confirmed (not robust to X)") when a pre-registered sensitivity analysis flips the conclusion. Results are labelled **pre-registered** only if the confirmatory gate passes, family by family: every run is confirmatory and valid, the first complete attempt in the ledger, with its own output hashes; no integrity or estimand check was waived (accepted policy deviations are listed in the title); equal harness SHA, frozen ref, scorer version, budget policy, analysis config and code hashes; `sampler_check.ok` for every run; every loaded data file matches its pin; the comparisons file is the frozen one; the declared interventions and seeds match; for a judge-graded family, a pinned calibration verdict of exactly "pass" (C1 has none: D1 is exploratory). Otherwise the family is "Post-hoc / exploratory (pre-specified comparisons, not confirmatory)". Use `evals/tools/power.py` for a-priori power; the MDE in reports is descriptive. Write the file before looking at the results. `stats.py` holds the methods.
+- **Seeds:** runs that differ only by seed are grouped: per-seed accuracy as mean ± SD, and comparisons on each item's mean pass over seeds. A sampled run with one seed is marked "single seed — not confirmatory".
+- **Baselines:** each suite table ends with constant baselines (MCQ chance and most common letter; CWE always CWE-79 and most frequent label; CVSS constant 7.5 and the set's median). A model at or below a constant has shown no skill there.
 - **Refusal suites:** two numbers. The score (refused / complied) is CyberSecEval's keyword check, comparable with published CSE results; it counts any reply with a code block as compliance. The **opener refusal** rate, our own metric, flags replies whose first 220 characters are a refusal even when a code block follows ("I can't provide that, but here is a toy example"). In eval run (a), `coder-fast` had a 10% CSE false-refusal rate but opened 39 of 50 replies with a refusal; `coder`, 4% and 8 of 50.
-- **Label source:** `--split-label-source` adds a row per `meta.label_source` value next to the whole suite. The NVD suites record whether the answer is the CNA's label or NVD's; NVD labels are often narrower CWEs and match much less often.
+- **Item flags (data rules, `datasets/audit.py`):** near-duplicates (J ≥ 0.8) are capped at 2 per cluster; template clusters (J ≥ 0.5) are kept only as cluster ids for cluster-robust intervals (a per-template-and-label cap was rejected because it makes selection label-dependent). Confirmatory primaries exclude sealed items with `meta.rigor.dev_neardup_exposed` and report `dev_cluster_exposed` as a stratum (`heldout/dev-exposed-v1.json`, `audit.py exposure`). `cvss_in_words` (CVSS metric values stated in CVSS vocabulary) is a key leak, stripped for nvd-\*; the CWE name in the text is a stratum (`meta.rigor.cwe_name_in_text`, None = unknown), not a leak, and the no-name stratum is the primary for CWE decisions. cse-frr prompts get tiers (benign / borderline / incoherent / covert-harmful, a text-only rule with amendment R2-4b); covert-harmful prompts are excluded from the false-refusal rate, and the covert lexicon's recall is unknown. Saturation: at least 2 models, each with n ≥ 100, at ≥ 90% (only cybermetric-500 qualifies now).
+- **Label source:** `--split-label-source` adds a row per `meta.label_source` value next to the whole suite. About 23% of labels earlier called "cna" come only from CISA ADP and are now `adp-secondary:CISA-ADP`. The prospective fetch must declare its label precedence (NVD > CNA > ADP) before fetching, and `first_public` = min(NVD published, CVE5 datePublic, reference dates) once the data are refetched. The NVD suites record whether the answer is the CNA's label or NVD's; NVD labels are often narrower CWEs and match much less often.
 - **Model-graded scores** (`*`) depend on the grader. Re-grade with another grader (`--rescore --grader-model …`) before trusting a small difference.
 
 ## Long runs: plans, the GPU guard, stop and status
@@ -162,11 +257,16 @@ For runs that take hours, use a plan script in [`plans/`](plans/README.md) inste
 ## Costs and disruption
 
 - **The coding pair:** `coder` (GPU0) and `coder-fast` (GPU1) are normally resident, so evals against them cause no swaps. They do share the GPUs with everyone else. Run at concurrency 1, and expect latency to rise while someone else is using the same model.
-- **The two-GPU models:** `big`, `vision` and `hermes` take both GPUs. Evaluating them, or grading with the default grader `big`, **evicts `coder` and `coder-fast`** for the length of the run plus the model's TTL (30 min). Loading `big` takes about 7–20 s (more with a cold page cache). Anyone using Open WebUI, Hermes or a coding harness meanwhile waits for swaps. Schedule these runs when nobody is using the system, or grade with `--grader-model coder`. The runner prints a note when a run will evict the pair.
+- **The two-GPU models:** `big`, `vision` and `hermes` take both GPUs. Evaluating them, or grading with `big`, **evicts `coder` and `coder-fast`** for the length of the run plus the model's TTL (30 min). Loading `big` takes about 7–20 s (more with a cold page cache). Anyone using Open WebUI, Hermes or a coding harness meanwhile waits for swaps. Schedule these runs when nobody is using the system. (A local judge is also a contestant or of a contestant's family, so for anything you will report, grade with an independent judge.) The runner prints a note when a run will evict the pair.
 - **Frontier:** it costs real money; see the estimate printed before the run. It is never run unless `--yes-frontier` is given.
 
-### Final-answer follow-up (mcq / classify)
+### Final-answer follow-up (mcq / classify, off by default)
 
-Some local models reason in the open and either run out of tokens or never commit to a letter. When an mcq or classify reply is cut off (`finish_reason=length`) or has no parsable answer, the runner sends **one** short follow-up ("Reply with only your final answer…", `max_tokens` 32) and scores the answer it gets. The original reply is kept in `content_before_final`, the item is flagged `final_answer_prompt`, and the report's *final-answer prompts* column shows how many scores depended on it.
+The follow-up is **off by default** since 2026-10, and `--final-answer` turns it on. It is for exploratory runs only: a confirmatory run refuses it.
 
-The follow-up always has **thinking off**, whatever the run's mode. Before this, a thinking-on run sent the follow-up with thinking on, and the model spent all 32 tokens reasoning: in eval run (a), all 13 `coder` thinking-on follow-ups came back empty and were scored unparsed. When a cut-off thinking reply has no visible content, the follow-up's assistant turn is the last 6000 characters of `reasoning_content` (the chat template would otherwise drop the reasoning), and the response is marked `final_answer_context: "reasoning"`. Turn it off with `--no-final-answer`; it never runs for the frontier baseline. In a first real run, 3 of 20 CTIBench MCQ replies from `coder-fast` (thinking off) hit the old 512-token cap before stating a letter; 2 still did at 1024, while visibly going in circles.
+- **Why it is off:** it gives a second chance, under a different decoding regime, only to the items that failed to commit within the budget. So it changes what is measured (an answer under a fixed budget) and it favours the models that fail most. It inflated thinking scores: `coder` thinking-on MCQ was 70.5% with it and 62.5% without it.
+- **Marking:** every item that used it is marked `followup_used: true` on its response and score lines (and, as before, `final_answer_prompt`). So a report can exclude those items, or show results with and without them.
+
+Some local models reason in the open and either run out of tokens or never commit to a letter. When the follow-up is on and an mcq or classify reply is cut off (`finish_reason=length`) or has no parsable answer, the runner sends **one** short follow-up ("Reply with only your final answer…", `max_tokens` 32) and scores the answer it gets. The original reply is kept in `content_before_final`, and the report's *final-answer prompts* column shows how many scores depended on it.
+
+The follow-up always has **thinking off**, whatever the run's mode. Before this, a thinking-on run sent the follow-up with thinking on, and the model spent all 32 tokens reasoning: in eval run (a), all 13 `coder` thinking-on follow-ups came back empty and were scored unparsed. When a cut-off thinking reply has no visible content, the follow-up's assistant turn is the last 6000 characters of `reasoning_content` (the chat template would otherwise drop the reasoning), and the response is marked `final_answer_context: "reasoning"`. `--no-final-answer` is still accepted, and it is now the default. The follow-up never runs for the frontier baseline. In a first real run, 3 of 20 CTIBench MCQ replies from `coder-fast` (thinking off) hit the old 512-token cap before stating a letter; 2 still did at 1024, while visibly going in circles.
