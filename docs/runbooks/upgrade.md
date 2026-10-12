@@ -86,6 +86,19 @@ A hardware change on the hypervisor moves the GPUs' host PCI addresses, and Walt
 
 Afterwards: `nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.width.current --format=csv` in Walter (live: `4, 8` for both GPUs), one load of each split model, and the checks from [power-loss-recovery](power-loss-recovery.md#2-walter).
 
+## 5b. Model, quant or llama.cpp changes: the upgrade gate
+
+For a new llama.cpp build (`server-cuda` digest), a new GGUF or quant behind an alias, or changed serving flags, run the [upgrade gate](../../evals/README.md#upgrade-gate) for each affected alias that has a manifest (`coder`, `coder-fast`). The owner approves the GPU time, and `--yes` is required. One run takes about 2.0 h for `coder` and 1.3 h for `coder-fast`, so run it with no other traffic.
+
+1. **Once per model**, and again after any caching or batching change (`-np`, prompt cache): `python3 evals/gate.py calibrate --model <alias> --yes` (two runs). It also stores a baseline. If the A/A does not pass, fix determinism first; `check` refuses until it passes.
+2. **Before the change**, if the alias has no current baseline: `python3 evals/gate.py baseline --model <alias> --yes`.
+3. Make the change.
+4. `python3 evals/gate.py check --model <alias> --yes`. The report is printed and written to the check's dir.
+   - **FAIL** (exit 1): roll back (put the old digest, file or flags back) and keep the report.
+   - **INCONCLUSIVE** (exit 2, hold): the owner decides from the per-suite table. This is common: a clean upgrade passes every suite only about half the time.
+   - **PASS** (exit 0): keep the change, and take a new baseline on it.
+   - Exit 3 (invalid run) or 4 (refused): fix the cause and rerun; it says nothing about the change.
+
 ## 6. After every upgrade
 
 - Run `sudo systemctl start spark-backup` so a snapshot with the new versions exists, and check that the manifest records the new digest.

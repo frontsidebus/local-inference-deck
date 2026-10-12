@@ -937,6 +937,10 @@ class Run:
             "max_tokens": None if self.frontier else caps,
             "think_budget": a.think_budget if self.thinking != "off" and not self.frontier else 0,
             "concurrency": a.concurrency,
+            "prompt_cache": None if self.frontier else {
+                "sent": {"cache_prompt": False} if getattr(a, "no_prompt_cache", False) else None,
+                "note": "--no-prompt-cache sends cache_prompt=false; whether the gateway forwards it is unverified"
+                if getattr(a, "no_prompt_cache", False) else "server default (not sent)"},
             "timeout_s": a.timeout,
             "retries": a.retries,
             "limit": a.limit,
@@ -1014,6 +1018,8 @@ class Run:
         if rj.exists():
             old = json.loads(rj.read_text(encoding="utf-8"))
             keys = ("model", "thinking", "sampling", "max_tokens", "think_budget")
+            if "prompt_cache" in old:   # recorded since 2026-10 (--no-prompt-cache)
+                keys += ("prompt_cache",)
             # scorer overrides only change scoring, so they may differ (scores.jsonl is rewritten at the end)
             diff = [k for k in keys if old.get(k) != self.config.get(k)]
             # settings recorded since 2026-10: compared only when the old run recorded them
@@ -1106,6 +1112,8 @@ class Run:
                                 **self.sampling, "seed": self.seed}
         if self.thinking in ("on", "off"):
             body["chat_template_kwargs"] = {"enable_thinking": self.thinking == "on"}
+        if getattr(a, "no_prompt_cache", False):
+            body["cache_prompt"] = False   # llama-server: no KV reuse across requests (A/A determinism)
         return body
 
     def call(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1249,7 +1257,8 @@ class Run:
         # non-llm_judge items are scored as they arrive; llm_judge ones in the grading phase
         table = dict(S.SCORERS)
 
-        confirm = (self.config.get("protocol") or {}).get("mode") == "confirmatory"
+        confirm = (self.config.get("protocol") or {}).get("mode") == "confirmatory" or \
+            bool(getattr(self.args, "stop_rules", False))
         max_err = int(0.05 * len(self.items))  # more than 5% of the run's items failing = an invalid run
         ident: Dict[str, Any] = {}
         prior = R.latest_by_id(R.read_jsonl(self.dir / "responses.jsonl"))
@@ -1630,6 +1639,12 @@ def parse_args(argv: Optional[List[str]] = None):
     pr.add_argument("--serving-config", help="static JSON with build/quant/flags per model (copied into run.json)")
     pr.add_argument("--probe-server", action="store_true",
                     help="ask the server for /v1/models and llama-swap/llama.cpp /props and record them")
+    ap.add_argument("--no-prompt-cache", action="store_true",
+                    help="send cache_prompt=false (llama-server: no KV-cache reuse between requests), for "
+                         "determinism checks; recorded in run.json. Off by default")
+    pr.add_argument("--stop-rules", action="store_true",
+                    help="enforce the confirmatory stopping rules (C1.12) in an exploratory run too: stop as invalid "
+                         "(exit 4) past 5%% failed items or on a serving-identity change mid-run (used by gate.py)")
     f = ap.add_argument_group("frontier baseline (off unless --model claude)")
     f.add_argument("--yes-frontier", action="store_true", help="confirm the estimated frontier cost")
     f.add_argument("--frontier-cmd", default="claude")
@@ -2607,6 +2622,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "stage2": getattr(a, "stage2", None), "plan": a.plan,
                              "interventions": getattr(a, "interventions_record", None) or None,
                              "seeds": a.seed_list, "doc": "evals/PROTOCOL.md"}
+        if getattr(a, "stop_rules", False):
+            a.protocol_record["stop_rules"] = True
         if fails:
             log(f"protocol: {len(fails)} failed check(s) accepted as declared deviations")
         if a.protocol == "exploratory":
