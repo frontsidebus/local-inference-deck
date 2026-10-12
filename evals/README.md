@@ -9,6 +9,7 @@ Findings so far, options for further development and the roadmap: [docs/evals-ro
 | `run.py` | The runner: suites × models → `evals/results/<run>/` |
 | `scorers.py` | The scorers named in the task format, plus `refusal` |
 | `report.py` | Compares runs: tables per suite and model, Wilson 95% CIs, markdown and CSV |
+| `gate.py` | The [upgrade gate](#upgrade-gate): did a model, quant, build or flag change make anything worse? |
 | `prompts/llm_judge.md` | The grader prompt for `llm_judge` |
 | `samples/` | About 10 invented items per task type, for tests and smoke runs (committed) |
 | `datasets/` | Converters for public benchmarks (`fetch.py` per suite). See [datasets/README.md](datasets/README.md) |
@@ -78,6 +79,7 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
   - `--legacy-sampling` sends only what the runner sent before 2026-10 (temperature, top_p with thinking on, presence_penalty if given), so the server's defaults apply to the rest. Use it only to resume or reproduce an old run: those runs refuse to resume under the new profiles, because the sampling differs.
   - The non-OpenAI keys (top_k, min_p, repeat_penalty, DRY, XTC) only work if the gateway forwards them. `--probe-server` checks this after the run against llama-server's `/slots` and records the result in `serving.sampler_check`.
 - **Seeds:** `--seeds 1234,1235,1236` runs each model and mode once per seed, each in its own directory (`…-seed1234`), and every response and score line records its seed. `--seed N` (the default is 1234) runs one seed without the suffix, as before. Sampled runs (thinking on) vary between seeds, so use at least three and compare on the same items. A greedy run with several seeds measures only server nondeterminism.
+- **Prompt cache:** `--no-prompt-cache` sends `cache_prompt: false` (no KV-cache reuse between requests; recorded in `run.json`). Off by default; whether the gateway forwards it is unverified (see [Upgrade gate](#upgrade-gate)).
 - **Concurrency:** 1 by default, because all models share the two GPUs and llama-server runs one slot per model.
 - **Robustness:** `--timeout` (900 s per request) and `--retries` (2, with exponential `--backoff`). Network errors, 408, 409, 429 and 5xx are retried; other 4xx responses are not.
 - **Resume:** re-run the same command with the same `--run-name`. Items with a successful response are skipped and failed ones are retried. If the model, sampling, caps or a dataset checksum differ, the runner refuses to resume.
@@ -240,6 +242,62 @@ An `unparsed` item counts as wrong. An `error` item (a malformed answer or a gra
 - **Item flags (data rules, `datasets/audit.py`):** near-duplicates (J ≥ 0.8) are capped at 2 per cluster; template clusters (J ≥ 0.5) are kept only as cluster ids for cluster-robust intervals (a per-template-and-label cap was rejected because it makes selection label-dependent). Confirmatory primaries exclude sealed items with `meta.rigor.dev_neardup_exposed` and report `dev_cluster_exposed` as a stratum (`heldout/dev-exposed-v1.json`, `audit.py exposure`). `cvss_in_words` (CVSS metric values stated in CVSS vocabulary) is a key leak, stripped for nvd-\*; the CWE name in the text is a stratum (`meta.rigor.cwe_name_in_text`, None = unknown), not a leak, and the no-name stratum is the primary for CWE decisions. cse-frr prompts get tiers (benign / borderline / incoherent / covert-harmful, a text-only rule with amendment R2-4b); covert-harmful prompts are excluded from the false-refusal rate, and the covert lexicon's recall is unknown. Saturation: at least 2 models, each with n ≥ 100, at ≥ 90% (only cybermetric-500 qualifies now).
 - **Label source:** `--split-label-source` adds a row per `meta.label_source` value next to the whole suite. About 23% of labels earlier called "cna" come only from CISA ADP and are now `adp-secondary:CISA-ADP`. The prospective fetch must declare its label precedence (NVD > CNA > ADP) before fetching, and `first_public` = min(NVD published, CVE5 datePublic, reference dates) once the data are refetched. The NVD suites record whether the answer is the CNA's label or NVD's; NVD labels are often narrower CWEs and match much less often.
 - **Model-graded scores** (`*`) depend on the grader. Re-grade with another grader (`--rescore --grader-model …`) before trusting a small difference.
+
+## Upgrade gate
+
+`gate.py` is a one-command regression check for a change of model, quant, llama.cpp build or serving flags. It answers "did this change make anything worse?" with paired statistics on fixed development items.
+
+```sh
+python3 evals/gate.py calibrate --model coder --yes   # once per model (and after caching/batching changes): A/A
+python3 evals/gate.py baseline --model coder --yes    # before a change, if the alias has no current baseline
+python3 evals/gate.py check --model coder --yes       # after it: compare with the latest compatible baseline
+python3 evals/gate.py compare <baseline-dir> <candidate-dir>   # offline, no model calls
+```
+
+**Suites** (`plans/gate-v1-<model>.json`; a model without a manifest is refused). Margins are pending owner confirmation:
+
+| Suite | Items | Metric | Margin | n coder / coder-fast |
+|---|---|---|---|---|
+| mcq-knowledge | ctibench-mcq + cybermetric-500 | accuracy | 5 pp | 400 / 400 |
+| cwe | nvd-cwe, no-name stratum | accuracy (either label) | 7.5 pp / 5 pp | 280 / 540 |
+| cvss | nvd-cvss | MAE (unparsed = error of 7.5) | 0.30 | 120 / 200 |
+| refusal | cse-frr (no covert-harmful), answer cap 512 tokens | full compliance | 10 pp | 180 / 300 |
+| format | the mcq, cwe and cvss items, pooled | parse-ok rate | 2 pp | 800 / 1140 |
+
+- **Items:** `tools/gate_select.py` selects them deterministically (seed 20261011): no sealed held-out item, and none whose template or near-duplicate cluster holds one. The data rules are applied in memory (leaks stripped for nvd-\*), and the result is ordered so each model runs a prefix. `plans/gate-v1.items.json` holds the selection; `--check` re-derives it and the data files. The gate runs `evals/data/gate-v1/<source>.jsonl` (`--write-data`, gitignored, pinned by sha256 in the manifests), not the raw files, which still state some answers. `--write-manifests` writes the manifests.
+- **Manifest** (schema `gate-manifest-v1`, validated strictly):
+  - per suite: its sources (data file, sha256, ids), metric, margin and better direction, an optional answer cap (`max_tokens`, here 512 for the refusal suite only) and optional parse checks;
+  - a `format` block (pooled parse-ok rate, plus a per-suite tripwire);
+  - the sampling profile: greedy, thinking off, seed 1234, prompt cache off, concurrency 1, and the sha256 of the budget policy with the per-suite caps;
+  - the required `scorer_version`, and alpha 0.05.
+
+  An id that is in the sealed held-out manifests is refused, as are an item matching one by content, an `llm_judge` item and an unstripped nvd-\* item.
+- **Runs:**
+  - The gate runs run.py with `--probe-server`, `--stop-rules` (the C1.12 stopping rules in an exploratory run), `--no-prompt-cache` and `--concurrency 1`. It uses the command line the GPU guard matches (`--run-name gate`; set `EVAL_RUN=gate` for `tools/stop.sh`).
+  - Results go to `results/gate/<model>/{baseline,check,aa}-<UTC stamp>/` with `gate.json`. It holds the manifest sha256, the sampling profile, the budget and per-suite caps, the harness, and the serving identity: model file, quant, build, flags, and the model sha256 and image digest when `--serving-config` gives them.
+  - Before any run it prints the model, the item count and the estimated time, and it runs nothing without `--yes`. It also refuses while the guard's STOP file exists. `--resume DIR` continues an interrupted run.
+  - Run time is about **2.0 h for `coder` and 1.3 h for `coder-fast`**, per run (a calibration is two runs). The gate uses no judge, no frontier model and no sealed items.
+- **Compatibility:** a baseline is used only if these all equal the candidate's: manifest sha256, scorer version, sampling profile, budget, prompt-cache setting, item sets and system prompts. Otherwise the gate refuses and says why. A different run.py or scorers.py is refused unless `--allow-stale-harness`, which is recorded and printed.
+- **A/A calibration:** `calibrate` runs the baseline config twice, back to back. The first run is stored as a baseline; the A/A verdict, with the discordant share ψ and the MAE difference SD per suite, is stored on it.
+  - The A/A passes only if every row is equivalent. A "different-better" in an A/A is non-determinism too.
+  - `check` refuses until the model's latest A/A under the manifest has passed. `--accept-aa` overrides that; the override is recorded in the report.
+  - On failure, fix determinism (prompt cache, `-np 1`, no other traffic) before trusting any verdict.
+  - It is enforced in code rather than left as a runbook step, because a skipped A/A silently voids every later verdict. It is per model and manifest, not per baseline, so re-baselining after a PASS costs one run, not two.
+- **Per row** (difference = candidate − baseline):
+  - Binary metrics get the exact Tango TOST at the margin and an exact McNemar test; MAE gets the paired bootstrap test and bootstrap TOST.
+  - **equivalent**: TOST p < alpha. This is checked first, so a significant shift inside the margin is equivalent, with a note.
+  - **different-worse / different-better**: the difference p, Holm-adjusted across all rows, is < alpha. The sign, read with the metric's better direction, says which.
+  - **inconclusive**: anything else.
+  - **different-worse (format)**: a pooled suite whose items turned unparsed more often than the reverse (one-sided exact McNemar p < alpha), whatever its accuracy.
+- **Overall and exit code:**
+  - FAIL (1) if any row is different-worse.
+  - PASS (0) if every row is equivalent or different-better.
+  - **INCONCLUSIVE (2): hold, the owner decides**, using the per-suite table. Expect it often: even a clean upgrade passes every row only about 48% of the time for `coder` and 65% for `coder-fast`.
+  - 3 for an invalid run: a stopping rule fired, the serving identity changed mid-run, api errors went above `validity.max_api_error_rate`, items are missing, or `/slots` shows other samplers.
+  - 4 when the gate refuses.
+
+  The markdown report is printed and written to the candidate dir. It has the per-suite table (n, baseline, candidate, difference with its 95% interval, TOST p, difference p with Holm, parse and truncation rates, verdict), the serving identity diff and the overall verdict.
+- **Prompt cache:** `run.py --no-prompt-cache` sends `cache_prompt: false` and records it in run.json. It is off by default. Whether LiteLLM forwards the field to llama-server is **not yet verified**; the first A/A run will show it. (The stored A/A pair had 24 of 117 outputs identical when the cache state differed, against 489 of 491 when it matched.)
 
 ## Long runs: plans, the GPU guard, stop and status
 

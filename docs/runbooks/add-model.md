@@ -69,6 +69,10 @@ curl -s http://${BACKEND_WG_IP}:4000/v1/models -H "Authorization: Bearer <a key>
 
 Then test each API the alias will serve: chat, `/v1/messages` (Claude Code) and `/v1/responses` (Codex).
 
+## 5a. Regression gate (when the model replaces an alias)
+
+If the new model, quant or flags take over an alias that has a gate manifest (`coder`, `coder-fast`), run the [upgrade gate](../../evals/README.md#upgrade-gate). Before the switch, make sure the alias has a passing A/A (`python3 evals/gate.py calibrate --model <alias> --yes`, once per model) and a current baseline (`gate.py baseline`). After the switch, run `python3 evals/gate.py check --model <alias> --yes` (about 2.0 h for `coder`, 1.3 h for `coder-fast`). On FAIL, roll back to the old entry. On INCONCLUSIVE (hold, which is common), the owner decides from the per-suite table. A brand-new alias has nothing to regress against; it needs its own manifest (`evals/tools/gate_select.py`) before the gate covers it.
+
 ## 6. Open WebUI visibility
 
 A new model is visible to admins only until it has an access grant. In Admin Panel → Settings → Models, open the alias and give it public read access (or a group grant).
