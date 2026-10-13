@@ -56,6 +56,12 @@ LIMITS = {"rpm_limit": 60, "max_parallel_requests": 4}
 # SERVED = every static model_name in litellm.yaml (walter/gateway/tests checks they match).
 # Adding an alias to litellm.yaml means adding it here too, or no key can call it.
 SERVED = ["coder", "coder-fast", "big", "flash", "vision", "hermes"]
+# Wildcards in a KEY's `models` are matched by open-source LiteLLM (checked in the pinned v1.103.1
+# source, litellm/proxy/auth/auth_checks.py): can_key_call_model (:4636) passes the key's models to
+# _can_object_call_model (:4657) -> _check_model_access_helper, which returns True when
+# _model_matches_any_wildcard_pattern_in_list (:4238, :6133) matches; the pattern is the regex
+# f"^{pattern.replace('*', '.*')}$" (:6127). No premium check on that path. The Enterprise-only
+# feature in LiteLLM's docs is model ACCESS GROUPS on wildcard deployments, which this does not use.
 LOCAL_WILDCARD = "local/*"     # raw llama-swap IDs (evals call local/qwen3.8-flash-next)
 CLAUDE_WILDCARD = "claude-*"   # safety net for Claude Code background tasks -> coder
 LAB_GROUP = "lab"              # access group of the future static lab/<name> entries

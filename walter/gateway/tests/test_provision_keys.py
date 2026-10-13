@@ -191,3 +191,19 @@ def test_failed_update_exits_nonzero(pk):
     pk.api = api
     with pytest.raises(SystemExit):
         pk.sync_models([("alice", "user")], "master")
+
+
+def litellm_key_allows(model, key_models):
+    """Mirror of LiteLLM v1.103.1 key model check for our case (no access groups, no team):
+    exact name, or a wildcard entry matched as ^pattern-with-*-as-.*$ (auth_checks.py:6127)."""
+    return model in key_models or any(
+        "*" in p and re.match("^" + p.replace("*", ".*") + "$", model) for p in key_models)
+
+
+@pytest.mark.parametrize("model", ["coder", "flash", "local/qwen3.8-flash-next", "local/qwen3.8-27b",
+                                   "claude-sonnet-4-5-20250929", "claude-haiku-4-5"])
+def test_harness_models_still_reachable(pk, model):
+    for name in ("claude-code", "hermes", "codex", "opencode"):
+        assert litellm_key_allows(model, pk.desired(name, "harness")[0]), (name, model)
+    assert litellm_key_allows(model, pk.desired("alice", "user")[0])
+    assert not litellm_key_allows("lab/x", pk.desired("alice", "user")[0])
