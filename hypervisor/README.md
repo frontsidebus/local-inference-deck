@@ -12,6 +12,7 @@ The host that runs Walter is managed outside this repo, by a separate (private) 
 | A whole NVMe passed raw as virtio `vdb` (`cache=none`, `io=native`, `discard=unmap`) with a fixed `<serial>` | Appears in the guest as `/dev/disk/by-id/virtio-<serial>`, which `walter/deploy.sh` formats/mounts as `${MODELS_DIR}` (by UUID, `nofail`). |
 | Disks referenced by `/dev/disk/by-id/...`, never `/dev/nvmeXn1` | NVMe device names swap between boots. |
 | `nvidia-cdi-refresh.{path,service}` masked on the host while every NVIDIA GPU is on `vfio-pci` | Otherwise they fail every boot and leave systemd "degraded". Unmask if a GPU is returned to the host. |
+| `/etc/environment.d/90-host-no-nvidia.conf` pinning the desktop to Mesa (`__EGL_VENDOR_LIBRARY_FILENAMES=.../50_mesa.json`, `VK_ICD_FILENAMES=.../radeon_icd.json`) while every NVIDIA GPU is on `vfio-pci` | The NVIDIA userspace stays installed and its EGL vendor file sorts before Mesa's, so GPU-drawn desktop apps (Spotify, App Center) otherwise crash with `GPU process isn't usable`. Delete it if a GPU is returned to the host. |
 | BIOS set to power on after AC loss | Unattended recovery; see [power-loss runbook](../docs/runbooks/power-loss-recovery.md). |
 | BIOS bifurcation x8/x8 on the riser slot | Both GPUs share one x16 CPU slot through the riser. |
 | A libvirt NAT bridge (`${HYPERVISOR_BRIDGE_IP}`) | Walter's LAN path, and where the optional workstation `hermes-gateway` listens. |
