@@ -11,6 +11,9 @@ startPort: 10001
 globalTTL: 0
 sendLoadingState: true
 includeAliasesInList: true
+# No request/response captures: v260 keeps the last 5 MB of bodies in memory by default and serves them at
+# /api/captures/{id} to any API-key holder (telemetry, monitoring). 0 turns capturing off. A test asserts it.
+captureBuffer: 0
 
 apiKeys:
   - "${env.LLAMA_SWAP_API_KEY}"
@@ -21,7 +24,21 @@ macros:
   # #29761 MTP, #29825 indexer memory, #29994 race). Every other model stays on ${image}.
   "image-next": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:fff6185edd2fbc4093aa5970bf6db53ed11c283e3a1c52a3e244cf27047264f4"
   # spark-docker-run.sh waits for a same-named container (from a reload) to be gone, then execs docker run --name <id>
-  "run": "/usr/local/sbin/spark-docker-run.sh ${MODEL_ID} --rm --init --label llama-swap=1 --runtime nvidia -p 127.0.0.1:${PORT}:8080 -v ${MODELS_DIR}:/models:ro"
+  # Hardened (walter/README.md "Model container hardening"; tests: walter/tests/test_llama_swap_config.py):
+  #  - mounts ONLY ${MODELS_DIR}/gguf (read-only) at /models/gguf; never ${MODELS_DIR} itself, which holds backups/
+  #  - non-root uid:gid 10010 (the image's default user is root), no capabilities, no-new-privileges, read-only
+  #    root filesystem with a small /tmp tmpfs (HOME=/tmp for the CUDA JIT cache), at most 512 processes
+  #  - network llama-net (bridge br-llama, created by deploy.sh): docker-user-rules.sh drops every new connection
+  #    from it, so the container has no egress; llama-swap still reaches it through the loopback published port
+  # The memory limit is per model: ${mem} (GPU-resident) or ${mem-moe} (experts in RAM); every cmd uses exactly one.
+  "run": "/usr/local/sbin/spark-docker-run.sh ${MODEL_ID} --rm --init --label llama-swap=1 --runtime nvidia --network llama-net -p 127.0.0.1:${PORT}:8080 -v ${MODELS_DIR}/gguf:/models/gguf:ro --user 10010:10010 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,size=1g -e HOME=/tmp --pids-limit 512"
+  # Memory caps (RAM + page cache charged to the container; clean model pages are reclaimed, not OOM-killed, at the
+  # cap). GPU-resident models need a few GB (CPU token embeddings, prompt cache up to 8 GiB, buffers); 32g also keeps
+  # most of a 39 GB GGUF in page cache for a warm reload. flash keeps ~17 GB of experts in RAM plus the on-demand
+  # n-gram table pages: 64g, which leaves ~16 GB of the 80 GiB VM for the gateway and the other stacks.
+  # Swap equal to memory: no swapping of weights.
+  "mem": "--memory 32g --memory-swap 32g"
+  "mem-moe": "--memory 64g --memory-swap 64g"
   # common llama-server args: everything on GPU, fail loudly instead of auto-shrinking, one slot, q8_0 KV
   # Every model also gets `-n <N>` (output backstop): llama-server's default is -1 = generate until the
   # context is full. -n is only a DEFAULT for requests without max_tokens (a request that asks for more
@@ -40,7 +57,7 @@ models:
     name: "Qwen3.8 27B (GPU0)"
     aliases: ["coder"]
     cmd: |
-      ${run} --gpus "\"device=0\"" ${image}
+      ${run} ${mem} --gpus "\"device=0\"" ${image}
       -m /models/gguf/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
       ${common} -c 131072 -n 32768 -sm none --spec-type draft-mtp --spec-draft-n-max 2
       --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
@@ -57,7 +74,7 @@ models:
     name: "Qwen3.6 35B-A3B (GPU1)"
     aliases: ["coder-fast"]
     cmd: |
-      ${run} --gpus "\"device=1\"" ${image}
+      ${run} ${mem} --gpus "\"device=1\"" ${image}
       -m /models/gguf/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf
       ${common} -c 131072 -n 32768 -sm none
       --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0 --presence-penalty 1.5
@@ -70,7 +87,7 @@ models:
     name: "Qwen3-Coder-Next 80B-A3B (GPU0+GPU1)"
     aliases: ["big"]
     cmd: |
-      ${run} --gpus "\"device=0,1\"" ${image}
+      ${run} ${mem} --gpus "\"device=0,1\"" ${image}
       -m /models/gguf/qwen3-coder-next/Qwen3-Coder-Next-UD-IQ4_NL.gguf
       ${common} -c 131072 -n 32768 -sm layer -ts 1,1
       --temp 1.0 --top-p 0.95 --top-k 40 --min-p 0.01
@@ -88,7 +105,7 @@ models:
     name: "Gemma 4 31B QAT + vision (GPU0+GPU1)"
     aliases: ["vision"]
     cmd: |
-      ${run} ${tp} --gpus "\"device=0,1\"" ${image}
+      ${run} ${mem} ${tp} --gpus "\"device=0,1\"" ${image}
       -m /models/gguf/gemma-4-31b-qat/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf
       --mmproj /models/gguf/gemma-4-31b-qat/mmproj-BF16.gguf
       ${common} -c 131072 -n 16384 -sm tensor --ctx-checkpoints 8
@@ -108,7 +125,7 @@ models:
     name: "Hermes 4.3 36B (GPU0+GPU1)"
     aliases: ["hermes"]
     cmd: |
-      ${run} ${tp} --gpus "\"device=0,1\"" ${image}
+      ${run} ${mem} ${tp} --gpus "\"device=0,1\"" ${image}
       -m /models/gguf/hermes-4.3-36b/hermes-4_3_36b-Q4_K_M.gguf
       ${common} -c 65536 -n 16384 -sm tensor
       --temp 0.6 --top-p 0.95 --top-k 20
@@ -132,7 +149,7 @@ models:
     name: "Qwen3.8-Flash-Next 125B-A6B IQ3_S (GPU0+GPU1+CPU experts, experimental)"
     aliases: ["flash"]
     cmd: |
-      ${run} --gpus "\"device=0,1\"" ${image-next}
+      ${run} ${mem-moe} --gpus "\"device=0,1\"" ${image-next}
       -m /models/gguf/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
       ${common} -c 131072 -n 32768 -sm layer -ts 1,1 -lm mmap -lzm on
       -ot "per_layer_token_embd=CPU,blk\.([0-5]|2[4-9]|3[0-3])\.ffn_.*_exps\.=CPU"

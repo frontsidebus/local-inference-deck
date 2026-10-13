@@ -327,13 +327,35 @@ There is no basic auth and there are no shared passwords.
 
 ```
 internet | Covenant (SG + ufw, fail2ban, nginx allowlist + limits) | wg0 | Walter (DOCKER-USER + ufw) | loopback (models, monitoring)
+                                                                             models: llama-net, no egress (WALTER-LLAMA-EGRESS)
 ```
 
 1. **Internet to Covenant.** ufw allows 22, 80, 443 and `udp/${WG_PORT}`; the cloud security group matches. An unknown `Host` gets nginx's 444, and the apex redirects to `chat.`. Rate limits per IP: login endpoints 5 r/m; Pocket-ID auth 10 r/m; API 10 r/s burst 40 with 20 connections; per-site zones for telemetry and digest.
 2. **Covenant to Walter.** The only path is the tunnel. On Walter, Docker-published ports bypass ufw, so `docker-user-rules.service` installs a chain `WALTER-PUBLISHED` hooked from `DOCKER-USER` that admits ports 3000, 1411 and 4000 only from `${EDGE_WG_IP}` and drops the rest. The telemetry and digest apps use host networking, which bypasses that chain, so ufw gates them: `allow in on wg0 from ${EDGE_WG_IP} to ${BACKEND_WG_IP} port 3200` (and 3300). The digest rules sit in `# >>> digest` blocks of the firewall templates, which `walter/deploy.sh` drops unless the digest is on.
-3. **Gateway to models.** ufw allows `${BACKEND_WG_IP}:8080` only from `${GATEWAY_DOCKER_SUBNET}`; the gateway compose network is pinned to that subnet so the rule stays valid. llama-swap also requires its own API key. llama-server containers bind loopback.
+3. **Gateway to models.** ufw allows `${BACKEND_WG_IP}:8080` only from `${GATEWAY_DOCKER_SUBNET}`; the gateway compose network is pinned to that subnet so the rule stays valid. llama-swap also requires its own API key and keeps no request captures (`captureBuffer: 0`). llama-server containers publish on loopback only.
 4. **Forwarded headers.** Every app behind the edge trusts `X-Forwarded-*` from `${EDGE_WG_IP}` only: Open WebUI `FORWARDED_ALLOW_IPS=${EDGE_WG_IP}`, Pocket-ID `TRUST_PROXY=true` (reachable only from the edge), LiteLLM `trusted_proxy_ranges` = `${EDGE_WG_IP}/32`. The oauth2-proxy sites pass identity headers to the app only from `auth_request_set`, never from the client. This keeps client IPs correct for rate limiting and logs without letting anything else spoof them.
 5. **Workstation.** The hermes-gateway binds only the libvirt bridge address and requires `API_SERVER_KEY`.
+
+### Model containers
+
+The llama-server containers are the part of the stack that parses untrusted input (GGUF files, prompts, images,
+chat templates), so each one is confined on the assumption that a parser bug gives an attacker code execution
+inside it ([walter/README.md](walter/README.md#model-container-hardening)):
+
+- **What it can read:** only `${MODELS_DIR}/gguf`, read-only, at `/models/gguf`. The backups next to it (secrets,
+  database dumps) are not mounted.
+- **Who it runs as:** uid 10010 with no capabilities and `no-new-privileges`, on a read-only root filesystem with a
+  small `/tmp` tmpfs; process and memory limits per model. The pinned images default to root.
+- **Where it can connect:** nowhere. The containers sit on their own bridge (`llama-net`, interface `br-llama`,
+  inter-container traffic off). `DOCKER-USER` chain `WALTER-LLAMA-EGRESS` drops every new forwarded connection from
+  that bridge, and ufw's default deny covers connections to Walter itself. llama-swap reaches each model through its
+  `127.0.0.1` published port, a host-originated path the rule does not touch. Docker's `--internal` networks would
+  block egress too, but they do not publish ports.
+- **What llama-swap keeps:** no request or response bodies (`captureBuffer: 0`; v260 otherwise keeps 5 MB and
+  serves them to any API-key holder).
+
+Left in scope: the GPU driver and container runtime, the other (public) model files, and the GPUs themselves.
+The flags are checked for every model by `walter/tests/test_llama_swap_config.py`.
 
 ### Key scoping
 

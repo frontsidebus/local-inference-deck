@@ -2,9 +2,11 @@
 
 Which model to use for which security task, with the eval evidence, is in [`docs/model-guide.md`](../docs/model-guide.md).
 
-All files live under `${MODELS_DIR}/gguf/<subdir>/` on the host. Inside the llama-server
-containers that directory is always mounted at `/models`, so `llama-swap/config.yaml.tmpl`
-keeps the in-container paths `/models/gguf/...` unchanged whatever `MODELS_DIR` is.
+All files live under `${MODELS_DIR}/gguf/<subdir>/` on the host. Only that directory is mounted into
+the llama-server containers (read-only, at `/models/gguf`), so `llama-swap/config.yaml.tmpl` keeps the
+in-container paths `/models/gguf/...` unchanged whatever `MODELS_DIR` is, and nothing else under `MODELS_DIR`
+(`backups/`, `logs/`) is visible to a model. Keep every model file under `gguf/` and world-readable: the
+containers run as uid 10010 ([README](README.md#model-container-hardening)).
 
 Download with `llama-swap/fetch-models.sh` (installed as `${MODELS_DIR}/fetch-models.sh`, run as
 `BACKEND_SSH_USER`). It resumes, retries, and checks every file against the size of the live copy.

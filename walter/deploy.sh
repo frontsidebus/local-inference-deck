@@ -27,7 +27,8 @@
 # compose.yaml or build/ tree differs from the last build (content hash in /srv/<stack>/.build-hash).
 # Docs (*.md, *.example) are installed but never force-recreate a stack or count toward a build hash.
 #
-# Order: render -> packages -> users -> /models mount -> llama-swap binary -> files ->
+# Order: render -> packages -> users -> /models mount -> llama-swap binary -> files (llama-swap config last,
+#        after the model containers' egress rule and llama-net) ->
 #        env files -> gen-secrets -> systemd units + firewall -> (offsite backups) -> gateway -> keys -> webui ->
 #        monitoring -> telemetry -> (digest: key copy + stack) -> (hermes). Never deletes anything; never
 #        overwrites a secret.
@@ -57,7 +58,7 @@ while [[ $# -gt 0 ]]; do
     --no-start) NO_START=1 ;;
     --with-hermes) WITH_HERMES=1 ;;
     --rebuild) REBUILD=1 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "deploy: unknown option $1" >&2; exit 2 ;;
   esac
   shift
@@ -185,6 +186,41 @@ mkdir_p() { # PATH MODE OWNER GROUP
   return 0
 }
 
+# Model containers (walter/README.md "Model container hardening"): they join this network, and
+# firewall/docker-user-rules.sh drops every new connection from its bridge (no egress).
+LLAMA_NET=llama-net LLAMA_BRIDGE=br-llama LLAMA_UID=10010
+ensure_llama_net() {
+  if [[ $LIVE == 0 ]]; then say "  would ensure docker network $LLAMA_NET (bridge $LLAMA_BRIDGE, icc off)"; return 0; fi
+  if ! docker info >/dev/null 2>&1; then
+    say "  docker is not running yet: $LLAMA_NET is created after docker starts"; return 0
+  fi
+  if docker network inspect "$LLAMA_NET" >/dev/null 2>&1; then
+    local br
+    br=$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$LLAMA_NET")
+    [[ $br == "$LLAMA_BRIDGE" ]] || die "docker network $LLAMA_NET uses bridge '$br', not $LLAMA_BRIDGE, so the egress rule would miss it: stop llama-swap, docker network rm $LLAMA_NET, re-run"
+    say "  docker network $LLAMA_NET present (bridge $LLAMA_BRIDGE)"
+  else
+    docker network create --driver bridge --label spark.role=llama-models \
+      -o com.docker.network.bridge.name="$LLAMA_BRIDGE" -o com.docker.network.bridge.enable_icc=false \
+      "$LLAMA_NET" >/dev/null
+    say "  created docker network $LLAMA_NET (bridge $LLAMA_BRIDGE)"
+  fi
+}
+
+# The model containers run as uid $LLAMA_UID, which owns nothing: every model file must be world-readable
+# (fetch-models.sh writes 0644 files and 0755 dirs; this fixes copies made with another umask).
+models_world_readable() {
+  local d=$T$MODELS_DIR/gguf n
+  [[ -d $d ]] || return 0
+  n=$(find "$d" \( \( -type d ! -perm -o=rx \) -o \( -type f ! -perm -o=r \) \) -print 2>/dev/null | wc -l)
+  ((n == 0)) && { say "  model files readable by uid $LLAMA_UID"; return 0; }
+  if [[ $DRY == 1 ]]; then say "  would chmod o+rX $n paths under $MODELS_DIR/gguf (model containers run as uid $LLAMA_UID)"
+  else
+    find "$d" \( \( -type d ! -perm -o=rx \) -o \( -type f ! -perm -o=r \) \) -print0 | xargs -0r chmod o+rX
+    say "  chmod o+rX $n paths under $MODELS_DIR/gguf (model containers run as uid $LLAMA_UID)"
+  fi
+}
+
 # env_from_example DIR NAME : DIR/NAME.example -> DIR/NAME (0600) only if NAME is absent;
 # if present, report drift of non-secret keys (never modified).
 env_from_example() {
@@ -275,6 +311,7 @@ if [[ $LIVE == 1 ]] && ! mountpoint -q "$MODELS_DIR"; then
 fi
 mkdir_p "$MODELS_DIR/gguf" 0775 "$BACKEND_SSH_USER" "$BACKEND_SSH_USER"
 mkdir_p "$MODELS_DIR/backups" 0700 root root
+models_world_readable   # backups/ stays 0700 root and is never mounted into a model container
 
 # ---- 5. llama-swap binary ------------------------------------------------------------
 step "llama-swap v$LLAMA_SWAP_VERSION"
@@ -314,7 +351,6 @@ else
   mkdir_p /etc/wireguard 0700 root root
   install_file "$S/wireguard/wg0.conf" /etc/wireguard/wg0.conf 0600 root root
 fi
-install_file "$S/llama-swap/config.yaml"        /etc/llama-swap/config.yaml               0640 root llamaswap
 install_file "$S/llama-swap/llama-swap.service" /etc/systemd/system/llama-swap.service    0644 root root llama-swap-unit
 install_file "$S/llama-swap/spark-docker-run.sh" /usr/local/sbin/spark-docker-run.sh      0755 root root
 install_file "$S/llama-swap/fetch-models.sh"    "$MODELS_DIR/fetch-models.sh"             0755 "$BACKEND_SSH_USER" "$BACKEND_SSH_USER"
@@ -365,6 +401,12 @@ install_file "$S/firewall/docker-user-rules.sh" /usr/local/sbin/docker-user-rule
 install_file "$S/firewall/docker-user-rules.service" /etc/systemd/system/docker-user-rules.service 0644 root root units
 install_file "$S/firewall/ufw-rules.sh"         /usr/local/sbin/ufw-rules.sh              0755 root root fw-ufw
 
+# llama-swap's config last: --watch-config reloads it at once and restarts the loaded models, which then join
+# llama-net. So the network and its no-egress rule must already exist (step 9 re-applies both).
+if [[ -n ${CHANGED[fw-docker]:-} ]]; then run /usr/local/sbin/docker-user-rules.sh; fi
+ensure_llama_net
+install_file "$S/llama-swap/config.yaml"        /etc/llama-swap/config.yaml               0640 root llamaswap
+
 # ---- 7. env files ----------------------------------------------------------------------
 step "env files"
 env_from_example /srv/gateway .env gateway/.env.example
@@ -391,6 +433,7 @@ if [[ $NO_START == 0 ]]; then
   if [[ -n ${CHANGED[fw-docker]:-} ]]; then run systemctl restart docker-user-rules.service
   else run systemctl start docker-user-rules.service; fi
   if [[ -n ${CHANGED[docker]:-} ]]; then run systemctl restart docker.service; else run systemctl start docker.service; fi
+  ensure_llama_net   # first deploy: docker was not running at the files step
   if [[ -n ${CHANGED[llama-swap-unit]:-} ]]; then run systemctl restart llama-swap.service
   else run systemctl start llama-swap.service; fi   # config.yaml changes: llama-swap --watch-config reloads itself
   run systemctl start spark-backup.timer spark-update-check.timer

@@ -9,9 +9,16 @@
 #  - ${BACKEND_LAN_IF} (LAN): nobody may reach the wg-bound published ports (defence in depth).
 #  - docker bridges / host-originated traffic are untouched (host traffic is
 #    DNAT'd in OUTPUT and never traverses FORWARD).
+#  - llama-net (bridge br-llama, the llama-server model containers): no egress.
+#    Chain WALTER-LLAMA-EGRESS drops every forwarded packet that enters from
+#    br-llama unless it belongs to an existing connection, so a container can
+#    open no connection to the internet, the LAN, wg0 or another container.
+#    llama-swap still reaches each model through its 127.0.0.1 published port:
+#    that path is host-originated (OUTPUT/INPUT), not FORWARD. Connections from
+#    the containers to the host itself hit INPUT, where ufw's default deny applies.
 #
-# Idempotent: rules live in our own chain WALTER-PUBLISHED, which is flushed and
-# rebuilt; DOCKER-USER gets exactly one jump at the top.
+# Idempotent: rules live in our own chains WALTER-PUBLISHED and WALTER-LLAMA-EGRESS,
+# which are flushed and rebuilt; DOCKER-USER gets exactly one jump to each, at the top.
 # Managed by docker-user-rules.service.
 set -eu
 
@@ -22,6 +29,8 @@ LAN_IF=${BACKEND_LAN_IF}
 EDGE=${EDGE_WG_IP}
 SVC_IP=${BACKEND_WG_IP}
 PORTS="3000 1411 4000 3200"   # 3200: telemetry (host-network; effective gate is the ufw rule, this covers a future published port)
+LLAMA_CHAIN=WALTER-LLAMA-EGRESS
+LLAMA_IF=br-llama     # walter/deploy.sh creates llama-net with com.docker.network.bridge.name=br-llama
 # >>> digest (opt-in: walter/deploy.sh drops this block unless SPARK_DIGEST_HOST is set)
 PORTS="$PORTS 3300"   # 3300: digest (host-network, like telemetry)
 # <<< digest
@@ -41,6 +50,16 @@ for p in $PORTS; do
 done
 $IPT -w -A "$CHAIN" -j RETURN
 
-# Exactly one jump, at the top of DOCKER-USER.
-while $IPT -w -D DOCKER-USER -j "$CHAIN" 2>/dev/null; do :; done
-$IPT -w -I DOCKER-USER 1 -j "$CHAIN"
+# Model containers: replies to existing connections only, nothing new (the interface name
+# matches before the bridge exists, so this is in place before the first container starts).
+$IPT -w -N "$LLAMA_CHAIN" 2>/dev/null || true
+$IPT -w -F "$LLAMA_CHAIN"
+$IPT -w -A "$LLAMA_CHAIN" -i "$LLAMA_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+$IPT -w -A "$LLAMA_CHAIN" -i "$LLAMA_IF" -m comment --comment "walter: no egress from llama-net ($LLAMA_IF)" -j DROP
+$IPT -w -A "$LLAMA_CHAIN" -j RETURN
+
+# Exactly one jump to each chain, at the top of DOCKER-USER.
+for c in "$LLAMA_CHAIN" "$CHAIN"; do
+  while $IPT -w -D DOCKER-USER -j "$c" 2>/dev/null; do :; done
+  $IPT -w -I DOCKER-USER 1 -j "$c"
+done

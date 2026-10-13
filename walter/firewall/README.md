@@ -3,7 +3,7 @@
 | file | installed as | what |
 |---|---|---|
 | `ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` (run by `walter/deploy.sh`) | ufw defaults and the INPUT allows |
-| `docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/docker-user-rules.sh`, `docker-user-rules.service` | `WALTER-PUBLISHED` chain in DOCKER-USER (Docker-published ports) |
+| `docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/docker-user-rules.sh`, `docker-user-rules.service` | `WALTER-PUBLISHED` chain in DOCKER-USER (Docker-published ports); `WALTER-LLAMA-EGRESS` chain (drops new connections forwarded from `br-llama`, the model containers' bridge: [no egress](../README.md#model-container-hardening)) |
 
 ## SSH (22/tcp)
 
@@ -31,8 +31,9 @@ Why not `ListenAddress`: binding sshd to the LAN and wg0 addresses would make ss
 existing at start (a boot-order lockout risk) and on cloud-init's sshd drop-ins. The firewall
 scope gives the same exposure with less risk.
 
-Tests: `python3 -m pytest walter/firewall/tests -q -p no:cacheprovider`. They render the template
-with `site.env.example` and with the checkout's `site.env` (or `SITE_ENV_REAL=<file>`), then run it
+Tests: `python3 -m pytest walter/firewall/tests -q -p no:cacheprovider`. `test_docker_user_rules.py` runs the rendered
+`docker-user-rules.sh` against a fake `iptables`. `test_ufw_rules.py` renders the template
+with `site.env.example` and with the checkout's `site.env` (or `SITE_ENV_REAL=<file>`), then runs it
 against fake `ufw` and `ip` commands.
 
 ## Deploying the SSH scope change safely

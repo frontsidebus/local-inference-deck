@@ -8,7 +8,8 @@
 # the copy that is live on Walter. Uses $HF_TOKEN or ~/.cache/huggingface/token if
 # present (none of these repos is gated, so a token is optional). See ../models.md.
 set -u
-DEST=${MODELS_DIR}/gguf
+umask 022   # files 0644, dirs 0755: the model containers run as uid 10010 and need world-read (walter/README.md)
+DEST=${MODELS_DIR}/gguf   # the ONLY directory mounted into the model containers (/models/gguf, read-only)
 LOGDIR=${MODELS_DIR}/logs
 
 # alias | HF repo[@revision] | file (path in the repo) | dest subdir | expected bytes
