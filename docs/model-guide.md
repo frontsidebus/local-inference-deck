@@ -34,6 +34,6 @@ Re-run the shared subsets after any change of model, quant or llama.cpp image.
 - **Weak spots for every model:** exact ATT&CK technique extraction (3–10%) and matching NVD's own CWE labels (21–35%). Treat both as needing review, whichever model you use.
 - **Thinking:** no gain has been shown, but equivalence hasn't been shown either; the comparison is exploratory. Leave it off by default for speed. For code edits in Hermes, use `--reasoning medium` or lower.
 - **`flash` is experimental** (see [`walter/models.md`](../walter/models.md)).
-  - Gateway keys reach it as `local/qwen3.8-flash-next`, because their model allow-lists include `local/*`.
+  - Gateway keys reach it as `flash` or as `local/qwen3.8-flash-next`. Every key's allow-list has `flash`; all but the digest key also have `local/*` (classes in [walter/README.md](../walter/README.md#after-the-first-deploy)).
   - Its speed tuning (MTP plus 16 CPU expert layers) has not yet been shown equivalent: accuracy moved −3.0 pp on CTIBench MCQ (100 items) and −3.3 pp on NVD CWE (92 items), and the equivalence test was inconclusive (`walter/llama-swap/BENCHMARKS.md`). The pre-registered check uses a 5 pp margin; the tuning is reverted only if the result is "different, worse".
 - **Scope:** these are single-turn benchmarks standing in for real work. They rank the models; they are not absolute skill, and agentic, multi-step use is not measured.

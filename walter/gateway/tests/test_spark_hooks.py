@@ -189,3 +189,74 @@ def test_presence_penalty_defaults():
         assert found == ([value] if value else []), model_id
         # the window is llama-server's default (64 tokens); the measurement did not change it
         assert "--repeat-last-n" not in ls["models"][model_id]["cmd"], model_id
+
+
+# --- lab guard -----------------------------------------------------------------------
+
+class Key:
+    def __init__(self, metadata=None, key_alias="someone"):
+        self.metadata = metadata
+        self.key_alias = key_alias
+
+
+LAB_NAMES = ["lab/uncensored-x", "local/lab-uncensored-x", "LAB/x", "local/LAB-x", " local/lab-x",
+             "openai/lab-x", "local/local/lab-x", "local/openai/lab-x", "local/ lab-x", "lab-x"]
+
+
+@pytest.mark.parametrize("model", LAB_NAMES)
+@pytest.mark.parametrize("key", [None, Key(), Key({}), Key({"lab": False}), Key({"lab": "true"}),
+                                 Key({"lab": 1}), Key({"kind": "user"})])
+def test_lab_model_refused_without_lab_metadata(model, key):
+    with pytest.raises(Exception) as e:
+        asyncio.run(H.proxy_handler_instance.async_pre_call_hook(
+            key, None, {"model": model, "messages": [{"role": "user", "content": "secret prompt"}]}, "acompletion"))
+    assert getattr(e.value, "status_code", None) == 403
+
+
+@pytest.mark.parametrize("model", LAB_NAMES)
+def test_lab_model_allowed_with_lab_metadata(model):
+    d = asyncio.run(H.proxy_handler_instance.async_pre_call_hook(
+        Key({"lab": True, "kind": "user"}), None, {"model": model, "messages": []}, "anthropic_messages"))
+    assert d["model"] == model
+
+
+@pytest.mark.parametrize("model", ["coder", "coder-fast", "big", "flash", "vision", "hermes",
+                                   "local/qwen3.8-flash-next", "claude-sonnet-4-5-20250929",
+                                   "local/collab-model", "labrador", "local/my-lab-model", None])
+def test_non_lab_models_pass_for_any_key(model):
+    d = asyncio.run(H.proxy_handler_instance.async_pre_call_hook(None, None, {"model": model, "messages": []}, "acompletion"))
+    assert d["model"] == model
+
+
+@pytest.mark.parametrize("call_type", ["acompletion", "anthropic_messages", "aresponses", "aembedding", "atext_completion"])
+def test_lab_guard_covers_every_call_type(call_type):
+    with pytest.raises(Exception) as e:
+        asyncio.run(H.proxy_handler_instance.async_pre_call_hook(Key(), None, {"model": "local/lab-x", "input": "x"}, call_type))
+    assert e.value.status_code == 403
+
+
+def test_lab_refusal_log_has_no_prompt(caplog):
+    caplog.set_level("INFO", logger="LiteLLM Proxy")
+    with pytest.raises(Exception):
+        asyncio.run(H.proxy_handler_instance.async_pre_call_hook(Key({}, "alice"), None, {"model": "lab/x", "messages": [
+            {"role": "user", "content": "PROMPT-MARKER-123"}]}, "acompletion"))
+    text = caplog.text
+    assert "refused lab model" in text and "'alice'" in text and "lab/x" in text
+    assert "PROMPT-MARKER-123" not in text
+
+
+def test_lab_routes_in_config_are_named_lab():
+    """A static LiteLLM entry targets openai/lab-* iff it is named lab/*, and no lab wildcard exists,
+    so the hook's name check is the whole alias resolution."""
+    ll = yaml.safe_load((WALTER / "gateway" / "litellm.yaml.tmpl").read_text())
+    for m in ll["model_list"]:
+        name, target = m["model_name"], m["litellm_params"]["model"]
+        assert H.is_lab_model(name) == H.is_lab_model(target), name
+        if H.is_lab_model(name):
+            assert "*" not in name and name.startswith("lab/"), name
+    ls = yaml.safe_load((WALTER / "llama-swap" / "config.yaml.tmpl").read_text())
+    for model_id, m in ls["models"].items():
+        aliases = m.get("aliases") or []
+        if model_id.startswith("lab-"):
+            assert not aliases, (model_id, "lab entries must not have aliases (the hook sees only names)")
+        assert not any(H.is_lab_model(a) for a in aliases), model_id

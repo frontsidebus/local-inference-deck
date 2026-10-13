@@ -62,6 +62,10 @@ Test tool calling and, if it is a thinking model, a generous `max_tokens`.
 
 In the gateway config (`litellm.yaml`, shipped in [walter/](../../walter/README.md)), add a `model_list` entry for the new alias pointing at `openai/<model-id>` on llama-swap. **Copy `model_info.supported_endpoints` from an existing alias**: without `["/v1/chat/completions","/v1/responses","/v1/messages"]`, Anthropic requests go through the Responses adapter and lose reasoning. The `local/*` wildcard already exposes the raw ID.
 
+**Add the alias to the key allow-lists.** Keys carry explicit `models` lists, so a new alias is unreachable until it is in `SERVED` (or the relevant class in `KEY_CLASSES`) in `walter/gateway/provision-keys.py.tmpl`; `walter/gateway/tests` fails while the two disagree. Deploy, then `sudo /srv/gateway/provision-keys.py --dry-run` shows the alias being added to each key, and `sudo /srv/gateway/provision-keys.py` applies it. Also add the alias's output maximum to `MODEL_MAX_OUTPUT` in `hooks/spark_hooks.py`.
+
+**Lab models** (research models, not served to everyone) are named `lab/<name>` in LiteLLM and `lab-<name>` in llama-swap, with no llama-swap `aliases`. Do not add them to `SERVED`: the gateway hook refuses them, also as `local/lab-<name>`, for every key without `metadata.lab=true` (`LAB_KEY_ALIASES`, see [walter/README.md](../../walter/README.md#after-the-first-deploy)).
+
 ```bash
 cd /srv/gateway && sudo docker compose up -d litellm   # or restart if only the config changed
 curl -s http://${BACKEND_WG_IP}:4000/v1/models -H "Authorization: Bearer <a key>" | jq -r '.data[].id'

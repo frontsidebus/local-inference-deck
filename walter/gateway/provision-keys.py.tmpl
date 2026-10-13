@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""provision-keys -- create the LiteLLM virtual keys for harnesses and users.
+"""provision-keys -- create the LiteLLM virtual keys for harnesses and users, and keep their
+model allow-lists in sync.
 
 Installed to /srv/gateway/provision-keys.py (root 0700) and run by walter/deploy.sh after the
 gateway stack is healthy. Idempotent; safe to re-run after adding names to site.env.
@@ -9,7 +10,19 @@ For every name in HARNESS_KEYS and SPARK_USERS:
   - alias <name> already exists in LiteLLM     -> NOT regenerated (would orphan the old key);
                                                   reported so the operator can decide
   - otherwise POST /key/generate with key_alias=<name>, rpm_limit=60, max_parallel_requests=4
-    (the limits every live key has) and write the key to keys/<name>.key (root 0600)
+    (the limits every live key has), the class's `models` allow-list (KEY_CLASSES below) and
+    write the key to keys/<name>.key (root 0600)
+Then every managed alias that exists in LiteLLM is brought to its class's allow-list with
+POST /key/update (`models`, and `metadata.lab`), only when it differs. A key with an empty
+`models` list can call EVERY model, including any future lab model, so no managed key is left
+empty. Each change is printed as `alias: old models -> new models`; aliases that are not in
+HARNESS_KEYS / SPARK_USERS are listed, never changed. --dry-run prints the same diff without
+writing (it reads the live keys when the master key and LiteLLM are reachable, else it prints
+the target lists only).
+
+Lab access: names in LAB_KEY_ALIASES (site.env, SPARK_USERS names only) also get the `lab`
+access group and metadata.lab=true, which spark_hooks.py requires for lab/<name> and
+local/lab-<name>. Removing a name from LAB_KEY_ALIASES sets metadata.lab=false on the next run.
 Then fills OPENAI_API_KEYS in /srv/webui/.env (if still CHANGEME / PENDING) with
 "<open-webui key>;<hermes-gateway key>", the order of OPENAI_API_BASE_URLS. The second key is
 the workstation hermes-gateway's API_SERVER_KEY, read from /srv/webui/hermes-gateway.key
@@ -20,6 +33,7 @@ Never prints a key. The master key is read from /srv/gateway/.env.
 
 Usage: provision-keys.py [--dry-run] [--root DESTDIR]
 """
+import hashlib
 import json
 import os
 import sys
@@ -31,7 +45,37 @@ import urllib.request
 LITELLM = "http://${BACKEND_WG_IP}:4000"
 HARNESS_KEYS = "${HARNESS_KEYS}".split()
 SPARK_USERS = "${SPARK_USERS}".split()
+# @@if LAB_KEY_ALIASES@@
+LAB_KEY_ALIASES = "${LAB_KEY_ALIASES}".split()
+# @@else@@
+LAB_KEY_ALIASES = []
+# @@endif@@
 LIMITS = {"rpm_limit": 60, "max_parallel_requests": 4}
+
+# --- model allow-lists per key class ---------------------------------------------------------
+# SERVED = every static model_name in litellm.yaml (walter/gateway/tests checks they match).
+# Adding an alias to litellm.yaml means adding it here too, or no key can call it.
+SERVED = ["coder", "coder-fast", "big", "flash", "vision", "hermes"]
+# Wildcards in a KEY's `models` are matched by open-source LiteLLM (checked in the pinned v1.103.1
+# source, litellm/proxy/auth/auth_checks.py): can_key_call_model (:4636) passes the key's models to
+# _can_object_call_model (:4657) -> _check_model_access_helper, which returns True when
+# _model_matches_any_wildcard_pattern_in_list (:4238, :6133) matches; the pattern is the regex
+# f"^{pattern.replace('*', '.*')}$" (:6127). No premium check on that path. The Enterprise-only
+# feature in LiteLLM's docs is model ACCESS GROUPS on wildcard deployments, which this does not use.
+LOCAL_WILDCARD = "local/*"     # raw llama-swap IDs (evals call local/qwen3.8-flash-next)
+CLAUDE_WILDCARD = "claude-*"   # safety net for Claude Code background tasks -> coder
+LAB_GROUP = "lab"              # access group of the future static lab/<name> entries
+KEY_CLASSES = {
+    # coding harnesses: claude-code, codex, opencode, hermes (also the judge's and the evals' key)
+    "agent": SERVED + [LOCAL_WILDCARD, CLAUDE_WILDCARD],
+    # Open WebUI's shared connection key: the aliases and the raw IDs it lists, no claude-*
+    "open-webui": SERVED + [LOCAL_WILDCARD],
+    # the digest app calls DIGEST_MODEL (an alias, default coder) only
+    "digest": list(SERVED),
+    # people: they run the same harnesses on their own machines
+    "user": SERVED + [LOCAL_WILDCARD, CLAUDE_WILDCARD],
+}
+HARNESS_CLASS = {"open-webui": "open-webui", "digest": "digest"}   # every other harness: agent
 
 args = sys.argv[1:]
 DRY = "--dry-run" in args
@@ -116,7 +160,155 @@ def alias_exists(master, alias):
     return bool(res.get("keys"))
 
 
+def key_class(name, kind):
+    return HARNESS_CLASS.get(name, "agent") if kind == "harness" else "user"
+
+
+def desired(name, kind):
+    """(models, lab) a managed key should have."""
+    lab = kind == "user" and name in LAB_KEY_ALIASES
+    models = list(KEY_CLASSES[key_class(name, kind)])
+    if lab:
+        models.append(LAB_GROUP)
+    return models, lab
+
+
+def check_lab_aliases():
+    bad = [n for n in LAB_KEY_ALIASES if n not in SPARK_USERS]
+    if bad:
+        sys.exit("provision-keys: LAB_KEY_ALIASES may only name SPARK_USERS entries (harness keys "
+                 "never get lab access); not allowed: " + " ".join(bad))
+
+
+def fmt_models(models):
+    return "[] (ALL models)" if not models else "[" + ", ".join(models) + "]"
+
+
+def is_lab(meta):
+    return isinstance(meta, dict) and meta.get("lab") is True
+
+
+def plan_update(name, kind, cur):
+    """Body for POST /key/update (without `key`), or None when cur already matches.
+
+    cur is the LiteLLM key object (models, metadata). metadata is sent whole (merged), so
+    the update never drops other fields; a lab flag that must go is set to false.
+    """
+    models, lab = desired(name, kind)
+    body = {}
+    if sorted(cur.get("models") or []) != sorted(models):
+        body["models"] = models
+    meta = cur.get("metadata") if isinstance(cur.get("metadata"), dict) else {}
+    if is_lab(meta) != lab:
+        new_meta = dict(meta)
+        new_meta["lab"] = lab
+        body["metadata"] = new_meta
+    return body or None
+
+
+def describe(name, cur, body):
+    old = cur.get("models") or []
+    new = body.get("models", old) if body else old
+    meta = cur.get("metadata") if isinstance(cur.get("metadata"), dict) else {}
+    lab_old = is_lab(meta)
+    lab_new = body["metadata"]["lab"] if body and "metadata" in body else lab_old
+    lab = "" if lab_old == lab_new else "; lab %s -> %s" % (str(lab_old).lower(), str(lab_new).lower())
+    return "%s: %s -> %s%s" % (name, fmt_models(old), fmt_models(new), lab)
+
+
+def list_keys(master, **query):
+    """All key objects (no key values are printed; `token` is LiteLLM's hash)."""
+    out, page = [], 1
+    while True:
+        q = urllib.parse.urlencode(dict(query, page=page, size=100, return_full_object="true"))
+        res = api("GET", "/key/list?" + q, master)
+        for k in res.get("keys") or []:
+            if isinstance(k, dict):
+                out.append(k)
+        if page >= int(res.get("total_pages") or 1):
+            return out
+        page += 1
+
+
+def key_ref(name, cur):
+    """What /key/update gets as `key`: the key file when it is this key (LiteLLM's token is
+    sha256(key) hex), else the token hash itself, which /key/update also accepts."""
+    token = cur.get("token") or ""
+    key = read_secret(os.path.join(KEY_DIR, name + ".key"))
+    if key and hashlib.sha256(key.encode()).hexdigest() == token:
+        return key
+    return token
+
+
+def sync_models(names, master):
+    """Bring every managed alias to its class's allow-list. master None -> targets only."""
+    if master is None:
+        for n, kind in names:
+            models, lab = desired(n, kind)
+            log("would set %s (%s): models %s%s (live keys not read)"
+                % (n, key_class(n, kind), fmt_models(models), "; lab true" if lab else ""))
+        return
+    try:
+        keys = list_keys(master)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        sys.exit("provision-keys: key/list failed (%s); allow-lists not synced" % getattr(e, "code", e))
+    by_alias = {}
+    for k in keys:
+        by_alias.setdefault(k.get("key_alias"), []).append(k)
+    managed = {n for n, _ in names}
+    changed = failed = 0
+    for n, kind in names:
+        for cur in by_alias.get(n, []):
+            body = plan_update(n, kind, cur)
+            if body is None:
+                log("ok      %s" % describe(n, cur, None))
+                continue
+            changed += 1
+            if DRY:
+                log("would update %s" % describe(n, cur, body))
+                continue
+            ref = key_ref(n, cur)
+            if not ref:
+                log("WARN    %s: no key file and no token in key/list; not updated" % n)
+                continue
+            try:
+                api("POST", "/key/update", master, dict(body, key=ref))
+            except (urllib.error.URLError, OSError) as e:
+                failed += 1
+                log("FAIL    %s: key/update failed (%s); still %s"
+                    % (n, getattr(e, "code", e), fmt_models(cur.get("models") or [])))
+                continue
+            log("updated %s" % describe(n, cur, body))
+        if not by_alias.get(n):
+            log("missing %s: no key with this alias in LiteLLM%s" % (n, " (would be created)" if DRY else ""))
+        if len(by_alias.get(n, [])) > 1:
+            log("WARN    %s: %d keys share this alias; each was synced" % (n, len(by_alias[n])))
+    for alias in sorted(a for a in by_alias if a not in managed and a):
+        for cur in by_alias[alias]:
+            log("unmanaged %s: models %s%s (not in HARNESS_KEYS/SPARK_USERS; not changed)"
+                % (alias, fmt_models(cur.get("models") or []), "; lab true" if is_lab(cur.get("metadata")) else ""))
+    if by_alias.get(None) or by_alias.get(""):
+        log("unmanaged: %d key(s) without an alias (not changed)"
+            % (len(by_alias.get(None, [])) + len(by_alias.get("", []))))
+    log("allow-lists: %d key(s) %s" % (changed, "would change" if DRY else "to update, %d failed" % failed))
+    if failed:
+        sys.exit("provision-keys: %d allow-list update(s) failed; re-run after fixing" % failed)
+
+
+def dry_master():
+    """Master key for a read-only dry-run diff, or None when it or LiteLLM is not reachable."""
+    master = env_get(GW_ENV, "LITELLM_MASTER_KEY")
+    if not master or master == "CHANGEME":
+        return None
+    try:
+        with urllib.request.urlopen(LITELLM + "/health/liveliness", timeout=5) as r:
+            return master if r.status == 200 else None
+    except (urllib.error.URLError, OSError):
+        return None
+
+
 def main():
+    check_lab_aliases()
     names = [(n, "harness") for n in HARNESS_KEYS] + [(n, "user") for n in SPARK_USERS]
     if not names:
         log("HARNESS_KEYS and SPARK_USERS are empty; nothing to do")
@@ -125,34 +317,42 @@ def main():
         if entry not in todo:
             log("keep    keys/%s.key (exists)" % entry[0])
 
-    if todo:
-        if DRY:
-            for n, k in todo:
-                log("would create %s key %s (rpm 60, 4 parallel)" % (k, n))
-        else:
-            master = env_get(GW_ENV, "LITELLM_MASTER_KEY")
-            if not master or master == "CHANGEME":
-                sys.exit("provision-keys: LITELLM_MASTER_KEY not set in " + GW_ENV)
-            if not wait_healthy():
-                sys.exit("provision-keys: LiteLLM not healthy at " + LITELLM)
-            os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
-            for n, kind in todo:
-                if alias_exists(master, n):
-                    log("SKIP    %s: alias exists in LiteLLM but keys/%s.key is missing. "
-                        "Restore the file from backup, or delete/regenerate the key in the "
-                        "LiteLLM UI and write it to keys/%s.key" % (n, n, n))
-                    continue
-                res = api("POST", "/key/generate", master, dict(
-                    LIMITS, key_alias=n,
-                    metadata={"kind": kind, "created_by": "provision-keys"}))
-                key = res.get("key", "")
-                if not key:
-                    sys.exit("provision-keys: no key returned for " + n)
-                path = os.path.join(KEY_DIR, n + ".key")
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w") as f:
-                    f.write(key + "\n")
-                log("created %s key %s -> keys/%s.key" % (kind, n, n))
+    master = None
+    if DRY:
+        for n, k in todo:
+            models, lab = desired(n, k)
+            log("would create %s key %s (rpm 60, 4 parallel, models %s%s) unless the alias exists"
+                % (k, n, fmt_models(models), ", lab" if lab else ""))
+    elif names:
+        master = env_get(GW_ENV, "LITELLM_MASTER_KEY")
+        if not master or master == "CHANGEME":
+            sys.exit("provision-keys: LITELLM_MASTER_KEY not set in " + GW_ENV)
+        if not wait_healthy():
+            sys.exit("provision-keys: LiteLLM not healthy at " + LITELLM)
+
+    if todo and not DRY:
+        os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+        for n, kind in todo:
+            if alias_exists(master, n):
+                log("SKIP    %s: alias exists in LiteLLM but keys/%s.key is missing. "
+                    "Restore the file from backup, or delete/regenerate the key in the "
+                    "LiteLLM UI and write it to keys/%s.key" % (n, n, n))
+                continue
+            models, lab = desired(n, kind)
+            res = api("POST", "/key/generate", master, dict(
+                LIMITS, key_alias=n, models=models,
+                metadata={"kind": kind, "created_by": "provision-keys", "lab": lab}))
+            key = res.get("key", "")
+            if not key:
+                sys.exit("provision-keys: no key returned for " + n)
+            path = os.path.join(KEY_DIR, n + ".key")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(key + "\n")
+            log("created %s key %s -> keys/%s.key" % (kind, n, n))
+
+    if names:
+        sync_models(names, dry_master() if DRY else master)
 
     # Open WebUI connection keys
     cur = env_get(WEBUI_ENV, "OPENAI_API_KEYS")

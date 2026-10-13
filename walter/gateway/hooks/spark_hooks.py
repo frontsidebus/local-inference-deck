@@ -34,6 +34,14 @@ max_output_tokens (responses), max_tokens (messages). The per-model maxima
 match model_info.max_tokens in litellm.yaml and the `-n` backstop in the
 llama-swap config (llama-server's -n is only a default: a request that asks
 for more gets more, so the clamp has to happen here).
+
+Third job: lab guard (runs first, fails closed). Research models are named
+lab/<name> in LiteLLM and lab-<name> in llama-swap. A request whose model,
+after the gateway's own routing (local/<id> -> <id>, openai/<id>), is lab/...
+or lab-... is refused with 403 unless the key's metadata has lab: true
+(provision-keys.py sets it for LAB_KEY_ALIASES). This also closes the local/*
+wildcard, which would otherwise reach any llama-swap ID (local/lab-x). The
+refusal is logged with the model, call type and key alias, never the prompt.
 """
 
 import logging
@@ -294,8 +302,65 @@ def cap_output(data, call_type):
     return changes
 
 
+# --- lab guard -----------------------------------------------------------------
+try:
+    from fastapi import HTTPException as _HTTPException
+except ImportError:  # tests run without LiteLLM / FastAPI
+    class _HTTPException(Exception):
+        def __init__(self, status_code, detail=None):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+# route prefixes the gateway strips before llama-swap sees the ID (litellm.yaml: local/* -> openai/*)
+_ROUTE_PREFIXES = ("local/", "openai/")
+
+
+def resolve_model(model):
+    """The name a request ends up at: lower-cased, route prefixes removed (repeatedly)."""
+    if not isinstance(model, str):
+        return ""
+    m = model.strip().lower()
+    changed = True
+    while changed:
+        changed = False
+        for p in _ROUTE_PREFIXES:
+            if m.startswith(p):
+                m, changed = m[len(p):].lstrip(), True
+    return m
+
+
+def is_lab_model(model):
+    """lab/<name> (LiteLLM) or lab-<name> (llama-swap), directly or through local/* / openai/*.
+
+    Every path segment is checked, so no prefix spelling reaches a lab ID."""
+    for seg in resolve_model(model).split("/"):
+        seg = seg.strip()
+        if seg == "lab" or seg.startswith("lab-"):
+            return True
+    return False
+
+
+def key_has_lab(user_api_key_dict):
+    meta = getattr(user_api_key_dict, "metadata", None)
+    return isinstance(meta, dict) and meta.get("lab") is True
+
+
+def lab_guard(user_api_key_dict, data, call_type):
+    """Raise 403 for a lab model without lab key metadata. Logs no request content."""
+    if not isinstance(data, dict) or not is_lab_model(data.get("model")):
+        return
+    if key_has_lab(user_api_key_dict):
+        return
+    alias = getattr(user_api_key_dict, "key_alias", None)
+    log.warning("spark_hooks: refused lab model %r for key alias %r (%s): key metadata lacks lab=true",
+                data.get("model"), alias, call_type)
+    raise _HTTPException(status_code=403, detail={"error": "model %r needs a lab-enabled key" % data.get("model")})
+
+
 class SparkHooks(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        lab_guard(user_api_key_dict, data, call_type)   # outside the try blocks: never skipped
         try:
             if call_type in ("anthropic_messages", "completion", "acompletion", "text_completion"):
                 tool_defs = []
