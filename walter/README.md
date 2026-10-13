@@ -178,7 +178,28 @@ Remove `$R` afterwards. The next full `deploy.sh` run converges everything else.
 3. **LiteLLM keys.** `provision-keys.py` already created `/srv/gateway/keys/<name>.key` (root 0600) for
    every name in `HARNESS_KEYS` and `SPARK_USERS` (rpm 60, 4 parallel requests, alias = name).
    Hand each key to its harness or user (clients/ expects them in `~/.config/spark/<harness>.key`).
-   Add a name to site.env and re-run deploy to add a key. Admin UI: `http://${BACKEND_WG_IP}:4000/ui`,
+   Add a name to site.env and re-run deploy to add a key.
+   - **Model allow-lists.** Every key gets an explicit `models` list by class (`KEY_CLASSES` in
+     `gateway/provision-keys.py.tmpl`); a LiteLLM key with an empty list could call every model:
+
+     | Class | Keys | `models` |
+     |---|---|---|
+     | agent | every harness except the two below (`claude-code`, `codex`, `opencode`, `hermes`; the judge and the evals use the hermes key) | the aliases (`coder`, `coder-fast`, `big`, `flash`, `vision`, `hermes`), `local/*`, `claude-*` |
+     | open-webui | `open-webui` | the aliases, `local/*` |
+     | digest | `digest` | the aliases |
+     | user | `SPARK_USERS` | the aliases, `local/*`, `claude-*`; plus `lab` for names in `LAB_KEY_ALIASES` |
+
+     Each run also brings **existing** managed keys to their list (`POST /key/update`, only where
+     they differ) and lists keys it does not manage without touching them. Preview first; the dry
+     run reads the live keys (read-only) and prints `alias: old models -> new models`, never a key:
+     `sudo /srv/gateway/provision-keys.py --dry-run`, then `sudo /srv/gateway/provision-keys.py`
+     (or re-run deploy). `[] (ALL models)` in the old column is a key without an allow-list.
+   - **Lab access.** Lab models are `lab/<name>` in LiteLLM and `lab-<name>` in llama-swap. The
+     gateway hook (`hooks/spark_hooks.py`) refuses them with 403, also as `local/lab-<name>`, unless
+     the key's metadata has `lab: true`. To enable a key, put its `SPARK_USERS` name in
+     `LAB_KEY_ALIASES` (site.env) and re-run provision-keys; harness keys are refused there. The
+     key then has `metadata.lab=true` and the `lab` access group. Removing the name sets
+     `lab: false` on the next run. The master key has no lab metadata, so it is refused too. Admin UI: `http://${BACKEND_WG_IP}:4000/ui`,
    user `admin`, password = `LITELLM_MASTER_KEY` from `/srv/gateway/.env`.
 4. **Pocket-ID / OIDC bootstrap** (below).
 5. **Open WebUI break-glass admin** (below).

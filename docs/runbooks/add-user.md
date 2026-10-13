@@ -78,11 +78,15 @@ cd /srv/gateway
 set -a; . ./.env; set +a
 curl -s http://${BACKEND_WG_IP}:4000/key/generate \
   -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H 'Content-Type: application/json' \
-  -d '{"key_alias":"alice","rpm_limit":60,"max_parallel_requests":4}' \
+  -d '{"key_alias":"alice","rpm_limit":60,"max_parallel_requests":4,
+       "models":["coder","coder-fast","big","flash","vision","hermes","local/*","claude-*"],
+       "metadata":{"kind":"user","lab":false}}' \
   | jq -r .key | sudo install -m 600 /dev/stdin keys/alice.key
 ```
 
-All keys use the same limits (60 rpm, 4 parallel requests); spend and usage are attributed per key. Add the name to `SPARK_USERS` in your local `site.env` so `scripts/gen-secrets.sh` and the docs stay in sync with reality.
+All keys use the same limits (60 rpm, 4 parallel requests); spend and usage are attributed per key. **Always set `models`:** a key without it can call every model, including lab models once they exist. Easier: add the name to `SPARK_USERS` in `site.env` and re-run deploy (or `sudo /srv/gateway/provision-keys.py`), which creates the key with the `user` allow-list and keeps it in sync (classes in [walter/README.md](../../walter/README.md#after-the-first-deploy)). Add the name to `SPARK_USERS` either way, or provision-keys reports the key as unmanaged.
+
+A user gets lab models (`lab/<name>`) only when their name is also in `LAB_KEY_ALIASES`; leave it out for everyone but the owner.
 
 Hand the key over once, out of band. The user stores it in a file (mode 600) and points their harness at `https://${SPARK_API_HOST}/v1` (see [clients/](../../clients/README.md) for each harness's settings).
 
@@ -97,7 +101,7 @@ Hand the key over once, out of band. The user stores it in a file (mode 600) and
 1. Pocket-ID: disable or delete the user (this ends new logins; also revoke their sessions). To take away one site only, remove them from that site's group instead.
 2. Open WebUI: Admin Panel → Users → delete (or set to `pending` to keep their chats).
 3. LiteLLM: `POST /key/delete` with their key, and remove `keys/<name>.key`.
-4. Remove the name from `SPARK_USERS`.
+4. Remove the name from `SPARK_USERS` (and from `LAB_KEY_ALIASES`, or provision-keys refuses to run).
 
 Existing telemetry and digest sessions last until their cookie expires (12 hours). To end them at
 once, restart that oauth2-proxy instance after rotating its cookie secret (see
