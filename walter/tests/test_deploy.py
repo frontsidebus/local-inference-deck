@@ -316,3 +316,29 @@ def test_no_stack_bind_mounts_a_doc_file():
     for tmpl in sorted((REPO / "walter").glob("*/compose.yaml.tmpl")):
         for m in re.finditer(r"^\s*-\s*(\./[^:\s]+):", tmpl.read_text(), flags=re.M):
             assert not re.search(r"\.(md|example)$", m.group(1)), f"{tmpl}: {m.group(1)}"
+
+
+# ---- deploy.sh --destdir: model container hardening ------------------------------------------
+
+def test_model_files_made_world_readable_and_network_step(tmp_path):
+    # The model containers run as uid 10010: deploy makes every GGUF under MODELS_DIR/gguf world-readable,
+    # and (destdir) only reports the llama-net step.
+    root = tmp_path / "root"
+    gguf = root / "models/gguf/m"
+    gguf.mkdir(parents=True)
+    f = gguf / "x.gguf"
+    f.write_text("GGUF")
+    f.chmod(0o600)
+    gguf.chmod(0o700)
+    dry = deploy(root, write_env(tmp_path), "--dry-run")
+    assert "would chmod o+rX 2 paths under /models/gguf" in dry and f.stat().st_mode & 0o777 == 0o600
+    out = deploy(root, write_env(tmp_path))
+    assert "chmod o+rX 2 paths under /models/gguf (model containers run as uid 10010)" in out
+    assert f.stat().st_mode & 0o777 == 0o604 and gguf.stat().st_mode & 0o777 == 0o705
+    assert "would ensure docker network llama-net (bridge br-llama, icc off)" in out
+    again = deploy(root, write_env(tmp_path))
+    assert "model files readable by uid 10010" in again and "chmod o+rX" not in again
+    # the config is installed after the firewall script and the network step (llama-swap reloads at once)
+    cfg, fw, net = (out.index(s) for s in ("/etc/llama-swap/config.yaml", "/usr/local/sbin/docker-user-rules.sh",
+                                          "would ensure docker network llama-net"))
+    assert fw < net < cfg

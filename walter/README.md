@@ -14,14 +14,16 @@ edge (Covenant) ──wg0──► BACKEND_WG_IP
                            :3300  digest app      (/srv/digest, host network; ufw: only EDGE_WG_IP on wg0; optional)
                            :8080  llama-swap      (systemd, user llamaswap; ufw: only GATEWAY_DOCKER_SUBNET)
                            :22    sshd            (all addresses; ufw: hypervisor bridge subnet on BACKEND_LAN_IF, EDGE_WG_IP on wg0)
-                                    └─► llama-server containers on 127.0.0.1:<dynamic> (GPU0 / GPU1 / both)
+                                    └─► llama-server containers on 127.0.0.1:<dynamic> (GPU0 / GPU1 / both;
+                                        uid 10010, network llama-net with no egress, only ${MODELS_DIR}/gguf mounted)
                     127.0.0.1:3001/9090/...  monitoring (/srv/monitoring, host network, SSH tunnel only)
 ```
 
 Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `coder-fast`, `big`,
 `vision`, `hermes`, `local/*`, `claude-*`; every request gets a bounded output limit, see
 [Output cap](#output-cap-no-unbounded-generations)) → llama-swap `:8080` → llama.cpp `llama-server`
-(image pinned by digest). Models and the GPU matrix are in `llama-swap/config.yaml.tmpl` and
+(image pinned by digest; each model runs in a hardened container, see
+[Model container hardening](#model-container-hardening)). Models and the GPU matrix are in `llama-swap/config.yaml.tmpl` and
 [`models.md`](models.md).
 
 ## Layout (repo → host)
@@ -44,7 +46,7 @@ Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `co
 | `backup/*` | `/usr/local/sbin/spark-backup*.sh`, units, `${MODELS_DIR}/backups/RESTORE.md` | nightly local backup + non-destructive restore test ([RESTORE](backup/RESTORE.md.tmpl)) |
 | `backup/spark-offsite*`, `backup/offsite-setup.sh` | `/usr/local/sbin/spark-offsite.sh`, `spark-offsite.{service,timer}`, `/usr/local/bin/restic`, `/etc/spark-restic/` | optional encrypted offsite copy of the backups (restic to S3, bucket-scoped IAM user), when `RESTIC_BUCKET` is set ([OFFSITE](backup/OFFSITE.md)) |
 | `update-check/*` | `/usr/local/sbin/spark-update-check.py`, units, `/etc/update-motd.d/90-spark-updates`, `/var/lib/spark-update-check/README.md` | weekly report-only update/advisory check ([README](update-check/README.md.tmpl)) |
-| `firewall/docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/`, `/etc/systemd/system/` | `WALTER-PUBLISHED` chain in DOCKER-USER |
+| `firewall/docker-user-rules.sh.tmpl` + `.service` | `/usr/local/sbin/`, `/etc/systemd/system/` | `WALTER-PUBLISHED` chain in DOCKER-USER; `WALTER-LLAMA-EGRESS` (no egress from the model containers' bridge `br-llama`, see [Model container hardening](#model-container-hardening)) |
 | `firewall/ufw-rules.sh.tmpl` | `/usr/local/sbin/ufw-rules.sh` | ufw defaults (deny in/routed) + INPUT allows: SSH 22 only from the hypervisor bridge subnet (kernel route of `BACKEND_LAN_IF`, must contain `HYPERVISOR_BRIDGE_IP`) and from `EDGE_WG_IP` on wg0, `GATEWAY_DOCKER_SUBNET` → 8080, `EDGE_WG_IP` on wg0 → 3200 (and 3300 with the digest); deletes the legacy any-source `allow 22/tcp` after the scoped allows exist ([firewall/README.md](firewall/README.md)) |
 | `hermes/*` | `~${BACKEND_SSH_USER}/.local/bin/hermes-spark`, merged into `~/.hermes/config.yaml` | optional, `--with-hermes` |
 
@@ -92,7 +94,8 @@ sudo walter/deploy.sh                    # do it (idempotent, but it converges t
 `deploy.sh` steps: render → apt packages (Docker, WireGuard tools, ufw, NVIDIA driver 580, container
 toolkit 1.20.1-1, `nvidia-ctk runtime configure`) → `llamaswap` system user (uid 995/gid 987 when
 free) and `docker` group membership → fstab line + mount for `${MODELS_DIR}` → llama-swap binary
-(download, sha256 check) → install files → create `.env` files from their `.example` (never
+(download, sha256 check) → install files (the llama-swap config last, after the model containers'
+no-egress rule and the `llama-net` network exist; model files made world-readable) → create `.env` files from their `.example` (never
 overwrites; reports drift) → `scripts/gen-secrets.sh walter` → enable units
 (`nvidia-persistenced`, `wg-quick@wg0`, `docker-user-rules`, `docker`, `llama-swap`,
 `spark-backup.timer`, `spark-update-check.timer`) and run `ufw-rules.sh` → offsite backups
@@ -352,12 +355,116 @@ curl -s 127.0.0.1:<port>/slots | jq '.[].params.n_predict'   # 16384 after a gat
 sudo docker logs --since 10m gateway-litellm-1 2>&1 | grep 'output cap'
 ```
 
+## Model container hardening
+
+The llama-server containers parse untrusted input: GGUF files from Hugging Face and every prompt, image and chat
+template that reaches a model. GGUF parser heap overflows are a live class of bug in llama.cpp. Before this change a
+container ran as **root** (both pinned images set no `USER`: their config has no `User` field), with all default
+capabilities, open egress, and `${MODELS_DIR}` mounted whole, which includes `${MODELS_DIR}/backups/`: the nightly
+snapshots with the gateway `.env`, LiteLLM keys and database dumps. One parser RCE could have read every secret and
+sent it out. llama-swap also kept the last 5 MB of request and response bodies in memory (v260's default
+`captureBuffer`) and served them at `/api/captures/{id}` to every holder of its API key.
+
+Every model now starts through the `run` macro in `llama-swap/config.yaml.tmpl`, which adds:
+
+| control | flag | why |
+|---|---|---|
+| model files only | `-v ${MODELS_DIR}/gguf:/models/gguf:ro` | `backups/`, `logs/` and `fetch-models.sh` are not visible. In-container paths (`/models/gguf/...`) are unchanged, so no `-m`/`--mmproj`/`-md` path moved and no file moved on disk: the GGUFs were already under `gguf/`. |
+| non-root | `--user 10010:10010`, `-e HOME=/tmp` | uid 10010 owns nothing on the host. Model files must be world-readable: `fetch-models.sh` sets `umask 022`, and `deploy.sh` runs `chmod o+rX` on anything under `gguf/` that is not. The NVIDIA runtime creates the GPU device nodes world-accessible. |
+| no privileges | `--cap-drop ALL --security-opt no-new-privileges` | llama-server needs no capability. |
+| immutable root | `--read-only --tmpfs /tmp:rw,nosuid,nodev,size=1g` | llama-server writes nothing outside `/tmp` (the CUDA JIT cache, via `HOME`). `/dev/shm` stays a separate tmpfs (`--shm-size 2g` for tensor split). |
+| limits | `--pids-limit 512`; `${mem}` = `--memory 32g` or `${mem-moe}` = `--memory 64g` (swap equal: no swapping) | Bounds a runaway or fork bomb. See the sizing note below. |
+| no egress | `--network llama-net` + chain `WALTER-LLAMA-EGRESS` | See below. |
+| no captures | `captureBuffer: 0` | Request and response bodies are not kept by llama-swap. |
+
+`tests/test_llama_swap_config.py` renders the template with `site.env.example` and checks every model's
+command for these flags, that no mount covers `${MODELS_DIR}` itself or `backups/`, that every `/models/...`
+path given to llama-server is under the mount and is a file `fetch-models.sh` downloads, and that
+`captureBuffer` is 0. `firewall/tests/test_docker_user_rules.py` checks the egress chain.
+
+**No egress: why a firewalled bridge, not `--internal`.** llama-swap reaches each model on its published port
+`127.0.0.1:${PORT}`. Docker does not publish ports for containers on an `--internal` network
+([moby#36174](https://github.com/moby/moby/issues/36174)), and `--network none` has no ports at all. So
+`deploy.sh` creates a normal user-defined bridge, `llama-net`, with a fixed bridge interface name `br-llama`
+(`com.docker.network.bridge.name`) and inter-container traffic off (`enable_icc=false`).
+`docker-user-rules.sh` adds chain `WALTER-LLAMA-EGRESS` at the top of `DOCKER-USER`: a packet forwarded from
+`br-llama` passes only if it belongs to an existing connection (`ESTABLISHED,RELATED`); everything else is
+dropped. That covers the internet, the LAN, wg0, the other Docker networks and the other model containers. DNS
+through Docker's embedded resolver is forwarded from the container's namespace for non-loopback upstreams, so it
+is dropped as well (not tested on Walter). The published-port path is host-originated (docker-proxy or the
+OUTPUT DNAT, then INPUT for the replies) and never traverses FORWARD, so it keeps working. A container's
+connection to an address of Walter itself goes to INPUT, where ufw's default `deny incoming` applies: every ufw
+allow is scoped to another source (the hypervisor bridge subnet, `EDGE_WG_IP`, `GATEWAY_DOCKER_SUBNET`). The rule
+matches the interface name, so it is in place before the bridge exists; `deploy.sh` refuses an existing
+`llama-net` whose bridge is not `br-llama`. IPv6 is not enabled on `llama-net`.
+
+**Memory sizing (to confirm on the host).** The cap counts RAM and the page cache the container faults in.
+Clean model pages are reclaimed at the cap rather than OOM-killed, so the cap mostly bounds anonymous memory.
+GPU-resident models need a few GB of RAM (CPU token embeddings, the prompt cache of up to 8 GiB, buffers); 32g
+also leaves most of `big`'s 39 GB file in the page cache for a warm reload. `flash` keeps about 17 GB of experts
+in RAM (`-ot ...=CPU`) and reads the 28.8 GB n-gram table on demand: 64g, which leaves about 16 GB of the 80 GiB
+VM for the other stacks. Watch `docker stats` during the first `flash` load and a long request; if it sits at the
+cap, raise `mem-moe`.
+
+**Not covered:** the GPU driver and the NVIDIA container runtime are still shared attack surface; a container
+can still read the other model files (all public weights) and use its GPUs.
+
+### Deploying the hardening
+
+The change restarts **every model**: llama-swap reloads the new config at once (`--watch-config`) and the
+containers come back with new arguments. It also changes the **serving identity** the eval gate records
+(`llama_swap_cmd_sha256`), and the C1 D8 pins in `evals/plans/c1-interventions.json` were re-pinned to the
+hardened flash command.
+
+1. **When:** after the gate calibration scheduled for 2026-10-13 (`gate.py calibrate` for `coder` and
+   `coder-fast` captures the A/A and the baseline on the old serving identity). Deploy afterwards, never during an
+   eval or gate run, with the GPUs idle (`nvidia-smi`).
+2. **Dry run:** `sudo walter/deploy.sh --dry-run`. Expect `new /usr/local/sbin/docker-user-rules.sh`,
+   `new /etc/llama-swap/config.yaml`, `new ${MODELS_DIR}/fetch-models.sh`, `would ensure docker network llama-net`
+   and, if any model file is not world-readable, `would chmod o+rX <n> paths under ${MODELS_DIR}/gguf`. No file
+   layout change is needed.
+3. **Deploy:** `sudo walter/deploy.sh`. Order inside the run: the new `docker-user-rules.sh` is installed and run,
+   `llama-net` is created, model files are made world-readable, and only then `config.yaml` is installed (which
+   triggers the reload). Narrow alternative, in the same order:
+   ```bash
+   sudo install -m 0755 "$R/firewall/docker-user-rules.sh" /usr/local/sbin/ && sudo /usr/local/sbin/docker-user-rules.sh
+   sudo docker network create --driver bridge --label spark.role=llama-models \
+     -o com.docker.network.bridge.name=br-llama -o com.docker.network.bridge.enable_icc=false llama-net
+   sudo find ${MODELS_DIR}/gguf \( \( -type d ! -perm -o=rx \) -o \( -type f ! -perm -o=r \) \) -exec chmod o+rX {} +
+   sudo cp -a /etc/llama-swap/config.yaml /etc/llama-swap/config.yaml.bak-harden-$(date +%Y%m%d-%H%M%S)
+   sudo install -m 0640 -o root -g llamaswap "$R/llama-swap/config.yaml" /etc/llama-swap/config.yaml
+   ```
+4. **Verify** (next section), then run the gate: `python3 evals/gate.py check --model coder --yes` and
+   `python3 evals/gate.py check --model coder-fast --yes` (about 2.0 h and 1.3 h). The weights and server flags
+   are unchanged, so the expected verdict is PASS or a hold with no per-suite regression.
+5. **Rollback:** restore the `config.yaml.bak-harden-*` copy (`install -m 0640 -o root -g llamaswap`); llama-swap
+   reloads it. The network and the egress chain are harmless without it and can stay.
+
+### Verify after deploy
+
+```bash
+C=qwen3.8-27b                                    # coder; repeat for qwen3.6-35b-a3b, and load vision/hermes/flash once
+sudo docker exec $C id -u                                                   # 10010, not 0
+sudo docker exec $C sh -c 'ls /models; test -e /models/backups && echo EXPOSED || echo "no backups"'   # gguf / no backups
+sudo docker exec $C sh -c 'touch /x 2>/dev/null && echo WRITABLE || echo read-only'                   # read-only
+sudo docker exec $C curl -sS -m 5 -o /dev/null https://example.com && echo EGRESS-OPEN || echo "egress blocked"
+sudo docker inspect $C --format '{{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}'
+sudo iptables -S WALTER-LLAMA-EGRESS; sudo iptables -S DOCKER-USER       # the DROP rule; jumps to both chains
+K=$(sudo cat /srv/gateway/keys/claude-code.key)                            # an inference request still works
+curl -s http://${BACKEND_WG_IP}:4000/v1/chat/completions -H "Authorization: Bearer $K" -H 'Content-Type: application/json' \
+  -d '{"model":"coder","max_tokens":64,"messages":[{"role":"user","content":"Say OK."}]}' | jq -r '.choices[0].message'; unset K
+```
+
+Also load `vision` (an image request) and `hermes` once: they use tensor split, and NCCL's shared-memory path is
+the part most likely to notice the non-root user. Load `flash` and watch `sudo docker stats --no-stream` for its
+memory against the 64g cap. If a model fails to start, `journalctl -u llama-swap -n 100` shows the docker error.
+
 ## Verify
 
 ```bash
 systemctl is-active llama-swap docker-user-rules wg-quick@wg0 nvidia-persistenced
 nvidia-smi --query-gpu=name,persistence_mode,pcie.link.gen.max,pcie.link.width.current --format=csv   # Enabled, 4, 8 on both
-sudo iptables -S WALTER-PUBLISHED; sudo ufw status verbose
+sudo iptables -S WALTER-PUBLISHED; sudo iptables -S WALTER-LLAMA-EGRESS; sudo ufw status verbose
 for s in gateway webui monitoring telemetry digest; do sudo docker compose -f /srv/$s/compose.yaml ps; done   # all (healthy)
 K=$(sudo cat /srv/gateway/keys/claude-code.key)
 curl -s http://${BACKEND_WG_IP}:4000/v1/models -H "Authorization: Bearer $K" | jq -r '.data[].id'; unset K
