@@ -281,7 +281,7 @@ def estimate(headers: list, ctx: int, *, kv_type: str = "q8_0", mmproj_bytes: in
              ram_budget_gb: float = RAM_BUDGET_GIB) -> Fit:
     """Estimate the per-GPU VRAM of serving `headers` (all shards of one model) at context `ctx`.
 
-    placement "auto" applies lifecycle.md's rules: one GPU if <= 22.5 GiB; else both (dense: -sm tensor, MoE:
+    placement "auto" applies the placement rules (walter/models/README.md, "Fit calculator"): one GPU if <= 22.5 GiB; else both (dense: -sm tensor, MoE:
     -sm layer -ts 1,1); else MoE with the experts of the fewest layers on the CPU within ram_budget_gb; else none.
     Pass placement ("gpu0"|"gpu1"|"both"|"both+cpu-experts") with split / cpu_expert_layers to evaluate a fixed
     configuration (that is how the calibration runs). mtp=True loads the model's own nextn/MTP layers;
