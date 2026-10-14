@@ -472,3 +472,166 @@ def test_as_dict_is_json_ready():
     d = fit.estimate(model(), 8192).as_dict()
     json.dumps(d)
     assert set(d) >= {"placement", "vram_gb", "speed_class", "warnings", "split", "fits"}
+
+
+# --- cli_fit: `spark-model search` / `spark-model fit` against a stub Hub (no network) -------------------------
+import argparse  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+import urllib.parse  # noqa: E402
+
+import cli_fit  # noqa: E402
+import hf  # noqa: E402
+
+SHA = "c" * 40
+
+
+class StubHub:
+    """A fetch() for hf.py: serves revision info, search results and Range reads of synthetic GGUFs."""
+
+    def __init__(self, files: dict, card=None, gated=False):
+        self.files = files                   # path -> bytes (a GGUF header is enough)
+        self.card = card or {"license": "apache-2.0"}
+        self.gated = gated
+        self.urls = []
+
+    def __call__(self, url, headers, max_body, timeout):
+        self.urls.append(url)
+        u = urllib.parse.urlsplit(url)
+        if u.path.startswith("/api/models/org/model/revision/"):
+            sib = [{"rfilename": p, "size": len(b) if not p.endswith("big.gguf") else 10**9,
+                    "lfs": {"sha256": "d" * 64}} for p, b in self.files.items()]
+            body = {"sha": SHA, "siblings": sib, "cardData": self.card, "gated": self.gated, "tags": []}
+            return hf.Response(200, {}, json.dumps(body).encode())
+        if u.path == "/api/models":
+            body = [{"id": "org/model", "downloads": 3, "gguf": {"architecture": "llama", "total": 8e9}},
+                    {"id": "other/huge", "gguf": {"architecture": "llama", "total": 400e9}},
+                    {"id": "other/weird", "gguf": {"architecture": "brandnew", "total": 8e9}},
+                    {"id": "other/proj", "gguf": {"architecture": "clip", "total": 4e8}}]
+            return hf.Response(200, {}, json.dumps(body).encode())
+        m = re.match(rf"^/org/model/resolve/{SHA}/(.+)$", u.path)
+        if m:
+            data = self.files[urllib.parse.unquote(m.group(1))]
+            a, b = (int(x) for x in headers["Range"].split("=")[1].split("-"))
+            chunk = data[a:b + 1]
+            return hf.Response(206, {"content-range": f"bytes {a}-{a + len(chunk) - 1}/{len(data)}"}, chunk)
+        return hf.Response(404, {"x-error-code": "EntryNotFound"}, b"")
+
+
+def serve_model(split=0, **kw):
+    """Bytes of synthetic GGUF headers: a single file, or `split` shards."""
+    hs = model(**kw)
+    kv = dict(hs[0].kv)
+    tensors = [(t.name, t.shape, t.ggml_type) for t in hs[0].tensors]
+    if not split:
+        return {"Q4_K_M/m-Q4_K_M.gguf": build_test_gguf(kv, tensors)}
+    out = {}
+    per = -(-len(tensors) // split)
+    for i in range(split):
+        skv = {"split.no": Typed("u16", i), "split.count": Typed("u16", split)}
+        if i == 0:
+            skv = {**kv, **skv}
+        out[f"Q8_0/m-Q8_0-{i + 1:05d}-of-{split:05d}.gguf"] = build_test_gguf(skv, tensors[i * per:(i + 1) * per])
+    return out
+
+
+def cli(argv, stub, env=None):
+    ap = argparse.ArgumentParser()
+    cli_fit.add_parsers(ap.add_subparsers(dest="cmd", required=True))
+    args = ap.parse_args(argv)
+    args.fetch = stub
+    args.endpoint = "https://huggingface.co"
+    args.env = env if env is not None else {"LAB_HF_ORGS": "org"}
+    return args.func(args)
+
+
+@pytest.fixture(autouse=True)
+def _clear_hf_cache():
+    hf._INFO.clear()
+
+
+def test_cli_fit_single_file_json(capsys):
+    files = serve_model()
+    files["mmproj-F16.gguf"] = build_test_gguf({"general.architecture": "clip"}, [])
+    files["README.md"] = b"x"
+    stub = StubHub(files)
+    assert cli(["fit", "org/model", "--ctx", "32768", "--json"], stub) == 0
+    r = json.loads(capsys.readouterr().out)
+    assert r["revision"] == SHA and r["quant"] == "Q4_K_M/m-Q4_K_M.gguf" and r["mmproj"] is None
+    assert r["fit"]["placement"] == "gpu1" and r["fit"]["fits"] and r["arch_supported"]
+    assert r["chat_template"]["present"] and r["chat_template"]["bytes"] == len(TMPL)
+    assert r["license"] == "apache-2.0" and r["license_flag"] is None
+    assert r["registry_fit"]["speed_class"] in "AB"
+    assert all("Range" not in u for u in stub.urls)                 # range goes in a header, not the URL
+    assert cli(["fit", "org/model", "--ctx", "32768", "--mmproj", "--json"], StubHub(files)) == 0
+    assert json.loads(capsys.readouterr().out)["mmproj"]["path"] == "mmproj-F16.gguf"
+
+
+def test_cli_fit_shards_and_text_output(capsys):
+    stub = StubHub(serve_model(split=3), card={"license": "cc-by-nc-4.0"}, gated="manual")
+    assert cli(["fit", "org/model@main", "--file", "Q8_0"], stub) == 0
+    out = capsys.readouterr().out
+    assert "(+2 shard(s))" in out and "[noncommercial]" in out and "gated: manual" in out
+    assert "placement" in out and "GPU1" in out and "class" in out
+    reads = [u for u in stub.urls if "/resolve/" in u]
+    assert len(reads) == 3
+
+
+def test_cli_fit_errors(capsys):
+    files = serve_model()
+    files["Q8_0/m-Q8_0.gguf"] = files["Q4_K_M/m-Q4_K_M.gguf"]
+    assert cli(["fit", "org/model", "--file", "*.gguf"], StubHub(files)) == 2
+    err = capsys.readouterr().err
+    assert "narrow it" in err and "Q8_0/m-Q8_0.gguf" in err
+    assert cli(["fit", "org/model"], StubHub({"model.safetensors": b"x"})) == 2
+    assert "no .gguf" in capsys.readouterr().err
+    assert cli(["fit", "bad repo"], StubHub({})) == 2
+    files = {"Q4_K_M/m.gguf": b"NOTGGUF" + b"\0" * 64}
+    assert cli(["fit", "org/model"], StubHub(files)) == 2
+    assert "magic" in capsys.readouterr().err
+
+
+def test_cli_search(capsys):
+    stub = StubHub({})
+    assert cli(["search", "model", "--json"], stub) == 0
+    rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows["org/model"]["allowed"] and not rows["other/huge"]["allowed"]
+    assert rows["org/model"]["fit_badge"].startswith("~1 GPU")
+    assert rows["other/huge"]["fit_badge"].startswith("too big")
+    assert "not in b11277" in rows["other/weird"]["fit_badge"]
+    assert rows["other/proj"]["fit_badge"] == "?"
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(stub.urls[0]).query)
+    assert q["filter"] == ["gguf"]
+    assert cli(["search", "model"], StubHub({}), env={}) == 0
+    out = capsys.readouterr().out
+    assert "NOT-ALLOWED" in out and "LAB_HF_ORGS is empty" in out
+
+
+def test_allowed_orgs_reads_only_that_key(tmp_path):
+    p = tmp_path / "site.env"
+    p.write_text('SPARK_DOMAIN=example.com\nLAB_HF_ORGS="unsloth  someorg"   # comment\n')
+    assert cli_fit.allowed_orgs({}, p) == {"unsloth", "someorg"}
+    assert cli_fit.allowed_orgs({"LAB_HF_ORGS": "x"}, p) == {"x"}
+    assert cli_fit.allowed_orgs({}, tmp_path / "missing") == set()
+
+
+def test_quant_grouping_and_choice():
+    files = [{"path": p, "size": s, "sha256": None} for p, s in [
+        ("BF16/m-BF16-00001-of-00002.gguf", 50), ("BF16/m-BF16-00002-of-00002.gguf", 5), ("m-Q4_K_M.gguf", 20),
+        ("m-UD-Q4_K_XL.gguf", 21), ("m-Q8_0.gguf", 30), ("mmproj-F16.gguf", 1), ("MTP/mtp-m-Q8_0.gguf", 2)]]
+    g = cli_fit.group_quants(files)
+    assert set(g) == {"BF16/m-BF16.gguf", "m-Q4_K_M.gguf", "m-UD-Q4_K_XL.gguf", "m-Q8_0.gguf"}
+    assert len(g["BF16/m-BF16.gguf"]) == 2
+    assert cli_fit.pick_quant(g, None) == ("m-Q4_K_M.gguf", [])
+    assert cli_fit.pick_quant(g, "q8_0") == ("m-Q8_0.gguf", [])
+    assert cli_fit.pick_quant(g, "BF16")[0] == "BF16/m-BF16.gguf"
+    key, cands = cli_fit.pick_quant(g, "Q4")
+    assert key is None and len(cands) == 2
+
+
+@pytest.mark.parametrize("lic,gated,flag", [
+    ("apache-2.0", False, None), ("mit", "auto", "gated"), ("cc-by-nc-4.0", False, "noncommercial"),
+    ("other", False, "other"), (None, False, "other"), ("gemma", False, "custom"), ("llama3.1", "manual", "custom"),
+    ("cc-by-nc-sa-4.0", False, "noncommercial")])
+def test_license_flag(lic, gated, flag):
+    assert cli_fit._license_flag(lic, gated) == flag
