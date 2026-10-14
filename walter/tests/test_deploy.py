@@ -383,7 +383,7 @@ def test_plain_deploy_installs_agent_and_config_equals_template(tmp_path):
     agent = root / "usr/local/sbin/spark-model-agent"
     assert agent.stat().st_mode & 0o777 == 0o755 and agent.read_text().startswith("#!/usr/bin/python3 -IB\n")
     sudo = (root / "etc/sudoers.d/spark-model")
-    assert sudo.stat().st_mode & 0o777 == 0o440
+    assert sudo.stat().st_mode & 0o777 == 0o440 and sudo.parent.stat().st_mode & 0o777 == 0o750
     rules = [l for l in sudo.read_text().splitlines() if l and not l.startswith("#")]
     assert rules == ["Defaults!/usr/local/sbin/spark-model-agent env_reset, !setenv",
                      "operator ALL=(root) NOPASSWD: /usr/local/sbin/spark-model-agent"]

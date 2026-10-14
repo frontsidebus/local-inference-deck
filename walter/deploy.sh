@@ -434,7 +434,18 @@ install_file "$S/models/agent.env"              /etc/spark-model/agent.env      
 if [[ $LIVE == 1 ]] && ! visudo -cqf "$S/models/sudoers-spark-model"; then
   die "walter/models/sudoers-spark-model.tmpl does not pass visudo -c; not installing it"
 fi
-install_file "$S/models/sudoers-spark-model"    /etc/sudoers.d/spark-model                0440 root root
+# Not install_file: its `install -d -m 0755` would loosen /etc/sudoers.d (0750 on Ubuntu).
+SUDOERS_D=/etc/sudoers.d SUDOERS_F=/etc/sudoers.d/spark-model
+if [[ -e $T$SUDOERS_F && ! -r $T$SUDOERS_F ]]; then say "  unreadable $SUDOERS_F (run as root to compare)"
+elif [[ -e $T$SUDOERS_F ]] && cmp -s "$S/models/sudoers-spark-model" "$T$SUDOERS_F"; then :
+else
+  say "  new      $SUDOERS_F"
+  if [[ $DRY == 0 ]]; then
+    [[ -d $T$SUDOERS_D ]] || install -d -m 0750 "$T$SUDOERS_D"
+    if [[ $EUID -eq 0 ]]; then install -m 0440 -o root -g root "$S/models/sudoers-spark-model" "$T$SUDOERS_F"
+    else install -m 0440 "$S/models/sudoers-spark-model" "$T$SUDOERS_F"; fi
+  fi
+fi
 install_file "$S/firewall/docker-user-rules.service" /etc/systemd/system/docker-user-rules.service 0644 root root units
 install_file "$S/firewall/ufw-rules.sh"         /usr/local/sbin/ufw-rules.sh              0755 root root fw-ufw
 
