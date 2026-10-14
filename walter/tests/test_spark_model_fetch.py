@@ -338,3 +338,25 @@ def test_remove_lab_dir_only_touches_its_dir(st, tmp_path):
         F.remove_lab_dir(st, "m3")
     with pytest.raises(F.FetchError, match="bad id"):
         F.remove_lab_dir(st, "../gguf")
+
+
+class _FakeFit:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_fit_fills_the_entry(st, hub, monkeypatch):
+    hub.add(REPO, {"m.gguf": model_gguf()})
+    fake = _FakeFit(vram_gb=[20.04, 21.5], speed_class="C", placement="both+cpu-experts", split="layer",
+                    cpu_override="blk\\.([0-5])\\.ffn_.*_exps\\.=CPU", warnings=["x"], ram_gb=17.0)
+    monkeypatch.setattr(F.fitmod, "estimate", lambda headers, ctx, **kw: fake)
+    p = plan(st, placement="both")
+    assert p.fit == {"vram_gb": [20.0, 21.5], "speed_class": "C", "placement": "both+cpu-experts", "warnings": ["x"]}
+    e = F.entry_from_plan(p)
+    assert e["split"] == "layer" and e["cpu_experts"] == "blk\\.([0-5])\\.ffn_.*_exps\\."
+    R.validate({"schema": R.SCHEMA, "models": [e]})
+    fake.placement = "none"
+    assert any("does not fit" in r for r in plan(st, placement="both").refusals)
+    fake.placement, fake.split = "gpu0", "none"
+    p = plan(st, placement="gpu1")
+    assert any("fit suggests placement gpu0" in w for w in p.warnings) and F.entry_from_plan(p)["cpu_experts"] is None

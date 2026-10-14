@@ -112,6 +112,8 @@ class Plan:
     fit: dict
     warnings: list[str] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
+    split: str = "layer"               # both: from the fit (layer | tensor)
+    cpu_experts: str | None = None     # both: the fit's -ot regex when it puts experts on the CPU
 
     @property
     def ok(self) -> bool:
@@ -436,11 +438,19 @@ def plan_pull(hub, reg: dict, settings: Settings, repo_arg: str, eid: str, place
         src = "repo name"
         if klass is None:
             raise FetchError("pass --class uncensored|abliterated|specialized|base (not detectable from the repo name)")
-    fitd = {}
+    fitd, split, cpu_experts = {}, "layer", None
     if fitmod is not None:
         try:
             byrole = {r: sum(f["bytes"] for f in files if f["role"] == r) for r in ("mmproj", "draft")}
-            fitd = fit_summary(fitmod.estimate(headers, ctx, mmproj_bytes=byrole["mmproj"], draft_bytes=byrole["draft"]))
+            raw = fitmod.estimate(headers, ctx, mmproj_bytes=byrole["mmproj"], draft_bytes=byrole["draft"])
+            fitd = fit_summary(raw)
+            if placement == "both":
+                if getattr(raw, "split", None) in R.SPLITS:
+                    split = raw.split
+                ov = getattr(raw, "cpu_override", None)
+                if fitd.get("placement") == "both+cpu-experts" and isinstance(ov, str) and ov.endswith("=CPU") \
+                        and R.CPU_EXPERTS_RE.match(ov[:-4]):
+                    cpu_experts = ov[:-4]
         except Exception as e:  # the estimate is advisory at pull time
             warnings.append(f"fit estimate failed: {e}")
     else:
@@ -477,7 +487,7 @@ def plan_pull(hub, reg: dict, settings: Settings, repo_arg: str, eid: str, place
     return Plan(id=eid, repo=repo, rev=rev, sha=sha, files=files, placement=placement, ctx=ctx, klass=klass,
                 klass_source=src, total_bytes=total, lab_bytes=lab, quota_bytes=quota, free_bytes=fb, need_free=need,
                 license=lic, card=card, template=tinfo, template_text=tmpl, arch=arch, fit=fitd,
-                warnings=warnings, refusals=refusals)
+                warnings=warnings, refusals=refusals, split=split, cpu_experts=cpu_experts)
 
 
 def _existing(p) -> Path:
@@ -506,8 +516,8 @@ def _check_shards(files: list[dict], headers: list) -> None:
 def entry_from_plan(p: Plan) -> dict:
     return {
         "id": p.id, "repo": p.repo, "revision": p.sha, "files": [dict(f) for f in p.files],
-        "placement": p.placement, "ctx": p.ctx, "n_max": min(8192, p.ctx), "image": "image", "split": "layer",
-        "cpu_experts": None, "sampling": {}, "extra_args": [], "ttl": 900, "class": p.klass,
+        "placement": p.placement, "ctx": p.ctx, "n_max": min(8192, p.ctx), "image": "image", "split": p.split,
+        "cpu_experts": p.cpu_experts, "sampling": {}, "extra_args": [], "ttl": 900, "class": p.klass,
         "tools_allowed": p.klass not in ("uncensored", "abliterated"),
         "license": dict(p.license), "template": dict(p.template), "fit": dict(p.fit), "enabled": False,
         "pinned": False, "added": R.now(), "last_used": None,

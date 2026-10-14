@@ -500,6 +500,8 @@ def cmd_pull(ctx: Ctx, args):
     text.append(f"  chat template: {tp['source']}, {tp['bytes']} bytes, flags: {', '.join(tp['flags']) or 'none'}")
     if plan.fit:
         text.append(f"  fit: {plan.fit}")
+    if plan.placement == "both":
+        text.append(f"  split {plan.split}" + (f", CPU experts -ot {plan.cpu_experts}=CPU" if plan.cpu_experts else ""))
     text += [f"  WARN {w}" for w in plan.warnings]
     text += [f"  REFUSED {r}" for r in plan.refusals]
     if not plan.ok:
