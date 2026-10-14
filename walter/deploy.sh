@@ -116,7 +116,7 @@ USER_HOME=${USER_HOME:-/home/$BACKEND_SSH_USER}
 step "render templates"
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/walter-render.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
-COMPONENTS=(base wireguard llama-swap gateway webui monitoring telemetry backup update-check firewall hermes)
+COMPONENTS=(base wireguard llama-swap models gateway webui monitoring telemetry backup update-check firewall hermes)
 [[ $DIGEST == 1 ]] && COMPONENTS+=(digest)
 for d in "${COMPONENTS[@]}"; do
   rx=()   # offsite off: skip its files (the IAM policy template needs RESTIC_BUCKET)
@@ -221,6 +221,27 @@ models_world_readable() {
   fi
 }
 
+# render_llama_config: /etc/llama-swap/config.yaml from the base (the rendered template) and the lab registry,
+# with the staged agent (walter/models/spark-model-agent). Fails the deploy on an invalid registry rather than
+# installing a config without its lab entries. Prints a line only when config.yaml changes.
+render_llama_config() {
+  local agent=(env SPARK_MODEL_BASE="$S/llama-swap/config.yaml" SPARK_MODEL_CONFIG="$T/etc/llama-swap/config.yaml"
+               SPARK_MODEL_MODELS_DIR="$T$MODELS_DIR" SPARK_MODEL_ENV_FILE="$S/models/agent.env"
+               SPARK_MODEL_LLAMA_SWAP="$T/usr/local/bin/llama-swap" SPARK_MODEL_API_KEY_FILE="$T/etc/llama-swap/api-key"
+               OMP_NUM_THREADS=1 python3 -IB "$S/models/spark-model-agent")
+  [[ $LIVE == 1 ]] || agent=("${agent[0]}" SPARK_MODEL_LLAMA_SWAP_URL=off "${agent[@]:1}")
+  if [[ $DRY == 1 ]]; then
+    local st
+    st=$("${agent[@]}" render --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print("new" if d["changed"] else "same")') \
+      || die "spark-model-agent render failed (see above): fix $MODELS_DIR/registry.yaml; config.yaml left alone"
+    [[ $st == same ]] || say "  new      /etc/llama-swap/config.yaml (base + lab registry; diff: sudo spark-model-agent render)"
+  else
+    local out
+    out=$("${agent[@]}" render --apply) || die "spark-model-agent render --apply failed (see above); config.yaml left alone"
+    [[ -z $out ]] || say "${out//$T\//\/}"
+  fi
+}
+
 # env_from_example DIR NAME : DIR/NAME.example -> DIR/NAME (0600) only if NAME is absent;
 # if present, report drift of non-secret keys (never modified).
 env_from_example() {
@@ -311,6 +332,10 @@ if [[ $LIVE == 1 ]] && ! mountpoint -q "$MODELS_DIR"; then
 fi
 mkdir_p "$MODELS_DIR/gguf" 0775 "$BACKEND_SSH_USER" "$BACKEND_SSH_USER"
 mkdir_p "$MODELS_DIR/backups" 0700 root root
+# Lab models (walter/models/README.md): spark-model-agent (root) downloads into quarantine/ (never mounted) and
+# promotes into gguf/lab/ (inside the read-only model mount). Both are root-owned so only the agent writes there.
+mkdir_p "$MODELS_DIR/quarantine" 0700 root root
+mkdir_p "$MODELS_DIR/gguf/lab" 0755 root root
 models_world_readable   # backups/ stays 0700 root and is never mounted into a model container
 
 # ---- 5. llama-swap binary ------------------------------------------------------------
@@ -398,6 +423,18 @@ install_file "$S/update-check/90-spark-updates" /etc/update-motd.d/90-spark-upda
 install_file "$S/update-check/README.md"        /var/lib/spark-update-check/README.md     0644 root root
 
 install_file "$S/firewall/docker-user-rules.sh" /usr/local/sbin/docker-user-rules.sh      0755 root root fw-docker
+
+# spark-model-agent: the only writer of lab state (registry, gguf/lab, quarantine, rendered config), run as root
+# by the operator through one sudoers line (walter/models/README.md "Access").
+mkdir_p /usr/local/lib/spark-model 0755 root root
+install_tree "$S/models/lib"                    /usr/local/lib/spark-model                0644 root root ""
+install_file "$S/models/spark-model-agent"      /usr/local/sbin/spark-model-agent         0755 root root
+mkdir_p /etc/spark-model 0755 root root
+install_file "$S/models/agent.env"              /etc/spark-model/agent.env                0644 root root
+if [[ $LIVE == 1 ]] && ! visudo -cqf "$S/models/sudoers-spark-model"; then
+  die "walter/models/sudoers-spark-model.tmpl does not pass visudo -c; not installing it"
+fi
+install_file "$S/models/sudoers-spark-model"    /etc/sudoers.d/spark-model                0440 root root
 install_file "$S/firewall/docker-user-rules.service" /etc/systemd/system/docker-user-rules.service 0644 root root units
 install_file "$S/firewall/ufw-rules.sh"         /usr/local/sbin/ufw-rules.sh              0755 root root fw-ufw
 
@@ -405,7 +442,13 @@ install_file "$S/firewall/ufw-rules.sh"         /usr/local/sbin/ufw-rules.sh    
 # llama-net. So the network and its no-egress rule must already exist (step 9 re-applies both).
 if [[ -n ${CHANGED[fw-docker]:-} ]]; then run /usr/local/sbin/docker-user-rules.sh; fi
 ensure_llama_net
-install_file "$S/llama-swap/config.yaml"        /etc/llama-swap/config.yaml               0640 root llamaswap
+# config.yaml = the rendered template (installed as config.base.yaml) + the ENABLED lab models of the site-local
+# registry ($MODELS_DIR/registry.yaml) and their matrix sets, rendered by spark-model-agent (walter/models/README.md).
+# So a plain deploy keeps every lab entry, and with no registry (or none enabled) config.yaml is exactly the
+# template, as before. The agent writes only when the content differs (llama-swap's --watch-config reloads on any
+# mtime change), atomically, keeping config.yaml.prev, after llama-swap -validate.
+install_file "$S/llama-swap/config.yaml"        /etc/llama-swap/config.base.yaml          0640 root llamaswap
+render_llama_config
 
 # ---- 7. env files ----------------------------------------------------------------------
 step "env files"

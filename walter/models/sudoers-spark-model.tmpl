@@ -1,0 +1,7 @@
+# /etc/sudoers.d/spark-model -- installed by walter/deploy.sh (checked with visudo -cf first).
+# The operator may run the lab model agent, and nothing else through this rule, as root without a password
+# (spark-model on the workstation calls: ssh ... sudo -n /usr/local/sbin/spark-model-agent <verb> --json ...).
+# The agent is the only writer of lab state; it validates its own arguments and takes no paths from them.
+# env_reset (the default) and no SETENV: the caller cannot pass SPARK_MODEL_* or PYTHON* variables.
+Defaults!/usr/local/sbin/spark-model-agent env_reset, !setenv
+${BACKEND_SSH_USER} ALL=(root) NOPASSWD: /usr/local/sbin/spark-model-agent
