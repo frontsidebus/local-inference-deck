@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""spark-model -- lab models for the Spark stack, from the workstation.
+
+  spark-model search ...  |  spark-model fit ...       run here (walter/models/lib/cli_fit.py of this checkout)
+  spark-model pull REPO[@REV] --id ID --placement gpu0|gpu1|both [--file GLOB]... [--ctx N] [--class C] [--yes]
+  spark-model ls
+  spark-model rm ID [--yes] [--force]  |  spark-model rm --suggest
+  spark-model review ID
+  spark-model render                    diff of the config deploy.sh would install (Phase 1: deploy.sh applies it)
+  spark-model status
+Add --json for machine-readable output. Every verb but search/fit runs on the backend as
+    ssh -o BatchMode=yes $BACKEND_SSH_USER@$BACKEND_LAN_IP sudo -n /usr/local/sbin/spark-model-agent <verb> --json ...
+(values from site.env). `rm --yes` refuses while an eval or gate run is live on this workstation (a running
+evals/run.py or gpu-guard.sh, or a live *.pid under evals/results/_runs/*/); --force overrides and says what.
+Runbook: walter/models/README.md.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+ME = Path(__file__).resolve()
+REPO = Path(os.environ.get("SPARK_REPO") or ME.parents[2])
+LIB = REPO / "walter" / "models" / "lib"
+AGENT = "/usr/local/sbin/spark-model-agent"
+REMOTE = ("pull", "ls", "rm", "review", "render", "status")
+LOCAL = ("search", "fit")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9@._/:*?\[\]=+,-]{1,256}$")
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"spark-model: {msg}\n")
+    sys.exit(code)
+
+
+# ------------------------------------------------------------------------------------------------ site values
+def site_value(name):
+    """environment > SPARK_SITE_ENV / <repo>/site.env (KEY=value lines; quotes and trailing comments stripped)."""
+    if os.environ.get(name):
+        return os.environ[name]
+    f = Path(os.environ.get("SPARK_SITE_ENV") or REPO / "site.env")
+    try:
+        lines = f.read_text().splitlines()
+    except OSError:
+        return ""
+    val = ""
+    for line in lines:
+        m = re.match(rf"^\s*(?:export\s+)?{name}=(.*)$", line)
+        if m:
+            v = re.sub(r"\s+#.*$", "", m.group(1)).strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            val = v
+    return val
+
+
+# ------------------------------------------------------------------------------------------------ live-run guard
+def _cmdlines():
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            argv = (p / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        yield int(p.name), [a.decode("utf-8", "replace") for a in argv if a]
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def live_runs(repos=None):
+    """What makes an eval/gate run live: a process running evals/run.py or evals/tools/gpu-guard.sh, or a *.pid
+    file under <repo>/evals/results/_runs/*/ whose pid is alive (repos: this checkout + SPARK_EVAL_REPOS)."""
+    found = []
+    me = os.getpid()
+    for pid, argv in _cmdlines():
+        if pid == me:
+            continue
+        for a in argv[:4]:
+            if a.endswith("evals/run.py") or a.endswith("evals/tools/gpu-guard.sh"):
+                found.append(f"pid {pid}: {' '.join(argv)[:160]}")
+                break
+    if repos is None:
+        repos = [REPO] + [Path(r) for r in os.environ.get("SPARK_EVAL_REPOS", "").split(":") if r]
+    for r in repos:
+        for pf in sorted(Path(r).glob("evals/results/_runs/*/*.pid")):
+            try:
+                pid = int(pf.read_text().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            if pid > 1 and _alive(pid):
+                found.append(f"{pf} (pid {pid} alive)")
+    return found
+
+
+def guard(verb, args):
+    """rm --yes (and render --apply) change what llama-swap serves or reload it: refuse during a live run."""
+    acting = (verb == "rm" and "--yes" in args and "--suggest" not in args) or (verb == "render" and "--apply" in args)
+    if not acting:
+        return
+    live = live_runs()
+    if not live:
+        return
+    if "--force" not in args:
+        die(f"{verb} refused: an eval/gate run is live (a reload or removal would change the serving identity under "
+            "evals/PROTOCOL.md):\n  " + "\n  ".join(live) + "\nwait for it to finish, or add --force to override")
+    sys.stderr.write("spark-model: --force: overriding the live-run guard:\n  " + "\n  ".join(live) + "\n")
+
+
+# ------------------------------------------------------------------------------------------------ verbs
+def run_local(verb, argv):
+    sys.path.insert(0, str(LIB))
+    try:
+        import cli_fit
+    except ImportError as e:
+        die(f"{verb} is not available in this checkout: {LIB}/cli_fit.py could not be imported ({e}). "
+            "It ships with the fit calculator (walter/models/README.md).", 3)
+    import argparse
+    p = argparse.ArgumentParser(prog="spark-model", allow_abbrev=False)
+    sub = p.add_subparsers(dest="verb", required=True)
+    cli_fit.add_parsers(sub)
+    args = p.parse_args([verb] + argv)
+    fn = cli_fit.run_search if verb == "search" else cli_fit.run_fit
+    return fn(args) or 0
+
+
+def remote_argv(verb, args, user, host):
+    for a in args:
+        if not TOKEN_RE.match(a):
+            die(f"argument {a!r} has characters spark-model does not send (letters, digits and @ . _ / : * ? [ ] = + , -)", 2)
+    rest = [a for a in args if a != "--json"]
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-T", f"{user}@{host}",
+            "sudo", "-n", AGENT, shlex.quote(verb), "--json", *[shlex.quote(a) for a in rest]]
+
+
+def run_remote(verb, args):
+    if verb == "render" and "--apply" in args:
+        die("render --apply is not available from the workstation in Phase 1: deploy.sh renders and installs the "
+            "config (spark-model render shows the diff it would apply)", 2)
+    guard(verb, args)
+    user, host = site_value("BACKEND_SSH_USER"), site_value("BACKEND_LAN_IP")
+    if not user or not host:
+        die("set BACKEND_SSH_USER and BACKEND_LAN_IP (site.env or environment)", 2)
+    cmd = remote_argv(verb, args, user, host)
+    if os.environ.get("SPARK_MODEL_SSH"):          # tests: a fake ssh
+        cmd[0] = os.environ["SPARK_MODEL_SSH"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)   # stderr (progress) passes through
+    out = r.stdout.strip()
+    try:
+        data = json.loads(out) if out else None
+    except ValueError:
+        data = None
+    if data is None:
+        if r.returncode == 255:
+            die(f"ssh to the backend failed (exit 255){': ' + out if out else ''}", 255)
+        if out:
+            sys.stdout.write(out + "\n")
+        return r.returncode
+    if "--json" in args:
+        sys.stdout.write(json.dumps(data, indent=1) + "\n")
+    elif data.get("text"):
+        sys.stdout.write(data["text"].rstrip("\n") + "\n")
+    return r.returncode          # an error was already written to stderr by the agent
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__)
+        return 0
+    verb, rest = argv[0], argv[1:]
+    if verb in LOCAL:
+        return run_local(verb, rest)
+    if verb in REMOTE:
+        return run_remote(verb, rest)
+    die(f"unknown verb {verb!r} (search fit pull ls rm review render status; -h for help)", 2)
+
+
+if __name__ == "__main__":
+    for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(v, "1")
+    sys.exit(main())
