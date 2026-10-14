@@ -334,3 +334,18 @@ def test_block_locator_handles_comments_and_nesting():
     assert R._block(lines, ("d",)) == (9, 10, 2)
     with pytest.raises(R.RegistryError):
         R._block(lines, ("a", "fake"))
+
+
+def test_registry_is_never_read_through_a_symlink(tmp_path):
+    secret = tmp_path / "secret"
+    secret.write_text("root:not-a-registry\n")
+    link = tmp_path / "registry.yaml"
+    os.symlink(secret, link)
+    with pytest.raises(R.RegistryError, match="symlink"):
+        R.load(link)
+    with pytest.raises(R.RegistryError):
+        R.save(link, R.empty())
+    assert secret.read_text() == "root:not-a-registry\n"
+    (tmp_path / "dir.yaml").mkdir()
+    with pytest.raises(R.RegistryError, match="not a regular file"):
+        R.load(tmp_path / "dir.yaml")

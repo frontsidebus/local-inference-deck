@@ -59,6 +59,9 @@ callable on Walter itself (deploy.sh, manual runbooks). The reasoning that makes
   a glob matched against the Hub's file list, `--ctx` as a bounded integer; no abbreviations, no path arguments;
 - every file operation is relative to a directory fd opened with `O_NOFOLLOW` and checked (owned by root, not group-
   or world-writable; quarantine 0700), because `/models` and `/models/gguf` belong to the operator user;
+- the registry is treated as untrusted input (it sits in the operator-owned `/models`): it is opened without
+  following symlinks, validated strictly on every load, and nothing in it reaches a command line except through
+  the whitelists above, so even a hand-edited registry cannot inject shell, paths or flags;
 - pulls are GGUF-only from allow-listed orgs, pinned to a commit, sha256-verified, header-parsed with hard caps.
 
 ## Registry (`/models/registry.yaml`)
@@ -214,7 +217,7 @@ All verbs take `--json` (the client always uses it; the human text is in its `"t
   `evals/results/_runs/*/` whose process is alive (this checkout plus `SPARK_EVAL_REPOS`, colon-separated).
   `--force` overrides and prints what it overrode. (`render --apply` is not offered by the client in Phase 1.)
 - **Server side**: `rm` and `render --apply` refuse while a lab model is in llama-swap's `/running`.
-- One registry writer at a time (`flock` on `/run/lock/spark-model-agent.lock`; a pull holds it for its whole
+- One registry writer at a time (`flock` on `/run/spark-model-agent.lock`; a pull holds it for its whole
   download); read-only verbs never wait.
 
 ## Runbook

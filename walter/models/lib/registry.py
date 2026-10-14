@@ -19,6 +19,7 @@ import copy
 import datetime as _dt
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -389,14 +390,48 @@ def loads(text: str, source: str = "registry") -> dict:
     return validate(raw, source)
 
 
+MAX_FILE = 16 << 20
+
+
+def read_file(path, cap: int = MAX_FILE) -> bytes | None:
+    """Content of a regular file, opened without following a symlink (None if absent). The registry lives in
+    /models, which belongs to the operator user, while the agent reading it runs as root."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise RegistryError(f"cannot open (a symlink?): {e.strerror}", str(path)) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RegistryError("not a regular file", str(path))
+        if st.st_size > cap:
+            raise RegistryError(f"larger than {cap} bytes", str(path))
+        chunks, n = [], 0
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            n += len(b)
+            if n > cap:
+                raise RegistryError(f"larger than {cap} bytes", str(path))
+            chunks.append(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def load(path) -> dict:
     """The registry at path; a missing file is an empty registry."""
-    p = Path(path)
-    try:
-        text = p.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    data = read_file(path)
+    if data is None:
         return empty()
-    return loads(text, str(p))
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise RegistryError("not UTF-8 text", str(path)) from None
+    return loads(text, str(path))
 
 
 HEADER = ("# spark-model lab registry (spark-model-registry-v1). Written by spark-model-agent; do not edit while a\n"
@@ -413,13 +448,10 @@ def atomic_write(path, text: str, mode: int = 0o644, keep_prev: bool = False) ->
     mtime stays) when the content is already identical. keep_prev: copy the old content to <path>.prev first."""
     p = Path(path)
     data = text.encode("utf-8")
-    try:
-        old = p.read_bytes()
-    except FileNotFoundError:
-        old = None
+    old = read_file(p, cap=1 << 30)
     if old == data:
         return False
-    st = p.stat() if old is not None else None
+    st = os.lstat(p) if old is not None else None
     if keep_prev and old is not None:
         _write_tmp_rename(p.with_name(p.name + ".prev"), old, st.st_mode & 0o777, st)
     _write_tmp_rename(p, data, (st.st_mode & 0o777) if st else mode, st)

@@ -91,7 +91,7 @@ class Ctx:
         self.llama_swap = env("LLAMA_SWAP", "/usr/local/bin/llama-swap")
         self.llama_swap_url = s("LLAMA_SWAP_URL", "")
         self.api_key_file = env("API_KEY_FILE", str(cdir / "api-key"))
-        self.lock = env("LOCK", "/run/lock/spark-model-agent.lock")
+        self.lock = env("LOCK", "/run/spark-model-agent.lock")   # /run: root-only (not the world-writable /run/lock)
         self.config_group = env("CONFIG_GROUP", "llamaswap")
         try:
             self.quota_gb = float(s("LAB_MODELS_QUOTA_GB", "1500"))
