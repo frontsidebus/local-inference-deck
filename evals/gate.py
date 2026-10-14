@@ -63,6 +63,8 @@ RESULTS_ROOT = RUN.RESULTS_DIR / "gate"
 SEALED_MANIFESTS = (EVALS_DIR / "datasets" / "heldout" / "heldout-v1.1.json",
                     EVALS_DIR / "datasets" / "heldout" / "heldout-v1.json")
 GUARD = EVALS_DIR / "tools" / "gpu-guard.sh"
+TUNNEL = EVALS_DIR / "tools" / "gateway-tunnel.sh"   # SSH to the backend's LiteLLM, skipping the public edge
+REQUEST_TIMEOUT_S = 300      # run.py --timeout for gate runs; the slowest gate item takes well under a minute
 RUN_NAME = "gate"            # run.py --run-name; the GPU guard and stop.sh match it (EVAL_RUN=gate)
 RECORD = "gate.json"
 REPORT = "gate-report.md"
@@ -963,14 +965,57 @@ def start_guard(a) -> Optional[subprocess.Popen]:
                             stderr=subprocess.DEVNULL)
 
 
-def run_argv(m: Dict[str, Any], a, gate_dir: Path) -> List[str]:
+def start_route(a) -> Tuple[str, Optional[str], Optional[Path]]:
+    """Pick the gateway route for one run. -> (route, base URL for run.py or None, tunnel script to stop or None).
+
+    ``--base-url`` or EVAL_BASE_URL (environment or site.env) is used as given. Otherwise the gate starts
+    tools/gateway-tunnel.sh (as the plans do): requests go over SSH to the backend's LiteLLM instead of through the
+    public edge, where a dead TLS handshake held a request until --timeout three times on 2026-10-13. When the tunnel
+    dies, ssh closes the local socket and run.py retries at once. ``--via-edge``, or no backend in site.env, keeps
+    the edge. A configured tunnel that does not come up is a refusal, not a silent fallback to the edge."""
+    if a.base_url:
+        return "base-url", a.base_url, None
+    site = RUN.load_site_env(Path(a.site_env))
+    if RUN.setting("EVAL_BASE_URL", site):
+        return "EVAL_BASE_URL", None, None          # run.py reads it itself
+    if getattr(a, "via_edge", False):
+        return "edge", None, None
+    if not ((os.environ.get("EVAL_GPU_SSH") or RUN.setting("BACKEND_LAN_IP", site)) and
+            RUN.setting("BACKEND_WG_IP", site)):
+        log("warning: no backend in site.env (BACKEND_LAN_IP, BACKEND_WG_IP): requests go through the public edge; "
+            "--via-edge silences this")
+        return "edge", None, None
+    env = dict(os.environ, EVAL_RUN=RUN_NAME)
+    try:
+        out = subprocess.run(["bash", str(TUNNEL), "start"], cwd=str(REPO_DIR), env=env, capture_output=True,
+                             text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GateError(f"gateway tunnel did not start ({exc}); --via-edge uses the public edge") from None
+    url = next((ln.split("=", 1)[1].strip() for ln in out.stdout.splitlines() if ln.startswith("EVAL_BASE_URL=")), "")
+    if out.returncode != 0 or not url:
+        raise GateError(f"gateway tunnel did not start ({(out.stderr or out.stdout).strip()[:200] or out.returncode}); "
+                        "--via-edge uses the public edge")
+    log(f"gate: requests go over the SSH tunnel to the backend's LiteLLM ({url})")
+    return "tunnel", url, TUNNEL
+
+
+def stop_route(tunnel: Optional[Path]) -> None:
+    if tunnel is not None:
+        subprocess.run(["bash", str(tunnel), "stop"], cwd=str(REPO_DIR), env=dict(os.environ, EVAL_RUN=RUN_NAME),
+                       capture_output=True, timeout=30)
+
+
+def run_argv(m: Dict[str, Any], a, gate_dir: Path, base_url: Optional[str] = None) -> List[str]:
     files = sorted({str(s["_path"]) for e in m["suites"] for s in e["sources"]})
     argv = [x for f in files for x in ("--suite", f)]
     argv += ["--model", a.model, "--thinking", m["sampling"]["thinking"], "--seed", str(m["sampling"]["seed"]),
              "--freeze", str(gate_dir / SELECTION), "--select-frozen", "--probe-server", "--stop-rules",
              "--no-final-answer", "--no-prompt-cache", "--concurrency", str(m["sampling"]["concurrency"]),
-             "--budget-policy", str(gate_dir / BUDGET), "--results", str(gate_dir), "--run-name", RUN_NAME]
-    for flag in ("base_url", "key_file", "site_env", "serving_config", "llama_swap_config"):
+             "--budget-policy", str(gate_dir / BUDGET), "--results", str(gate_dir), "--run-name", RUN_NAME,
+             "--timeout", str(getattr(a, "request_timeout", REQUEST_TIMEOUT_S))]
+    if base_url:
+        argv += ["--base-url", base_url]
+    for flag in ("key_file", "site_env", "serving_config", "llama_swap_config"):
         v = getattr(a, flag, None)
         if v:
             argv += ["--" + flag.replace("_", "-"), str(v)]
@@ -1047,25 +1092,30 @@ def generate(m: Dict[str, Any], a, kind: str, resume: Optional[str] = None) -> T
         if rec.get("kind") != kind or rec.get("model") != a.model or \
                 (rec.get("manifest") or {}).get("sha256") != m["_sha256"]:
             raise GateError(f"--resume {gd.name}: not a {kind} of {a.model} under this manifest")
-    else:
-        gd = new_gate_dir(Path(a.results_root), a.model, kind)
-        gd.mkdir(parents=True)
-        rec = {"schema": RECORD_SCHEMA, "kind": kind, "model": a.model, "created": RUN.utcnow(),
-               "manifest": {"path": RUN.rel(m["_path"]), "sha256": m["_sha256"], "name": m["name"],
-                            "status": m.get("status")},
-               "scorer_version": m["scorer_version"], "sampling": public_sampling(m),
-               "budget": {"policy": budget_doc(m), "policy_sha256": m["sampling"]["budget_policy_sha256"],
-                          "suite_answer_tokens": suite_caps(m["suites"])},
-               "run_dir": f"{RUN_NAME}-{RUN_slug(a.model)}", "items": len(manifest_items(m)), "status": "running"}
-    (gd / SELECTION).write_text(json.dumps(selection(m), indent=2) + "\n", encoding="utf-8")
-    (gd / BUDGET).write_text(json.dumps(budget_doc(m), indent=2) + "\n", encoding="utf-8")
-    write_record(gd, rec)
-    guard = start_guard(a)
+    route, url, tunnel = start_route(a)     # a refusal here leaves no gate dir behind
+    guard = None
     try:
-        rc = RUNNER(run_argv(m, a, gd))
+        if not resume:
+            gd = new_gate_dir(Path(a.results_root), a.model, kind)
+            gd.mkdir(parents=True)
+            rec = {"schema": RECORD_SCHEMA, "kind": kind, "model": a.model, "created": RUN.utcnow(),
+                   "manifest": {"path": RUN.rel(m["_path"]), "sha256": m["_sha256"], "name": m["name"],
+                                "status": m.get("status")},
+                   "scorer_version": m["scorer_version"], "sampling": public_sampling(m),
+                   "budget": {"policy": budget_doc(m), "policy_sha256": m["sampling"]["budget_policy_sha256"],
+                              "suite_answer_tokens": suite_caps(m["suites"])},
+                   "run_dir": f"{RUN_NAME}-{RUN_slug(a.model)}", "items": len(manifest_items(m)),
+                   "status": "running"}
+        (gd / SELECTION).write_text(json.dumps(selection(m), indent=2) + "\n", encoding="utf-8")
+        (gd / BUDGET).write_text(json.dumps(budget_doc(m), indent=2) + "\n", encoding="utf-8")
+        rec.setdefault("routes", []).append(route)      # one per run.py invocation (resumes add one)
+        write_record(gd, rec)
+        guard = start_guard(a)
+        rc = RUNNER(run_argv(m, a, gd, url))
     finally:
         if guard is not None:
             guard.terminate()
+        stop_route(tunnel)
     rec.setdefault("run_exits", []).append(rc)
     return gd, rc, rec
 
@@ -1256,7 +1306,11 @@ def parse_args(argv: Optional[List[str]] = None):
         p.add_argument("--resume", metavar="GATE_DIR", help="continue an interrupted gate dir of this kind")
         p.add_argument("--results-root", default=str(RESULTS_ROOT))
         p.add_argument("--no-guard", action="store_true", help="do not start tools/gpu-guard.sh")
-        p.add_argument("--base-url")
+        p.add_argument("--base-url", help="gateway URL (default: EVAL_BASE_URL, else an SSH tunnel to the backend)")
+        p.add_argument("--via-edge", action="store_true",
+                       help="send requests through the public edge instead of the SSH tunnel")
+        p.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT_S,
+                       help=f"seconds per request for run.py (default {REQUEST_TIMEOUT_S:g})")
         p.add_argument("--key-file")
         p.add_argument("--site-env", default=str(REPO_DIR / "site.env"))
         p.add_argument("--serving-config")

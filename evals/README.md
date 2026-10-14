@@ -79,7 +79,7 @@ Each (model, thinking mode) gets `evals/results/<run-name>-<model>[-think|-think
   - `--legacy-sampling` sends only what the runner sent before 2026-10 (temperature, top_p with thinking on, presence_penalty if given), so the server's defaults apply to the rest. Use it only to resume or reproduce an old run: those runs refuse to resume under the new profiles, because the sampling differs.
   - The non-OpenAI keys (top_k, min_p, repeat_penalty, DRY, XTC) only work if the gateway forwards them. `--probe-server` checks this after the run against llama-server's `/slots` and records the result in `serving.sampler_check`.
 - **Seeds:** `--seeds 1234,1235,1236` runs each model and mode once per seed, each in its own directory (`…-seed1234`), and every response and score line records its seed. `--seed N` (the default is 1234) runs one seed without the suffix, as before. Sampled runs (thinking on) vary between seeds, so use at least three and compare on the same items. A greedy run with several seeds measures only server nondeterminism.
-- **Prompt cache:** `--no-prompt-cache` sends `cache_prompt: false` (no KV-cache reuse between requests; recorded in `run.json`). Off by default; whether the gateway forwards it is unverified (see [Upgrade gate](#upgrade-gate)).
+- **Prompt cache:** `--no-prompt-cache` sends `cache_prompt: false` (no KV-cache reuse between requests; recorded in `run.json`). Off by default. LiteLLM forwards it (verified 2026-10-13; see [Upgrade gate](#upgrade-gate)).
 - **Concurrency:** 1 by default, because all models share the two GPUs and llama-server runs one slot per model.
 - **Robustness:** `--timeout` (900 s per request) and `--retries` (2, with exponential `--backoff`). Network errors, 408, 409, 429 and 5xx are retried; other 4xx responses are not.
 - **Resume:** re-run the same command with the same `--run-name`. Items with a successful response are skipped and failed ones are retried. If the model, sampling, caps or a dataset checksum differ, the runner refuses to resume.
@@ -254,7 +254,7 @@ python3 evals/gate.py check --model coder --yes       # after it: compare with t
 python3 evals/gate.py compare <baseline-dir> <candidate-dir>   # offline, no model calls
 ```
 
-**Suites** (`plans/gate-v1-<model>.json`; a model without a manifest is refused). Margins are pending owner confirmation:
+**Suites** (`plans/gate-v1-<model>.json`; a model without a manifest is refused). Margins confirmed by the owner on 2026-10-12:
 
 | Suite | Items | Metric | Margin | n coder / coder-fast |
 |---|---|---|---|---|
@@ -275,6 +275,8 @@ python3 evals/gate.py compare <baseline-dir> <candidate-dir>   # offline, no mod
 - **Runs:**
   - The gate runs run.py with `--probe-server`, `--stop-rules` (the C1.12 stopping rules in an exploratory run), `--no-prompt-cache` and `--concurrency 1`. It uses the command line the GPU guard matches (`--run-name gate`; set `EVAL_RUN=gate` for `tools/stop.sh`).
   - Results go to `results/gate/<model>/{baseline,check,aa}-<UTC stamp>/` with `gate.json`. It holds the manifest sha256, the sampling profile, the budget and per-suite caps, the harness, and the serving identity: model file, quant, build, flags, and the model sha256 and image digest when `--serving-config` gives them.
+  - **Route:** requests go over `tools/gateway-tunnel.sh` (SSH to the backend's LiteLLM, as the plans do), not through the public edge, which on 2026-10-13 held a request for the full timeout three times: a TLS handshake that never got an answer. If the tunnel dies, ssh closes the local socket and run.py retries at once. `--base-url` or `EVAL_BASE_URL` is used as given, `--via-edge` keeps the edge, and with no backend in `site.env` the gate warns and uses the edge. A configured tunnel that does not start is a refusal. `gate.json` records the route of each run (`routes`).
+  - Each request times out after `--request-timeout` seconds (default 300; the slowest gate item takes under a minute), passed to run.py as `--timeout`.
   - Before any run it prints the model, the item count and the estimated time, and it runs nothing without `--yes`. It also refuses while the guard's STOP file exists. `--resume DIR` continues an interrupted run.
   - Run time is about **2.0 h for `coder` and 1.3 h for `coder-fast`**, per run (a calibration is two runs). The gate uses no judge, no frontier model and no sealed items.
 - **Compatibility:** a baseline is used only if these all equal the candidate's: manifest sha256, scorer version, sampling profile, budget, prompt-cache setting, item sets and system prompts. Otherwise the gate refuses and says why. A different run.py or scorers.py is refused unless `--allow-stale-harness`, which is recorded and printed.
@@ -297,7 +299,7 @@ python3 evals/gate.py compare <baseline-dir> <candidate-dir>   # offline, no mod
   - 4 when the gate refuses.
 
   The markdown report is printed and written to the candidate dir. It has the per-suite table (n, baseline, candidate, difference with its 95% interval, TOST p, difference p with Holm, parse and truncation rates, verdict), the serving identity diff and the overall verdict.
-- **Prompt cache:** `run.py --no-prompt-cache` sends `cache_prompt: false` and records it in run.json. It is off by default. Whether LiteLLM forwards the field to llama-server is **not yet verified**; the first A/A run will show it. (The stored A/A pair had 24 of 117 outputs identical when the cache state differed, against 489 of 491 when it matched.)
+- **Prompt cache:** `run.py --no-prompt-cache` sends `cache_prompt: false` and records it in run.json. It is off by default. LiteLLM forwards the field to llama-server: on 2026-10-13, identical requests through the gateway reused 0 prompt tokens with `cache_prompt: false` and 459 of 463 with `true` (llama-server `timings.cache_n`), and both A/A calibrations were byte-identical run to run (980/980 coder, 1440/1440 coder-fast). (Before that, the stored A/A pair had 24 of 117 outputs identical when the cache state differed, against 489 of 491 when it matched.)
 
 ## Long runs: plans, the GPU guard, stop and status
 
