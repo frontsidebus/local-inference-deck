@@ -130,6 +130,10 @@ say "[wrappers] $HOME/.local/bin"
 for w in claude-spark codex-spark hermes-spark; do
   load_copy "$here/bin/$w";                    place "$HOME/.local/bin/$w" 755
 done
+# spark-model (lab models) imports walter/models/lib from this checkout for search/fit, so it is installed as a
+# launcher that runs the checkout's copy rather than as a copy of its own.
+content=$(printf '#!/bin/sh\n# spark-model launcher written by clients/install.sh: runs this checkout'"'"'s clients/bin/spark-model\nexec python3 %q "$@"\n' "$here/bin/spark-model")$'\n'
+place "$HOME/.local/bin/spark-model" 755
 
 # ---- 3. Claude Code (isolated config dir only) ------------------------------
 say "[claude] $HOME/.claude-spark"

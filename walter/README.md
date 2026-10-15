@@ -33,10 +33,11 @@ Request path: Open WebUI → LiteLLM `:4000` (virtual keys, aliases `coder`, `co
 | `base/nvidia-persistenced.service.d/override.conf` | `/etc/systemd/system/nvidia-persistenced.service.d/` | persistence mode on, `StopWhenUnneeded=false` |
 | `base/fstab-models.tmpl` | line in `/etc/fstab` | `UUID=${MODELS_FS_UUID}` XFS at `${MODELS_DIR}`, `nofail` |
 | `wireguard/wg0.conf.tmpl` | `/etc/wireguard/wg0.conf` (0600) | client side; `@WG_PRIVATE_KEY@` filled by gen-secrets |
-| `llama-swap/config.yaml.tmpl` | `/etc/llama-swap/config.yaml` (root:llamaswap 0640) | `--watch-config`: edits reload by themselves |
+| `llama-swap/config.yaml.tmpl` | `/etc/llama-swap/config.base.yaml` -> `/etc/llama-swap/config.yaml` (root:llamaswap 0640) | config.yaml = the template + enabled lab models, rendered by `spark-model-agent` ([models/README.md](models/README.md)); with none enabled it is the template byte for byte. `--watch-config`: changes reload by themselves |
 | `llama-swap/llama-swap.service.tmpl` | `/etc/systemd/system/llama-swap.service` | binds `${BACKEND_WG_IP}:8080`, API key from `/etc/llama-swap/api-key` |
 | `llama-swap/spark-docker-run.sh` | `/usr/local/sbin/` | waits for a same-named container to be gone (safe reloads) |
 | `llama-swap/fetch-models.sh.tmpl` | `${MODELS_DIR}/fetch-models.sh` | GGUF downloader, see `models.md` |
+| `models/spark-model-agent`, `models/lib/*`, `models/agent.env.tmpl`, `models/sudoers-spark-model.tmpl` | `/usr/local/sbin/spark-model-agent`, `/usr/local/lib/spark-model/`, `/etc/spark-model/agent.env`, `/etc/sudoers.d/spark-model` (0440) | lab models: the agent is the only writer of `${MODELS_DIR}/registry.yaml`, `${MODELS_DIR}/gguf/lab/`, `${MODELS_DIR}/quarantine/` (root 0700) and the rendered config; the operator reaches it through one sudoers line. Runbook: [models/README.md](models/README.md) |
 | `gateway/*` | `/srv/gateway/` | LiteLLM + Postgres 17 compose, `litellm.yaml`, `hooks/spark_hooks.py`, `.env.example`, `provision-keys.py` |
 | `webui/*` | `/srv/webui/` (0750) | Open WebUI + Pocket-ID compose, `.env.example`, `pocket-id.env.example`, `theme/`, `pocketid-bootstrap.py` |
 | `monitoring/*` | `/srv/monitoring/` | Prometheus, Grafana, node-exporter, cAdvisor, dcgm-exporter, blackbox, llama-swap SD sidecar ([README](monitoring/README.md.tmpl)) |

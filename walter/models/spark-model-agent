@@ -1,0 +1,616 @@
+#!/usr/bin/python3 -IB
+"""spark-model-agent -- the only writer of lab model state on Walter (registry, lab files, rendered config).
+
+Installed by walter/deploy.sh to /usr/local/sbin/spark-model-agent (lib: /usr/local/lib/spark-model/). The operator
+reaches it as root through ONE sudoers line (/etc/sudoers.d/spark-model):
+    <BACKEND_SSH_USER> ALL=(root) NOPASSWD: /usr/local/sbin/spark-model-agent
+sudo resets the environment, and this program takes no paths from its arguments: every path is fixed (or set by
+root through SPARK_MODEL_* variables, which are ignored when sudo started this program). Arguments are validated
+strictly (ids by regex, --file only as globs matched against the Hub's file list).
+
+Verbs (all take --json):
+  pull REPO[@REV] --id ID --placement gpu0|gpu1|both [--file GLOB]... [--ctx N] [--class C] [--yes]
+  ls                         registry, disk use, quota; core models listed read-only
+  rm ID [--yes] [--force]    remove a lab entry and lab/<ID>/ (pinned needs --force); rm --suggest: LRU candidates
+  review ID                  print the chat template and record reviewed: true
+  render [--apply] [--force] diff of the rendered llama-swap config; --apply installs it (deploy.sh uses this)
+  status                     paths, settings, registry state, lab models running in llama-swap
+Runbook: walter/models/README.md in the repo.
+"""
+import argparse
+import contextlib
+import difflib
+import fcntl
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+LIB = HERE / "lib" if (HERE / "lib" / "registry.py").is_file() else Path("/usr/local/lib/spark-model")
+sys.path.insert(0, str(LIB))
+
+import registry as R  # noqa: E402
+import fetch as F     # noqa: E402
+
+GB = 1000 ** 3
+AGENT_PATH = "/usr/local/sbin/spark-model-agent"
+
+
+# ------------------------------------------------------------------------------------------------ settings
+def via_sudo() -> bool:
+    """True when sudo started this program directly: then SPARK_MODEL_* overrides are ignored (sudo's env_reset
+    removes them anyway; this is the second line of defence if someone adds SETENV)."""
+    cmd = os.environ.get("SUDO_COMMAND", "")
+    return bool(cmd) and cmd.split(" ", 1)[0].endswith("/spark-model-agent")
+
+
+def env(name, default=None):
+    if via_sudo():
+        return default
+    v = os.environ.get("SPARK_MODEL_" + name)
+    return v if v not in (None, "") else default
+
+
+def read_env_file(path) -> dict:
+    out = {}
+    try:
+        text = Path(path).read_text()
+    except (FileNotFoundError, PermissionError):
+        return out
+    for line in text.splitlines():
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=(.*)$", line.strip())
+        if m:
+            v = re.sub(r"\s+#.*$", "", m.group(2)).strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            out[m.group(1)] = v
+    return out
+
+
+class Ctx:
+    def __init__(self):
+        ef = env("ENV_FILE", "/etc/spark-model/agent.env")
+        site = read_env_file(ef)
+
+        def s(name, default):
+            return env(name, site.get(name, default))
+        self.env_file = ef
+        self.models_dir = Path(env("MODELS_DIR", site.get("MODELS_DIR", "/models")))
+        self.registry = Path(env("REGISTRY", str(self.models_dir / "registry.yaml")))
+        cdir = Path(env("CONFIG_DIR", "/etc/llama-swap"))
+        self.config = Path(env("CONFIG", str(cdir / "config.yaml")))
+        self.base = Path(env("BASE", str(cdir / "config.base.yaml")))
+        self.token_file = env("TOKEN_FILE", "/etc/spark-hf/token")
+        self.endpoint = env("HF_ENDPOINT", "https://huggingface.co")
+        self.llama_swap = env("LLAMA_SWAP", "/usr/local/bin/llama-swap")
+        self.llama_swap_url = s("LLAMA_SWAP_URL", "")
+        self.api_key_file = env("API_KEY_FILE", str(cdir / "api-key"))
+        self.lock = env("LOCK", "/run/spark-model-agent.lock")   # /run: root-only (not the world-writable /run/lock)
+        self.config_group = env("CONFIG_GROUP", "llamaswap")
+        try:
+            self.quota_gb = float(s("LAB_MODELS_QUOTA_GB", "1500"))
+            self.reserve_gb = float(s("LAB_FREE_RESERVE_GB", "300"))
+        except ValueError:
+            die("LAB_MODELS_QUOTA_GB / LAB_FREE_RESERVE_GB must be numbers", 2)
+        self.orgs = tuple(o for o in s("LAB_HF_ORGS", "").split() if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}", o))
+
+    def settings(self) -> F.Settings:
+        tf = self.token_file if self.token_file and os.path.exists(self.token_file) else None
+        return F.Settings(models_dir=self.models_dir, registry=self.registry, orgs=self.orgs, quota_gb=self.quota_gb,
+                          reserve_gb=self.reserve_gb, token_file=tf, endpoint=self.endpoint)
+
+
+# ------------------------------------------------------------------------------------------------ output
+class Fail(Exception):
+    def __init__(self, msg, code=1, **extra):
+        super().__init__(msg)
+        self.code, self.extra = code, extra
+
+
+def die(msg, code=1, **extra):
+    raise Fail(msg, code, **extra)
+
+
+def emit(args, data: dict, text: str):
+    """--json: one JSON object (with the human text in "text", which the workstation client prints)."""
+    if args.json:
+        data = {**data, "text": text}
+        sys.stdout.write(json.dumps(data, indent=1, sort_keys=False, default=str) + "\n")
+    elif text:
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+
+
+def gb(n) -> str:
+    return f"{n / GB:.1f} GB"
+
+
+@contextlib.contextmanager
+def locked(ctx: Ctx, what: str):
+    """One registry writer at a time (pull holds it for the whole download)."""
+    Path(ctx.lock).parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(ctx.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            die(f"another spark-model-agent is changing the registry (pull or rm running?); {what} refused")
+        yield
+    finally:
+        os.close(fd)
+
+
+def load_registry(ctx: Ctx) -> dict:
+    try:
+        return R.load(ctx.registry)
+    except R.RegistryError as e:
+        die(str(e))
+
+
+# ------------------------------------------------------------------------------------------------ llama-swap
+def running_models(ctx: Ctx):
+    """Model ids llama-swap reports in /running, or None when it cannot be asked."""
+    if ctx.llama_swap_url in ("", "off"):
+        return None
+    try:
+        key = Path(ctx.api_key_file).read_text().strip()
+    except OSError:
+        key = ""
+    req = urllib.request.Request(ctx.llama_swap_url.rstrip("/") + "/running",
+                                 headers={"Authorization": f"Bearer {key}"} if key else {})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=5) as r:
+            data = json.loads(r.read(1 << 20))
+        return [m.get("model") for m in data.get("running", []) if isinstance(m, dict)]
+    except Exception:
+        return None
+
+
+def llama_swap_validate(ctx: Ctx, text: str) -> tuple[bool, str]:
+    """`llama-swap -validate` (v260: llama-swap.go runValidate) on the candidate; skipped without the binary.
+    The API key macro gets a placeholder value: validation never sees the real key."""
+    if not ctx.llama_swap or not os.access(ctx.llama_swap, os.X_OK):
+        return True, "llama-swap binary not found: -validate skipped (structural checks passed)"
+    with tempfile.TemporaryDirectory(prefix="spark-model-validate.") as d:
+        p = Path(d) / "config.yaml"
+        p.write_text(text)
+        envv = {"PATH": "/usr/bin:/bin", "LLAMA_SWAP_API_KEY": "validate-placeholder", "HOME": d}
+        r = subprocess.run([ctx.llama_swap, "-validate", "-config", str(p)], capture_output=True, text=True,
+                           timeout=60, env=envv)
+    msg = (r.stdout + r.stderr).strip().splitlines()
+    return r.returncode == 0, (msg[-1] if msg else f"exit {r.returncode}")
+
+
+# ------------------------------------------------------------------------------------------------ live runs
+def lab_running(ctx: Ctx):
+    run = running_models(ctx)
+    if run is None:
+        return None
+    return [m for m in run if isinstance(m, str) and m.startswith(R.LAB_PREFIX)]
+
+
+# ------------------------------------------------------------------------------------------------ verbs
+def cmd_render(ctx: Ctx, args):
+    try:
+        base = ctx.base.read_text()
+    except FileNotFoundError:
+        die(f"base config {ctx.base} not found (deploy.sh installs it)")
+    reg = load_registry(ctx)
+    try:
+        out = R.render(base, reg)
+    except R.RegistryError as e:
+        die(str(e))
+    try:
+        cur = ctx.config.read_text()
+    except FileNotFoundError:
+        cur = None
+    changed = cur != out
+    enabled = [m["id"] for m in reg["models"] if m["enabled"]]
+    diff = "".join(difflib.unified_diff((cur or "").splitlines(True), out.splitlines(True),
+                                        str(ctx.config), str(ctx.config) + " (rendered)")) if changed else ""
+    data = {"ok": True, "verb": "render", "changed": changed, "enabled_lab_models": enabled,
+            "config": str(ctx.config), "base": str(ctx.base), "applied": False}
+    if not args.apply:
+        data["diff"] = diff
+        state = "new" if cur is None else ("changed" if changed else "unchanged")
+        emit(args, data, f"  render: {ctx.config} {state} ({len(enabled)} enabled lab model(s))" + ("\n" + diff if diff else ""))
+        return 0
+    if not changed:
+        emit(args, data, "")      # quiet: deploy.sh prints nothing for an unchanged config (no reload)
+        return 0
+    ok, msg = llama_swap_validate(ctx, out)
+    data["validate"] = msg
+    if not ok:
+        die(f"llama-swap -validate refused the rendered config: {msg}", validate=msg)
+    if args.live_guard:
+        lab = lab_running(ctx)
+        if lab:
+            if not args.force:
+                die(f"lab model(s) running in llama-swap ({', '.join(lab)}): a config change reloads llama-swap and "
+                    "restarts them; re-run with --force to override", running=lab)
+            sys.stderr.write(f"--force: overriding the running-lab-model guard ({', '.join(lab)})\n")
+    group = None
+    if cur is None and os.geteuid() == 0:
+        import grp
+        try:
+            group = grp.getgrnam(ctx.config_group).gr_gid
+        except KeyError:
+            group = None
+    R.atomic_write(ctx.config, out, mode=0o640, keep_prev=True)
+    if group is not None:
+        os.chown(ctx.config, 0, group)
+    data["applied"] = True
+    prev = "" if cur is None else f"; previous kept as {ctx.config.name}.prev"
+    emit(args, data, f"  new      {ctx.config} (rendered: base + {len(enabled)} enabled lab model(s){prev}; {msg})")
+    return 0
+
+
+def disk_use(path: Path) -> int:
+    n = 0
+    try:
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for f in files:
+                try:
+                    st = os.lstat(os.path.join(root, f))
+                    n += st.st_size if stat.S_ISREG(st.st_mode) else 0
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return n
+
+
+def core_models(ctx: Ctx) -> list[dict]:
+    try:
+        import yaml
+        cfg = yaml.safe_load(ctx.base.read_text())
+    except Exception:
+        return []
+    out = []
+    for mid, mc in (cfg.get("models") or {}).items():
+        files = re.findall(r"(?:-m|--mmproj|-md)\s+(/models/gguf/\S+)", str(mc.get("cmd", "")))
+        out.append({"id": mid, "aliases": mc.get("aliases") or [], "files": files})
+    return out
+
+
+def cmd_ls(ctx: Ctx, args):
+    reg = load_registry(ctx)
+    lab_dir = ctx.models_dir / "gguf" / "lab"
+    rows = []
+    for m in reg["models"]:
+        reg_bytes = sum(f["bytes"] for f in m["files"])
+        on_disk = disk_use(lab_dir / m["id"])
+        rows.append({"id": m["id"], "repo": m["repo"], "revision": m["revision"], "placement": m["placement"],
+                     "ctx": m["ctx"], "class": m["class"], "bytes": reg_bytes, "disk_bytes": on_disk,
+                     "enabled": m["enabled"], "pinned": m["pinned"], "license_flag": m["license"].get("flag"),
+                     "template_flags": m["template"].get("flags", []), "reviewed": m["template"].get("reviewed"),
+                     "fit": m["fit"], "added": m["added"], "last_used": m["last_used"],
+                     "missing_files": on_disk == 0})
+    orphans = []
+    try:
+        orphans = sorted(n for n in os.listdir(lab_dir) if not R.find(reg, n))
+    except FileNotFoundError:
+        pass
+    quarantine = []
+    try:
+        quarantine = sorted(os.listdir(ctx.models_dir / "quarantine"))
+    except (FileNotFoundError, PermissionError):
+        pass
+    used = R.lab_bytes(reg)
+    quota = int(ctx.quota_gb * GB)
+    try:
+        free = F.free_bytes(ctx.models_dir)
+    except OSError:
+        free = None
+    data = {"ok": True, "verb": "ls", "lab": rows, "lab_bytes": used, "quota_bytes": quota, "free_bytes": free,
+            "orphans": orphans, "quarantine": quarantine, "core": core_models(ctx), "registry": str(ctx.registry)}
+    lines = [f"lab models ({len(rows)}; {gb(used)} of the {ctx.quota_gb:g} GB quota"
+             + (f"; {gb(free)} free on {ctx.models_dir}" if free is not None else "") + "):"]
+    if rows:
+        lines.append(f"  {'id':<28} {'placement':<9} {'class':<12} {'size':>9}  {'ctx':>7}  flags")
+    for r in rows:
+        fl = []
+        if r["enabled"]:
+            fl.append("ENABLED")
+        if r["pinned"]:
+            fl.append("pinned")
+        if r["license_flag"]:
+            fl.append(f"licence:{r['license_flag']}")
+        if r["template_flags"]:
+            fl.append(f"template:{'+'.join(r['template_flags'])}{'' if r['reviewed'] else '(unreviewed)'}")
+        if r["missing_files"]:
+            fl.append("FILES MISSING")
+        lines.append(f"  {r['id']:<28} {r['placement']:<9} {r['class']:<12} {gb(r['bytes']):>9}  {r['ctx']:>7}  {' '.join(fl)}")
+    if orphans:
+        lines.append(f"orphan dirs under {lab_dir} (no registry entry; inspect, then delete by hand): {' '.join(orphans)}")
+    if quarantine:
+        lines.append(f"quarantine (failed or interrupted pulls; re-run the pull to resume): {' '.join(quarantine)}")
+    lines.append("core models (repo template; read-only, never touched by spark-model):")
+    for c in data["core"]:
+        lines.append(f"  {c['id']:<28} {','.join(c['aliases'])}")
+    emit(args, data, "\n".join(lines))
+    return 0
+
+
+def lru(reg: dict) -> list[dict]:
+    cands = [m for m in reg["models"] if not m["pinned"]]
+    return sorted(cands, key=lambda m: (m["last_used"] or m["added"], m["added"]))
+
+
+def cmd_rm(ctx: Ctx, args):
+    if args.suggest:
+        if args.id:
+            die("rm --suggest takes no id", 2)
+        reg = load_registry(ctx)
+        rows = [{"id": m["id"], "bytes": sum(f["bytes"] for f in m["files"]), "last_used": m["last_used"],
+                 "added": m["added"], "enabled": m["enabled"]} for m in lru(reg)]
+        emit(args, {"ok": True, "verb": "rm", "suggest": rows},
+             "least recently used unpinned lab models (nothing is deleted; spark-model rm <id>):\n" +
+             "\n".join(f"  {r['id']:<28} {gb(r['bytes']):>9}  last used {r['last_used'] or 'never'}  added {r['added']}"
+                       for r in rows) if rows else "no unpinned lab models")
+        return 0
+    if not args.id:
+        die("rm needs an id (or --suggest)", 2)
+    with locked(ctx, "rm"):
+        reg = load_registry(ctx)
+        m = R.find(reg, args.id)
+        if m is None:
+            die(f"{args.id!r} is not a lab model in the registry (core models are never removed by spark-model)")
+        overrides = []
+        if m["pinned"]:
+            if not args.force:
+                die(f"{args.id} is pinned; re-run with --force to remove it anyway")
+            overrides.append("pinned")
+        lab = lab_running(ctx)
+        if lab and R.model_id(m) in lab:
+            if not args.force:
+                die(f"{R.model_id(m)} is running in llama-swap; unload it first or re-run with --force")
+            overrides.append("running in llama-swap")
+        if m["enabled"]:
+            if not args.force:
+                die(f"{args.id} is enabled (served); removing it changes the llama-swap config and reloads it. "
+                    "Re-run with --force to override")
+            overrides.append("enabled (llama-swap config will be re-rendered and reloaded)")
+        size = sum(f["bytes"] for f in m["files"])
+        plan = {"id": m["id"], "bytes": size, "dir": str(ctx.models_dir / "gguf" / "lab" / m["id"]),
+                "overrides": overrides}
+        if not args.yes:
+            emit(args, {"ok": True, "verb": "rm", "dry_run": True, "plan": plan},
+                 f"would remove {m['id']} ({gb(size)}): registry entry and {plan['dir']}/"
+                 + (f"; overriding: {', '.join(overrides)}" if overrides else "") + "\nre-run with --yes to do it")
+            return 0
+        for o in overrides:
+            sys.stderr.write(f"--force: overriding: {o}\n")
+        try:
+            F.check_lab_dir(ctx.settings())     # before touching the registry: never leave a half-done rm
+        except F.FetchError as e:
+            die(str(e))
+        reg["models"] = [x for x in reg["models"] if x["id"] != m["id"]]
+        R.save(ctx.registry, reg)      # entry first: a crash leaves an orphan dir (ls shows it), never a dangling entry
+        try:
+            freed = F.remove_lab_dir(ctx.settings(), m["id"])
+        except (F.FetchError, OSError) as e:
+            die(f"registry entry removed but {plan['dir']} could not be deleted: {e}")
+        if m["enabled"]:
+            a = argparse.Namespace(apply=True, force=True, json=False, live_guard=False)
+            with contextlib.redirect_stdout(sys.stderr):
+                cmd_render(ctx, a)
+        emit(args, {"ok": True, "verb": "rm", "removed": m["id"], "freed_bytes": freed, "overrides": overrides},
+             f"removed {m['id']}: registry entry and {plan['dir']}/ ({gb(freed)} freed)")
+        return 0
+
+
+def cmd_review(ctx: Ctx, args):
+    with locked(ctx, "review"):
+        reg = load_registry(ctx)
+        m = R.find(reg, args.id)
+        if m is None:
+            die(f"{args.id!r} is not a lab model in the registry")
+        text, src = read_template(ctx, m)
+        t = m["template"]
+        if text is not None and t.get("sha256"):
+            import hashlib
+            if hashlib.sha256(text.encode()).hexdigest() != t["sha256"]:
+                die(f"the template in the model file does not match the registry sha256; not marking {args.id} reviewed")
+        t["reviewed"] = True
+        R.save(ctx.registry, reg)
+        emit(args, {"ok": True, "verb": "review", "id": m["id"], "flags": t.get("flags", []), "sha256": t.get("sha256"),
+                    "bytes": t.get("bytes"), "source": src, "template": text, "reviewed": True},
+             f"chat template of {m['id']} ({src}; flags: {', '.join(t.get('flags') or []) or 'none'}):\n"
+             f"{'-' * 80}\n{text if text is not None else '(no template)'}\n{'-' * 80}\nrecorded reviewed: true")
+        return 0
+
+
+def read_template(ctx: Ctx, m: dict):
+    import gguf
+    f = R.main_file(m)
+    p = ctx.models_dir / "gguf" / "lab" / m["id"] / f["path"].rsplit("/", 1)[-1]
+    try:
+        fd = os.open(str(p), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        die(f"{p} is missing")
+    try:
+        h = gguf.parse_header(lambda off, n: os.pread(fd, n, off), max_bytes=F.HEADER_MAX)
+    finally:
+        os.close(fd)
+    t = h.kv.get("tokenizer.chat_template")
+    return (t if isinstance(t, str) else None), f"embedded in {p.name}"
+
+
+def cmd_status(ctx: Ctx, args):
+    problems = []
+    try:
+        reg = R.load(ctx.registry)
+    except R.RegistryError as e:
+        reg, problems = None, [str(e)]
+    lab = lab_running(ctx)
+    try:
+        base_ok = ctx.base.is_file()
+        rendered = R.render(ctx.base.read_text(), reg) if reg is not None and base_ok else None
+        in_sync = rendered is not None and ctx.config.is_file() and ctx.config.read_text() == rendered
+    except (R.RegistryError, OSError) as e:
+        problems.append(str(e))
+        in_sync = False
+    data = {"ok": not problems, "verb": "status", "registry": str(ctx.registry), "registry_exists": ctx.registry.exists(),
+            "lab_models": len(reg["models"]) if reg else None,
+            "enabled": [m["id"] for m in reg["models"] if m["enabled"]] if reg else None,
+            "config": str(ctx.config), "base": str(ctx.base), "config_in_sync": in_sync,
+            "lab_running": lab, "llama_swap_reachable": lab is not None,
+            "orgs": list(ctx.orgs), "quota_gb": ctx.quota_gb, "reserve_gb": ctx.reserve_gb,
+            "hf_token": "present" if ctx.token_file and os.path.exists(ctx.token_file) else "absent",
+            "models_dir": str(ctx.models_dir), "problems": problems}
+    lines = [f"registry   {ctx.registry} ({'present' if data['registry_exists'] else 'absent = empty'}; "
+             f"{data['lab_models']} lab model(s), enabled: {', '.join(data['enabled'] or []) or 'none'})",
+             f"config     {ctx.config} {'in sync with' if in_sync else 'DIFFERS from'} base + registry"
+             + ("" if in_sync else " (spark-model render shows the diff)"),
+             f"llama-swap {'running lab models: ' + (', '.join(lab) or 'none') if lab is not None else 'not reachable (or LLAMA_SWAP_URL unset)'}",
+             f"orgs       {' '.join(ctx.orgs) or '(LAB_HF_ORGS empty: every pull is refused)'}",
+             f"quota      {ctx.quota_gb:g} GB; free-space reserve {ctx.reserve_gb:g} GB; HF token {data['hf_token']}"]
+    lines += [f"PROBLEM    {p}" for p in problems]
+    emit(args, data, "\n".join(lines))
+    return 0 if not problems else 1
+
+
+def cmd_pull(ctx: Ctx, args):
+    st = ctx.settings()
+    reg = load_registry(ctx)
+    try:
+        hub = F.Hub(st.endpoint, st.token_file, st.timeout)
+        plan = F.plan_pull(hub, reg, st, args.repo, args.id, args.placement, patterns=args.file, ctx=args.ctx,
+                           klass=getattr(args, "class"))
+    except F.FetchError as e:
+        die(str(e))
+    s = plan.summary()
+    text = [f"pull {plan.repo}@{plan.rev} -> revision {plan.sha}",
+            f"  id {plan.id} (llama-swap {R.LAB_PREFIX}{plan.id}), placement {plan.placement}, ctx {plan.ctx}, "
+            f"class {plan.klass} (from {plan.klass_source}), arch {plan.arch or '?'}"]
+    for f in plan.files:
+        text.append(f"  {f['role']:<6} {f['path']}  {gb(f['bytes'])}  sha256 {f['sha256'][:16]}...")
+    text.append(f"  total {gb(plan.total_bytes)}; lab after {gb(plan.lab_bytes + plan.total_bytes)} of {ctx.quota_gb:g} GB; "
+                f"free {gb(plan.free_bytes)} (need {gb(plan.need_free)})")
+    lic = plan.license
+    text.append(f"  licence {lic['id'] or '(none)'}" + (f"  FLAG: {lic['flag']}" if lic["flag"] else "") +
+                ("  (gated)" if lic["gated"] else ""))
+    tp = plan.template
+    text.append(f"  chat template: {tp['source']}, {tp['bytes']} bytes, flags: {', '.join(tp['flags']) or 'none'}")
+    if plan.fit:
+        text.append(f"  fit: {plan.fit}")
+    if plan.placement == "both":
+        text.append(f"  split {plan.split}" + (f", CPU experts -ot {plan.cpu_experts}=CPU" if plan.cpu_experts else ""))
+    text += [f"  WARN {w}" for w in plan.warnings]
+    text += [f"  REFUSED {r}" for r in plan.refusals]
+    if not plan.ok:
+        die("pull refused:\n" + "\n".join(text), plan=s)
+    if not args.yes:
+        text.append("plan only: nothing downloaded. Re-run with --yes to pull (registers with enabled: false).")
+        emit(args, {"ok": True, "verb": "pull", "dry_run": True, "plan": s}, "\n".join(text))
+        return 0
+    sys.stderr.write("\n".join(text) + "\n")
+    with locked(ctx, "pull"):
+        def save_entry(entry):
+            r2 = load_registry(ctx)
+            if R.find(r2, entry["id"]):
+                raise F.FetchError(f"id {entry['id']!r} appeared in the registry during the pull")
+            r2["models"].append(entry)
+            R.save(ctx.registry, r2)
+        try:
+            entry = F.execute(plan, hub, st, out=sys.stderr, save_entry=save_entry)
+        except F.FetchError as e:
+            die(f"pull failed: {e}" + (f"\nthe quarantine copy is kept in {e.kept}/ (re-run the same pull to resume; "
+                                       f"delete it by hand to give up)" if e.kept else ""), kept=e.kept)
+    emit(args, {"ok": True, "verb": "pull", "dry_run": False, "plan": s, "entry": entry},
+         f"pulled {plan.id}: {gb(plan.total_bytes)} in {ctx.models_dir}/gguf/lab/{plan.id}/, registered (enabled: false)")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ argv
+def id_arg(v):
+    if not R.ID_RE.match(v):
+        raise argparse.ArgumentTypeError(f"invalid id {v!r} (must match {R.ID_RE.pattern})")
+    return v
+
+
+def repo_arg(v):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}(@[A-Za-z0-9._/-]{1,100})?", v) \
+            or ".." in v:
+        raise argparse.ArgumentTypeError(f"invalid repo {v!r} (org/name[@revision])")
+    return v
+
+
+def glob_arg(v):
+    if not F.PATTERN_RE.match(v) or ".." in v.split("/"):
+        raise argparse.ArgumentTypeError(f"invalid --file pattern {v!r}")
+    return v
+
+
+def ctx_arg(v):
+    if not re.fullmatch(r"\d{3,7}", v) or not 512 <= int(v) <= 1048576:
+        raise argparse.ArgumentTypeError("--ctx must be an integer 512..1048576")
+    return int(v)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Fail(f"{self.prog}: {message}", 2)
+
+
+def parser():
+    p = Parser(prog="spark-model-agent", allow_abbrev=False, description=__doc__.split("\n\n")[0])
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="verb", required=True, parser_class=Parser)
+
+    def sp(name, **kw):
+        s = sub.add_parser(name, allow_abbrev=False, **kw)
+        s.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        return s
+    s = sp("pull", help="plan (default) or --yes download, verify and register a GGUF model")
+    s.add_argument("repo", type=repo_arg)
+    s.add_argument("--id", type=id_arg, required=True)
+    s.add_argument("--placement", choices=R.PLACEMENTS, required=True)
+    s.add_argument("--file", type=glob_arg, action="append", default=[], help="glob over the repo's file list")
+    s.add_argument("--ctx", type=ctx_arg)
+    s.add_argument("--class", choices=R.CLASSES)
+    s.add_argument("--yes", action="store_true")
+    sp("ls", help="registry, disk use, quota, core models")
+    s = sp("rm", help="remove a lab model (entry + lab/<id>/)")
+    s.add_argument("id", nargs="?", type=id_arg)
+    s.add_argument("--suggest", action="store_true")
+    s.add_argument("--yes", action="store_true")
+    s.add_argument("--force", action="store_true")
+    s = sp("review", help="print a lab model's chat template and record reviewed: true")
+    s.add_argument("id", type=id_arg)
+    s = sp("render", help="diff (default) or --apply the rendered llama-swap config")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--force", action="store_true")
+    sp("status", help="paths, settings, sync state")
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    as_json = "--json" in argv
+    try:
+        args = parser().parse_args(argv)
+        args.json = as_json
+        ctx = Ctx()
+        if args.verb == "render":
+            args.live_guard = True
+        return {"pull": cmd_pull, "ls": cmd_ls, "rm": cmd_rm, "review": cmd_review, "render": cmd_render,
+                "status": cmd_status}[args.verb](ctx, args)
+    except Fail as e:
+        if as_json:
+            sys.stdout.write(json.dumps({"ok": False, "error": str(e), **e.extra}, default=str) + "\n")
+        sys.stderr.write(f"spark-model-agent: {e}\n")
+        return e.code
+    except KeyboardInterrupt:
+        sys.stderr.write("spark-model-agent: interrupted (a partial download stays in quarantine and resumes)\n")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

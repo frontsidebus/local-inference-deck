@@ -38,6 +38,8 @@ clients/
   bin/claude-spark                -> ~/.local/bin/          Claude Code wrapper
   bin/codex-spark                 -> ~/.local/bin/          Codex wrapper
   bin/hermes-spark                -> ~/.local/bin/          Hermes wrapper
+  bin/spark-model                 -> ~/.local/bin/spark-model (a launcher that runs this checkout's copy):
+                                     lab models, see ../walter/models/README.md
   claude/settings.json            -> ~/.claude-spark/settings.json
   codex/config.toml.tmpl          -> ~/.codex/config.toml
   codex/spark.config.toml         -> ~/.codex/              profile "spark" (coder)

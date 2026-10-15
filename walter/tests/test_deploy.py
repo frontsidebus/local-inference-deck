@@ -342,3 +342,121 @@ def test_model_files_made_world_readable_and_network_step(tmp_path):
     cfg, fw, net = (out.index(s) for s in ("/etc/llama-swap/config.yaml", "/usr/local/sbin/docker-user-rules.sh",
                                           "would ensure docker network llama-net"))
     assert fw < net < cfg
+
+
+# ---- deploy.sh --destdir: lab models (walter/models/README.md) ------------------------------------------------
+
+LAB_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def lab_registry(root, *entries):
+    """Write MODELS_DIR/registry.yaml under a destdir (entries: (id, enabled))."""
+    models = []
+    for eid, enabled in entries:
+        models.append({"id": eid, "repo": "someorg/Some-Model-GGUF", "revision": LAB_SHA, "placement": "gpu1",
+                       "ctx": 8192, "class": "abliterated", "added": "2026-10-14T00:00:00Z", "enabled": enabled,
+                       "files": [{"path": f"{eid}.gguf", "bytes": 100, "sha256": "a" * 64, "role": "model"}]})
+    p = root / "models/registry.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    import yaml
+    p.write_text(yaml.safe_dump({"schema": "spark-model-registry-v1", "models": models}, sort_keys=False))
+    return p
+
+
+def rendered_template(tmp_path, env):
+    out = tmp_path / "template-config.yaml"
+    r = render(env, str(REPO / "walter/llama-swap/config.yaml.tmpl"), str(out))
+    assert r.returncode == 0, r.stderr
+    return out.read_text()
+
+
+def test_plain_deploy_installs_agent_and_config_equals_template(tmp_path):
+    root, env = tmp_path / "root", write_env(tmp_path)
+    out = deploy(root, env)
+    tmpl = rendered_template(tmp_path, env)
+    assert (root / "etc/llama-swap/config.base.yaml").read_text() == tmpl
+    assert (root / "etc/llama-swap/config.yaml").read_text() == tmpl          # no registry: exactly the template
+    assert not (root / "etc/llama-swap/config.yaml.prev").exists()
+    assert "  new      /etc/llama-swap/config.yaml (rendered: base + 0 enabled lab model(s)" in out
+    for f in ("registry.py", "fetch.py", "gguf.py", "hf.py"):
+        assert (root / "usr/local/lib/spark-model" / f).is_file(), f
+    agent = root / "usr/local/sbin/spark-model-agent"
+    assert agent.stat().st_mode & 0o777 == 0o755 and agent.read_text().startswith("#!/usr/bin/python3 -IB\n")
+    sudo = (root / "etc/sudoers.d/spark-model")
+    assert sudo.stat().st_mode & 0o777 == 0o440 and sudo.parent.stat().st_mode & 0o777 == 0o750
+    rules = [l for l in sudo.read_text().splitlines() if l and not l.startswith("#")]
+    assert rules == ["Defaults!/usr/local/sbin/spark-model-agent env_reset, !setenv",
+                     "operator ALL=(root) NOPASSWD: /usr/local/sbin/spark-model-agent"]
+    aenv = (root / "etc/spark-model/agent.env").read_text()
+    assert "LAB_MODELS_QUOTA_GB=1500" in aenv and "LAB_HF_ORGS" not in aenv     # empty in site.env.example
+    assert (root / "models/quarantine").stat().st_mode & 0o777 == 0o700
+    assert (root / "models/gguf/lab").stat().st_mode & 0o777 == 0o755
+    # the agent was installed before the config it renders; the config still comes after the network step
+    assert out.index("/usr/local/sbin/spark-model-agent") < out.index("/etc/llama-swap/config.yaml")
+    assert out.index("/etc/llama-swap/config.base.yaml") < out.index("/etc/llama-swap/config.yaml")
+
+
+def test_deploy_keeps_enabled_lab_entries_and_does_not_rewrite(tmp_path):
+    root, env = tmp_path / "root", write_env(tmp_path)
+    deploy(root, env)
+    cfg = root / "etc/llama-swap/config.yaml"
+    lab_registry(root, ("on-model", True), ("off-model", False))
+    out = deploy(root, env)
+    assert changed_lines(out) == ["  new      /etc/llama-swap/config.yaml (rendered: base + 1 enabled lab model(s);"
+                                  " previous kept as config.yaml.prev; llama-swap binary not found: -validate skipped"
+                                  " (structural checks passed))"]
+    text = cfg.read_text()
+    assert '"lab-on-model":' in text and "lab-off-model" not in text
+    assert (root / "etc/llama-swap/config.yaml.prev").read_text() == rendered_template(tmp_path, env)
+    mtime = cfg.stat().st_mtime_ns
+    again = deploy(root, env)                       # plain re-deploy: lab entry kept, file not touched (no reload)
+    assert changed_lines(again) == [] and cfg.read_text() == text and cfg.stat().st_mtime_ns == mtime
+    dry = deploy(root, env, "--dry-run")
+    assert "/etc/llama-swap/config.yaml" not in "\n".join(l for l in dry.splitlines() if l.startswith("  new "))
+
+
+def test_template_change_rerenders_with_lab_entries(tmp_path):
+    repo, root, env = repo_copy(tmp_path), tmp_path / "root", write_env(tmp_path)
+    deploy(root, env, repo=repo)
+    lab_registry(root, ("on-model", True))
+    deploy(root, env, repo=repo)
+    t = repo / "walter/llama-swap/config.yaml.tmpl"
+    t.write_text(t.read_text().replace("healthCheckTimeout: 600", "healthCheckTimeout: 601"))
+    out = deploy(root, env, repo=repo)
+    assert "  new      /etc/llama-swap/config.base.yaml" in out
+    text = (root / "etc/llama-swap/config.yaml").read_text()
+    assert "healthCheckTimeout: 601" in text and '"lab-on-model":' in text
+
+
+def test_disabled_only_registry_keeps_the_template_and_dry_run_reports_changes(tmp_path):
+    root, env = tmp_path / "root", write_env(tmp_path)
+    deploy(root, env)
+    lab_registry(root, ("off-model", False))
+    assert changed_lines(deploy(root, env)) == []
+    lab_registry(root, ("on-model", True))
+    before = (root / "etc/llama-swap/config.yaml").read_text()
+    dry = deploy(root, env, "--dry-run")
+    assert "  new      /etc/llama-swap/config.yaml (base + lab registry" in dry
+    assert (root / "etc/llama-swap/config.yaml").read_text() == before
+
+
+def test_invalid_registry_fails_the_deploy_and_keeps_the_config(tmp_path):
+    root, env = tmp_path / "root", write_env(tmp_path)
+    deploy(root, env)
+    before = (root / "etc/llama-swap/config.yaml").read_text()
+    (root / "models/registry.yaml").write_text("schema: spark-model-registry-v1\nmodels:\n  - id: Bad!\n")
+    r = subprocess.run(["bash", str(REPO / "walter/deploy.sh"), "--destdir", str(root), "--site-env", str(env)],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0 and "spark-model-agent render --apply failed" in r.stderr
+    assert "id 'Bad!'" in r.stderr
+    assert (root / "etc/llama-swap/config.yaml").read_text() == before
+    dry = subprocess.run(["bash", str(REPO / "walter/deploy.sh"), "--destdir", str(root), "--site-env", str(env),
+                          "--dry-run"], capture_output=True, text=True, timeout=120)
+    assert dry.returncode != 0 and "spark-model-agent render failed" in dry.stderr
+
+
+def test_lab_orgs_reach_the_agent_env(tmp_path):
+    root = tmp_path / "root"
+    deploy(root, write_env(tmp_path, LAB_HF_ORGS="someorg otherorg", LAB_MODELS_QUOTA_GB="900"))
+    aenv = (root / "etc/spark-model/agent.env").read_text()
+    assert 'LAB_HF_ORGS="someorg otherorg"' in aenv and "LAB_MODELS_QUOTA_GB=900" in aenv
