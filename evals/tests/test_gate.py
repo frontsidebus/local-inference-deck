@@ -778,3 +778,84 @@ def test_calibrate_aa_gates_check(gw, gate_env, tmp_path, capsys):
     assert "did not pass" in capsys.readouterr().err
     gw.answer = lambda body: "Answer: A"
     assert G.main(["check", *args, "--accept-aa"]) in (0, 1, 2)
+
+
+# ------------------------------------------------------------------------------------------- gateway route
+@pytest.fixture
+def tunnel_env(gate_env, tmp_path, monkeypatch, gw):
+    """site.env with a backend, and a fake tools/gateway-tunnel.sh (subprocess.run) that 'starts' the fake server."""
+    (tmp_path / "site.env").write_text("SPARK_API_HOST=api.example.com\nBACKEND_LAN_IP=192.0.2.10\n"
+                                       "BACKEND_WG_IP=10.99.0.2\n")
+    monkeypatch.delenv("EVAL_BASE_URL", raising=False)
+    monkeypatch.delenv("EVAL_GPU_SSH", raising=False)
+    tunnel = {"calls": [], "fail": False}
+
+    class Done:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    real_run = G.subprocess.run   # the same module run.py uses (git status): pass everything else through
+
+    def fake_run(argv, *a, **kw):
+        if argv[:2] != ["bash", str(G.TUNNEL)]:
+            return real_run(argv, *a, **kw)
+        assert kw["env"]["EVAL_RUN"] == "gate"
+        tunnel["calls"].append(argv[2])
+        if argv[2] == "start" and tunnel["fail"]:
+            return Done(1, err="tunnel did not come up")
+        return Done(0, f"EVAL_BASE_URL={gw.url}\n" if argv[2] == "start" else "")
+    monkeypatch.setattr(G.subprocess, "run", fake_run)
+    gate_env["tunnel"] = tunnel
+    return gate_env
+
+
+def test_route_tunnel_by_default(gw, tunnel_env, capsys):
+    assert G.main(["baseline", "--model", "coder", "--yes", *tunnel_env["args"]]) == 0
+    argv = tunnel_env["calls"][0]
+    assert argv[argv.index("--base-url") + 1] == gw.url and len(gw.requests) == 10
+    assert argv[argv.index("--timeout") + 1] == str(G.REQUEST_TIMEOUT_S)
+    assert tunnel_env["tunnel"]["calls"] == ["start", "stop"]
+    bdir = next((tunnel_env["root"] / "coder").glob("baseline-*"))
+    assert json.loads((bdir / "gate.json").read_text())["routes"] == ["tunnel"]
+    assert "SSH tunnel" in capsys.readouterr().err
+
+
+def test_route_calibrate_starts_a_tunnel_per_run(gw, tunnel_env):
+    G.main(["calibrate", "--model", "coder", "--yes", *tunnel_env["args"]])
+    assert tunnel_env["tunnel"]["calls"] == ["start", "stop", "start", "stop"]
+    assert len(tunnel_env["calls"]) == 2
+    assert all(c[c.index("--base-url") + 1] == gw.url for c in tunnel_env["calls"])
+
+
+def test_route_tunnel_failure_refuses_before_any_dir(gw, tunnel_env, capsys):
+    tunnel_env["tunnel"]["fail"] = True
+    assert G.main(["baseline", "--model", "coder", "--yes", *tunnel_env["args"]]) == 4
+    assert not gw.requests and not tunnel_env["calls"] and not (tunnel_env["root"] / "coder").exists()
+    assert "--via-edge" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [["--via-edge"], ["--base-url", "BASE"]])
+def test_route_no_tunnel_when_told(gw, tunnel_env, extra):
+    extra = [gw.url if x == "BASE" else x for x in extra]
+    G.main(["baseline", "--model", "coder", "--yes", "--request-timeout", "120", *extra, *tunnel_env["args"]])
+    assert tunnel_env["tunnel"]["calls"] == []
+    argv = tunnel_env["calls"][0]
+    assert argv[argv.index("--timeout") + 1] == "120.0"
+    assert ("--base-url" in argv) == ("--via-edge" not in extra)
+
+
+def test_route_env_base_url_skips_tunnel(gw, tunnel_env, monkeypatch):
+    monkeypatch.setenv("EVAL_BASE_URL", gw.url)
+    assert G.main(["baseline", "--model", "coder", "--yes", *tunnel_env["args"]]) == 0
+    assert tunnel_env["tunnel"]["calls"] == [] and "--base-url" not in tunnel_env["calls"][0]
+    assert len(gw.requests) == 10
+
+
+def test_route_no_backend_warns_and_uses_edge(gw, gate_env, monkeypatch, capsys):
+    monkeypatch.delenv("EVAL_BASE_URL", raising=False)
+    monkeypatch.delenv("EVAL_GPU_SSH", raising=False)
+    real_run = G.subprocess.run
+    monkeypatch.setattr(G.subprocess, "run", lambda argv, *a, **k: pytest.fail("no tunnel without a backend")
+                        if argv[:2] == ["bash", str(G.TUNNEL)] else real_run(argv, *a, **k))
+    route = G.start_route(G.parse_args(["baseline", "--model", "coder", *gate_env["args"]]))
+    assert route == ("edge", None, None) and "public edge" in capsys.readouterr().err
