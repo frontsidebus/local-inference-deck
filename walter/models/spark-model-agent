@@ -15,6 +15,8 @@ Verbs (all take --json):
   review ID                  print the chat template and record reviewed: true
   render [--apply] [--force] diff of the rendered llama-swap config; --apply installs it (deploy.sh uses this)
   status                     paths, settings, registry state, lab models running in llama-swap
+  serving                    read-only: per model, the cmd sha256 and server flags of the LIVE config.yaml (no
+                             paths, no keys); the eval gate records it as serving identity (evals/gate.py)
 Runbook: walter/models/README.md in the repo.
 """
 import argparse
@@ -37,6 +39,7 @@ sys.path.insert(0, str(LIB))
 
 import registry as R  # noqa: E402
 import fetch as F     # noqa: E402
+import swapcmd        # noqa: E402
 
 GB = 1000 ** 3
 AGENT_PATH = "/usr/local/sbin/spark-model-agent"
@@ -476,6 +479,23 @@ def cmd_status(ctx: Ctx, args):
     return 0 if not problems else 1
 
 
+def cmd_serving(ctx: Ctx, args):
+    """What llama-swap serves now: the live config's entries as hashes (swapcmd.py). Read-only, no lock."""
+    try:
+        text = ctx.config.read_text()
+    except OSError as e:
+        die(f"cannot read {ctx.config}: {e.strerror}")
+    models = swapcmd.entries(text)
+    data = {"ok": bool(models), "verb": "serving", "config": str(ctx.config),
+            "config_sha256": swapcmd.sha256_text(text), "models": models}
+    if not models:
+        data["error"] = f"no models parsed from {ctx.config}"
+    lines = [f"config {ctx.config} sha256 {data['config_sha256'][:12]}"]
+    lines += [f"  {mid:<24} cmd {e['cmd_sha256'][:12]}  {' '.join(e['aliases'])}" for mid, e in models.items()]
+    emit(args, data, "\n".join(lines))
+    return 0 if models else 1
+
+
 def cmd_pull(ctx: Ctx, args):
     st = ctx.settings()
     reg = load_registry(ctx)
@@ -588,6 +608,7 @@ def parser():
     s.add_argument("--apply", action="store_true")
     s.add_argument("--force", action="store_true")
     sp("status", help="paths, settings, sync state")
+    sp("serving", help="cmd sha256 and server flags of the live config, per model (read-only)")
     return p
 
 
@@ -601,7 +622,7 @@ def main(argv=None):
         if args.verb == "render":
             args.live_guard = True
         return {"pull": cmd_pull, "ls": cmd_ls, "rm": cmd_rm, "review": cmd_review, "render": cmd_render,
-                "status": cmd_status}[args.verb](ctx, args)
+                "status": cmd_status, "serving": cmd_serving}[args.verb](ctx, args)
     except Fail as e:
         if as_json:
             sys.stdout.write(json.dumps({"ok": False, "error": str(e), **e.extra}, default=str) + "\n")
