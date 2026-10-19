@@ -207,6 +207,9 @@ enable refuses flagged + unreviewed). The heuristics are deliberately simple:
   `reviewed: true`.
 - `render`: the diff; from the workstation it is dry only in Phase 1 (deploy.sh applies).
 - `status`: paths, settings, whether config.yaml equals base + registry, lab models in `/running`.
+- `serving`: read-only. For each model in the live config.yaml: the cmd sha256, aliases and a few server flags
+  (`-c -n -sm -m` basename and sampling), parsed exactly as `evals/run.py` parses the template (`lib/swapcmd.py`).
+  No paths and no keys are printed. The eval gate records it as the serving identity (`evals/README.md`).
 
 All verbs take `--json` (the client always uses it; the human text is in its `"text"` field).
 

@@ -65,6 +65,10 @@ SEALED_MANIFESTS = (EVALS_DIR / "datasets" / "heldout" / "heldout-v1.1.json",
 GUARD = EVALS_DIR / "tools" / "gpu-guard.sh"
 TUNNEL = EVALS_DIR / "tools" / "gateway-tunnel.sh"   # SSH to the backend's LiteLLM, skipping the public edge
 REQUEST_TIMEOUT_S = 300      # run.py --timeout for gate runs; the slowest gate item takes well under a minute
+# Read-only on the backend (walter/models/spark-model-agent, one sudoers line): the LIVE llama-swap config's cmd
+# sha256 and server flags per model, never the cmd itself. run.py records the repo template's cmd, which is not
+# what serves when the backend has not been redeployed.
+LIVE_SERVING_CMD = ("sudo", "-n", "/usr/local/sbin/spark-model-agent", "serving", "--json")
 RUN_NAME = "gate"            # run.py --run-name; the GPU guard and stop.sh match it (EVAL_RUN=gate)
 RECORD = "gate.json"
 REPORT = "gate-report.md"
@@ -553,7 +557,8 @@ def compatibility(base_dir: Path, cand_dir: Path, m: Dict[str, Any], allow_stale
     if probs:
         raise GateError(f"baseline {Path(base_dir).name} is not compatible with candidate {Path(cand_dir).name}",
                         probs)
-    return {"stale_harness": stale, "baseline_run": brd, "candidate_run": crd, "baseline": b, "candidate": c}
+    return {"stale_harness": stale, "baseline_run": brd, "candidate_run": crd, "baseline": b, "candidate": c,
+            "baseline_rec": brec, "candidate_rec": crec}
 
 
 def public_sampling(m: Dict[str, Any]) -> Dict[str, Any]:
@@ -793,26 +798,99 @@ def overall(rows: Sequence[Dict[str, Any]]) -> str:
 
 # ------------------------------------------------------------------------------------------- identity
 IDENTITY_FIELDS = ("model", "model_file", "model_sha256", "quant", "llama_cpp_build", "image_digest", "ctx_size",
-                   "chat_template_sha256", "flags", "llama_swap_cmd_sha256", "served_models", "system_fingerprints")
+                   "chat_template_sha256", "flags", "llama_swap_cmd_sha256", "llama_swap_source", "served_models",
+                   "system_fingerprints")
+SOURCE_LIVE, SOURCE_TEMPLATE = "live config", "repo template"
 
 
-def serving_identity(run: Dict[str, Any]) -> Dict[str, Any]:
+def _gpu_ssh(a) -> Optional[str]:
+    """The backend's ssh target, as tools/gpu-guard.sh picks it: EVAL_GPU_SSH, else BACKEND_SSH_USER@BACKEND_LAN_IP."""
+    if os.environ.get("EVAL_GPU_SSH"):
+        return os.environ["EVAL_GPU_SSH"]
+    site = RUN.load_site_env(Path(a.site_env))
+    host, user = RUN.setting("BACKEND_LAN_IP", site), RUN.setting("BACKEND_SSH_USER", site)
+    return (f"{user}@{host}" if user else host) if host else None
+
+
+def _ssh_live_serving(target: str) -> Dict[str, Any]:
+    """spark-model-agent serving --json on the backend -> its JSON object; raises GateError when unavailable."""
+    try:
+        out = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, *LIVE_SERVING_CMD],
+                             capture_output=True, text=True, timeout=60)
+        data = json.loads(out.stdout) if out.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise GateError(f"spark-model-agent serving: {exc}") from None
+    if out.returncode != 0 or not data.get("ok"):
+        raise GateError(f"spark-model-agent serving exited {out.returncode}: "
+                        f"{(data.get('error') or out.stderr or '').strip()[:200]}")
+    return data
+
+
+LIVE_FETCH = _ssh_live_serving     # tests replace this
+
+
+def live_snapshot(a, when: str) -> Dict[str, Any]:
+    """The live llama-swap entry serving a.model now: {when, at, model_id, aliases, cmd_sha256, server_flags,
+    config_sha256}, or {when, at, error} when it cannot be read (the identity then falls back to the template)."""
+    snap: Dict[str, Any] = {"when": when, "at": RUN.utcnow()}
+    target = _gpu_ssh(a)
+    if not target:
+        snap["error"] = "no backend in site.env (EVAL_GPU_SSH or BACKEND_LAN_IP)"
+        return snap
+    try:
+        data = LIVE_FETCH(target)
+    except GateError as exc:
+        snap["error"] = str(exc)
+        return snap
+    for mid, e in (data.get("models") or {}).items():
+        if a.model == mid or a.model in (e.get("aliases") or []):
+            snap.update(model_id=mid, aliases=e.get("aliases"), cmd_sha256=e.get("cmd_sha256"),
+                        server_flags=e.get("server_flags"), config_sha256=data.get("config_sha256"))
+            return snap
+    snap["error"] = f"{a.model!r} is not in the live llama-swap config"
+    return snap
+
+
+def _live(rec: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [x for x in ((rec or {}).get("llama_swap_live") or []) if isinstance(x, dict)]
+
+
+def live_problems(rec: Optional[Dict[str, Any]]) -> List[str]:
+    """A run whose model's live cmd changed between the snapshots (before and after every run.py invocation) was
+    served by two configs: invalid."""
+    seen = [x for x in _live(rec) if x.get("cmd_sha256")]
+    hashes = list(dict.fromkeys(x["cmd_sha256"] for x in seen))
+    if len(hashes) > 1:
+        return [f"the live llama-swap cmd for {seen[0].get('model_id')} changed during the run ("
+                + " -> ".join(h[:12] + "…" for h in hashes) + ")"]
+    return []
+
+
+def serving_identity(run: Dict[str, Any], rec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """What served the tokens, from run.json: the serving fields (static config > probe > template), the static
     record's model sha256 / image digest / flags when given, the llama-swap flags and cmd hash (not the cmd: it can
-    hold paths), and what the responses reported."""
+    hold paths), and what the responses reported. The cmd hash and flags come from the live config snapshot in the
+    gate record when there is one, else from the repo template run.py read (``llama_swap_source`` says which; the two
+    never hash alike, as deploy fills site values into the template)."""
     sv = run.get("serving") if isinstance(run.get("serving"), dict) else {}
     f = sv.get("fields") or {}
     st = sv.get("static") or {}
     sw = run.get("llama_swap") or {}
     served = run.get("served") or {}
+    live = next((x for x in _live(rec) if x.get("cmd_sha256")), None)
+    if live:
+        cmd_sha, swap_flags, source = live["cmd_sha256"], live.get("server_flags"), SOURCE_LIVE
+    else:
+        cmd_sha = RUN.sha256_text(sw["cmd"]) if sw.get("cmd") else None
+        swap_flags, source = sw.get("server_flags"), SOURCE_TEMPLATE if cmd_sha else None
     return {
         "model": run.get("model"),
         "model_file": _val(f.get("model_file")), "model_sha256": st.get("model_sha256"),
         "quant": _val(f.get("quant")), "llama_cpp_build": _val(f.get("llama_cpp_build")),
         "image_digest": st.get("image_digest"), "ctx_size": _val(f.get("ctx_size")),
         "chat_template_sha256": _val(f.get("chat_template_sha256")),
-        "flags": st.get("flags") or (sw.get("server_flags") or None),
-        "llama_swap_cmd_sha256": RUN.sha256_text(sw["cmd"]) if sw.get("cmd") else None,
+        "flags": st.get("flags") or (swap_flags or None),
+        "llama_swap_cmd_sha256": cmd_sha, "llama_swap_source": source,
         "served_models": served.get("models"), "system_fingerprints": served.get("system_fingerprints"),
     }
 
@@ -918,7 +996,14 @@ def analyse(m: Dict[str, Any], base_dir: Path, cand_dir: Path, allow_stale_harne
     items = load_items_for(m) if m.get("_checked_data") else None
     inv_b, base = run_invalid(comp["baseline_run"], m, items)
     inv_c, cand = run_invalid(comp["candidate_run"], m, items)
-    bi, ci = serving_identity(comp["baseline"]), serving_identity(comp["candidate"])
+    inv_b += live_problems(comp["baseline_rec"])
+    inv_c += live_problems(comp["candidate_rec"])
+    bi = serving_identity(comp["baseline"], comp["baseline_rec"])
+    ci = serving_identity(comp["candidate"], comp["candidate_rec"])
+    if bi["llama_swap_source"] and ci["llama_swap_source"] and bi["llama_swap_source"] != ci["llama_swap_source"]:
+        notes.append(f"llama_swap_cmd_sha256 comes from the {bi['llama_swap_source']} for the baseline and the "
+                     f"{ci['llama_swap_source']} for the candidate: the two hashes are not comparable (deploy fills "
+                     "site values into the template)")
     invalid = [f"baseline: {x}" for x in inv_b] + [f"candidate: {x}" for x in inv_c]
     rows = [] if invalid else verdicts(m, base, cand)
     verdict = "INVALID" if invalid else overall(rows)
@@ -1109,6 +1194,11 @@ def generate(m: Dict[str, Any], a, kind: str, resume: Optional[str] = None) -> T
         (gd / SELECTION).write_text(json.dumps(selection(m), indent=2) + "\n", encoding="utf-8")
         (gd / BUDGET).write_text(json.dumps(budget_doc(m), indent=2) + "\n", encoding="utf-8")
         rec.setdefault("routes", []).append(route)      # one per run.py invocation (resumes add one)
+        before = live_snapshot(a, "before")
+        rec.setdefault("llama_swap_live", []).append(before)
+        if before.get("error"):
+            log(f"warning: live llama-swap config not read ({before['error']}); the serving identity falls back to "
+                "the repo template")
         write_record(gd, rec)
         guard = start_guard(a)
         rc = RUNNER(run_argv(m, a, gd, url))
@@ -1116,6 +1206,7 @@ def generate(m: Dict[str, Any], a, kind: str, resume: Optional[str] = None) -> T
         if guard is not None:
             guard.terminate()
         stop_route(tunnel)
+    rec["llama_swap_live"].append(live_snapshot(a, "after"))
     rec.setdefault("run_exits", []).append(rc)
     return gd, rc, rec
 
@@ -1146,8 +1237,8 @@ def finish_baseline(m: Dict[str, Any], gd: Path, rec: Dict[str, Any]) -> Optiona
     rd = gd / rec["run_dir"]
     inv, _ = run_invalid(rd, m, load_items_for(m))
     run = R._read_run(rd)
-    inv += manifest_problems(run, m, "baseline")
-    rec["serving_identity"] = serving_identity(run)
+    inv += manifest_problems(run, m, "baseline") + live_problems(rec)
+    rec["serving_identity"] = serving_identity(run, rec)
     rec["harness"] = harness_signature(run)
     rec["budget"]["per_suite"] = (run.get("budget") or {}).get("per_suite")
     if inv:
@@ -1252,7 +1343,7 @@ def cmd_check(m: Dict[str, Any], a) -> int:
     if bad is not None:
         return bad
     rd = gd / rec["run_dir"]
-    rec["serving_identity"] = serving_identity(R._read_run(rd))
+    rec["serving_identity"] = serving_identity(R._read_run(rd), rec)
     rec["harness"] = harness_signature(R._read_run(rd))
     try:
         res = analyse(m, bdir, gd, a.allow_stale_harness, extra_notes=[aa_note] if aa_note else ())

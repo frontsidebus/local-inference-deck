@@ -551,10 +551,18 @@ def gate_env(tmp_path, monkeypatch):
         return RUN.main(argv + ["--backoff", "0"])
     monkeypatch.setattr(G, "RUNNER", runner)
     monkeypatch.setenv("EVAL_STATE_DIR", str(tmp_path / "state"))
+    live = {"calls": [], "seq": []}     # spark-model-agent serving replies, one per snapshot; none = unreachable
+
+    def live_fetch(target):
+        live["calls"].append(target)
+        if not live["seq"]:
+            raise G.GateError("spark-model-agent serving: unreachable in tests")
+        return live["seq"].pop(0) if len(live["seq"]) > 1 else live["seq"][0]
+    monkeypatch.setattr(G, "LIVE_FETCH", live_fetch)
     # the sample MCQ suite, min parse rate 0, so the fake server's "no idea" replies are not a format failure
     data = Path(G.EVALS_DIR / "samples" / "mcq.jsonl")
     man = write_manifest(tmp_path, [suite_entry(data, "sample-mcq", min_parse_rate=0.0, parse_margin=0.05)])
-    return {"calls": calls, "manifest": man, "root": tmp_path / "gate",
+    return {"calls": calls, "manifest": man, "root": tmp_path / "gate", "live": live,
             "args": ["--manifest", str(man), "--results-root", str(tmp_path / "gate"), "--key-file", str(key),
                      "--site-env", str(site), "--no-guard"]}
 
@@ -859,3 +867,70 @@ def test_route_no_backend_warns_and_uses_edge(gw, gate_env, monkeypatch, capsys)
                         if argv[:2] == ["bash", str(G.TUNNEL)] else real_run(argv, *a, **k))
     route = G.start_route(G.parse_args(["baseline", "--model", "coder", *gate_env["args"]]))
     assert route == ("edge", None, None) and "public edge" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------------------------------- live serving identity
+def agent_reply(cmd_sha="c" * 64, flags=None):
+    return {"ok": True, "verb": "serving", "config_sha256": "f" * 64,
+            "models": {"other": {"aliases": ["x"], "cmd_sha256": "0" * 64, "server_flags": {}},
+                       "qwen3.8-27b": {"aliases": ["coder"], "cmd_sha256": cmd_sha,
+                                       "server_flags": flags or {"-c": "131072", "-sm": "none"}}}}
+
+
+@pytest.fixture
+def live_env(gate_env, tmp_path, monkeypatch):
+    monkeypatch.delenv("EVAL_GPU_SSH", raising=False)
+    (tmp_path / "site.env").write_text("SPARK_API_HOST=api.example.com\nBACKEND_LAN_IP=192.0.2.10\n"
+                                       "BACKEND_SSH_USER=op\n")
+    return gate_env
+
+
+def _baseline(gw, env):
+    assert G.main(["baseline", "--model", "coder", "--yes", "--base-url", gw.url, *env["args"]]) in (0, 3)
+    bdir = sorted((env["root"] / "coder").glob("baseline-*"))[-1]
+    return bdir, json.loads((bdir / G.RECORD).read_text())
+
+
+def test_live_identity_recorded_before_and_after(gw, live_env):
+    live_env["live"]["seq"] = [agent_reply()]
+    bdir, rec = _baseline(gw, live_env)
+    assert live_env["live"]["calls"] == ["op@192.0.2.10"] * 2
+    assert [x["when"] for x in rec["llama_swap_live"]] == ["before", "after"]
+    assert rec["llama_swap_live"][0]["model_id"] == "qwen3.8-27b" and rec["status"] == "complete"
+    ident = rec["serving_identity"]
+    assert ident["llama_swap_cmd_sha256"] == "c" * 64 and ident["llama_swap_source"] == G.SOURCE_LIVE
+    assert ident["flags"] == {"-c": "131072", "-sm": "none"}
+
+
+def test_live_cmd_change_during_run_is_invalid(gw, live_env):
+    live_env["live"]["seq"] = [agent_reply("a" * 64), agent_reply("b" * 64)]
+    bdir, rec = _baseline(gw, live_env)
+    assert rec["status"] == "invalid" and any("changed during the run" in x for x in rec["invalid"])
+
+
+def test_no_live_config_falls_back_to_the_template(gw, gate_env, capsys):
+    bdir, rec = _baseline(gw, gate_env)              # site.env has no backend: no ssh at all
+    assert gate_env["live"]["calls"] == [] and rec["status"] == "complete"
+    assert "no backend" in rec["llama_swap_live"][0]["error"]
+    assert rec["serving_identity"]["llama_swap_source"] == G.SOURCE_TEMPLATE
+    assert rec["serving_identity"]["llama_swap_cmd_sha256"]
+    assert "falls back to the repo template" in capsys.readouterr().err
+
+
+def test_unreachable_agent_or_unknown_model_falls_back(gw, live_env):
+    bdir, rec = _baseline(gw, live_env)              # LIVE_FETCH raises
+    assert "unreachable" in rec["llama_swap_live"][0]["error"]
+    live_env["live"]["seq"] = [{**agent_reply(), "models": {}}]
+    bdir, rec = _baseline(gw, live_env)
+    assert "not in the live llama-swap config" in rec["llama_swap_live"][0]["error"]
+    assert rec["serving_identity"]["llama_swap_source"] == G.SOURCE_TEMPLATE
+
+
+def test_report_notes_mixed_identity_sources(gw, live_env, gate_env, tmp_path, capsys):
+    b1, _ = _baseline(gw, live_env)                  # template (agent unreachable)
+    live_env["live"]["seq"] = [agent_reply()]
+    b2, _ = _baseline(gw, live_env)                  # live
+    res = G.analyse(G.load_manifest(gate_env["manifest"]), b1, b2)
+    assert "not comparable" in res["report"] and "| llama_swap_source | repo template | live config | **yes** |" \
+        in res["report"]
+    assert res["identity"]["candidate"]["llama_swap_cmd_sha256"] == "c" * 64
