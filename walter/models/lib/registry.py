@@ -832,8 +832,10 @@ def check_config(text: str, base_text: str | None = None) -> list[str]:
             base = yaml.safe_load(base_text)
         except yaml.YAMLError as x:
             return p + [f"base: not valid YAML: {x}"]
-        core = {k: v for k, v in models.items() if not str(k).startswith(LAB_PREFIX)}
-        if core != base.get("models"):
+        # (a lab- model the base itself defines, as the Maya engine's walter/maya, is core: only the registry's are not)
+        base_models = base.get("models") or {}
+        core = {k: v for k, v in models.items() if not str(k).startswith(LAB_PREFIX) or k in base_models}
+        if core != base_models:
             p.append("core models differ from the base config")
         a, b = dict(cfg), dict(base)
         a.pop("models", None), b.pop("models", None)

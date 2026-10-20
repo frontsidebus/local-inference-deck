@@ -166,3 +166,10 @@ Decision:
 - **`coder`: leave it off.** Runaway reasoning was unchanged (3/5 at 0 and at 1.5). The list loop survives the 64-token window. 1.0 corrupted numbers in free JSON (`"population": 00`), and 1.5 made the judge-style answer longer (5 → 7 items) and the digest pick fewer items. Its model card also gives 0 for thinking mode.
 - **`big`: not measured, left off.**
 - The output cap (gateway `max_tokens` clamp, `-n` backstop) stays the guard against runaway generations; a penalty only lowers how often they happen. Clients can still send `presence_penalty` (0 restores the old behaviour on `coder-fast`). Re-measure after an image or model bump.
+
+## 2026-10-20: `lab-glm-5.3-flash` (GLM-5.3-Flash Maya-S24 on the Project Maya engine)
+
+Not llama-server: walter/maya/README.md has the setup and the full table. A transient container with llama-swap's models
+unloaded; method as the `flash` runs above (temperature 0, thinking off, `timings`). Decode 38.9 / 39.8 / 39.4 t/s on
+the 1.5k prompts (29.0 on the short one), prompt 375 t/s at 1.7k and 916 t/s at 9.4k tokens; thinking on 33.9 t/s
+over 2977 tokens. 83 % of the routed experts in VRAM, the rest in 46 GB of pinned RAM, no disk reads; load ~35 s.

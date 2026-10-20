@@ -202,9 +202,9 @@ def test_render_inserts_only_and_keeps_the_base(base):
     assert R.render(base, lab_reg()) == out                       # deterministic
     assert R.check_config(out, base) == []
     cfg, b = yaml.safe_load(out), yaml.safe_load(base)
-    core = {k: v for k, v in cfg["models"].items() if not k.startswith("lab-")}
+    core = {k: v for k, v in cfg["models"].items() if not k.startswith("lab-") or k in b["models"]}
     assert core == b["models"] and list(core) == list(b["models"])
-    assert [k for k in cfg["models"] if k.startswith("lab-")] == ["lab-one-gpu1", "lab-two-gpu0", "lab-big-both",
+    assert [k for k in cfg["models"] if k.startswith("lab-") and k not in b["models"]] == ["lab-one-gpu1", "lab-two-gpu0", "lab-big-both",
                                                                   "lab-moe-both"]   # disabled one left out
     for k in set(b) - {"models", "routing"}:
         assert cfg[k] == b[k]
@@ -265,7 +265,8 @@ def test_lab_entries_pass_the_core_hardening_checks(base):
     sys.path.insert(0, str(Path(__file__).parent))
     import test_llama_swap_config as T
     cfg = yaml.safe_load(R.render(base, lab_reg()))
-    for mid in (k for k in cfg["models"] if k.startswith("lab-")):
+    core = yaml.safe_load(base)["models"]   # (its own lab- entry, the Maya engine, has its own test)
+    for mid in (k for k in cfg["models"] if k.startswith("lab-") and k not in core):
         args, server = T.docker_args(cfg, mid)
         assert T.values(args, "--cap-drop") == ["ALL"] and "--read-only" in args
         assert T.values(args, "-v") == [f"{T.MODELS_DIR}/gguf:/models/gguf:ro"]

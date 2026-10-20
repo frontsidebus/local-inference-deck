@@ -7,7 +7,7 @@
 # The image has no git, no .git, no compiler and no network need at runtime; the server's self-update cannot run.
 #
 # Build (any x86-64 host with Docker; no GPU needed):
-#   docker build -t walter-maya:<MAYA_COMMIT[:7]> walter/maya
+#   docker build -t walter-maya:<MAYA_COMMIT[:7]>-<n> walter/maya   (<n>: this directory's revision, see README.md)
 # GGML_NATIVE (-march=native) is on, as Maya builds it: build on a CPU with the runtime CPU's vector extensions
 # (README.md), or pass --build-arg PORTABLE=ON for an AVX2 baseline.
 ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd360766059e62956e9379485d9e073bbd2f6e3c20c270ed66
@@ -55,15 +55,17 @@ RUN python3 -m venv /venv \
       -r /tmp/requirements.lock \
  && rm -rf /venv/lib/python3*/site-packages/pip* /venv/bin/pip* /tmp/requirements.lock
 COPY --from=build /out /opt/maya
+# lab_entry.py: Maya's server with only the inference routes reachable (llama-swap's /upstream/<model>/ passes any path)
+COPY lab_entry.py /opt/maya/lab_entry.py
 # MAYA_UPDATE_CHECK=0: no GitHub release check from the dashboard (egress is blocked anyway)
 ENV PATH=/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 MAYA_UPDATE_CHECK=0 TMPDIR=/tmp \
     STRATA_GGUF_PY=/opt/maya/third_party/llama.cpp/gguf-py STRATA_MAX_BODY_MIB=32 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 # smoke: the server imports, and the engines need no library the image lacks (libcuda comes from the driver at run time)
 RUN python3 -m compileall -q /opt/maya/serve /opt/maya/tools /venv/lib/python3*/site-packages \
- && cd /opt/maya && python3 -c "import serve.server" \
+ && cd /opt/maya && python3 -c "import serve.server" && python3 -c "import runpy; runpy.run_path('lab_entry.py')" \
  && ! ldd build/maya build/maya-ds4 | grep 'not found' | grep -v 'libcuda\.so'
 USER 10010:10010
 WORKDIR /opt/maya
 EXPOSE 8080
-ENTRYPOINT ["python3", "/opt/maya/serve/server.py", "--engine", "strata"]
+ENTRYPOINT ["python3", "/opt/maya/lab_entry.py", "--engine", "strata"]

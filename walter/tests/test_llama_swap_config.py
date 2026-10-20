@@ -7,6 +7,8 @@ llama-swap does (${MODEL_ID} and ${PORT} stay), and every model's docker command
   - the only bind mount is ${MODELS_DIR}/gguf, read-only: never MODELS_DIR's root or its backups/;
   - every /models/... path the server is given (-m, --mmproj, -md) lies under that mount and is a file that
     fetch-models.sh downloads.
+The Maya lab engine (walter/maya, image walter-maya) is the one exception, checked on its own: besides that mount it
+gets ${MODELS_DIR}/maya-data (rw: packs, log) and its run config from /etc/maya (ro), and serves only the API routes.
 Run: python3 -m pytest walter/tests -q -p no:cacheprovider
 """
 import re
@@ -19,6 +21,7 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO / "walter" / "llama-swap" / "config.yaml.tmpl"
+MAYA = REPO / "walter" / "maya"
 FETCH = REPO / "walter" / "llama-swap" / "fetch-models.sh.tmpl"
 DEPLOY = REPO / "walter" / "deploy.sh"
 FW = REPO / "walter" / "firewall" / "docker-user-rules.sh.tmpl"
@@ -53,7 +56,7 @@ def docker_args(cfg, model_id):
     """The `docker run` args of a model's cmd (everything before the image), and the server args after it."""
     argv = shlex.split(expand(cfg, cfg["models"][model_id]["cmd"]))
     assert argv[0] == "/usr/local/sbin/spark-docker-run.sh" and argv[1] == "${MODEL_ID}", argv[:2]
-    img = next(i for i, a in enumerate(argv) if a.startswith("ghcr.io/ggml-org/llama.cpp:"))
+    img = next(i for i, a in enumerate(argv) if a.startswith(("ghcr.io/ggml-org/llama.cpp:", "walter-maya:")))
     return argv[2:img], argv[img + 1:]
 
 
@@ -76,6 +79,21 @@ def mem_bytes(v):
 
 def model_ids():
     return list(yaml.safe_load(TEMPLATE.read_text())["models"])
+
+
+def is_maya(cfg, mid):
+    return "${maya-image}" in cfg["models"][mid]["cmd"]
+
+
+def server_ids():
+    """The llama-server models (every model but Maya's)."""
+    cfg = yaml.safe_load(TEMPLATE.read_text())
+    return [m for m in cfg["models"] if not is_maya(cfg, m)]
+
+
+def maya_ids():
+    cfg = yaml.safe_load(TEMPLATE.read_text())
+    return [m for m in cfg["models"] if is_maya(cfg, m)]
 
 
 # ---- llama-swap itself ---------------------------------------------------------------------------
@@ -116,7 +134,7 @@ def test_run_is_hardened(config, mid):
         assert not any(a == bad or a.startswith(bad + "=") for a in args), (mid, bad)
 
 
-@pytest.mark.parametrize("mid", model_ids())
+@pytest.mark.parametrize("mid", server_ids())
 def test_mounts_only_model_files(config, mid):
     args, _ = docker_args(config, mid)
     vols = values(args, "-v", "--volume")
@@ -143,7 +161,7 @@ def fetched_files():
     return out
 
 
-@pytest.mark.parametrize("mid", model_ids())
+@pytest.mark.parametrize("mid", server_ids())
 def test_model_paths_resolve(config, mid):
     args, server = docker_args(config, mid)
     mounts = {PurePosixPath(v.split(":")[1]): PurePosixPath(v.split(":")[0]) for v in values(args, "-v", "--volume")}
@@ -165,13 +183,57 @@ def test_model_paths_resolve(config, mid):
 def test_cpu_offload_models_get_the_large_memory_cap(config, mid):
     args, server = docker_args(config, mid)
     cpu = any("=CPU" in a for a in values(server, "-ot", "--override-tensor")) or \
-        any(a in server for a in ("--n-cpu-moe", "-ncmoe", "--cpu-moe", "-cmoe"))
+        any(a in server for a in ("--n-cpu-moe", "-ncmoe", "--cpu-moe", "-cmoe")) or is_maya(config, mid)
     mem = mem_bytes(values(args, "--memory")[0])
     if cpu:
         assert mem >= 64 * 2**30, (mid, mem)   # ~17 GB of experts + n-gram pages + prompt cache
     else:
         assert 16 * 2**30 <= mem <= 48 * 2**30, (mid, mem)
     assert mem <= 72 * 2**30, "leave room in the 80 GiB VM for the gateway and the other stacks"
+
+
+# ---- the Maya lab engine (walter/maya) ------------------------------------------------------------
+
+@pytest.mark.parametrize("mid", maya_ids())
+def test_maya_entry(config, mid):
+    args, server = docker_args(config, mid)
+    m = config["models"][mid]
+    assert mid.startswith("lab-") and m.get("unlisted") is True, "the gateway's lab guard keys on the lab- id"
+    assert m["capabilities"]["tools"] is False and not m.get("aliases")
+    vols = sorted(values(args, "-v", "--volume"))
+    assert vols == sorted([f"{MODELS_DIR}/gguf:/models/gguf:ro", f"{MODELS_DIR}/maya-data:/data",
+                           "/etc/maya/glm-5.3-flash.json:/cfg/glm.json:ro"]), vols
+    assert "backups" not in "".join(vols)
+    # no --api-key on the command line, no MCP config, the run config is the mounted one
+    assert server == ["--config", "/cfg/glm.json", "--port", "8080"], server
+    assert values(args, "-e", "--env", "--env-file") == ["HOME=/tmp"]
+    run = yaml.safe_load(expand(config, "x: ${maya-image}"))["x"]
+    tag = run.split(":", 1)[1]
+    assert re.fullmatch(r"[0-9a-f]{7}-\d+", tag), run
+    assert tag.split("-")[0] in (MAYA / "Dockerfile").read_text(), "the tag names the pinned MAYA_COMMIT"
+
+
+def test_maya_run_config():
+    import json
+    cfg = json.loads((MAYA / "glm-5.3-flash.json").read_text())
+    assert "vision" not in cfg and "mcp_servers" not in cfg and "api_key" not in cfg
+    env = cfg.get("env") or {}
+    ram = float(env["MAYA_GLM_RAM_GB"])   # the GLM engine is not cgroup-aware: its RAM tier must fit the cap
+    cap = 64   # ${mem-moe}
+    assert ram + 12 <= cap, (ram, cap)
+    assert cfg["log"].startswith("/data/") and cfg["tokenizer"].startswith("/data/")
+    assert cfg["exe"] == "/opt/maya/build/maya" and cfg["port"] == 8080
+
+
+def test_maya_entrypoint_allows_only_the_api():
+    import ast
+    tree = ast.parse((MAYA / "lab_entry.py").read_text())
+    allow = next(n.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                 and any(getattr(t, "id", "") == "ALLOW" for t in n.targets))
+    allow = ast.literal_eval(allow)
+    assert allow == {"GET": {"/health", "/v1/models", "/models", "/props", "/slots"},
+                     "POST": {"/v1/chat/completions", "/v1/messages"}}
+    assert 'ENTRYPOINT ["python3", "/opt/maya/lab_entry.py"' in (MAYA / "Dockerfile").read_text()
 
 
 # ---- the names that tie config, deploy.sh and the firewall together ------------------------------
