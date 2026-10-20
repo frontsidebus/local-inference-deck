@@ -23,6 +23,10 @@ macros:
   # build 11459, used ONLY by the experimental flash entry (qwen4exp needs fixes after 11277: #29751 decode +13-55 %,
   # #29761 MTP, #29825 indexer memory, #29994 race). Every other model stays on ${image}.
   "image-next": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:fff6185edd2fbc4093aa5970bf6db53ed11c283e3a1c52a3e244cf27047264f4"
+  # build 11749, used ONLY by lab models that pick it (registry `image: image-lab`): Nemotron 3.5 Bolt / Super's pruned
+  # MoE layers have per-layer expert counts, which load from llama.cpp PR #30520 (merged 2026-10-15) on; 11277 and 11459
+  # refuse them (check_tensor_dims). Measured 2026-10-20: Bolt 74B-A9B 24GB on GPU1, 21.2 GiB at 32K, ~87 t/s.
+  "image-lab": "ghcr.io/ggml-org/llama.cpp:server-cuda-b11749@sha256:31b39eacce2bab5fde9286ec3980ed5548a3987644e94da0d0c2092f93313538"
   # spark-docker-run.sh waits for a same-named container (from a reload) to be gone, then execs docker run --name <id>
   # Hardened (walter/README.md "Model container hardening"; tests: walter/tests/test_llama_swap_config.py):
   #  - mounts ONLY ${MODELS_DIR}/gguf (read-only) at /models/gguf; never ${MODELS_DIR} itself, which holds backups/

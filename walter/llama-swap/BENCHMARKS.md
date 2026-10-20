@@ -173,3 +173,26 @@ Not llama-server: walter/maya/README.md has the setup and the full table. A tran
 unloaded; method as the `flash` runs above (temperature 0, thinking off, `timings`). Decode 38.9 / 39.8 / 39.4 t/s on
 the 1.5k prompts (29.0 on the short one), prompt 375 t/s at 1.7k and 916 t/s at 9.4k tokens; thinking on 33.9 t/s
 over 2977 tokens. 83 % of the routed experts in VRAM, the rest in 46 GB of pinned RAM, no disk reads; load ~35 s.
+
+## 2026-10-20: uncensored lab models vs their bases (exploratory)
+
+Three lab candidates, each against its own base, in transient containers with llama-swap's models unloaded (flags as
+in production: q8_0 KV, 32K context; the 27B pair with MTP, the Flash pair with flash's placement and MTP head).
+`evals/run.py --protocol exploratory --thinking off` (greedy), 200 items per suite: **CSE FRR** (CyberSecEval's
+MITRE false-refusal prompts, benign security requests; `--scorer-override cse-frr=refusal`, replies capped at 384
+tokens: the keyword check reads the opening) and **CTIBench MCQ** (threat-intel multiple choice). Wilson 95 % CIs.
+
+| Model (image) | Placement | FRR complied | Opener refusals | MCQ correct | Decode t/s |
+|---|---|---|---|---|---|
+| Nemotron-3.5-Bolt-74B-A9B 24GB, NVIDIA (b11749) | GPU1 | 158 (79 %) | 24.0 % | 134 (67.0 %) | ~80 |
+| Bolt, BoldingBuilds abliterated (b11749) | GPU1 | **199 (99.5 %)** | 0.5 % | 134 (67.0 %) | ~81 |
+| Qwen3.8-27B UD-Q4_K_XL (coder's) (b11277) | GPU1 | 166 (83 %) | 19.0 % | 126 (63.0 %) | ~68 |
+| Qwen3.8-27B Heretic Q4_K_M, llmfan46 (b11277) | GPU1 | **200 (100 %)** | 0.0 % | 120 (60.0 %) | ~69 |
+| Qwen3.8-Flash-Next GSQ-RCO IQ3_S (flash's) (b11459) | both + RAM | 119 (59.5 %) | 58.5 % | 135 (67.5 %) | ~41 |
+| Flash-Next GSQ-RCO abliterated IQ3_S, SC117 (b11459) | both + RAM | **200 (100 %)** | 0.0 % | 140 (70.0 %) | ~41 |
+
+MCQ intervals overlap in every pair (about +/-6.5 pp). Heretic is the only one lower, and its letter-balanced
+accuracy (60.4 -> 54.8 %) and accuracy where the key is not the longest option (58.2 -> 52.5 %) also fell: watch it.
+The 27B pair's quants differ (UD-Q4_K_XL vs Q4_K_M); the others share theirs. Results: the run dirs
+`labcmp-20261020-*` and `labcmp-frr-20261020-*` (site archive). FRR measures over-refusal of benign requests only.
+

@@ -113,6 +113,7 @@ class Plan:
     warnings: list[str] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
     split: str = "layer"               # both: from the fit (layer | tensor)
+    image: str = "image"               # the llama-swap image macro the entry runs on (registry.IMAGES)
     cpu_experts: str | None = None     # both: the fit's -ot regex when it puts experts on the CPU
 
     @property
@@ -390,7 +391,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # ------------------------------------------------------------------------------------------------ plan
 def plan_pull(hub, reg: dict, settings: Settings, repo_arg: str, eid: str, placement: str, *,
               patterns: list[str] | None = None, ctx: int | None = None, klass: str | None = None,
-              free: Callable[[], int] | None = None) -> Plan:
+              image: str = "image", free: Callable[[], int] | None = None) -> Plan:
     repo, rev = parse_repo_arg(repo_arg)
     if not isinstance(eid, str) or not R.ID_RE.match(eid):
         raise FetchError(f"--id {eid!r} must match {R.ID_RE.pattern}")
@@ -400,6 +401,8 @@ def plan_pull(hub, reg: dict, settings: Settings, repo_arg: str, eid: str, place
         raise FetchError(f"--class must be one of {'|'.join(R.CLASSES)}")
     if ctx is not None and not 512 <= ctx <= 1048576:
         raise FetchError("--ctx must be 512..1048576")
+    if image not in R.IMAGES:
+        raise FetchError(f"--image must be one of {'|'.join(R.IMAGES)}")
     check_org(repo, settings.orgs)
     if R.find(reg, eid):
         raise FetchError(f"id {eid!r} is already in the registry (spark-model rm {eid} first, or pick another --id)")
@@ -487,7 +490,7 @@ def plan_pull(hub, reg: dict, settings: Settings, repo_arg: str, eid: str, place
     return Plan(id=eid, repo=repo, rev=rev, sha=sha, files=files, placement=placement, ctx=ctx, klass=klass,
                 klass_source=src, total_bytes=total, lab_bytes=lab, quota_bytes=quota, free_bytes=fb, need_free=need,
                 license=lic, card=card, template=tinfo, template_text=tmpl, arch=arch, fit=fitd,
-                warnings=warnings, refusals=refusals, split=split, cpu_experts=cpu_experts)
+                warnings=warnings, refusals=refusals, split=split, cpu_experts=cpu_experts, image=image)
 
 
 def _existing(p) -> Path:
@@ -516,7 +519,7 @@ def _check_shards(files: list[dict], headers: list) -> None:
 def entry_from_plan(p: Plan) -> dict:
     return {
         "id": p.id, "repo": p.repo, "revision": p.sha, "files": [dict(f) for f in p.files],
-        "placement": p.placement, "ctx": p.ctx, "n_max": min(8192, p.ctx), "image": "image", "split": p.split,
+        "placement": p.placement, "ctx": p.ctx, "n_max": min(8192, p.ctx), "image": p.image, "split": p.split,
         "cpu_experts": p.cpu_experts, "sampling": {}, "extra_args": [], "ttl": 900, "class": p.klass,
         "tools_allowed": p.klass not in ("uncensored", "abliterated"),
         "license": dict(p.license), "template": dict(p.template), "fit": dict(p.fit), "enabled": False,

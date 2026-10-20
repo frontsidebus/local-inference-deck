@@ -2,10 +2,12 @@
 """spark-model -- lab models for the Spark stack, from the workstation.
 
   spark-model search ...  |  spark-model fit ...       run here (walter/models/lib/cli_fit.py of this checkout)
-  spark-model pull REPO[@REV] --id ID --placement gpu0|gpu1|both [--file GLOB]... [--ctx N] [--class C] [--yes]
+  spark-model pull REPO[@REV] --id ID --placement gpu0|gpu1|both [--file GLOB]... [--ctx N] [--class C]
+                   [--image image|image-next|image-lab] [--yes]
   spark-model ls
   spark-model rm ID [--yes] [--force]  |  spark-model rm --suggest
   spark-model review ID
+  spark-model enable ID  |  spark-model disable ID     the registry flag; served after the next deploy.sh
   spark-model render                    diff of the config deploy.sh would install (Phase 1: deploy.sh applies it)
   spark-model status
 Add --json for machine-readable output. Every verb but search/fit runs on the backend as
@@ -26,7 +28,7 @@ ME = Path(__file__).resolve()
 REPO = Path(os.environ.get("SPARK_REPO") or ME.parents[2])
 LIB = REPO / "walter" / "models" / "lib"
 AGENT = "/usr/local/sbin/spark-model-agent"
-REMOTE = ("pull", "ls", "rm", "review", "render", "status")
+REMOTE = ("pull", "ls", "rm", "review", "enable", "disable", "render", "status")
 LOCAL = ("search", "fit")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9@._/:*?\[\]=+,-]{1,256}$")
 
@@ -184,7 +186,7 @@ def main(argv=None):
         return run_local(verb, rest)
     if verb in REMOTE:
         return run_remote(verb, rest)
-    die(f"unknown verb {verb!r} (search fit pull ls rm review render status; -h for help)", 2)
+    die(f"unknown verb {verb!r} (search fit pull ls rm review enable disable render status; -h for help)", 2)
 
 
 if __name__ == "__main__":

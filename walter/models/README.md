@@ -2,10 +2,12 @@
 
 Lab models are arbitrary GGUF models from allow-listed Hugging Face orgs (abliterated, uncensored, specialised
 research models), kept next to the core models on Walter's `/models` disk. Phase 1 ships the lifecycle core:
-`spark-model search | fit | pull | ls | rm | review | render | status`, the site-local registry and the renderer.
-**Phase 1 never changes what llama-swap serves**: a pulled model is registered with `enabled: false`, and with no
-enabled lab model the rendered llama-swap config is byte for byte the repo template. Enabling, load/unload/restore
-and the LiteLLM `lab/<id>` entries are Phase 2.
+`spark-model search | fit | pull | ls | rm | review | enable | disable | render | status`, the site-local registry
+and the renderer. A pulled model is registered with `enabled: false`, and with no enabled lab model the rendered
+llama-swap config is byte for byte the repo template. `enable <id>` (2026-10-20) sets the flag in the registry; the
+model is served only after the next `deploy.sh`, which renders and installs the config, so a deploy is still the
+step that changes what llama-swap serves. Enabled lab models are reachable as `local/lab-<id>` by lab keys only
+(the gateway's lab guard); load/unload/restore verbs and LiteLLM `lab/<id>` entries are still to come.
 
 <!-- ======================================== lifecycle (feat/lab-lifecycle) ======================================== -->
 
@@ -140,7 +142,12 @@ passes the real v260 binary's `-validate` (`LLAMA_SWAP_BIN=<v260 binary> pytest 
 
 ## Pull
 
-`spark-model pull <org/name>[@rev] --id <id> --placement gpu0|gpu1|both [--file GLOB]... [--ctx N] [--class C] [--yes]`
+`spark-model pull <org/name>[@rev] --id <id> --placement gpu0|gpu1|both [--file GLOB]... [--ctx N] [--class C]
+[--image image|image-next|image-lab] [--yes]`
+
+`--image` picks the llama.cpp build (a llama-swap macro): `image` (b11277, the core models'), `image-next` (b11459,
+flash's) or `image-lab` (b11749, for architectures the others lack, e.g. Nemotron 3.5 Bolt/Super, whose pruned MoE
+layers have per-layer expert counts: 11277 and 11459 refuse them in `check_tensor_dims`).
 
 Without `--yes` it prints the plan and writes nothing: files with sizes and sha256, total, quota after, free space,
 licence and flag, chat-template size and flags, fit estimate, warnings and refusals. With `--yes`:
@@ -205,7 +212,10 @@ enable refuses flagged + unreviewed). The heuristics are deliberately simple:
   recent use (`last_used`, else `added`); nothing is deleted.
 - `review <id>`: prints the template from the model file (checked against the registry sha256) and records
   `reviewed: true`.
-- `render`: the diff; from the workstation it is dry only in Phase 1 (deploy.sh applies).
+- `enable <id>` / `disable <id>`: set the entry's `enabled` flag. The registry is validated first, so a model whose
+  chat template is flagged and not reviewed cannot be enabled (`review <id>` first). Nothing reaches llama-swap
+  until the next deploy (or `render --apply` on Walter).
+- `render`: the diff; from the workstation it is dry only (deploy.sh applies).
 - `status`: paths, settings, whether config.yaml equals base + registry, lab models in `/running`.
 - `serving`: read-only. For each model in the live config.yaml: the cmd sha256, aliases and a few server flags
   (`-c -n -sm -m` basename and sampling), parsed exactly as `evals/run.py` parses the template (`lib/swapcmd.py`).
@@ -241,7 +251,12 @@ spark-model pull someorg/Some-Model-GGUF --file '*Q4_K_M*' --id some-model-8b --
 spark-model pull someorg/Some-Model-GGUF --file '*Q4_K_M*' --id some-model-8b --placement gpu1 --yes
 spark-model ls
 spark-model review some-model-8b                             # only if its template is flagged
+spark-model enable some-model-8b                             # registry only
+spark-model render                                           # the diff the next deploy installs
 ```
+
+Then deploy Walter (owner go-ahead): the model is `local/lab-some-model-8b` for lab keys. `spark-model disable` and
+a deploy take it out again.
 
 Verify: `sudo spark-model-agent status` says config in sync; `sha256sum /models/gguf/lab/<id>/*` matches the
 registry; `sudo -l -U <operator>` shows only the agent rule from this file.
