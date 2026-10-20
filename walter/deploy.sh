@@ -116,7 +116,7 @@ USER_HOME=${USER_HOME:-/home/$BACKEND_SSH_USER}
 step "render templates"
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/walter-render.XXXXXX")
 trap 'rm -rf "$STAGE"' EXIT
-COMPONENTS=(base wireguard llama-swap models gateway webui monitoring telemetry backup update-check firewall hermes)
+COMPONENTS=(base wireguard llama-swap models maya gateway webui monitoring telemetry backup update-check firewall hermes)
 [[ $DIGEST == 1 ]] && COMPONENTS+=(digest)
 for d in "${COMPONENTS[@]}"; do
   rx=()   # offsite off: skip its files (the IAM policy template needs RESTIC_BUCKET)
@@ -380,6 +380,22 @@ install_file "$S/llama-swap/llama-swap.service" /etc/systemd/system/llama-swap.s
 install_file "$S/llama-swap/spark-docker-run.sh" /usr/local/sbin/spark-docker-run.sh      0755 root root
 install_file "$S/llama-swap/fetch-models.sh"    "$MODELS_DIR/fetch-models.sh"             0755 "$BACKEND_SSH_USER" "$BACKEND_SSH_USER"
 
+# Project Maya lab engine (walter/maya/README.md): the run config (root-owned, mounted read-only), the fetch script and
+# the container's writable data dir (packs, log) with links to the GGUFs, which the engine opens at <pack>/.. under
+# the container's /models/gguf path. The image itself is built and loaded by hand (README.md), and packing is a step
+# of its own; llama-swap's lab-glm-5.3-flash entry fails to start until both are done.
+MAYA_GLM_SHARDS=(GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-0000{1,2,3}-of-00003.gguf)
+mkdir_p /etc/maya 0755 root root
+install_file "$S/maya/glm-5.3-flash.json"       /etc/maya/glm-5.3-flash.json              0644 root root
+install_file "$S/maya/fetch.sh"                 "$MODELS_DIR/maya-fetch.sh"               0755 "$BACKEND_SSH_USER" "$BACKEND_SSH_USER"
+for d in "" /glm /glm/Maya-S24 /logs; do mkdir_p "$MODELS_DIR/maya-data$d" 0750 "$LLAMA_UID" "$LLAMA_UID"; done
+for f in "${MAYA_GLM_SHARDS[@]}"; do
+  link=$T$MODELS_DIR/maya-data/glm/Maya-S24/$f want=/models/gguf/maya/glm-5.3-flash/Maya-S24/$f
+  [[ $(readlink "$link" 2>/dev/null) == "$want" ]] && continue
+  if [[ $DRY == 1 ]]; then say "  would link $MODELS_DIR/maya-data/glm/Maya-S24/$f -> $want"
+  else ln -sfn "$want" "$link"; say "  linked   $MODELS_DIR/maya-data/glm/Maya-S24/$f"; fi
+done
+
 install_file "$S/gateway/compose.yaml"          /srv/gateway/compose.yaml                 0644 root root gateway
 install_file "$S/gateway/litellm.yaml"          /srv/gateway/litellm.yaml                 0644 root root gateway
 install_file "$S/gateway/hooks/spark_hooks.py"  /srv/gateway/hooks/spark_hooks.py         0644 root root gateway
@@ -491,6 +507,10 @@ if [[ $NO_START == 0 ]]; then
   if [[ -n ${CHANGED[llama-swap-unit]:-} ]]; then run systemctl restart llama-swap.service
   else run systemctl start llama-swap.service; fi   # config.yaml changes: llama-swap --watch-config reloads itself
   run systemctl start spark-backup.timer spark-update-check.timer
+  maya_image=$(sed -n 's/^ *"maya-image": *"\(.*\)"$/\1/p' "$S/llama-swap/config.yaml")
+  if [[ -n $maya_image ]] && ! docker image inspect "$maya_image" >/dev/null 2>&1; then
+    warn "image $maya_image is not loaded: lab-glm-5.3-flash cannot start (build and load it: walter/maya/README.md)"
+  fi
   if ! compgen -G "$T$MODELS_DIR/gguf/*/*.gguf" >/dev/null; then
     warn "no GGUF files under $MODELS_DIR/gguf yet: run $MODELS_DIR/fetch-models.sh as $BACKEND_SSH_USER (see walter/models.md)"
   fi

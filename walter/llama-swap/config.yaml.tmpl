@@ -49,6 +49,9 @@ macros:
   # goes through host shared memory; Docker's default 64 MB /dev/shm crashes at the first allreduce
   # ("unhandled system error ... ncclGroupEnd()"). Only the tensor-split models use it; ${run} is unchanged.
   "tp": "--shm-size 2g"
+  # Project Maya (walter/maya/README.md): built on Walter's side from pinned sources, so a local tag, not a digest.
+  # deploy.sh checks the tag is present. Bump the tag with walter/maya/Dockerfile.
+  "maya-image": "walter-maya:8d9a9b5-2"
   # rm -f is synchronous (stop + --rm removes asynchronously, so a reload's docker run could hit a name conflict)
   "stop": "docker rm -f ${MODEL_ID}"
 
@@ -162,6 +165,28 @@ models:
     ttl: 1800
     capabilities: { in: [text], out: [text], tools: true, context: 131072 }
 
+  # LAB (2026-10-20): GLM-5.3-Flash (321B MoE, ~18B active) on the Project Maya engine, not llama-server
+  # (walter/maya/README.md). Maya-S24 quant (94.7 GB): 83 % of the routed experts in VRAM, the rest pinned in RAM
+  # (MAYA_GLM_RAM_GB=46 in the run config, under the 64g cap), nothing read from disk. Decode ~39 t/s, prompt
+  # 375 t/s at 1.7k and 916 t/s at 9.4k tokens (BENCHMARKS.md, 2026-10-20). Load ~35 s warm.
+  # lab-: the gateway's lab guard (spark_hooks.py) refuses it to keys without metadata.lab; unlisted; no tools.
+  # Extra mounts: the packs and the engine log (rw, uid 10010) and the root-owned run config (ro). The image's
+  # entrypoint (lab_entry.py) answers only /health, /v1/models, /models, /props, /slots, POST /v1/chat/completions
+  # and /v1/messages: llama-swap's /upstream/<id>/ would otherwise reach Maya's admin routes. No API key: like the
+  # llama-server containers it listens on 127.0.0.1 only, and llama-swap holds the key.
+  "lab-glm-5.3-flash":
+    name: "GLM-5.3-Flash Maya-S24 (Project Maya, GPU0+GPU1+RAM experts, lab)"
+    cmd: |
+      ${run} ${mem-moe} --gpus "\"device=0,1\""
+      -v ${MODELS_DIR}/maya-data:/data -v /etc/maya/glm-5.3-flash.json:/cfg/glm.json:ro
+      ${maya-image} --config /cfg/glm.json --port 8080
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    ttl: 1800
+    unlisted: true
+    capabilities: { in: [text], out: [text], tools: false, context: 32768 }
+
 routing:
   router:
     use: matrix
@@ -174,15 +199,18 @@ routing:
           v: gemma-4-31b
           h: hermes-4.3-36b
           x: qwen3.8-flash-next
+          m: lab-glm-5.3-flash
         evict_costs:
           b: 5     # ~40 GB read from disk: about 20 s when the page cache is cold, 7 s when warm
           x: 5     # ~55 GB of weights to read (the n-gram table is read on demand); slower than big
+          m: 5     # ~90 GB of experts into VRAM and pinned RAM: ~35 s warm
         sets:
           coding: "c & f"   # one per GPU, the default working pair
           big: "b"
           vision: "v"
           hermes: "h"
           flash: "x"
+          maya: "m"
 
 hooks:
   on_startup:

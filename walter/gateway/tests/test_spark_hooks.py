@@ -168,6 +168,8 @@ def test_limits_match_litellm_and_llama_swap():
     ls = yaml.safe_load((WALTER / "llama-swap" / "config.yaml.tmpl").read_text())
     seen = set()
     for model_id, m in ls["models"].items():
+        if model_id.startswith("lab-"):   # the Maya lab engine: no -n, its context (32768) bounds an answer, and the
+            continue                      # gateway caps unknown local/* IDs at FALLBACK_MAX_OUTPUT
         found = re.findall(r"(?:^|\s)-n\s+(\d+)(?=\s)", m["cmd"])
         assert len(found) == 1, (model_id, "every model needs exactly one -n")
         alias = m["aliases"][0]
