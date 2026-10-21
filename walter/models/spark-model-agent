@@ -13,6 +13,7 @@ Verbs (all take --json):
   ls                         registry, disk use, quota; core models listed read-only
   rm ID [--yes] [--force]    remove a lab entry and lab/<ID>/ (pinned needs --force); rm --suggest: LRU candidates
   review ID                  print the chat template and record reviewed: true
+  args ID [-- FLAG [V]... | --clear]  show / set / clear extra llama-server flags (whitelist: registry.EXTRA_ARGS)
   render [--apply] [--force] diff of the rendered llama-swap config; --apply installs it (deploy.sh uses this)
   status                     paths, settings, registry state, lab models running in llama-swap
   serving                    read-only: per model, the cmd sha256 and server flags of the LIVE config.yaml (no
@@ -455,6 +456,44 @@ def cmd_enable(ctx: Ctx, args):
     return 0
 
 
+def cmd_args(ctx: Ctx, args):
+    """args: show (no tokens), replace (`-- TOKEN...`) or --clear a lab model's extra llama-server flags. The
+    registry is validated before it is saved, so only whitelisted flags and values get in (registry.EXTRA_ARGS).
+    What llama-swap serves changes only with `render --apply` / the next deploy."""
+    toks = [t for t in (args.tokens or []) if t != "--json"]
+    if toks[:1] == ["--"]:
+        toks = toks[1:]
+    clear = toks == ["--clear"]
+    if not toks:
+        reg = load_registry(ctx)
+        m = R.find(reg, args.id)
+        if m is None:
+            die(f"{args.id!r} is not a lab model in the registry")
+        emit(args, {"ok": True, "verb": "args", "id": m["id"], "extra_args": m["extra_args"], "changed": False},
+             f"{m['id']}: extra_args {' '.join(m['extra_args']) or '(none)'}")
+        return 0
+    new = [] if clear else toks
+    with locked(ctx, "args"):
+        reg = load_registry(ctx)
+        m = R.find(reg, args.id)
+        if m is None:
+            die(f"{args.id!r} is not a lab model in the registry")
+        if m["extra_args"] == new:
+            emit(args, {"ok": True, "verb": "args", "id": m["id"], "extra_args": new, "changed": False},
+                 f"{m['id']}: extra_args already {' '.join(new) or '(none)'}")
+            return 0
+        old, m["extra_args"] = m["extra_args"], new
+        try:
+            R.validate(reg)
+        except R.RegistryError as e:
+            die(f"extra_args not changed: {e}")
+        R.save(ctx.registry, reg)
+    emit(args, {"ok": True, "verb": "args", "id": m["id"], "extra_args": new, "old": old, "changed": True},
+         f"{m['id']}: extra_args {' '.join(old) or '(none)'} -> {' '.join(new) or '(none)'} in the registry. "
+         f"llama-swap is unchanged until spark-model render --apply (render alone shows the diff)")
+    return 0
+
+
 def read_template(ctx: Ctx, m: dict):
     import gguf
     f = R.main_file(m)
@@ -635,6 +674,9 @@ def parser():
     for v in ("enable", "disable"):
         s = sp(v, help=f"{v} a lab model in the registry (llama-swap changes with render --apply)")
         s.add_argument("id", type=id_arg)
+    s = sp("args", help="show, set (-- FLAG [VALUE]...) or --clear a lab model's extra llama-server flags (whitelist)")
+    s.add_argument("id", type=id_arg)
+    s.add_argument("tokens", nargs=argparse.REMAINDER)
     s = sp("render", help="diff (default) or --apply the rendered llama-swap config")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--force", action="store_true")
@@ -654,7 +696,7 @@ def main(argv=None):
             args.live_guard = True
         return {"pull": cmd_pull, "ls": cmd_ls, "rm": cmd_rm, "review": cmd_review, "render": cmd_render,
                 "status": cmd_status, "serving": cmd_serving, "enable": cmd_enable,
-                "disable": cmd_enable}[args.verb](ctx, args)
+                "disable": cmd_enable, "args": cmd_args}[args.verb](ctx, args)
     except Fail as e:
         if as_json:
             sys.stdout.write(json.dumps({"ok": False, "error": str(e), **e.extra}, default=str) + "\n")

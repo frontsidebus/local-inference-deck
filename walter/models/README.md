@@ -2,7 +2,7 @@
 
 Lab models are arbitrary GGUF models from allow-listed Hugging Face orgs (abliterated, uncensored, specialised
 research models), kept next to the core models on Walter's `/models` disk. Phase 1 ships the lifecycle core:
-`spark-model search | fit | pull | ls | rm | review | enable | disable | render | status`, the site-local registry
+`spark-model search | fit | pull | ls | rm | review | enable | disable | args | render | status`, the site-local registry
 and the renderer. A pulled model is registered with `enabled: false`, and with no enabled lab model the rendered
 llama-swap config is byte for byte the repo template. `enable <id>` (2026-10-20) sets the flag in the registry; the
 model is served only after the next `deploy.sh`, which renders and installs the config, so a deploy is still the
@@ -83,7 +83,8 @@ anything not on a whitelist is an error, and every problem is reported at once w
 - `sampling`: `temp top_p top_k min_p typical_p presence_penalty frequency_penalty repeat_penalty`, bounded.
 - `extra_args`: whitelist only: `--ctx-checkpoints N`, `--cache-reuse N`, `--spec-type draft-mtp`,
   `--spec-draft-n-max N`, `-devd CUDA0|CUDA1`, `-ngld N`, `--reasoning-format none|auto|deepseek|deepseek-legacy`,
-  `--reasoning-budget N`, `--chat-template-file /models/gguf/lab/<id>/<name>.jinja`, `--swa-full`.
+  `--reasoning-budget N`, `--chat-template-file /models/gguf/lab/<id>/<name>.jinja`, `--swa-full`. `pull` writes `[]`;
+  set it with `args <id> -- FLAG [VALUE]...` (below).
 - `license: {id, flag, gated}`, `template: {source, sha256, bytes, flags, reviewed}`, `fit: {vram_gb, speed_class,
   placement, warnings}` are written by `pull`. An `enabled` model with a flagged, unreviewed template is invalid.
 
@@ -204,7 +205,7 @@ enable refuses flagged + unreviewed). The heuristics are deliberately simple:
 | `dunder` | `__attribute__` access inside a tag (sandbox-escape attempts) |
 | `system-text` | literal text outside the messages loop longer than 200 characters, or containing "you are", "always", "never", "ignore", "must" (an injected system prompt) |
 
-## ls, rm, review, render, status
+## ls, rm, review, enable, args, render, status
 
 - `ls`: lab entries (placement, class, size, ctx, flags: enabled, pinned, licence, template, missing files), lab
   bytes vs quota, free space, orphan dirs, quarantine leftovers, and the core models (read-only).
@@ -217,6 +218,10 @@ enable refuses flagged + unreviewed). The heuristics are deliberately simple:
 - `enable <id>` / `disable <id>`: set the entry's `enabled` flag. The registry is validated first, so a model whose
   chat template is flagged and not reviewed cannot be enabled (`review <id>` first). Nothing reaches llama-swap
   until the next deploy (or `render --apply` on Walter).
+- `args <id>`: shows the entry's `extra_args`; `args <id> -- FLAG [VALUE]...` replaces them, `args <id> --clear`
+  empties them. Validated against the whitelist before the registry is saved; served after the next deploy. A
+  model with its MTP head preserved in the GGUF (e.g. a Qwen3.8 27B fine-tune) gets native speculative decoding
+  like the core `qwen3.8-27b`: `args <id> -- --spec-type draft-mtp --spec-draft-n-max 2`.
 - `render`: the diff; from the workstation it is dry only (deploy.sh applies).
 - `status`: paths, settings, whether config.yaml equals base + registry, lab models in `/running`.
 - `serving`: read-only. For each model in the live config.yaml: the cmd sha256, aliases and a few server flags
