@@ -42,6 +42,16 @@ or lab-... is refused with 403 unless the key's metadata has lab: true
 (provision-keys.py sets it for LAB_KEY_ALIASES). This also closes the local/*
 wildcard, which would otherwise reach any llama-swap ID (local/lab-x). The
 refusal is logged with the model, call type and key alias, never the prompt.
+
+Fourth job: no tools on lab models (runs last, fails closed). Lab models never
+act through tools, whatever the client sends: every tool field (tools,
+tool_choice, functions, function_call, parallel_tool_calls, mcp_servers) is
+removed from a lab request, after the normalization above (which can add tool
+definitions). That covers Open WebUI's native function calling, where Code
+Interpreter, web search and memory arrive as tools. Its legacy mode instead
+puts the Code Interpreter instructions into a user message and runs the
+<code_interpreter> blocks the model writes; a lab request whose system or user
+text carries that prompt is refused with 400. Logged without request content.
 """
 
 import logging
@@ -358,6 +368,60 @@ def lab_guard(user_api_key_dict, data, call_type):
     raise _HTTPException(status_code=403, detail={"error": "model %r needs a lab-enabled key" % data.get("model")})
 
 
+# --- no tools on lab models ------------------------------------------------------
+LAB_TOOL_FIELDS = ("tools", "tool_choice", "functions", "function_call", "parallel_tool_calls", "mcp_servers")
+# Open WebUI's legacy-mode Code Interpreter prompt (DEFAULT_CODE_INTERPRETER_PROMPT, v0.11.4)
+CODE_INTERPRETER_MARKER = '<code_interpreter type="code"'
+_INSTRUCTION_ROLES = ("system", "developer", "user")
+
+
+def _texts(content):
+    if isinstance(content, str):
+        yield content
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                yield part
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                yield part["text"]
+
+
+def _instruction_texts(data):
+    """System and user text of a chat, messages or responses request (not assistant output)."""
+    yield from _texts(data.get("system"))
+    yield from _texts(data.get("instructions"))
+    items = data.get("messages")
+    if not isinstance(items, list):
+        items = data.get("input")
+        if isinstance(items, str):
+            yield items
+            return
+        if not isinstance(items, list):
+            return
+    for m in items:
+        if isinstance(m, dict) and m.get("role") in _INSTRUCTION_ROLES:
+            yield from _texts(m.get("content"))
+
+
+def lab_no_tools(data, call_type):
+    """Strip tool fields from a lab request; raise 400 for Open WebUI's legacy Code Interpreter.
+    Returns the removed field names."""
+    if not isinstance(data, dict) or not is_lab_model(data.get("model")):
+        return []
+    if any(CODE_INTERPRETER_MARKER in t for t in _instruction_texts(data)):
+        log.warning("spark_hooks: refused lab model %r (%s): Code Interpreter prompt in the request",
+                    data.get("model"), call_type)
+        raise _HTTPException(status_code=400, detail={
+            "error": "lab models cannot use Code Interpreter or other tools; turn it off for this chat"})
+    removed = [f for f in LAB_TOOL_FIELDS if f in data]
+    for f in removed:
+        del data[f]
+    if removed:
+        log.warning("spark_hooks: removed %s from a lab request (%s, model=%r)",
+                    ", ".join(removed), call_type, data.get("model"))
+    return removed
+
+
 class SparkHooks(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         lab_guard(user_api_key_dict, data, call_type)   # outside the try blocks: never skipped
@@ -396,6 +460,7 @@ class SparkHooks(CustomLogger):
                 log.info("spark_hooks: output cap %s (%s, model=%s)", ", ".join(changes), call_type, data.get("model"))
         except Exception as e:
             log.warning("spark_hooks: output cap skipped: %r", e)
+        lab_no_tools(data, call_type)   # last and outside the try blocks: never skipped
         return data
 
 

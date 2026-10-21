@@ -192,6 +192,7 @@ Remove `$R` afterwards. The next full `deploy.sh` run converges everything else.
      | open-webui | `open-webui` | the aliases, `local/*` |
      | digest | `digest` | the aliases |
      | user | `SPARK_USERS` | the aliases, `local/*`, `claude-*`; plus `lab` for names in `LAB_KEY_ALIASES` |
+     | open-webui-lab | `open-webui-lab` (created only with `LAB_WEBUI`) | `local/lab-*`, `lab`: lab models only |
 
      Each run also brings **existing** managed keys to their list (`POST /key/update`, only where
      they differ) and lists keys it does not manage without touching them. Preview first; the dry
@@ -203,7 +204,21 @@ Remove `$R` afterwards. The next full `deploy.sh` run converges everything else.
      the key's metadata has `lab: true`. To enable a key, put its `SPARK_USERS` name in
      `LAB_KEY_ALIASES` (site.env) and re-run provision-keys; harness keys are refused there. The
      key then has `metadata.lab=true` and the `lab` access group. Removing the name sets
-     `lab: false` on the next run. The master key has no lab metadata, so it is refused too. Admin UI: `http://${BACKEND_WG_IP}:4000/ui`,
+     `lab: false` on the next run. The master key has no lab metadata, so it is refused too.
+   - **No tools on lab models.** The same hook removes every tool field (`tools`, `tool_choice`,
+     `functions`, `function_call`, `parallel_tool_calls`, `mcp_servers`) from a lab request, for
+     every key, and refuses with 400 a lab request that carries Open WebUI's legacy Code Interpreter
+     prompt. Lab models answer; they never act.
+   - **Lab models in Open WebUI** (`LAB_WEBUI="1"` in site.env, then deploy). provision-keys creates
+     the `open-webui-lab` key (lab models only, `metadata.lab=true`; the shared `open-webui` key never
+     gets lab access) and adds a third connection to `/srv/webui/.env`: the gateway again, with that
+     key and `OPENAI_API_CONFIGS` listing every `lab-` model of the installed llama-swap config as
+     `local/lab-<id>` (lab models are unlisted, so Open WebUI cannot discover them). deploy.sh
+     recreates Open WebUI when the file changed. Open WebUI shows a model without a model entry to
+     **admins only**: do not create entries or grants for `local/lab-*` in Admin → Models, and keep
+     in mind that every admin account sees them. Enabling or disabling a lab model updates the list
+     on the next deploy (not on `spark-model render --apply`). Removing `LAB_WEBUI` removes the
+     connection and clears the key's lab flag on the next deploy. Admin UI: `http://${BACKEND_WG_IP}:4000/ui`,
    user `admin`, password = `LITELLM_MASTER_KEY` from `/srv/gateway/.env`.
 4. **Pocket-ID / OIDC bootstrap** (below).
 5. **Open WebUI break-glass admin** (below).

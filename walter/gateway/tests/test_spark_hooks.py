@@ -262,3 +262,87 @@ def test_lab_routes_in_config_are_named_lab():
         if model_id.startswith("lab-"):
             assert not aliases, (model_id, "lab entries must not have aliases (the hook sees only names)")
         assert not any(H.is_lab_model(a) for a in aliases), model_id
+
+
+# --- no tools on lab models ----------------------------------------------------------
+
+LAB_KEY = Key({"lab": True}, "open-webui-lab")
+TOOL = {"type": "function", "function": {"name": "execute_code", "parameters": {"type": "object"}}}
+
+
+def _hook(data, call_type="acompletion", key=LAB_KEY):
+    return asyncio.run(H.proxy_handler_instance.async_pre_call_hook(key, None, data, call_type))
+
+
+@pytest.mark.parametrize("call_type", ["acompletion", "anthropic_messages", "aresponses", "atext_completion"])
+@pytest.mark.parametrize("model", ["local/lab-qwen38-27b-heretic", "lab/x", "openai/lab-x"])
+def test_lab_request_loses_every_tool_field(call_type, model):
+    data = {"model": model, "messages": [{"role": "user", "content": "hi"}], "tools": [TOOL],
+            "tool_choice": "auto", "functions": [TOOL["function"]], "function_call": "auto",
+            "parallel_tool_calls": True, "mcp_servers": [{"url": "x"}], "temperature": 0.2}
+    d = _hook(data, call_type)
+    assert not any(f in d for f in H.LAB_TOOL_FIELDS)
+    assert d["temperature"] == 0.2 and d["messages"][0]["content"] == "hi"
+
+
+def test_lab_tools_injected_by_normalization_are_stripped_too():
+    """A mid-conversation MCP announcement adds tool definitions; the strip runs after it."""
+    def data(model):
+        return {"model": model, "messages": [
+            {"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"},
+            {"role": "system", "content": [{"type": "tool_addition", "tool": {
+                "type": "tool_definition", "definition": {"name": "x", "input_schema": {"type": "object"}}}}]}]}
+    assert [t.get("name") for t in _hook(data("coder"), "anthropic_messages", key=None)["tools"]] == ["x"]
+    assert "tools" not in _hook(data("local/lab-x"), "anthropic_messages")
+
+
+def test_non_lab_request_keeps_its_tools():
+    d = _hook({"model": "coder", "messages": [{"role": "user", "content": "hi"}], "tools": [TOOL],
+               "tool_choice": "auto"}, key=None)
+    assert d["tools"] == [TOOL] and d["tool_choice"] == "auto"
+
+
+CI_PROMPT = ('#### Code Interpreter\n\nYou have access to a Python code interpreter via: '
+             '`<code_interpreter type="code" lang="python"></code_interpreter>`')
+
+
+@pytest.mark.parametrize("data", [
+    {"messages": [{"role": "user", "content": "scan this\n\n" + CI_PROMPT}]},
+    {"messages": [{"role": "user", "content": [{"type": "text", "text": CI_PROMPT}]}]},
+    {"messages": [{"role": "system", "content": CI_PROMPT}, {"role": "user", "content": "hi"}]},
+    {"system": [{"type": "text", "text": CI_PROMPT}], "messages": [{"role": "user", "content": "hi"}]},
+    {"input": [{"role": "user", "content": [{"type": "input_text", "text": CI_PROMPT}]}]},
+    {"input": CI_PROMPT},
+])
+def test_lab_code_interpreter_prompt_is_refused(data):
+    with pytest.raises(Exception) as e:
+        _hook(dict(data, model="local/lab-x"))
+    assert e.value.status_code == 400
+
+
+def test_code_interpreter_in_assistant_output_is_not_refused():
+    d = _hook({"model": "local/lab-x", "messages": [
+        {"role": "user", "content": "hi"}, {"role": "assistant", "content": CI_PROMPT},
+        {"role": "user", "content": "go on"}]})
+    assert d["model"] == "local/lab-x"
+
+
+def test_code_interpreter_prompt_is_fine_for_non_lab_models():
+    d = _hook({"model": "coder", "messages": [{"role": "user", "content": CI_PROMPT}]}, key=None)
+    assert d["model"] == "coder"
+
+
+def test_lab_tool_logs_have_no_prompt(caplog):
+    caplog.set_level("INFO", logger="LiteLLM Proxy")
+    _hook({"model": "local/lab-x", "messages": [{"role": "user", "content": "PROMPT-MARKER-456"}], "tools": [TOOL]})
+    with pytest.raises(Exception):
+        _hook({"model": "local/lab-x", "messages": [{"role": "user", "content": "PROMPT-MARKER-789 " + CI_PROMPT}]})
+    assert "removed tools" in caplog.text and "Code Interpreter prompt" in caplog.text
+    assert "PROMPT-MARKER" not in caplog.text
+
+
+def test_tool_strip_is_never_skipped_by_hook_errors(monkeypatch):
+    monkeypatch.setattr(H, "cap_output", lambda *a: 1 / 0)
+    monkeypatch.setattr(H, "normalize", lambda *a, **k: 1 / 0)
+    d = _hook({"model": "local/lab-x", "messages": [], "tools": [TOOL]})
+    assert "tools" not in d

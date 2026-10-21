@@ -7,7 +7,9 @@ and the renderer. A pulled model is registered with `enabled: false`, and with n
 llama-swap config is byte for byte the repo template. `enable <id>` (2026-10-20) sets the flag in the registry; the
 model is served only after the next `deploy.sh`, which renders and installs the config, so a deploy is still the
 step that changes what llama-swap serves. Enabled lab models are reachable as `local/lab-<id>` by lab keys only
-(the gateway's lab guard); load/unload/restore verbs and LiteLLM `lab/<id>` entries are still to come.
+(the gateway's lab guard), with every tool field stripped by the gateway, and in Open WebUI for admins when
+`LAB_WEBUI` is set (walter/README.md, "Lab models in Open WebUI"); load/unload/restore verbs and LiteLLM
+`lab/<id>` entries are still to come.
 
 <!-- ======================================== lifecycle (feat/lab-lifecycle) ======================================== -->
 

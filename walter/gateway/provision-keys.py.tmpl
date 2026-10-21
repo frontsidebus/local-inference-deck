@@ -29,6 +29,17 @@ the workstation hermes-gateway's API_SERVER_KEY, read from /srv/webui/hermes-gat
 (root 0600, copied there by hand from the workstation; see walter/README.md). Until that
 file exists the slot holds the literal PENDING and the Hermes connection simply fails.
 
+Open WebUI lab connection (LAB_WEBUI non-empty in site.env): a third key, open-webui-lab, whose
+allow-list is the lab models only (local/lab-*, lab) and which has metadata.lab=true. It is a
+separate key so Open WebUI's shared key never gets lab access. The .env gets a third connection
+to the gateway with that key and OPENAI_API_CONFIGS listing the lab models explicitly (they are
+`unlisted` in llama-swap, so /v1/models never shows them): every `lab-` ID in the installed
+/etc/llama-swap/config.yaml, as local/<id>. Open WebUI shows a model without a model entry of its
+own to admins only. Turning LAB_WEBUI off removes the connection and sets the key's lab flag to
+false (the key then reaches nothing: its allow-list is lab models only). Tool use on lab models
+is stopped in the gateway (spark_hooks.py), not here. The .env is rewritten only when it differs;
+deploy.sh recreates Open WebUI when it changed.
+
 Never prints a key. The master key is read from /srv/gateway/.env.
 
 Usage: provision-keys.py [--dry-run] [--root DESTDIR]
@@ -36,6 +47,7 @@ Usage: provision-keys.py [--dry-run] [--root DESTDIR]
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -49,6 +61,11 @@ SPARK_USERS = "${SPARK_USERS}".split()
 LAB_KEY_ALIASES = "${LAB_KEY_ALIASES}".split()
 # @@else@@
 LAB_KEY_ALIASES = []
+# @@endif@@
+# @@if LAB_WEBUI@@
+LAB_WEBUI = True
+# @@else@@
+LAB_WEBUI = False
 # @@endif@@
 LIMITS = {"rpm_limit": 60, "max_parallel_requests": 4}
 
@@ -65,6 +82,7 @@ SERVED = ["coder", "coder-fast", "big", "flash", "vision", "hermes"]
 LOCAL_WILDCARD = "local/*"     # raw llama-swap IDs (evals call local/qwen3.8-flash-next)
 CLAUDE_WILDCARD = "claude-*"   # safety net for Claude Code background tasks -> coder
 LAB_GROUP = "lab"              # access group of the future static lab/<name> entries
+LAB_WILDCARD = "local/lab-*"   # the llama-swap lab models (same wildcard matching as local/*)
 KEY_CLASSES = {
     # coding harnesses: claude-code, codex, opencode, hermes (also the judge's and the evals' key)
     "agent": SERVED + [LOCAL_WILDCARD, CLAUDE_WILDCARD],
@@ -74,8 +92,12 @@ KEY_CLASSES = {
     "digest": list(SERVED),
     # people: they run the same harnesses on their own machines
     "user": SERVED + [LOCAL_WILDCARD, CLAUDE_WILDCARD],
+    # Open WebUI's lab connection (LAB_WEBUI): lab models only, nothing else
+    "open-webui-lab": [LAB_WILDCARD, LAB_GROUP],
 }
-HARNESS_CLASS = {"open-webui": "open-webui", "digest": "digest"}   # every other harness: agent
+HARNESS_CLASS = {"open-webui": "open-webui", "digest": "digest",
+                 "open-webui-lab": "open-webui-lab"}   # every other harness: agent
+WEBUI_LAB_ALIAS = "open-webui-lab"
 
 args = sys.argv[1:]
 DRY = "--dry-run" in args
@@ -84,6 +106,8 @@ GW_ENV = ROOT + "/srv/gateway/.env"
 KEY_DIR = ROOT + "/srv/gateway/keys"
 WEBUI_ENV = ROOT + "/srv/webui/.env"
 HERMES_GW_KEY = ROOT + "/srv/webui/hermes-gateway.key"
+LLAMA_SWAP_CONFIG = ROOT + "/etc/llama-swap/config.yaml"
+GATEWAY_URL = LITELLM + "/v1"
 
 
 def log(msg):
@@ -102,13 +126,24 @@ def env_get(path, var):
 
 
 def env_set(path, var, value):
+    """Set var=value (appended when missing); value None removes the line."""
     st = os.stat(path)
     with open(path) as f:
         lines = f.read().split("\n")
     for i, line in enumerate(lines):
         if line.startswith(var + "="):
-            lines[i] = var + "=" + value
+            if value is None:
+                del lines[i]
+            else:
+                lines[i] = var + "=" + value
             break
+    else:
+        if value is None:
+            return
+        if lines and lines[-1] == "":
+            lines.insert(len(lines) - 1, var + "=" + value)
+        else:
+            lines.append(var + "=" + value)
     tmp = path + ".pk-tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, st.st_mode & 0o7777)
     with os.fdopen(fd, "w") as o:
@@ -166,11 +201,35 @@ def key_class(name, kind):
 
 def desired(name, kind):
     """(models, lab) a managed key should have."""
+    if kind == "harness" and name == WEBUI_LAB_ALIAS:
+        return list(KEY_CLASSES["open-webui-lab"]), LAB_WEBUI
     lab = kind == "user" and name in LAB_KEY_ALIASES
     models = list(KEY_CLASSES[key_class(name, kind)])
     if lab:
         models.append(LAB_GROUP)
     return models, lab
+
+
+def managed_names():
+    """(name, kind) of every managed key. open-webui-lab is always synced (so turning LAB_WEBUI
+    off clears its lab flag) but only created when LAB_WEBUI is on."""
+    names = [(n, "harness") for n in HARNESS_KEYS if n != WEBUI_LAB_ALIAS]
+    users = [(n, "user") for n in SPARK_USERS]
+    if LAB_WEBUI or names or users:
+        names.append((WEBUI_LAB_ALIAS, "harness"))
+    return names + users
+
+
+def lab_model_ids(path=None):
+    """local/<id> for every lab- model in the installed llama-swap config (generated by deploy.sh /
+    spark-model render: `  "lab-x":` or `  lab-x:` at the models level)."""
+    try:
+        with open(path or LLAMA_SWAP_CONFIG) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return []
+    ids = re.findall(r'^  "?(lab-[A-Za-z0-9._-]+)"?:[ \t]*(?:#.*)?$', text, flags=re.M)
+    return ["local/" + i for i in dict.fromkeys(ids)]
 
 
 def check_lab_aliases():
@@ -279,7 +338,7 @@ def sync_models(names, master):
                     % (n, getattr(e, "code", e), fmt_models(cur.get("models") or [])))
                 continue
             log("updated %s" % describe(n, cur, body))
-        if not by_alias.get(n):
+        if not by_alias.get(n) and (n != WEBUI_LAB_ALIAS or LAB_WEBUI):
             log("missing %s: no key with this alias in LiteLLM%s" % (n, " (would be created)" if DRY else ""))
         if len(by_alias.get(n, [])) > 1:
             log("WARN    %s: %d keys share this alias; each was synced" % (n, len(by_alias[n])))
@@ -309,12 +368,13 @@ def dry_master():
 
 def main():
     check_lab_aliases()
-    names = [(n, "harness") for n in HARNESS_KEYS] + [(n, "user") for n in SPARK_USERS]
+    names = managed_names()
     if not names:
         log("HARNESS_KEYS and SPARK_USERS are empty; nothing to do")
-    todo = [(n, k) for n, k in names if not read_secret(os.path.join(KEY_DIR, n + ".key"))]
+    todo = [(n, k) for n, k in names if not read_secret(os.path.join(KEY_DIR, n + ".key"))
+            and (n != WEBUI_LAB_ALIAS or LAB_WEBUI)]
     for entry in names:
-        if entry not in todo:
+        if entry not in todo and read_secret(os.path.join(KEY_DIR, entry[0] + ".key")):
             log("keep    keys/%s.key (exists)" % entry[0])
 
     master = None
@@ -354,32 +414,73 @@ def main():
     if names:
         sync_models(names, dry_master() if DRY else master)
 
-    # Open WebUI connection keys
-    cur = env_get(WEBUI_ENV, "OPENAI_API_KEYS")
-    if cur is None:
+    webui_env()
+
+
+def webui_target(cur, owui, hermes, lab_key, lab_ids):
+    """{var: value or None} for /srv/webui/.env from its current values (cur: var -> value or
+    None), or None when OPENAI_API_KEYS cannot be filled yet. Slots follow OPENAI_API_BASE_URLS:
+    0 gateway (open-webui key), 1 Hermes (key or PENDING), 2 gateway lab (open-webui-lab key)."""
+    keys = cur.get("OPENAI_API_KEYS")
+    urls = (cur.get("OPENAI_API_BASE_URLS") or "").split(";")
+    if keys == "CHANGEME":
+        if not owui:
+            return None
+        slots = [owui, hermes or "PENDING"]
+    else:
+        slots = keys.split(";")
+        if len(slots) == 1:
+            slots.append("PENDING")
+        if slots[1] == "PENDING" and hermes:
+            slots[1] = hermes
+    out = {}
+    if LAB_WEBUI and lab_key:
+        slots = slots[:2] + [lab_key]
+        out["OPENAI_API_BASE_URLS"] = ";".join(urls[:2] + [GATEWAY_URL])
+        out["OPENAI_API_CONFIGS"] = json.dumps(
+            {"2": {"enable": True, "model_ids": lab_ids, "tags": [{"name": "lab"}]}}, separators=(",", ":"))
+    else:
+        slots = slots[:2]
+        out["OPENAI_API_BASE_URLS"] = ";".join(urls[:2])
+        out["OPENAI_API_CONFIGS"] = None
+    out["OPENAI_API_KEYS"] = ";".join(slots)
+    return out
+
+
+def webui_env():
+    """Open WebUI connection keys (and the lab connection) in /srv/webui/.env."""
+    cur = {v: env_get(WEBUI_ENV, v) for v in ("OPENAI_API_KEYS", "OPENAI_API_BASE_URLS", "OPENAI_API_CONFIGS")}
+    if cur["OPENAI_API_KEYS"] is None:
         log("skip    OPENAI_API_KEYS (%s not installed)" % WEBUI_ENV)
         return
     owui = read_secret(os.path.join(KEY_DIR, "open-webui.key"))
     hermes = read_secret(HERMES_GW_KEY)
-    if cur == "CHANGEME":
-        if not owui:
-            log("WARN    open-webui key missing; OPENAI_API_KEYS left as CHANGEME"
-                + (" (dry run)" if DRY else ""))
-            return
-        new = owui + ";" + (hermes or "PENDING")
-    elif cur.endswith(";PENDING") and hermes:
-        new = cur[: -len("PENDING")] + hermes
-    else:
-        log("keep    OPENAI_API_KEYS in /srv/webui/.env (set%s)"
-            % ("; hermes-gateway slot PENDING" if cur.endswith(";PENDING") else ""))
+    lab_key = read_secret(os.path.join(KEY_DIR, WEBUI_LAB_ALIAS + ".key"))
+    lab_ids = lab_model_ids()
+    if LAB_WEBUI and not lab_key:
+        log("WARN    LAB_WEBUI is on but keys/%s.key is missing; no lab connection%s"
+            % (WEBUI_LAB_ALIAS, " (dry run: it would be created first)" if DRY else ""))
+    want = webui_target(cur, owui, hermes, lab_key, lab_ids)
+    if want is None:
+        log("WARN    open-webui key missing; OPENAI_API_KEYS left as CHANGEME" + (" (dry run)" if DRY else ""))
+        return
+    diff = [v for v, val in want.items() if cur.get(v) != val]
+    lab_note = ("; lab connection: %d model(s) %s" % (len(lab_ids), " ".join(lab_ids))
+                if "OPENAI_API_CONFIGS" in diff and want["OPENAI_API_CONFIGS"] else
+                "; lab connection removed" if "OPENAI_API_CONFIGS" in diff else "")
+    if not diff:
+        log("keep    Open WebUI connections in /srv/webui/.env (set%s%s)"
+            % ("; hermes-gateway slot PENDING" if want["OPENAI_API_KEYS"].split(";")[1] == "PENDING" else "",
+               "; lab connection: %d model(s)" % len(lab_ids) if want["OPENAI_API_CONFIGS"] else ""))
         return
     if DRY:
-        log("would set OPENAI_API_KEYS in /srv/webui/.env")
+        log("would set %s in /srv/webui/.env%s" % (", ".join(diff), lab_note))
         return
-    env_set(WEBUI_ENV, "OPENAI_API_KEYS", new)
-    log("set     OPENAI_API_KEYS in /srv/webui/.env%s (restart open-webui to apply)"
-        % ("" if hermes else "; hermes-gateway slot PENDING"))
-
+    for v in diff:
+        env_set(WEBUI_ENV, v, want[v])
+    log("set     %s in /srv/webui/.env%s%s"
+        % (", ".join(diff), lab_note,
+           "; hermes-gateway slot PENDING" if want["OPENAI_API_KEYS"].split(";")[1] == "PENDING" else ""))
 
 if __name__ == "__main__":
     main()
