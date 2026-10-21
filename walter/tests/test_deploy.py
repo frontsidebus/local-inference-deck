@@ -460,3 +460,14 @@ def test_lab_orgs_reach_the_agent_env(tmp_path):
     deploy(root, write_env(tmp_path, LAB_HF_ORGS="someorg otherorg", LAB_MODELS_QUOTA_GB="900"))
     aenv = (root / "etc/spark-model/agent.env").read_text()
     assert 'LAB_HF_ORGS="someorg otherorg"' in aenv and "LAB_MODELS_QUOTA_GB=900" in aenv
+
+
+def test_provision_keys_env_change_recreates_webui():
+    """Live runs only (DESTDIR runs skip provision-keys' writes): a .env rewritten by provision-keys
+    (connection keys, LAB_WEBUI) marks the webui stack changed before its compose_up."""
+    text = (REPO / "walter" / "deploy.sh").read_text()
+    pk = text.index("    /srv/gateway/provision-keys.py\n")
+    mark = text.index('CHANGED[webui]+=" /srv/webui/.env(provision-keys)"')
+    up = text.index("compose_up /srv/webui webui webui-theme")
+    before = text.index("webui_env_before=$(sha256sum /srv/webui/.env")
+    assert before < pk < mark < up

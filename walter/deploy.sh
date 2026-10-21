@@ -573,7 +573,13 @@ if [[ $NO_START == 1 ]]; then step "compose stacks: skipped (--no-start)"
 else
   step "gateway (Postgres + LiteLLM)";   EXTRA_UP=(--wait); compose_up /srv/gateway gateway
   step "LiteLLM keys (HARNESS_KEYS, SPARK_USERS)"
-  if [[ $LIVE == 1 ]]; then /srv/gateway/provision-keys.py
+  if [[ $LIVE == 1 ]]; then
+    # provision-keys may rewrite the Open WebUI connections (keys, LAB_WEBUI): recreate it if so
+    webui_env_before=$(sha256sum /srv/webui/.env 2>/dev/null || true)
+    /srv/gateway/provision-keys.py
+    if [[ $(sha256sum /srv/webui/.env 2>/dev/null || true) != "$webui_env_before" ]]; then
+      CHANGED[webui]+=" /srv/webui/.env(provision-keys)"
+    fi
   else python3 "$S/gateway/provision-keys.py" --dry-run ${DESTDIR:+--root "$DESTDIR"} 2>&1 | sed 's/^/  /' || true; fi
   step "webui (Pocket-ID + Open WebUI)"; EXTRA_UP=(--wait); compose_up /srv/webui webui webui-theme
   step "monitoring";                     EXTRA_UP=(); compose_up /srv/monitoring monitoring
