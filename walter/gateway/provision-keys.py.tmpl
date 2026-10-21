@@ -458,8 +458,10 @@ def webui_env():
     lab_key = read_secret(os.path.join(KEY_DIR, WEBUI_LAB_ALIAS + ".key"))
     lab_ids = lab_model_ids()
     if LAB_WEBUI and not lab_key:
-        log("WARN    LAB_WEBUI is on but keys/%s.key is missing; no lab connection%s"
-            % (WEBUI_LAB_ALIAS, " (dry run: it would be created first)" if DRY else ""))
+        if DRY:   # the key would be created first; preview the connection (nothing is written)
+            lab_key = "<new %s key>" % WEBUI_LAB_ALIAS
+        else:
+            log("WARN    LAB_WEBUI is on but keys/%s.key is missing; no lab connection" % WEBUI_LAB_ALIAS)
     want = webui_target(cur, owui, hermes, lab_key, lab_ids)
     if want is None:
         log("WARN    open-webui key missing; OPENAI_API_KEYS left as CHANGEME" + (" (dry run)" if DRY else ""))

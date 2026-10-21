@@ -346,3 +346,12 @@ def test_existing_webui_env_is_left_alone_without_lab(tmp_path):
     before = env.read_text()
     load(render(tmp_path), tmp_path).webui_env()
     assert env.read_text() == before
+
+
+def test_dry_run_previews_the_lab_connection_before_the_key_exists(tmp_path, capsys):
+    env = _webui_root(tmp_path, keys=OWUI_KEY + ";PENDING")
+    (tmp_path / "srv" / "gateway" / "keys" / "open-webui-lab.key").unlink()
+    before = env.read_text()
+    load(render(tmp_path, LAB_WEBUI="1"), tmp_path, dry=True).webui_env()
+    assert env.read_text() == before
+    assert "lab connection: 1 model(s) local/lab-a" in capsys.readouterr().err
