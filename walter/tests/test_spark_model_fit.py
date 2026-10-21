@@ -591,7 +591,8 @@ def test_cli_fit_errors(capsys):
     assert "magic" in capsys.readouterr().err
 
 
-def test_cli_search(capsys):
+def test_cli_search(capsys, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_fit, "REPO_ROOT", tmp_path)   # no site.env: the checkout's own must not leak in
     stub = StubHub({})
     assert cli(["search", "model", "--json"], stub) == 0
     rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)}
@@ -635,3 +636,13 @@ def test_quant_grouping_and_choice():
     ("cc-by-nc-sa-4.0", False, "noncommercial")])
 def test_license_flag(lic, gated, flag):
     assert cli_fit._license_flag(lic, gated) == flag
+
+
+def test_per_layer_expert_counts():
+    # Nemotron 3.5 Bolt/Super: expert_used_count is an array (0 on the layers without experts); fit read it as an int
+    used = [0, 9] * 16
+    h = model(n_expert=496, exp_mib=50, extra={"llama.expert_used_count": used})[0]
+    info = fit._arch_info(h, "q8_0")
+    assert (info.n_expert, info.n_expert_used) == (496, 9)
+    f = fit.estimate([h], 32768)
+    assert f.fits

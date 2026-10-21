@@ -120,6 +120,14 @@ def _per_layer(v, n: int, default=0) -> list:
     return [v if isinstance(v, (int, float)) and not isinstance(v, bool) else default] * n
 
 
+def _top(v) -> int:
+    """A count that may be per layer (Nemotron 3.5's pruned MoE layers: expert_used_count is an array, 0 on the
+    layers without experts): the largest value, as llama.cpp's n_expert_used_max()."""
+    if isinstance(v, list):
+        return max((int(x) for x in v if isinstance(x, (int, float)) and not isinstance(x, bool)), default=0)
+    return int(v or 0)
+
+
 def _pad(n: int, to: int) -> int:
     return -(-n // to) * to
 
@@ -222,8 +230,8 @@ def _arch_info(h: GGUFHeader, kv_type: str) -> _Arch:
         if b:
             f16[1 if swa[il] else 0] = max(f16[1 if swa[il] else 0], b * 2.0 / eb)
     tmpl = h.kv.get("tokenizer.chat_template")
-    return _Arch(a or None, n_layer, n_nextn, n_vocab, n_embd, int(_kv(h, a, "expert_count", 0) or 0),
-                 int(_kv(h, a, "expert_used_count", 0) or 0), attn, swa, n_swa, recurrent, rs_bytes,
+    return _Arch(a or None, n_layer, n_nextn, n_vocab, n_embd, _top(_kv(h, a, "expert_count", 0)),
+                 _top(_kv(h, a, "expert_used_count", 0)), attn, swa, n_swa, recurrent, rs_bytes,
                  int(idx_len * eb), nextn_kv, int(f16[0]), int(f16[1]), tmpl if isinstance(tmpl, str) else None)
 
 

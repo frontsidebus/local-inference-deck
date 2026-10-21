@@ -429,6 +429,32 @@ def cmd_review(ctx: Ctx, args):
         return 0
 
 
+def cmd_enable(ctx: Ctx, args):
+    """enable / disable: set a lab model's `enabled` flag. The registry is validated before it is saved, so a model
+    whose chat template is flagged and not reviewed cannot be enabled. What llama-swap serves changes only with
+    `render --apply`, which shows the diff first."""
+    on = args.verb == "enable"
+    with locked(ctx, args.verb):
+        reg = load_registry(ctx)
+        m = R.find(reg, args.id)
+        if m is None:
+            die(f"{args.id!r} is not a lab model in the registry")
+        if m["enabled"] == on:
+            emit(args, {"ok": True, "verb": args.verb, "id": m["id"], "enabled": on, "changed": False},
+                 f"{m['id']} is already {'enabled' if on else 'disabled'}")
+            return 0
+        m["enabled"] = on
+        try:
+            R.validate(reg)
+        except R.RegistryError as e:
+            die(f"not {args.verb}d: {e}")
+        R.save(ctx.registry, reg)
+    emit(args, {"ok": True, "verb": args.verb, "id": m["id"], "enabled": on, "changed": True},
+         f"{m['id']}: enabled: {str(on).lower()} in the registry. llama-swap is unchanged until "
+         f"spark-model render --apply (render alone shows the diff)")
+    return 0
+
+
 def read_template(ctx: Ctx, m: dict):
     import gguf
     f = R.main_file(m)
@@ -502,13 +528,13 @@ def cmd_pull(ctx: Ctx, args):
     try:
         hub = F.Hub(st.endpoint, st.token_file, st.timeout)
         plan = F.plan_pull(hub, reg, st, args.repo, args.id, args.placement, patterns=args.file, ctx=args.ctx,
-                           klass=getattr(args, "class"))
+                           klass=getattr(args, "class"), image=args.image)
     except F.FetchError as e:
         die(str(e))
     s = plan.summary()
     text = [f"pull {plan.repo}@{plan.rev} -> revision {plan.sha}",
             f"  id {plan.id} (llama-swap {R.LAB_PREFIX}{plan.id}), placement {plan.placement}, ctx {plan.ctx}, "
-            f"class {plan.klass} (from {plan.klass_source}), arch {plan.arch or '?'}"]
+            f"class {plan.klass} (from {plan.klass_source}), arch {plan.arch or '?'}, image ${{{plan.image}}}"]
     for f in plan.files:
         text.append(f"  {f['role']:<6} {f['path']}  {gb(f['bytes'])}  sha256 {f['sha256'][:16]}...")
     text.append(f"  total {gb(plan.total_bytes)}; lab after {gb(plan.lab_bytes + plan.total_bytes)} of {ctx.quota_gb:g} GB; "
@@ -595,6 +621,8 @@ def parser():
     s.add_argument("--file", type=glob_arg, action="append", default=[], help="glob over the repo's file list")
     s.add_argument("--ctx", type=ctx_arg)
     s.add_argument("--class", choices=R.CLASSES)
+    s.add_argument("--image", choices=R.IMAGES, default="image",
+                   help="the llama.cpp image macro (image-lab: a newer build, for architectures the others lack)")
     s.add_argument("--yes", action="store_true")
     sp("ls", help="registry, disk use, quota, core models")
     s = sp("rm", help="remove a lab model (entry + lab/<id>/)")
@@ -604,6 +632,9 @@ def parser():
     s.add_argument("--force", action="store_true")
     s = sp("review", help="print a lab model's chat template and record reviewed: true")
     s.add_argument("id", type=id_arg)
+    for v in ("enable", "disable"):
+        s = sp(v, help=f"{v} a lab model in the registry (llama-swap changes with render --apply)")
+        s.add_argument("id", type=id_arg)
     s = sp("render", help="diff (default) or --apply the rendered llama-swap config")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--force", action="store_true")
@@ -622,7 +653,8 @@ def main(argv=None):
         if args.verb == "render":
             args.live_guard = True
         return {"pull": cmd_pull, "ls": cmd_ls, "rm": cmd_rm, "review": cmd_review, "render": cmd_render,
-                "status": cmd_status, "serving": cmd_serving}[args.verb](ctx, args)
+                "status": cmd_status, "serving": cmd_serving, "enable": cmd_enable,
+                "disable": cmd_enable}[args.verb](ctx, args)
     except Fail as e:
         if as_json:
             sys.stdout.write(json.dumps({"ok": False, "error": str(e), **e.extra}, default=str) + "\n")

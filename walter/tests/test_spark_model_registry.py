@@ -350,3 +350,9 @@ def test_registry_is_never_read_through_a_symlink(tmp_path):
     (tmp_path / "dir.yaml").mkdir()
     with pytest.raises(R.RegistryError, match="not a regular file"):
         R.load(tmp_path / "dir.yaml")
+
+
+def test_every_registry_image_is_a_base_macro(base):
+    macros = yaml.safe_load(base)["macros"]
+    for img in R.IMAGES:
+        assert img in macros and "@sha256:" in macros[img] and macros[img].startswith("ghcr.io/ggml-org/llama.cpp:"), img
