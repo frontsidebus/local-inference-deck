@@ -120,6 +120,14 @@ def test_globs_survive_the_remote_shell(W):
     assert (W.models / "gguf/lab/m1/m-Q4_K_M.gguf").is_file()
 
 
+def test_args_flags_reach_the_agent_intact(W):
+    W.run("pull", ORG_REPO, "--file", "*Q4*", "--id", "m1", "--placement", "gpu1", "--yes", check=0)
+    r = W.run("args", "m1", "--", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", check=0)
+    assert "-> --spec-type draft-mtp --spec-draft-n-max 2 in the registry" in r.stdout
+    assert W.ssh_calls()[-1][-7:] == ["--json", "m1", "--", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
+    assert "extra_args not changed" in W.run("args", "m1", "--", "--rpc", "x", check=1).stderr
+
+
 @pytest.mark.parametrize("bad", ["a;b", "$(id)", "x y", "`id`", "a|b", "a\nb", "'"])
 def test_unsafe_arguments_never_reach_ssh(W, bad):
     r = W.run("rm", bad, check=2)
