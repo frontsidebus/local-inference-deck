@@ -1,0 +1,19 @@
+{
+ "exe": "/opt/maya/build/maya-ds4",
+ "args": ["--pack", "/data/ds4/Maya-S/maya-ds4", "--max-context", "65536", "--tp", "2",
+          "--vision", "off", "--dspark", "none", "--cpu-threads", "12",
+          "--expert-profile", "/data/ds4/Maya-S/maya-ds4/expert-profile.bin"],
+ "cwd": "/opt/maya",
+ "tokenizer": "/data/ds4/Maya-S/maya-ds4/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "gpu": [0, 1],
+ "sampling": {"temperature": 1.0, "top_p": 1.0},
+ "reasoning_effort": "high",
+ "lib_dirs": [],
+ "host": "0.0.0.0",
+ "port": 8080,
+ "fit_max_tokens": true,
+ "lab_max_tokens": 16384,
+ "env": {},
+ "log": "/data/logs/deepseek-v4.1-flash.log"
+}

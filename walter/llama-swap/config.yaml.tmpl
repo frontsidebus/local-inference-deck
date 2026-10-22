@@ -43,6 +43,8 @@ macros:
   # Swap equal to memory: no swapping of weights.
   "mem": "--memory 32g --memory-swap 32g"
   "mem-moe": "--memory 64g --memory-swap 64g"
+  # lab-deepseek-v4.1-flash only: its RAM tier is the page cache of the mmap'd experts, inside this cap
+  "mem-ds4": "--memory 72g --memory-swap 72g"
   # common llama-server args: everything on GPU, fail loudly instead of auto-shrinking, one slot, q8_0 KV
   # Every model also gets `-n <N>` (output backstop): llama-server's default is -1 = generate until the
   # context is full. -n is only a DEFAULT for requests without max_tokens (a request that asks for more
@@ -55,7 +57,7 @@ macros:
   "tp": "--shm-size 2g"
   # Project Maya (walter/maya/README.md): built on Walter's side from pinned sources, so a local tag, not a digest.
   # deploy.sh checks the tag is present. Bump the tag with walter/maya/Dockerfile.
-  "maya-image": "walter-maya:8d9a9b5-2"
+  "maya-image": "walter-maya:451f9cb-1"
   # rm -f is synchronous (stop + --rm removes asynchronously, so a reload's docker run could hit a name conflict)
   "stop": "docker rm -f ${MODEL_ID}"
 
@@ -191,6 +193,26 @@ models:
     unlisted: true
     capabilities: { in: [text], out: [text], tools: false, context: 32768 }
 
+  # LAB (2026-10-22): DeepSeek-V4.1-Flash-1017 (552B MoE + 196B Engram, arch deepseek41, not in our llama.cpp) on
+  # Project Maya's maya-ds4 engine (walter/maya/README.md). Maya-S quant (339.5 GB, 178 GB without the Engram tables):
+  # the hottest experts in VRAM, the rest mmap'd from /models and served from the page cache (the ${mem-ds4} cap is
+  # that tier) or read from the NVMe on demand; the Engram tables stay on disk (~48 small row reads a token).
+  # Expect a few tokens/s and prompts of minutes: batch / second-opinion use only. Same sandbox and API-only
+  # entrypoint as lab-glm-5.3-flash; one conversation at a time (the engine has no parallel slots).
+  # The engine waits up to 50 s for its own shutdown, so unloadTimeout is above that.
+  "lab-deepseek-v4.1-flash":
+    name: "DeepSeek-V4.1-Flash Maya-S (Project Maya, GPU0+GPU1+page-cache/NVMe experts, lab)"
+    cmd: |
+      ${run} ${mem-ds4} --gpus "\"device=0,1\""
+      -v ${MODELS_DIR}/maya-data:/data -v /etc/maya/deepseek-v4.1-flash.json:/cfg/ds4.json:ro
+      ${maya-image} --config /cfg/ds4.json --port 8080
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 60
+    ttl: 1800
+    unlisted: true
+    capabilities: { in: [text], out: [text], tools: false, context: 65536 }
+
 routing:
   router:
     use: matrix
@@ -204,10 +226,12 @@ routing:
           h: hermes-4.3-36b
           x: qwen3.8-flash-next
           m: lab-glm-5.3-flash
+          d: lab-deepseek-v4.1-flash
         evict_costs:
           b: 5     # ~40 GB read from disk: about 20 s when the page cache is cold, 7 s when warm
           x: 5     # ~55 GB of weights to read (the n-gram table is read on demand); slower than big
           m: 5     # ~90 GB of experts into VRAM and pinned RAM: ~35 s warm
+          d: 5     # ~30 GB of experts into VRAM plus a page-cache warm-up read from the NVMe
         sets:
           coding: "c & f"   # one per GPU, the default working pair
           big: "b"
@@ -215,6 +239,7 @@ routing:
           hermes: "h"
           flash: "x"
           maya: "m"
+          deepseek: "d"
 
 hooks:
   on_startup:
