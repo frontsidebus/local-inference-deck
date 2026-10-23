@@ -186,10 +186,26 @@ def test_cpu_offload_models_get_the_large_memory_cap(config, mid):
         any(a in server for a in ("--n-cpu-moe", "-ncmoe", "--cpu-moe", "-cmoe")) or is_maya(config, mid)
     mem = mem_bytes(values(args, "--memory")[0])
     if cpu:
-        assert mem >= 64 * 2**30, (mid, mem)   # ~17 GB of experts + n-gram pages + prompt cache
+        assert mem >= 64 * 2**30, (mid, mem)   # flash: ~47 GB of mapped experts + n-gram pages + prompt cache
     else:
         assert 16 * 2**30 <= mem <= 48 * 2**30, (mid, mem)
     assert mem <= 72 * 2**30, "leave room in the 80 GiB VM for the gateway and the other stacks"
+
+
+@pytest.mark.parametrize("mid", server_ids())
+def test_moe_cache_settings(config, mid):
+    """--moe-cache-mib: a build that has it on several GPUs, experts on the CPU for it to cache, and an even split."""
+    args, server = docker_args(config, mid)
+    mib = values(server, "--moe-cache-mib")
+    if not mib:
+        return
+    assert "${image-lab}" in config["models"][mid]["cmd"], "the MoE cache needs b11749 (#29887 + #30112 multi-GPU)"
+    assert any("_exps" in a and "=CPU" in a for a in values(server, "-ot", "--override-tensor")), "nothing to cache"
+    gpus = values(args, "--gpus")[0].count(",") + 1
+    if gpus > 1:
+        # the size is a TOTAL split over the GPUs by -ts (by free memory without it): keep the split explicit and even
+        assert values(server, "-ts", "--tensor-split") == [",".join(["1"] * gpus)], mid
+    assert 0 < int(mib[0]) <= gpus * 16 * 1024, mid
 
 
 # ---- the Maya lab engine (walter/maya) ------------------------------------------------------------

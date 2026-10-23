@@ -39,13 +39,16 @@ Notes
   tensor split (`-sm tensor`, plus `--shm-size 2g` for the container through the `${tp}` macro), which gave them
   +39–67 % decode. Numbers and the fallback are in `llama-swap/BENCHMARKS.md`.
 - `flash` (experimental, 2026-10-08) is Qwen3.8-Flash-Next, a 125B MoE (6B active, arch `qwen4exp`), at ISTA-DASLab's GSQ-RCO IQ3_S quant. The model card gives a task average of 93.26, against 93.12 for BF16.
-  - **Image:** it runs on its own pinned llama.cpp image (`${image-next}`, build 11459), because qwen4exp needs fixes after 11277. Every other model stays on `${image}`.
+  - **Image:** it runs on `${image-lab}` (build 11749), the first pinned build with llama.cpp's MoE expert cache on several GPUs (#29887, #30112, #30637). Until 2026-10-23 it ran on `${image-next}` (build 11459), which has the qwen4exp fixes after 11277 but no cache. The core models stay on `${image}`.
   - **Placement:**
     - layer split over both GPUs;
-    - the routed experts of 16 of its 48 layers run on the CPU from RAM, about 17 GB (`-ot`), leaving GPU1 room for an MTP draft head (`--spec-type draft-mtp`, unsloth's self-contained Q8_0 file): decode 45–47 tok/s, against 38–40 without MTP (`llama-swap/BENCHMARKS.md`);
+    - all routed experts (~47 GB) stay in RAM (`-ot`), and the MoE expert cache (`--moe-cache-mib 22000`, a total split evenly by `-ts 1,1`: 11 GiB per GPU) runs the recently used ones on the GPU and uploads only the misses. About 93 % of expert uses hit in decode;
+    - `-b 2048 -ub 2048`, so a prompt uploads each missed expert once per 2048 tokens instead of per 512;
+    - an MTP draft head on GPU1 (`--spec-type draft-mtp`, unsloth's self-contained Q8_0 file);
+    - decode 57–60 tok/s and prompt 333–407 tok/s, against 40–45 and 260–280 for the old placement, 16 CPU expert layers without the cache (`llama-swap/BENCHMARKS.md`, 2026-10-23);
     - the 28.8 GB n-gram table (`per_layer_token_embd`, shard 2) stays on disk and is read on demand (`-lm mmap -lzm on`).
   - **Eviction:** it takes both GPUs, so it evicts the coding pair, as `big` does.
-  - **Status:** being evaluated with the eval harness (`evals/plans/`). Keep it hidden in Open WebUI until a routing decision. Eval run (c) measured it on the shared 100-item subsets (`evals/`).
+  - **Status:** being evaluated with the eval harness (`evals/plans/`). Keep it hidden in Open WebUI until a routing decision. Eval run (c) measured it on the shared 100-item subsets (`evals/`). Eval runs before 2026-10-23 used build 11459 and the old placement; greedy text changes with the build and the GPU/CPU split (floating-point order), so treat results from the two setups as separate runs, not as one sample.
   - **Background:** this came out of looking at the Strata server. It runs the same GGUF family in stock llama.cpp, so the model can be judged apart from the engine.
 - Row split (`-sm row`) does not load on the pinned build ("does not support split buffers").
 - The llama.cpp image is pinned by digest in `config.yaml.tmpl` (build 11277). Change model
