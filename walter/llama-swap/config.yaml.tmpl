@@ -20,12 +20,14 @@ apiKeys:
 
 macros:
   "image": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:7149a45c80596644320de1d565db1b3b8e70b22c66fed612e69b73f6b1e0d746"
-  # build 11459, used ONLY by the experimental flash entry (qwen4exp needs fixes after 11277: #29751 decode +13-55 %,
-  # #29761 MTP, #29825 indexer memory, #29994 race). Every other model stays on ${image}.
+  # build 11459 (qwen4exp fixes after 11277: #29751 decode +13-55 %, #29761 MTP, #29825 indexer memory, #29994 race).
+  # flash ran on it until 2026-10-23 and moved to ${image-lab} for the MoE expert cache; no core model uses it now,
+  # but the lab registry can still pick it (walter/models/lib/registry.py IMAGES).
   "image-next": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:fff6185edd2fbc4093aa5970bf6db53ed11c283e3a1c52a3e244cf27047264f4"
-  # build 11749, used ONLY by lab models that pick it (registry `image: image-lab`): Nemotron 3.5 Bolt / Super's pruned
-  # MoE layers have per-layer expert counts, which load from llama.cpp PR #30520 (merged 2026-10-15) on; 11277 and 11459
-  # refuse them (check_tensor_dims). Measured 2026-10-20: Bolt 74B-A9B 24GB on GPU1, 21.2 GiB at 32K, ~87 t/s.
+  # build 11749, used by flash (the MoE expert cache: llama.cpp #29887 + #30112 multi-GPU + #30637 SLRU) and by lab
+  # models that pick it (registry `image: image-lab`): Nemotron 3.5 Bolt / Super's pruned MoE layers have per-layer
+  # expert counts, which load from llama.cpp PR #30520 (merged 2026-10-15) on; 11277 and 11459 refuse them
+  # (check_tensor_dims). Measured 2026-10-20: Bolt 74B-A9B 24GB on GPU1, 21.2 GiB at 32K, ~87 t/s.
   "image-lab": "ghcr.io/ggml-org/llama.cpp:server-cuda-b11749@sha256:31b39eacce2bab5fde9286ec3980ed5548a3987644e94da0d0c2092f93313538"
   # spark-docker-run.sh waits for a same-named container (from a reload) to be gone, then execs docker run --name <id>
   # Hardened (walter/README.md "Model container hardening"; tests: walter/tests/test_llama_swap_config.py):
@@ -38,8 +40,10 @@ macros:
   "run": "/usr/local/sbin/spark-docker-run.sh ${MODEL_ID} --rm --init --label llama-swap=1 --runtime nvidia --network llama-net -p 127.0.0.1:${PORT}:8080 -v ${MODELS_DIR}/gguf:/models/gguf:ro --user 10010:10010 --cap-drop ALL --security-opt no-new-privileges --read-only --tmpfs /tmp:rw,nosuid,nodev,size=1g -e HOME=/tmp --pids-limit 512"
   # Memory caps (RAM + page cache charged to the container; clean model pages are reclaimed, not OOM-killed, at the
   # cap). GPU-resident models need a few GB (CPU token embeddings, prompt cache up to 8 GiB, buffers); 32g also keeps
-  # most of a 39 GB GGUF in page cache for a warm reload. flash keeps ~17 GB of experts in RAM plus the on-demand
-  # n-gram table pages: 64g, which leaves ~16 GB of the 80 GiB VM for the gateway and the other stacks.
+  # most of a 39 GB GGUF in page cache for a warm reload. flash maps all ~47 GB of its experts plus the on-demand
+  # n-gram table pages: 64g, which leaves ~16 GB of the 80 GiB VM for the gateway and the other stacks. The mapped
+  # pages are clean, so at the cap the kernel drops cold ones and re-reads them from NVMe; the hot experts also sit in
+  # the GPU expert cache, so decode rarely touches them (measured 2026-10-23, BENCHMARKS.md).
   # Swap equal to memory: no swapping of weights.
   "mem": "--memory 32g --memory-swap 32g"
   "mem-moe": "--memory 64g --memory-swap 64g"
@@ -146,20 +150,25 @@ models:
   # 1 sparse attention]), ISTA-DASLab GSQ-RCO IQ3_S (model-card task average 93.26 vs 93.12 BF16). Being evaluated
   # (evals/plans) before any routing decision; hidden in Open WebUI until then.
   # Placement: layer split over both GPUs; the 28.8 GB n-gram table (per_layer_token_embd, shard 2) stays on the CPU
-  # and is read from disk on demand (-lm mmap -lzm on); the routed experts of 16 layers (blk 0-5 on GPU0's half,
-  # blk 24-33 on GPU1's) run on the CPU from RAM (~17 GB), leaving GPU1 room for the MTP draft head.
-  # MTP (unsloth's self-contained Q8_0 head on GPU1, 2 drafted tokens): decode 45-47 t/s vs 38-40 without it, prompt
-  # processing ~295 vs ~390 t/s (BENCHMARKS.md, 2026-10-09). The "shared" head does not load on mainline (it needs
-  # tensor borrowing). VRAM after load ~21.5 / 23.5 of 24.6 GB. KV is small: 12 attention layers (~1.7 GB at 128K).
-  # Fallback without MTP: drop the -md/--spec-type/-devd/-ngld args and use blk\.([0-4]|2[4-9])\. (11 CPU layers).
+  # and is read from disk on demand (-lm mmap -lzm on). ALL routed experts (~47 GB) live in RAM (-ot ...=CPU) and
+  # llama.cpp's MoE expert cache (--moe-cache-mib, a TOTAL split over the GPUs by -ts: 2 x 11 GiB) runs the recently
+  # used ones on the GPU, uploading only the misses (hit rate ~93 % in decode). -b/-ub 2048 uploads each missed expert
+  # once per 2048 prompt tokens instead of per 512. MTP: unsloth's self-contained Q8_0 head on GPU1, 2 drafted tokens.
+  # Measured 2026-10-23 (BENCHMARKS.md): decode 57-60 t/s and prompt 333-407 t/s, against 40-45 / 260-280 for the old
+  # placement (16 CPU expert layers, no cache). VRAM after load ~16.7 / 22.3 of 24.6 GB; GPU1 (MTP head) is the
+  # tightest card; it peaked ~180 MiB above that at ~127K tokens, where the old placement ran out of memory on GPU1
+  # at ~106K. A bigger cache at the default -ub 512 (2 x 14.5 GiB) decodes faster (66-79) but prompts at 155-179.
+  # Small caches lose: 1.5 GiB per GPU with 20 CPU layers hit 60 % and decoded slower than no cache (PCIe x8).
+  # Fallback (old placement, ${image-next}): -ot "per_layer_token_embd=CPU,blk\.([0-5]|2[4-9]|3[0-3])\.ffn_.*_exps\.=CPU",
+  # no --moe-cache-mib / -b / -ub. The "shared" MTP head does not load on mainline (it needs tensor borrowing).
   "qwen3.8-flash-next":
     name: "Qwen3.8-Flash-Next 125B-A6B IQ3_S (GPU0+GPU1+CPU experts, experimental)"
     aliases: ["flash"]
     cmd: |
-      ${run} ${mem-moe} --gpus "\"device=0,1\"" ${image-next}
+      ${run} ${mem-moe} --gpus "\"device=0,1\"" ${image-lab}
       -m /models/gguf/qwen3.8-flash-next/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf
-      ${common} -c 131072 -n 32768 -sm layer -ts 1,1 -lm mmap -lzm on
-      -ot "per_layer_token_embd=CPU,blk\.([0-5]|2[4-9]|3[0-3])\.ffn_.*_exps\.=CPU"
+      ${common} -c 131072 -n 32768 -sm layer -ts 1,1 -lm mmap -lzm on -b 2048 -ub 2048
+      -ot "per_layer_token_embd=CPU,blk\.[0-9]+\.ffn_.*_exps\.=CPU" --moe-cache-mib 22000
       -md /models/gguf/qwen3.8-flash-next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf
       --spec-type draft-mtp --spec-draft-n-max 2 -devd CUDA1 -ngld 99
       --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0

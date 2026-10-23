@@ -167,6 +167,60 @@ Decision:
 - **`big`: not measured, left off.**
 - The output cap (gateway `max_tokens` clamp, `-n` backstop) stays the guard against runaway generations; a penalty only lowers how often they happen. Clients can still send `presence_penalty` (0 restores the old behaviour on `coder-fast`). Re-measure after an image or model bump.
 
+## 2026-10-23: `flash` with llama.cpp's MoE expert cache (`--moe-cache-mib`)
+
+llama.cpp #29887 (merged 2026-10-07) keeps an LRU cache of experts on the GPU for MoE layers whose experts live in host
+memory: small batches (<= 32 tokens, so decode and MTP verification) run those experts on the GPU and upload only the
+misses. #30112 adds several GPUs (the size is a total, split by `-ts`) and #30637 makes it a 50/50 SLRU. All three are
+in b11749 (`${image-lab}`), not in b11459 (`${image-next}`). The PR's own benchmark is this model (Q4_0, 2x 4090:
+34.8 -> 60.4 t/s).
+
+Method: as the 2026-10-09 runs (transient hardened container, llama-swap's models unloaded, temperature 0, thinking
+off, MTP Q8_0 head on GPU1, `timings`), four prompts per variant: short + 120, 1.5k + 300, a second 1.5k + 600 (520
+new prompt tokens after the cached prefix) and 6k + 300. Hit rates are llama.cpp's own count at shutdown (`-lv 4`).
+
+| Variant | Image | CPU expert layers | Cache (per GPU) | `-ub` | VRAM GPU0 / GPU1 (MiB) | Prompt t/s | Decode t/s | Decode hit rate |
+|---|---|---|---|---|---|---|---|---|
+| A, production until now | b11459 | 16 | - | 512 | 21472 / 23450 | 249-271 | 28.3 / 40.4 / 40.5 / 44.0 | - |
+| B, the new build alone | b11749 | 16 | - | 512 | 21484 / 23442 | 259-282 | 34.1 / 45.3 / 40.2 / 41.1 | - |
+| D | b11749 | 20 | 1.5 GiB | 512 | 20958 / 22838 | 225-244 | 32.5 / 38.6 / 39.0 / 38.7 | 60 % |
+| F | b11749 | all 48 | 13 GiB | 512 | 17456 / 21552 | 155-171 | 36.7 / 65.6 / 70.5 / 70.5 | 95.2 % |
+| F3 | b11749 | all 48 | 14.5 GiB | 512 | 18958 / 23052 | 155-179 | 35.3 / 66.4 / 79.1 / 77.3 | 96.3 % |
+| **F2 (chosen)** | b11749 | **all 48** | **11 GiB** | **2048** | 16744 / 22320 | **333-407** | 36.4 / **58.8 / 56.6 / 60.4** | 92.8 % |
+
+(Prompt t/s leaves out the 26-token prompt. Decode is short / 1.5k / 1.5k / 6k.)
+
+Long context (F2 vs A, one request each at ~63K, ~100K and ~127K tokens of context, the later ones reusing the cached
+prefix; 400-600 output tokens; VRAM sampled every second):
+
+| Config | ~63K: prompt / decode t/s | ~100K | ~127K | Peak VRAM GPU0 / GPU1 (MiB) |
+|---|---|---|---|---|
+| A (production until now) | 260 / 34.1 | 256 / 32.6 | **CUDA out of memory on GPU1 at ~106K** | 21832 / 24124 |
+| F2 | 321 / 42.9 | 369 / 44.6 | 370 / 41.4 | 16868 / 22498 |
+
+All answers counted the batches right (41, 64, 80).
+
+Results:
+- **The build alone changes nothing:** A and B are within noise of each other.
+- **Small caches lose on our PCIe x8 links:** at 60 % hits D uploaded ~135 MB per decoded token and decoded slower
+  than no cache. The cache pays once it holds most of the hot experts, which needs all experts on the CPU so that the
+  VRAM they held on the GPUs becomes cache.
+- **Prompt processing:** large batches skip the cache and upload whole experts, so at `-ub 512` prompts drop to
+  155-180 t/s; `-ub 2048` uploads each expert once per 2048 tokens and lifts them above the old placement, at the cost
+  of ~1.3 GB more compute buffer per GPU (hence the smaller cache, 11 instead of 13-14.5 GiB, and ~4 points of hit rate).
+- **The old placement does not reach its advertised 131072 context:** GPU1 (MTP head) ran out of memory at ~106K.
+  F2 leaves GPU1 ~2 GB free at ~127K; the peak was ~180 MiB above the post-load figure.
+- **RAM:** all ~47 GB of experts are mapped under the 64g cap with the n-gram table; nothing was killed or swapped,
+  and decode reads cold experts rarely (hit rate). Container RSS stayed ~1-2 GiB; the rest is reclaimable page cache.
+- **Failed:** moving the MTP head to GPU0 for a bigger cache with `-ub 2048` ran out of memory on GPU0 at the first
+  long prompt. Load-time VRAM is not enough: test long prompts after any change.
+- **Exactness:** greedy text differs between builds and placements (as on 2026-10-09: floating-point order); F2 and F3
+  gave identical text, coherent in every case. Eval results from before and after this change are separate runs.
+
+Decision: **F2**. Faster than the old placement at both decode (+35-45 % on the 1.5k/6k prompts, +25-35 % at 63-100K)
+and prompt processing (+25-50 %), and it reaches the full context. F3 decodes faster still but halves prompt speed; revisit if per-device
+cache sizes land (#30205) or traffic turns decode-bound. Logs: site archive `moe-cache-20261023/`.
+
 ## 2026-10-20: `lab-glm-5.3-flash` (GLM-5.3-Flash Maya-S24 on the Project Maya engine)
 
 Not llama-server: walter/maya/README.md has the setup and the full table. A transient container with llama-swap's models
