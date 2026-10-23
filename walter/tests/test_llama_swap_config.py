@@ -194,18 +194,28 @@ def test_cpu_offload_models_get_the_large_memory_cap(config, mid):
 
 # ---- the Maya lab engine (walter/maya) ------------------------------------------------------------
 
+# llama-swap id -> (run config in walter/maya, its path in the container)
+MAYA_RUN = {"lab-glm-5.3-flash": ("glm-5.3-flash.json", "/cfg/glm.json"),
+            "lab-deepseek-v4.1-flash": ("deepseek-v4.1-flash.json", "/cfg/ds4.json")}
+
+
+def test_maya_ids_have_run_configs():
+    assert sorted(maya_ids()) == sorted(MAYA_RUN)
+
+
 @pytest.mark.parametrize("mid", maya_ids())
 def test_maya_entry(config, mid):
     args, server = docker_args(config, mid)
     m = config["models"][mid]
+    name, cfg_path = MAYA_RUN[mid]
     assert mid.startswith("lab-") and m.get("unlisted") is True, "the gateway's lab guard keys on the lab- id"
     assert m["capabilities"]["tools"] is False and not m.get("aliases")
     vols = sorted(values(args, "-v", "--volume"))
     assert vols == sorted([f"{MODELS_DIR}/gguf:/models/gguf:ro", f"{MODELS_DIR}/maya-data:/data",
-                           "/etc/maya/glm-5.3-flash.json:/cfg/glm.json:ro"]), vols
+                           f"/etc/maya/{name}:{cfg_path}:ro"]), vols
     assert "backups" not in "".join(vols)
     # no --api-key on the command line, no MCP config, the run config is the mounted one
-    assert server == ["--config", "/cfg/glm.json", "--port", "8080"], server
+    assert server == ["--config", cfg_path, "--port", "8080"], server
     assert values(args, "-e", "--env", "--env-file") == ["HOME=/tmp"]
     run = yaml.safe_load(expand(config, "x: ${maya-image}"))["x"]
     tag = run.split(":", 1)[1]
@@ -225,6 +235,27 @@ def test_maya_run_config():
     assert cfg["exe"] == "/opt/maya/build/maya" and cfg["port"] == 8080
 
 
+def test_maya_ds4_run_config(config):
+    import json
+    cfg = json.loads((MAYA / "deepseek-v4.1-flash.json").read_text())
+    assert "vision" not in cfg and "mcp_servers" not in cfg and "api_key" not in cfg
+    assert cfg["exe"] == "/opt/maya/build/maya-ds4" and cfg["port"] == 8080 and cfg["gpu"] == [0, 1]
+    a = cfg["args"]
+    opt = {a[i]: a[i + 1] for i in range(len(a) - 1) if a[i].startswith("--")}
+    # image input off (it fetches URLs / reads files), no drafter, pack and profile on the rw data mount
+    assert opt["--vision"] == "off" and opt["--dspark"] == "none"
+    assert opt["--pack"].startswith("/data/ds4/") and opt["--expert-profile"].startswith(opt["--pack"] + "/")
+    ctx = config["models"]["lab-deepseek-v4.1-flash"]["capabilities"]["context"]
+    assert int(opt["--max-context"]) == ctx
+    assert int(opt["--cpu-threads"]) <= 12, "leave vCPUs for the gateway and the other stacks"
+    # the debug dump variables write files wherever they point
+    assert not any(k.startswith(("DS4_DUMP", "DS4_DSPARK_DUMP")) for k in cfg.get("env") or {})
+    assert cfg["log"].startswith("/data/") and cfg["tokenizer"].startswith(opt["--pack"] + "/")
+    # the engine sizes its page-cache tier from the cgroup: the cap is the tier, below the VM's 80 GiB
+    args, _ = docker_args(config, "lab-deepseek-v4.1-flash")
+    assert mem_bytes(values(args, "--memory")[0]) == 72 * 2**30
+
+
 def test_maya_entrypoint_allows_only_the_api():
     import ast
     tree = ast.parse((MAYA / "lab_entry.py").read_text())
@@ -234,6 +265,84 @@ def test_maya_entrypoint_allows_only_the_api():
     assert allow == {"GET": {"/health", "/v1/models", "/models", "/props", "/slots"},
                      "POST": {"/v1/chat/completions", "/v1/messages"}}
     assert 'ENTRYPOINT ["python3", "/opt/maya/lab_entry.py"' in (MAYA / "Dockerfile").read_text()
+
+
+def _lab_entry(monkeypatch):
+    """lab_entry.py loaded against a stub serve.server (the real one is only in the image)."""
+    import runpy, sys, types
+
+    class Base:
+        def __init__(self, path, body=b""):
+            self.path, self.raw, self.sent, self.seen = path, body, None, None
+
+        def _json(self, status, obj):
+            self.sent = status
+
+        def _body(self):
+            return self.raw
+
+        def do_GET(self):
+            self.seen = "GET"
+
+        def do_POST(self):
+            self.seen = ("POST", self._body())
+
+    stub = types.ModuleType("serve.server")
+    stub.make_handler = lambda svc: Base
+    monkeypatch.setitem(sys.modules, "serve", types.ModuleType("serve"))
+    monkeypatch.setitem(sys.modules, "serve.server", stub)
+    ns = runpy.run_path(str(MAYA / "lab_entry.py"))
+    return ns, stub.make_handler(None)
+
+
+@pytest.mark.parametrize("method", ["OPTIONS", "HEAD", "DELETE", "PUT", "PATCH", "TRACE", "CONNECT"])
+def test_maya_entrypoint_refuses_other_methods(monkeypatch, method):
+    ns, H = _lab_entry(monkeypatch)
+    h = H("/v1/responses/abc")
+    getattr(h, "do_" + method)()
+    assert h.sent == 404 and h.seen is None
+    h = H("/admin")
+    h.do_GET()
+    assert h.sent == 404 and h.seen is None
+
+
+@pytest.mark.parametrize("req,want", [
+    ({}, 100), ({"max_tokens": 0}, 100), ({"max_tokens": -1}, 100), ({"max_tokens": 5000}, 100),
+    ({"max_completion_tokens": 5000, "max_tokens": 10}, 100), ({"max_tokens": True}, 100),
+    ({"max_tokens": "50"}, 100), ({"max_tokens": 50}, 50), ({"max_completion_tokens": 100}, 100),
+])
+def test_maya_entrypoint_clamps_output(monkeypatch, req, want):
+    import json
+    ns, H = _lab_entry(monkeypatch)
+    ns["clamp_body"].__globals__["CAP"] = 100
+    for path in ("/v1/chat/completions", "/v1/messages?beta=true"):
+        h = H(path, json.dumps(dict(req, messages=[])).encode())
+        h.do_POST()
+        out = json.loads(h.seen[1])
+        assert out.get("max_completion_tokens", out.get("max_tokens")) == want and out["messages"] == []
+    # no cap configured, or a body that is not a JSON object: passed through untouched
+    assert ns["clamp_body"](b'{"max_tokens": 9}', "/v1/chat/completions", 0) == b'{"max_tokens": 9}'
+    assert ns["clamp_body"](b"[1]", "/v1/chat/completions", 100) == b"[1]"
+    assert ns["clamp_body"](b"not json", "/v1/chat/completions", 100) == b"not json"
+
+
+def test_maya_entrypoint_reads_the_cap(monkeypatch, tmp_path):
+    import json
+    ns, _ = _lab_entry(monkeypatch)
+    ds4 = json.loads((MAYA / "deepseek-v4.1-flash.json").read_text())
+    assert ns["_config_cap"](["x", "--config", str(MAYA / "deepseek-v4.1-flash.json")]) == ds4["lab_max_tokens"]
+    assert ns["_config_cap"](["x", "--config", str(MAYA / "glm-5.3-flash.json")]) == 0
+    assert ds4["fit_max_tokens"] is True, "a long prompt plus the cap would otherwise be a 400"
+    bad = tmp_path / "bad.json"
+    for v in ("16384", -1, True, 1.5):
+        bad.write_text(json.dumps({"lab_max_tokens": v}))
+        with pytest.raises(SystemExit):
+            ns["_config_cap"](["x", "--config", str(bad)])
+
+
+def test_maya_image_ships_the_ds4_profile():
+    # the ds4 pack's expert-profile.bin is seeded from it (README.md); without it placement starts by expert index
+    assert "data/expert-profile-ds4.bin" in (MAYA / "Dockerfile").read_text()
 
 
 # ---- the names that tie config, deploy.sh and the firewall together ------------------------------

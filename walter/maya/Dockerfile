@@ -14,7 +14,7 @@ ARG CUDA_DEVEL=nvidia/cuda:12.8.1-devel-ubuntu24.04@sha256:520292dbb4f755fd36076
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843105edf3b8b0ac45e0b43acee358e8046867
 
 FROM ${CUDA_DEVEL} AS build
-ARG MAYA_COMMIT=8d9a9b5d705049a87da853717cdc59440252de30
+ARG MAYA_COMMIT=451f9cb6a21ea65673bdde2e57b4a670ae2b8859
 # third_party/ggml/VERSION.txt of that commit (setup.py LLAMA_CPP_COMMIT); Maya's setup fetches it as an unchecked zip
 ARG LLAMA_CPP_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d
 ARG CUDA_ARCH=86
@@ -39,7 +39,8 @@ RUN cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA
  && cmake --build build --target maya maya-ds4 -j ${JOBS} \
  && mkdir -p /out/build /out/data /out/third_party/llama.cpp \
  && cp build/maya build/maya-ds4 /out/build/ \
- && cp -r serve tools VERSION LICENSE /out/ && cp data/expert-profile-glm.bin /out/data/ \
+ && cp -r serve tools VERSION LICENSE LICENSE.deepseek-v41 /out/ \
+ && cp data/expert-profile-glm.bin data/expert-profile-ds4.bin /out/data/ \
  && cp -r third_party/llama.cpp/gguf-py third_party/llama.cpp/LICENSE /out/third_party/llama.cpp/ \
  && for d in ggml exllamav3 beellama.cpp; do mkdir -p /out/third_party/$d; \
       cp third_party/$d/LICENSE* /out/third_party/$d/ 2>/dev/null || true; done \
