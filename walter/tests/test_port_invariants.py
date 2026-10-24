@@ -3,7 +3,8 @@
 Covenant's nginx sites proxy to ${BACKEND_WG_IP}:<port>; Walter publishes/binds those ports on
 BACKEND_WG_IP (compose), lets only the edge reach them (docker-user-rules.sh PORTS, and the ufw
 rules for the host-network apps), and walter/deploy.sh pins DIGEST_PORT to 3300. The ports are
-fixed invariants: WebUI 3000, Pocket-ID 1411, LiteLLM 4000, telemetry 3200, digest 3300.
+fixed invariants: WebUI 3000, Pocket-ID 1411, LiteLLM 4000, telemetry 3200, digest 3300, read from the C2 contract
+contracts/edge.yaml (the trusted proxy, OIDC and header parts of C2 are in contracts/tests/test_c2_edge.py).
 
 Everything is rendered with scripts/render.sh and site.env.example (digest turned on with a fake
 example host, as in test_deploy.env_on). Run:
@@ -15,18 +16,30 @@ from pathlib import Path
 
 import pytest
 
+yaml = pytest.importorskip("yaml", reason="PyYAML (python3-yaml) reads contracts/edge.yaml")
+
 REPO = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO / "site.env.example"
 RENDER = REPO / "scripts" / "render.sh"
 
-INVARIANT = {"WEBUI_PORT": 3000, "POCKETID_PORT": 1411, "LITELLM_PORT": 4000,
-             "TELEMETRY_PORT": 3200, "DIGEST_PORT": 3300}
+# The invariants come from the C2 contract (contracts/edge.yaml); this test checks the rendered files against it.
+EDGE = yaml.safe_load((REPO / "contracts" / "edge.yaml").read_text())
+INVARIANT = {k: v["port"] for k, v in EDGE["ports"].items()}
 EDGE_PORTS = set(INVARIANT.values())
-HOST_NETWORK = {3200, 3300}          # telemetry and digest bind BACKEND_WG_IP themselves (ufw-gated)
+# telemetry and digest bind BACKEND_WG_IP themselves (ufw-gated); the others are published by compose
+HOST_NETWORK = {v["port"] for v in EDGE["ports"].values() if v["backend"] == "host-network"}
 # covenant site -> the backend port it must proxy to
-SITE_PORT = {"20-chat": 3000, "30-id": 1411, "40-api": 4000, "50-telemetry": 3200, "60-digest": 3300}
+SITE_PORT = {v["edge_site"]: v["port"] for v in EDGE["ports"].values()}
 # walter stacks that serve the edge
-EDGE_STACKS = ("webui", "gateway", "telemetry", "digest")
+EDGE_STACKS = tuple(dict.fromkeys(v["stack"] for v in EDGE["ports"].values()))
+
+
+def test_contract_pins_the_known_invariants():
+    """A port change is a C2 major version: edge.yaml and this list change together, on purpose."""
+    assert EDGE["contract"] == "edge" and EDGE["contract_version"].startswith("1.")
+    assert INVARIANT == {"WEBUI_PORT": 3000, "POCKETID_PORT": 1411, "LITELLM_PORT": 4000,
+                         "TELEMETRY_PORT": 3200, "DIGEST_PORT": 3300}
+    assert HOST_NETWORK == {3200, 3300} and EDGE_STACKS == ("webui", "gateway", "telemetry", "digest")
 
 
 def _example_value(key):

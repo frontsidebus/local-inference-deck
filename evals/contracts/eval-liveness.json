@@ -1,0 +1,26 @@
+{
+  "contract": "eval-liveness",
+  "contract_version": "1.0",
+  "owner": "sec-evals",
+  "about": "C5: how another tool (the deck's clients/bin/spark-model live-run guard) can tell that an eval or gate run is live, so it refuses to reload or remove models under it. Frozen by keeping the evals/ path prefix inside the sec-evals checkout. Versioning: minor = an added argv suffix or pid location; major = a renamed path, a changed pid-file format or a removed signal.",
+  "argv_suffixes": ["evals/run.py", "evals/tools/gpu-guard.sh"],
+  "argv_window": 4,
+  "argv_rule": "a process is live when one of its first argv_window arguments ends with an argv_suffix",
+  "pid_glob": "evals/results/_runs/*/*.pid",
+  "pid_file": "the first whitespace-separated token is the pid of a process that belongs to the run",
+  "repos_env": "SPARK_EVAL_REPOS",
+  "repos_separator": ":",
+  "repos_rule": "pid_glob is matched under each checkout listed in SPARK_EVAL_REPOS (and the consumer's own checkout)",
+  "examples": {
+    "live_argv": [["python3", "-B", "evals/run.py", "--run-name", "gate"],
+                  ["python3", "-B", "evals/run.py", "--suite", "evals/samples", "--run-name", "evalb-x"],
+                  ["bash", "/src/deck/sec-evals/evals/tools/gpu-guard.sh"]],
+    "not_live_argv": [["vim", "notes about evals/run.py.txt"],
+                      ["python3", "evals/report.py", "evals/results/x"],
+                      ["less", "a", "b", "c", "evals/run.py"]]
+  },
+  "guard_liveness": {
+    "rule": "gate.py refuses (exit 4) when the GPU guard exits within its startup window; its output is in <gate dir>/guard.log; --no-guard is the only bypass",
+    "log": "guard.log"
+  }
+}

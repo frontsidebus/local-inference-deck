@@ -1,7 +1,12 @@
 """swapcmd.py and ``spark-model-agent serving``: the live config's cmd hashes, as the eval gate records them.
 
 swapcmd.entries must hash a cmd exactly as evals/run.py's llama_swap_entry does, or the gate's serving identity
-would change with the reader instead of the config. No root, no network.
+would change with the reader instead of the config. The contract between the two readers is C4
+(contracts/serving-identity/vectors.json): the deck's provider test (contracts/tests/test_c4_serving_identity.py)
+and the sec-evals consumer test (evals/tests/test_contract_serving_identity.py) each reproduce the vectors, so
+neither side imports the other. The direct cross-check below (swapcmd vs run.py over the real rendered template and
+lab entries) is kept only while evals/ is in this checkout, behind the vectors: it skips once evals/run.py is gone.
+No root, no network.
 Run: python3 -B -m pytest -q walter/tests/test_spark_model_serving.py
 """
 import json
@@ -15,10 +20,17 @@ yaml = pytest.importorskip("yaml", reason="PyYAML (python3-yaml) is needed for t
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "walter" / "models" / "lib"))
-sys.path.insert(0, str(REPO / "evals"))
 import registry as R  # noqa: E402
 import swapcmd        # noqa: E402
-import run as RUN     # noqa: E402
+
+VECTORS = json.loads((REPO / "contracts" / "serving-identity" / "vectors.json").read_text())
+RUN_PY = REPO / "evals" / "run.py"
+if RUN_PY.is_file():          # monorepo only (C4: the vectors are the contract; see the module docstring)
+    sys.path.insert(0, str(RUN_PY.parent))
+    import run as RUN     # noqa: E402
+else:
+    RUN = None
+needs_run_py = pytest.mark.skipif(RUN is None, reason="evals/run.py is not in this checkout (C4 vectors cover it)")
 
 AGENT = REPO / "walter" / "models" / "spark-model-agent"
 TEMPLATE = REPO / "walter" / "llama-swap" / "config.yaml.tmpl"
@@ -39,6 +51,16 @@ def rendered(tmp_path_factory):
     return {"template": TEMPLATE, "base": out, "lab": with_lab}
 
 
+@pytest.mark.parametrize("which", ["template", "base", "lab"])
+def test_entries_parse_every_model(rendered, which):
+    got = swapcmd.entries(rendered[which].read_text())
+    assert got and list(swapcmd.FLAGS) == VECTORS["flags"]
+    assert all(e["cmd_sha256"] != swapcmd.sha256_text("") for e in got.values())   # every model has a cmd
+    if which == "lab":
+        assert any(mid.startswith("lab-") for mid in got)
+
+
+@needs_run_py
 @pytest.mark.parametrize("which", ["template", "base", "lab"])
 def test_entries_hash_like_run_py(rendered, which):
     path = rendered[which]

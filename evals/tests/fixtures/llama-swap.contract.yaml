@@ -1,0 +1,57 @@
+# C4 fixture template (owner: local-inference-deck): a small llama-swap config in the exact layout of
+# walter/llama-swap/config.yaml.tmpl, for the serving-identity vectors (vectors.json, generated from this file).
+# Consumers test their reader against a vendored copy (sec-evals: evals/tests/fixtures/llama-swap.contract.yaml).
+# Versioned by vectors.json (contract_version there). The "qwen3.8-27b" entry is the coder entry of the real template; the others exercise the parse: two aliases,
+# a full -m path, nested macros, an unknown ${...} reference, no aliases and no name. No site values.
+healthCheckTimeout: 600
+startPort: 10001
+
+macros:
+  "image": "ghcr.io/ggml-org/llama.cpp:server-cuda@sha256:7149a45c80596644320de1d565db1b3b8e70b22c66fed612e69b73f6b1e0d746"
+  # comment lines between macros are skipped
+  "run": "/usr/local/sbin/spark-docker-run.sh ${MODEL_ID} --rm --init --label llama-swap=1 --runtime nvidia --network llama-net -p 127.0.0.1:${PORT}:8080 -v ${MODELS_DIR}/gguf:/models/gguf:ro"
+  "mem": "--memory 32g --memory-swap 32g"
+  "common": "-a ${MODEL_ID} --fit off -ngl all -np 1 -fa on -ctk q8_0 -ctv q8_0 --jinja --metrics --no-webui"
+  "inner": "--top-k 40"
+  "middle": "${inner} --min-p 0.05"
+  "outer": "${middle} --repeat-penalty 1.1"
+  "stop": "docker rm -f ${MODEL_ID}"
+
+models:
+  "qwen3.8-27b":
+    name: "Qwen3.8 27B (GPU0)"
+    aliases: ["coder"]
+    cmd: |
+      ${run} ${mem} --gpus "\"device=0\"" ${image}
+      -m /models/gguf/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf
+      ${common} -c 131072 -n 32768 -sm none --spec-type draft-mtp --spec-draft-n-max 2
+      --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    unloadTimeout: 30
+    capabilities: { in: [text], out: [text], tools: true, context: 131072 }
+
+  # a comment between models
+  "example-moe":
+    name: "Example MoE (GPU0+GPU1)"
+    aliases: ["fast", "fast-2"]
+    cmd: |
+      ${run} ${mem} --gpus "\"device=0,1\"" ${image}
+      -m /models/gguf/example-moe/Example-MoE-IQ4_NL-00001-of-00002.gguf
+      ${common} -c 65536 -n 16384 -sm layer -ts 1,1
+      --temp 1.0 --top-p 0.9 ${outer} --presence-penalty 1.5 --dry-multiplier 0.8 --xtc-probability 0.1
+      --frequency-penalty 0.2
+    cmdStop: ${stop}
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 1800
+
+  "example-lab":
+    cmd: |
+      ${run} ${mem} --gpus "\"device=1\"" ${image} ${not-a-macro}
+      -m /models/gguf/lab/lab-model-Q8_0.gguf ${common} -c 8192
+    cmdStop: ${stop}
+    unlisted: true
+
+routing:
+  router:
+    use: matrix
