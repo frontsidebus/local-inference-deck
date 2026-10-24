@@ -15,9 +15,18 @@ STOP_FILE="$EVAL_STATE_DIR/STOP"
 # editor whose command line merely contains the text.
 RUN_PATTERN="^python3 -B evals/run.py .*--run-name ${EVAL_RUN}(-[^ ]*)?( |\$)"
 
-# site_value KEY: a value from site.env (KEY=value, trailing comment stripped), else empty
+# site_env_path: the site.env this tool reads, in the deck-wide order: $SITE_ENV (used as given, even when the file
+# is missing, so a wrong path fails closed instead of falling back) > ~/.config/deck/site.env > $REPO/site.env
+site_env_path() {
+  if [ -n "${SITE_ENV:-}" ]; then echo "$SITE_ENV"
+  elif [ -n "${HOME:-}" ] && [ -f "$HOME/.config/deck/site.env" ]; then echo "$HOME/.config/deck/site.env"
+  else echo "$REPO/site.env"
+  fi
+}
+
+# site_value KEY: a value from the site.env above (KEY=value, trailing comment stripped), else empty
 site_value() {
-  local f="${SITE_ENV:-$REPO/site.env}"
+  local f; f="$(site_env_path)"
   [ -f "$f" ] || return 0
   sed -n "s/^$1=//p" "$f" | tail -1 | sed 's/[[:space:]]*#.*$//; s/^"\(.*\)"$/\1/; s/[[:space:]]*$//'
 }

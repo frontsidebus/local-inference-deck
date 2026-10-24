@@ -1037,17 +1037,32 @@ def _subprocess_runner(argv: List[str]) -> int:
 RUNNER = _subprocess_runner      # tests replace this with an in-process call
 
 
-def start_guard(a) -> Optional[subprocess.Popen]:
-    """tools/gpu-guard.sh for the run (as the plans do), unless --no-guard or no GPU host is configured."""
+GUARD_LOG = "guard.log"             # the guard's stdout/stderr, in the gate dir
+GUARD_STARTUP_S = 5.0              # how long the guard must survive before the run starts (tests shorten it)
+
+
+def start_guard(a, gate_dir: Path) -> Optional[subprocess.Popen]:
+    """tools/gpu-guard.sh for the run (as the plans do), unless --no-guard or no GPU host is configured.
+
+    The guard reads the same site.env the gate decided from (SITE_ENV), writes to <gate dir>/guard.log, and must
+    still be running after GUARD_STARTUP_S: a guard that exits at once (a site.env it cannot read, no ssh) would
+    otherwise leave the run without thermal protection. --no-guard is the only bypass."""
     if a.no_guard:
         return None
     site = RUN.load_site_env(Path(a.site_env))
     if not (os.environ.get("EVAL_GPU_SSH") or RUN.setting("BACKEND_LAN_IP", site)):
         log("warning: GPU guard not started (set EVAL_GPU_SSH or BACKEND_LAN_IP in site.env); --no-guard silences this")
         return None
-    env = dict(os.environ, EVAL_RUN=RUN_NAME)
-    return subprocess.Popen(["bash", str(GUARD)], cwd=str(REPO_DIR), env=env, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+    env = dict(os.environ, EVAL_RUN=RUN_NAME, SITE_ENV=str(a.site_env))
+    log_path = gate_dir / GUARD_LOG
+    with log_path.open("ab") as fh:
+        proc = subprocess.Popen(["bash", str(GUARD)], cwd=str(REPO_DIR), env=env, stdin=subprocess.DEVNULL,
+                                stdout=fh, stderr=subprocess.STDOUT)
+    try:
+        rc = proc.wait(timeout=GUARD_STARTUP_S)
+    except subprocess.TimeoutExpired:
+        return proc                 # still running: it is watching the GPUs
+    raise GateError(f"GPU guard exited rc={rc}; see {log_path} (--no-guard runs without it)")
 
 
 def start_route(a) -> Tuple[str, Optional[str], Optional[Path]]:
@@ -1070,7 +1085,7 @@ def start_route(a) -> Tuple[str, Optional[str], Optional[Path]]:
         log("warning: no backend in site.env (BACKEND_LAN_IP, BACKEND_WG_IP): requests go through the public edge; "
             "--via-edge silences this")
         return "edge", None, None
-    env = dict(os.environ, EVAL_RUN=RUN_NAME)
+    env = dict(os.environ, EVAL_RUN=RUN_NAME, SITE_ENV=str(a.site_env))     # the tunnel reads what the gate read
     try:
         out = subprocess.run(["bash", str(TUNNEL), "start"], cwd=str(REPO_DIR), env=env, capture_output=True,
                              text=True, timeout=60)
@@ -1200,7 +1215,7 @@ def generate(m: Dict[str, Any], a, kind: str, resume: Optional[str] = None) -> T
             log(f"warning: live llama-swap config not read ({before['error']}); the serving identity falls back to "
                 "the repo template")
         write_record(gd, rec)
-        guard = start_guard(a)
+        guard = start_guard(a, gd)
         rc = RUNNER(run_argv(m, a, gd, url))
     finally:
         if guard is not None:

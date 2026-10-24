@@ -29,7 +29,7 @@ target() {
 case "${1:-}" in
   start)
     t="$(target)"; wg="$(site_value BACKEND_WG_IP)"; port="$(site_value LITELLM_PORT)"; port="${port:-4000}"
-    [ -n "$t" ] && [ -n "$wg" ] || { echo "need BACKEND_LAN_IP and BACKEND_WG_IP in site.env (or EVAL_GPU_SSH)" >&2; exit 2; }
+    [ -n "$t" ] && [ -n "$wg" ] || { echo "need BACKEND_LAN_IP and BACKEND_WG_IP in site.env (or EVAL_GPU_SSH; read: $(site_env_path))" >&2; exit 2; }
     if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
       echo "EVAL_BASE_URL=http://127.0.0.1:$LPORT/v1"; exit 0
     fi
