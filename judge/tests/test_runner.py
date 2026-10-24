@@ -63,6 +63,9 @@ def enqueue(review, request_id, data_class="infra", evidence=True, session="2026
 
 
 # ------------------------------------------------------------------ frontier stub CLI
+FRONTIER_SITE_ENV = "SPARK_DOMAIN=judge-fixture.invalid\n"
+
+
 @pytest.fixture
 def frontier(tmp_path, monkeypatch):
     """A fake `claude`: records argv/env/stdin per call, replies from a list of canned results."""
@@ -83,6 +86,11 @@ def frontier(tmp_path, monkeypatch):
         """))
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setenv("JUDGE_FRONTIER_CMD", str(script))
+    # 0a: the frontier is refused without a resolved site env that yields a site value to mask. An example-valued
+    # site env (a value no bundle contains) lets the call through without changing what is sent.
+    site = tmp_path / "frontier-site.env"
+    site.write_text(FRONTIER_SITE_ENV)
+    monkeypatch.setenv("SITE_ENV", str(site))
 
     class F:
         def replies(self, *texts):

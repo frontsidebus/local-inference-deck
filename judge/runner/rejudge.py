@@ -25,6 +25,8 @@ and the summary row gets "version_warning": true.
           the frontier judge, exactly as run_judge.py's second stage for a sensitive completion does. A bundle
           the self-check refuses is not sent (error row). <id>.input.txt is then exactly what was sent.
 --sensitive-local  with `--mode frontier`, judge sensitive bundles locally instead (with a note).
+Data boundary (0a): `--mode frontier` / `--mode frontier-claims` is REFUSED (nothing sent, error in the row)
+          while the site env is unresolved or yields no site value to mask (run_judge.frontier_refusal).
 --model   sets JUDGE_LOCAL_MODEL or JUDGE_FRONTIER_MODEL (by --mode; both without --mode), e.g. `--model vision`.
           The comparison column "old" is findings/<id>.json, or findings/<id>.claims.json for frontier-claims.
 --no-budget  do not count frontier calls against JUDGE_FRONTIER_DAILY_MAX (usage.json is then not touched).
@@ -113,6 +115,11 @@ def rejudge_one(rid: str, out: Path, mode_arg: Optional[str], use_budget: bool,
             mode = "local"
         else:
             mode = mode_arg
+        why = RJ.frontier_refusal() if mode == "frontier" else ""
+        if why:
+            row["refused"] = True
+            row["error"] = f"refused: --mode frontier: {why}; nothing sent, not judged"
+            return row
     notes.append("rejudge: re-judged an existing bundle (no collection, no probes)")
     try:
         res = RJ.judge_bundle(rid, request, ev, mode, notes, probes_allowed=False, use_budget=use_budget)

@@ -126,14 +126,15 @@ def env(tmp_path):
     e.review = tmp_path / "review"
     e.units = tmp_path / "units"
 
-    def run(*args, check=True):
+    def run(*args, check=True, site_arg=True, extra_env=None):
         clean = {k: v for k, v in os.environ.items()
                  if k not in ("HERMES_HOME", "JUDGE_REVIEW_DIR", "JUDGE_SITE_ENV", "SITE_ENV", "XDG_CONFIG_HOME")
                  and not k.startswith(("JUDGE_", "SPARK_", "EDGE_", "BACKEND_"))}
         clean["HOME"] = str(home)
+        clean.update(extra_env or {})
         cmd = ["bash", str(judge / "install.sh"), "--hermes-home", str(hermes), "--hermes-python", VENV_PY,
-               "--hermes-src", str(src), "--site-env", str(site), "--review-dir", str(e.review),
-               "--unit-dir", str(e.units), *args]
+               "--hermes-src", str(src), *(["--site-env", str(site)] if site_arg else []),
+               "--review-dir", str(e.review), "--unit-dir", str(e.units), *args]
         p = subprocess.run(cmd, capture_output=True, text=True, env=clean, timeout=60)
         if check and p.returncode != 0:
             raise AssertionError(f"install.sh {args} failed rc={p.returncode}\n{p.stdout}\n{p.stderr}")
@@ -418,3 +419,87 @@ def test_rendered_units_pass_systemd_analyze_verify(env):
                        text=True, timeout=60)
     out = (p.stdout + p.stderr).strip()
     assert p.returncode == 0 and out == "", out
+
+
+# ---------------------------------------------------------------- 0a: judge.env merge (temp HOME only)
+def _judge_env(env):
+    return env.home / ".config" / "judge" / "judge.env"
+
+
+def test_apply_creates_judge_env_with_site_env_only(env):
+    p = env.run("--apply")
+    je = _judge_env(env)
+    assert je.is_file() and stat.S_IMODE(je.stat().st_mode) == 0o600
+    keys = [l.split("=", 1)[0] for l in je.read_text().splitlines() if l and not l.startswith("#")]
+    assert keys == ["SITE_ENV"]
+    assert f"SITE_ENV={env.site}" in je.read_text().splitlines()
+    assert "judge.env: created" in p.stdout
+
+
+def test_dry_run_does_not_write_judge_env(env):
+    p = env.run()
+    assert not _judge_env(env).exists()
+    assert "judge.env: would create" in p.stdout
+
+
+def test_judge_env_merge_keeps_knobs_and_is_idempotent(env):
+    je = _judge_env(env)
+    je.parent.mkdir(parents=True)
+    je.write_text("# mine\nJUDGE_MODE=local\nSITE_ENV=/old/site.env\nJUDGE_FRONTIER_DAILY_MAX=5\n")
+    env.run("--apply")
+    text = je.read_text()
+    assert text == f"# mine\nJUDGE_MODE=local\nSITE_ENV={env.site}\nJUDGE_FRONTIER_DAILY_MAX=5\n"
+    backups = sorted(je.parent.glob("judge.env.bak-judge-*"))
+    assert len(backups) == 1 and "SITE_ENV=/old/site.env" in backups[0].read_text()
+    p = env.run("--apply")              # second run: nothing changes, no new backup
+    assert je.read_text() == text and "judge.env: no change needed" in p.stdout
+    assert sorted(je.parent.glob("judge.env.bak-judge-*")) == backups
+    # a run without --site-env resolves SITE_ENV from judge.env itself and keeps it
+    env.run("--apply", site_arg=False)
+    assert je.read_text() == text
+
+
+def test_judge_env_merge_honours_judge_env_override(env):
+    je = env.tmp / "elsewhere" / "judge.env"
+    env.run("--apply", extra_env={"JUDGE_ENV": str(je)})
+    assert f"SITE_ENV={env.site}" in je.read_text().splitlines()
+    assert not _judge_env(env).exists()
+
+
+def test_judge_env_identifying_keys_warned_not_moved(env):
+    je = _judge_env(env)
+    je.parent.mkdir(parents=True)
+    je.write_text("JUDGE_SSH_ALIASES=edge-example\n")
+    p = env.run("--apply")
+    assert "JUDGE_SSH_ALIASES: site-identifying keys belong in site.env" in p.stderr
+    assert je.read_text().splitlines() == ["JUDGE_SSH_ALIASES=edge-example", f"SITE_ENV={env.site}"]
+
+
+def test_no_repo_root_site_env_search(env):
+    """0a: <judge>/../site.env exists (the fixture's), but without --site-env, $SITE_ENV, judge.env or
+    ~/.config/deck/site.env nothing is resolved: no SITE_ENV= is written and the operator is warned."""
+    assert (env.judge.parent / "site.env").is_file()
+    p = env.run("--apply", site_arg=False, check=False)  # the gate policy then cannot render: rc != 0
+    assert p.returncode != 0
+    assert "no site env resolved" in p.stderr
+    assert str(env.judge.parent / "site.env") not in p.stdout
+    assert not _judge_env(env).exists()
+
+
+def test_deck_site_env_is_the_default(env):
+    deck = env.home / ".config" / "deck"
+    deck.mkdir(parents=True)
+    (deck / "site.env").symlink_to(env.site)
+    env.run("--apply", site_arg=False)
+    assert f"SITE_ENV={deck / 'site.env'}" in _judge_env(env).read_text().splitlines()  # the link, not its target
+
+
+def test_inline_site_env_lookup_without_shared_lib(env):
+    """Without lib/config.py the installer still follows the 0a order (judge.env, then ~/.config/deck/site.env)."""
+    shutil.rmtree(env.judge / "lib", ignore_errors=True)
+    je = _judge_env(env)
+    je.parent.mkdir(parents=True)
+    je.write_text(f"JUDGE_MODE=frontier\nSITE_ENV='{env.site}'\n")
+    p = env.run("--apply", site_arg=False)
+    assert f"site.env      {env.site}" in p.stdout
+    assert je.read_text().splitlines() == ["JUDGE_MODE=frontier", f"SITE_ENV={env.site}"]

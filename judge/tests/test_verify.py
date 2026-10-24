@@ -127,11 +127,35 @@ def test_sanitizer_failure_in_fake_repo(v, env):
     f = write(repo / "walter" / "x.conf", "server_name example-leak;\n")
     out = call(v, env, [f])
     assert out["action"] == "continue"
-    assert "check-sanitized.sh failed" in out["message"]
+    assert "check-sanitized.sh found real values" in out["message"]
     [req] = queued(env)
     # request carries only the tag, never the sanitizer's hit lines
     assert req["detail"]["verify"]["failed"] == ["check-sanitized"]
     assert "example-leak" not in json.dumps(req["detail"])
+
+
+def test_sanitizer_exit_2_is_no_real_value_source(v, env):
+    """0a sanitizer contract: exit 2 = no real-value source. verify fails closed, and says what to create."""
+    repo = env["tmp"] / "deck"
+    write(repo / "CONVENTIONS.md", "# conventions\n")
+    write(repo / "scripts" / "check-sanitized.sh",
+          "#!/usr/bin/env bash\necho 'check-sanitized: no site env found' >&2\nexit 2\n").chmod(0o755)
+    f = write(repo / "walter" / "x.conf", "server_name example.com;\n")
+    out = call(v, env, [f])
+    assert out["action"] == "continue"
+    assert "no real-value source (create ~/.config/deck/site.env)" in out["message"]
+    assert "found real values" not in out["message"]
+    [req] = queued(env)
+    assert req["detail"]["verify"]["failed"] == ["check-sanitized"]
+
+
+def test_sanitizer_other_exit_is_a_failure(v, env):
+    repo = env["tmp"] / "deck"
+    write(repo / "CONVENTIONS.md", "# conventions\n")
+    write(repo / "scripts" / "check-sanitized.sh", "#!/usr/bin/env bash\nexit 3\n").chmod(0o755)
+    f = write(repo / "walter" / "x.conf", "server_name example.com;\n")
+    out = call(v, env, [f])
+    assert "check-sanitized.sh failed (exit 3)" in out["message"]
 
 
 def test_sanitizer_pass_and_nginx_note(v, env):

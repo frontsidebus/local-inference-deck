@@ -25,8 +25,10 @@ Operator view (settings, pause and resume, troubleshooting): [judge/README.md](.
   then `systemctl --user start judge-review.service` once for the backlog.
 - Health: `judge-findings` prints a `WARNING:` (stderr) when a unit is failed or the oldest ready request waited
   more than `JUDGE_STALL_MINUTES` (15); the C5 hook tells the agent once per stall (#41).
-- The policy lives in the repo's `site.env`. `~/.config/judge/judge.env` (KEY=value lines) is optional and
-  **overrides** `site.env` for the units only (it is environment), e.g. `JUDGE_MODE=local` to stop frontier spend.
+- The units load `~/.config/judge/judge.env` (KEY=value lines) as their environment. The hooks and the runner read
+  the same file (lib/config.py: environment > judge.env > site env > defaults), so a knob there, e.g.
+  `JUDGE_MODE=local` to stop frontier spend, applies everywhere. It holds `SITE_ENV=` (merged in by
+  `judge/install.sh --apply`) and non-identifying knobs only; see `judge/judge.env.example`.
 - Requests that land while the service runs are picked up by the same run (`--pending` re-scans `queue/` before
   it exits). A request whose judge backend fails stays queued and is retried on the next run (the service exits
   non-zero, which also raises an alert); after `JUDGE_MAX_ATTEMPTS` (3) it gets a placeholder finding.

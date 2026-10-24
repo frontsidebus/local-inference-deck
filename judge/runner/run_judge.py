@@ -19,6 +19,10 @@ Mode selection:
 - JUDGE_MODE=frontier (default) -> `${JUDGE_FRONTIER_CMD:-claude} -p`, unless the daily cap
   JUDGE_FRONTIER_DAILY_MAX (default 20 calls per UTC day, counted in usage.json) is reached; then local.
 - JUDGE_MODE=local -> OpenAI-compatible POST to https://${SPARK_API_HOST}/v1/chat/completions.
+Data boundary (0a, fail closed): no frontier call is made while the site env is unresolved (SITE_ENV from the
+environment or ~/.config/judge/judge.env, else ~/.config/deck/site.env) or yields no site value to mask
+(lib/config.frontier_refusal): the main stage is judged locally (with a note saying why), the claims stage is
+skipped, and an explicit rejudge --mode frontier / frontier-claims is refused. Nothing is sent.
 Every frontier call (both stages) has the site's configured values masked as ${KEY} (lib/sitemask) at send time;
 the reply is validated against the masked bundle, then the finding is unmasked locally. In a mixed infra bundle
 (#43 withheld sensitive paths) the agent's free text is masked further and claims-self-checked before a frontier
@@ -159,8 +163,25 @@ def _flatten(messages: List[Dict[str, str]]) -> str:
     return "\n\n".join(out)
 
 
+def frontier_refusal() -> str:
+    """Why no frontier call may be made now ("" = allowed): lib/config.frontier_refusal on the current config.
+    Fails closed: no config at all is a refusal too."""
+    cfg = C._site()
+    if not cfg:
+        return "judge config unavailable (lib/config.py could not be loaded)"
+    try:
+        from lib import config as LC
+        return LC.frontier_refusal(cfg)
+    except Exception as exc:
+        return f"frontier boundary check failed ({type(exc).__name__})"
+
+
 def call_frontier(messages: List[Dict[str, str]], record_cost: bool = True) -> Tuple[str, str]:
-    """record_cost=False (rejudge --no-budget) leaves usage.json completely untouched."""
+    """record_cost=False (rejudge --no-budget) leaves usage.json completely untouched. The ONLY place the frontier
+    command runs; it re-checks the data boundary itself (callers check earlier, this is the last line)."""
+    why = frontier_refusal()
+    if why:
+        raise JudgeError(f"frontier call refused: {why}; nothing sent")
     argv = frontier_argv(messages[0]["content"])
     timeout = int(C.setting("JUDGE_FRONTIER_TIMEOUT", "900"))
     with tempfile.TemporaryDirectory(prefix="judge-") as cwd:  # empty cwd: no project CLAUDE.md
@@ -740,9 +761,11 @@ def site_mask() -> SM.SiteMask:
 def frontier_messages(messages: List[Dict[str, str]], smask: SM.SiteMask) -> Tuple[List[Dict[str, str]], int]:
     """(messages exactly as sent to the frontier judge, number of values masked): every site value -> ${KEY},
     MASK_NOTE appended to the system prompt. Raises JudgeError, sending nothing, when the self-check still finds
-    a configured value in what would be sent."""
+    a configured value in what would be sent, and (0a) when there is no mask at all: an empty mask is never a
+    pass-through."""
     if not smask:
-        return [dict(m) for m in messages], 0
+        raise JudgeError("frontier call refused: the site mask is empty (site env unresolved or without site "
+                         "values); nothing sent")
     out, hits = [], 0
     for m in messages:
         text, n = smask.mask_count(m["content"])
@@ -1031,7 +1054,14 @@ def choose_mode(data_class: str) -> Tuple[str, List[str]]:
         if wanted != "local":
             notes.append(f"data_class={data_class}: local judge enforced")
         return "local", notes
-    return ("frontier" if wanted == "frontier" else "local"), notes
+    if wanted == "frontier":
+        why = frontier_refusal()
+        if why:
+            notes.append(f"frontier refused (nothing sent): {why}; judged locally")
+            log(f"frontier refused (nothing sent): {why}")
+            return "local", notes
+        return "frontier", notes
+    return "local", notes
 
 
 def judge_request(request_id: str) -> bool:
@@ -1100,6 +1130,9 @@ def claims_stage_enabled(data_class: str, request: Dict[str, Any]) -> Optional[s
         return "JUDGE_MODE is not frontier"
     if not CO.claims_eligible(request):
         return f"kind={request.get('kind')} has no agent final answer (claims stage: {', '.join(CO.CLAIMS_KINDS)})"
+    why = frontier_refusal()
+    if why:
+        return f"frontier refused (nothing sent): {why}"
     return None
 
 
@@ -1116,6 +1149,9 @@ def judge_claims(request_id: str, request: Dict[str, Any], evidence_dir: Path, n
     """Frontier judge on the CLAIMS-ONLY bundle (collector/claims_only.py) of *evidence_dir*. Writes nothing.
     Raises ClaimsSkipped (self-check refused: nothing sent; or the daily cap is reached) or JudgeError.
     Returns judge_bundle's dict; its finding has mode frontier-claims and FC item ids."""
+    why = frontier_refusal()
+    if why:
+        raise ClaimsSkipped(f"frontier refused (nothing sent): {why}")
     built = CO.build(request, evidence_dir)
     if built.problems:
         raise ClaimsSkipped("self-check refused the claims-only bundle (nothing sent): " + "; ".join(built.problems))
@@ -1232,6 +1268,12 @@ def _judge_loop(request_id: str, request: Dict[str, Any], messages: List[Dict[st
     try:
         while True:
             frontier = mode in ("frontier", CLAIMS_MODE)
+            if frontier:
+                why = frontier_refusal()  # before the budget is touched; callers have checked already
+                if why:
+                    if mode == CLAIMS_MODE:
+                        raise ClaimsSkipped(f"frontier refused (nothing sent): {why}")
+                    raise JudgeError(f"frontier call refused: {why}; nothing sent")
             if frontier and use_budget and not frontier_budget_take():
                 cap = C.setting('JUDGE_FRONTIER_DAILY_MAX', '20')
                 if not cap_fallback:

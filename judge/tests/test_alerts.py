@@ -33,8 +33,10 @@ def env(tmp_path):
                                     else ""))
         (stub / name).chmod(0o755)
     e = {k: v for k, v in os.environ.items() if not k.startswith(("JUDGE_", "HERMES_", "MONITOR_"))}
+    site = tmp_path / "site.env"  # example values: with no site env judge-findings warns that frontier is refused
+    site.write_text("SPARK_DOMAIN=judge-fixture.invalid\n")
     e.update({"HERMES_HOME": str(review.parent), "JUDGE_REVIEW_DIR": str(review),
-              "SITE_ENV": str(tmp_path / "no-site.env"), "PATH": f"{stub}:{os.environ['PATH']}",
+              "SITE_ENV": str(site), "JUDGE_ENV": str(tmp_path / "no-judge.env"), "PATH": f"{stub}:{os.environ['PATH']}",
               "JUDGE_HERMES_AGENT_DIR": str(tmp_path / "none"), "NO_COLOR": "1"})
     return {"review": review, "calls": calls, "env": e, "tmp": tmp_path}
 
@@ -128,6 +130,15 @@ def test_inject_stall_warning_is_fast(env):
 
 
 # ---------------------------------------------------------------- judge-findings
+def test_judge_findings_warns_when_frontier_is_refused(env):
+    """0a: no resolvable site env -> the frontier judge is refused; judge-findings says so (and why)."""
+    p = run(env, [FINDINGS], JUDGE_CHECK_UNITS="0", SITE_ENV=str(env["tmp"] / "no-site.env"))
+    assert p.returncode == 0
+    assert "WARNING: frontier judge refused, every request is judged locally: site env unresolved" in p.stderr
+    p = run(env, [FINDINGS], JUDGE_CHECK_UNITS="0", SITE_ENV=str(env["tmp"] / "no-site.env"), JUDGE_MODE="local")
+    assert "frontier judge refused" not in p.stderr
+
+
 def test_judge_findings_prints_health_warnings(env):
     p = run(env, [FINDINGS], JUDGE_CHECK_UNITS="0")
     assert p.returncode == 0 and "WARNING" not in p.stderr
