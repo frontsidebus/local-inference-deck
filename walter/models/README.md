@@ -234,12 +234,12 @@ All verbs take `--json` (the client always uses it; the human text is in its `"t
 
 - **Live eval/gate runs** (client side): `spark-model rm --yes` refuses while an eval or gate run is live on the
   workstation: a process running `evals/run.py` or `evals/tools/gpu-guard.sh`, or a `*.pid` file under
-  `evals/results/_runs/*/` whose process is alive (this checkout plus `SPARK_EVAL_REPOS`, colon-separated).
+  `evals/results/_runs/*/` whose process is alive. Checked: this checkout (which also covers an old monorepo
+  checkout's gitignored `evals/results/`), the sec-evals checkout `bin/deck` uses (`$SEC_EVALS_DIR`, else
+  `~/src/deck/sec-evals`, when it exists), and any extra checkouts in `SPARK_EVAL_REPOS` (colon-separated).
   `--force` overrides and prints what it overrode.
-  - The harness is the sec-evals repo. **Add its checkout (`~/src/deck/sec-evals`, or your `$SEC_EVALS_DIR`) to
-    `SPARK_EVAL_REPOS` before any model swap**, for example `export SPARK_EVAL_REPOS=$HOME/src/deck/sec-evals` in
-    the shell profile. While an old monorepo checkout still holds gate state under its gitignored `evals/results/`,
-    keep it listed too (`SPARK_EVAL_REPOS=<sec-evals>:<old checkout>`). The process check matches the
+  - So the default sec-evals checkout needs no setup. Set `SEC_EVALS_DIR` (or list the path in `SPARK_EVAL_REPOS`)
+    only for a checkout elsewhere, in the environment spark-model runs in. The process check matches the
     `evals/run.py` argv suffix wherever the checkout is. (`render --apply` is not offered by the client in Phase 1.)
 - **Server side**: `rm` and `render --apply` refuse while a lab model is in llama-swap's `/running`.
 - One registry writer at a time (`flock` on `/run/spark-model-agent.lock`; a pull holds it for its whole

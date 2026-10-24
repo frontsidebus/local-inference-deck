@@ -184,6 +184,31 @@ def test_live_run_detection(tmp_path, monkeypatch):
     assert c.live_runs(repos=[tmp_path / "nothing"]) == []
 
 
+
+def test_live_runs_default_repos_include_the_sec_evals_checkout(tmp_path, monkeypatch):
+    """Step 3: runs live in the sec-evals checkout ($SEC_EVALS_DIR, else ~/src/deck/sec-evals) are seen without
+    SPARK_EVAL_REPOS; a missing checkout is skipped; SPARK_EVAL_REPOS still adds more."""
+    c = load_client()
+    monkeypatch.setattr(c, "_cmdlines", lambda: iter([]))
+    monkeypatch.delenv("SPARK_EVAL_REPOS", raising=False)
+    monkeypatch.setattr(c, "REPO", tmp_path / "deck")
+    se = tmp_path / "se"
+    runs = se / "evals/results/_runs/gate1"
+    runs.mkdir(parents=True)
+    (runs / "run.pid").write_text(f"{os.getpid()}\n")
+    monkeypatch.setenv("SEC_EVALS_DIR", str(se))
+    assert c.live_runs() == [f"{runs / 'run.pid'} (pid {os.getpid()} alive)"]
+    monkeypatch.delenv("SEC_EVALS_DIR")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert c.live_runs() == []
+    home_se = tmp_path / "home/src/deck/sec-evals/evals/results/_runs/r"
+    home_se.mkdir(parents=True)
+    (home_se / "g.pid").write_text(f"{os.getpid()}\n")
+    assert c.live_runs() == [f"{home_se / 'g.pid'} (pid {os.getpid()} alive)"]
+    monkeypatch.setenv("SEC_EVALS_DIR", str(tmp_path / "missing"))
+    monkeypatch.setenv("SPARK_EVAL_REPOS", str(se))
+    assert c.live_runs() == [f"{runs / 'run.pid'} (pid {os.getpid()} alive)"]
+
 @pytest.fixture
 def dummy_eval(tmp_path):
     """A process whose argv looks like a running evals/run.py."""
