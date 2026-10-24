@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # gen-secrets.sh -- generate a component's secrets ON THE TARGET HOST.
 #
-# Usage: scripts/gen-secrets.sh <component> [--dry-run] [--destdir DIR]
+# Usage: scripts/gen-secrets.sh <component> [--dry-run] [--destdir DIR] [--site-env FILE]
 #   component   name of a file in scripts/secrets.d/<component>.sh (walter, covenant, ...)
 #   --dry-run   report what would be created; write nothing (also: DRY_RUN=1)
 #   --destdir   operate under a prefix instead of / (local tests; also: DESTDIR=...)
+#   --site-env  site env for specs that read a site value (covenant: SPARK_DIGEST_HOST when it is
+#               not already in the environment). Default: $SITE_ENV, else ~/.config/deck/site.env,
+#               else <repo>/site.env. Passed to the spec as GS_SITE_ENV.
 #
 # Contract (every secrets.d file must honour it):
 #   - NEVER overwrite an existing secret. Existing files / env values are kept as is.
 #   - NEVER print a secret value (names, paths and modes only).
 #   - Idempotent: a second run changes nothing.
 #
-# secrets.d files are sourced (bash) with DESTDIR, DRY_RUN, REPO and the helpers below
+# secrets.d files are sourced (bash) with DESTDIR, DRY_RUN, REPO, GS_SITE_ENV and the helpers below
 # available. They may also be self-contained (covenant.sh defines its own helpers).
 #
 # Helpers (all paths are absolute target paths; DESTDIR is prepended internally):
@@ -29,22 +32,35 @@ set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export REPO
 
-component=""
+component="" GS_SITE_ENV=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --dry-run) export DRY_RUN=1 ;;
     --destdir) export DESTDIR=${2:?--destdir needs a directory}; shift ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --site-env) GS_SITE_ENV=${2:?--site-env needs a file}; shift
+                [[ -f $GS_SITE_ENV ]] || { echo "gen-secrets: site env not found: $GS_SITE_ENV" >&2; exit 2; } ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     -*) echo "gen-secrets: unknown option $1" >&2; exit 2 ;;
     *) component=$1 ;;
   esac
   shift
 done
-[[ -n $component ]] || { echo "usage: gen-secrets.sh <component> [--dry-run] [--destdir DIR]" >&2; exit 2; }
+[[ -n $component ]] || { echo "usage: gen-secrets.sh <component> [--dry-run] [--destdir DIR] [--site-env FILE]" >&2; exit 2; }
 [[ $component =~ ^[a-z0-9_-]+$ ]] || { echo "gen-secrets: bad component name" >&2; exit 2; }
 export DESTDIR=${DESTDIR:-}
 export DRY_RUN=${DRY_RUN:-0}
 DESTDIR=${DESTDIR%/}
+# Site env lookup: --site-env > $SITE_ENV > ~/.config/deck/site.env > <repo>/site.env. A dangling
+# ~/.config/deck/site.env symlink is an error. The path may not exist (walter needs no site value).
+if [[ -z $GS_SITE_ENV ]]; then
+  _gs_cfg=${HOME:-/nonexistent}/.config/deck/site.env
+  if [[ -n ${SITE_ENV:-} ]]; then GS_SITE_ENV=$SITE_ENV
+  elif [[ -L $_gs_cfg && ! -e $_gs_cfg ]]; then echo "gen-secrets: site env is a dangling symlink: $_gs_cfg" >&2; exit 2
+  elif [[ -f $_gs_cfg ]]; then GS_SITE_ENV=$_gs_cfg
+  else GS_SITE_ENV=$REPO/site.env; fi
+  unset _gs_cfg
+fi
+export GS_SITE_ENV
 
 SPEC=$REPO/scripts/secrets.d/$component.sh
 [[ -f $SPEC ]] || { echo "gen-secrets: no secrets spec $SPEC" >&2; exit 1; }

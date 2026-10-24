@@ -19,10 +19,13 @@
 _cov_root=${DESTDIR:-}
 _cov_dry=${DRY_RUN:-0}
 # Digest gate: opt-in. covenant/deploy.sh exports SPARK_DIGEST_HOST from site.env; a standalone
-# `gen-secrets.sh covenant` reads it from <repo>/site.env (value only, nothing else is kept).
+# `gen-secrets.sh covenant` reads it from the site env gen-secrets resolved (GS_SITE_ENV), else
+# <repo>/site.env when this file is sourced directly (value only, nothing else is kept).
 _cov_digest=${SPARK_DIGEST_HOST:-}
-if [[ -z $_cov_digest && -n ${REPO:-} && -r $REPO/site.env ]]; then
-  _cov_digest=$(set +u; . "$REPO/site.env" >/dev/null 2>&1; printf '%s' "${SPARK_DIGEST_HOST:-}")
+_cov_env=${GS_SITE_ENV:-${REPO:+$REPO/site.env}}
+if [[ -z $_cov_digest && -n $_cov_env && -r $_cov_env ]]; then
+  # shellcheck disable=SC1090
+  _cov_digest=$(set +u; . "$_cov_env" >/dev/null 2>&1; printf '%s' "${SPARK_DIGEST_HOST:-}")
 fi
 
 _cov_note() { printf 'secrets[covenant]: %s\n' "$*" >&2; }
@@ -82,4 +85,4 @@ else
 fi
 
 unset -f _cov_note _cov_put _cov_cookie_secret _cov_wg_genkey _cov_wg_pubkey
-unset _cov_root _cov_dry _cov_digest
+unset _cov_root _cov_dry _cov_digest _cov_env

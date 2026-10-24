@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# pre-commit: run scripts/check-sanitized.sh on the staged (and untracked) files.
+# Blocks the commit on a finding (exit 1) and when no real-value source is found (exit 2):
+# create ~/.config/deck/site.env (for example a symlink to your site.env) in that case.
+# Install: git config core.hooksPath hooks   (see CONVENTIONS.md, "Before every commit").
+set -uo pipefail
+root=$(git rev-parse --show-toplevel) || exit 1
+"$root/scripts/check-sanitized.sh"
+rc=$?
+case $rc in
+  0) exit 0 ;;
+  1) echo "pre-commit: check-sanitized found site values or secret-shaped strings; commit blocked" >&2 ;;
+  2) echo "pre-commit: check-sanitized has no real-value source (or a dangling symlink); commit blocked" >&2 ;;
+  *) echo "pre-commit: check-sanitized failed (exit $rc); commit blocked" >&2 ;;
+esac
+exit "$rc"
