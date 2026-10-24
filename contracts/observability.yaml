@@ -1,0 +1,31 @@
+# C7: backend observability (owner: local-inference-deck). What agent-judge's read-only probes and the runaway
+# watcher rely on (judge/probes/probe.py slots_summary, judge/watch/runaway.py, judge/collector/extras.py
+# KNOWN_UNITS). Provider test: contracts/tests/test_c7_observability.py (the rendered llama-swap config and the
+# deploy scripts). Consumer test (vendored copy): judge/tests/test_contract_observability.py.
+# Versioning (contracts/README.md): minor = additive (a new unit, a new optional slot field); major = a renamed
+# label, path, field or unit, or a changed meaning.
+contract: observability
+contract_version: "1.0"
+
+model_containers:
+  host: walter                    # reached over ssh; the probe runs `docker ps` there
+  label: "llama-swap=1"           # on every model container (the llama-swap `run` macro)
+  docker_ps_filter: "label=llama-swap=1"
+  name: model_id                  # spark-docker-run.sh <model id> -> docker run --name <model id>
+  publish: "127.0.0.1:${PORT}:8080"   # loopback only; `docker ps` shows 127.0.0.1:<port>->8080/tcp
+  stop: "docker rm -f ${MODEL_ID}"    # every model's cmdStop; llama-swap reloads the model on its next request
+
+slots:
+  path: /slots                    # llama-server (and the Maya entrypoint), on the published loopback port, no key
+  # A slot is a JSON object with these fields (next_token is a list of one object in recent llama-server builds).
+  fields: [id, id_task, is_processing, params.n_predict, params.max_tokens, next_token.n_decoded]
+  example:
+    - {id: 0, id_task: 4711, is_processing: true, params: {n_predict: -1, max_tokens: -1},
+       next_token: [{has_next_token: true, n_remain: -1, n_decoded: 48213}]}
+    - {id: 1, id_task: -1, is_processing: false, params: {n_predict: 2048, max_tokens: 2048},
+       next_token: [{has_next_token: false, n_remain: 0, n_decoded: 0}]}
+
+# systemd units (without .service) by host, as the judge names them for unit_state / unit_journal probes.
+units:
+  walter: [llama-swap, docker, docker-user-rules, spark-backup, spark-update-check, nvidia-persistenced]
+  covenant: [nginx, oauth2-proxy, fail2ban]

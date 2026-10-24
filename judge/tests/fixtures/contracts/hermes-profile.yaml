@@ -1,0 +1,57 @@
+# C8: the Hermes profile config.yaml shared by two installers (owner: local-inference-deck, which composes both).
+# Each installer owns one block and must leave the other alone; either may run first, and re-running either is a
+# no-op. Provider test: contracts/tests/test_c8_hermes_profile.py (clients/install.sh, and both installers together
+# while judge/ is in this repo). Consumer test (vendored copy): judge/tests/test_contract_hermes_profile.py.
+# Versioning (contracts/README.md): minor = a new key inside a block; major = a block moves, a marker or owned key
+# is renamed, or the merge rule changes.
+contract: hermes-profile
+contract_version: "1.0"
+config: "$HERMES_HOME/config.yaml"   # clients/install.sh writes $HOME/.hermes/config.yaml (the default HERMES_HOME)
+
+blocks:
+  clients:
+    owner: local-inference-deck (clients/install.sh, from clients/hermes/config.spark.yaml.tmpl)
+    owns: ["model", "custom_providers[name=spark]", "security.redact_secrets"]
+    merge: >-
+      model and security are dict-merged (the fragment's keys win, other keys stay); the custom_providers entry
+      named spark is replaced, other providers stay; every other top-level key, hooks included, is kept as data.
+      With --force it rewrites the file (backup first); otherwise it writes config.yaml.spark.
+    example:          # the rendered fragment with SPARK_API_HOST=api.example.com
+      model: {default: coder, provider: "custom:spark", base_url: "https://api.example.com/v1", max_tokens: 32768}
+      custom_providers:
+        - name: spark
+          base_url: "https://api.example.com/v1"
+          key_env: SPARK_HERMES_API_KEY
+          api_mode: chat_completions
+          model: coder
+          models:
+            coder: {context_length: 131072}
+            coder-fast: {context_length: 131072}
+            hermes: {context_length: 65536}
+            big: {context_length: 131072}
+            vision: {context_length: 131072}
+      security: {redact_secrets: true}
+  judge:
+    owner: agent-judge (judge/install.sh --apply)
+    owns: ["hooks.<event>[managed_by=agent-judge]"]
+    marker: {managed_by: agent-judge}
+    merge: >-
+      entries carrying the marker (or a .../judge/hooks/{gate,verify,enqueue,inject}.py command) are replaced in
+      place, at most one per event; entries without it and every key outside hooks: are kept, comments outside
+      hooks: included. hooks_auto_accept is never set.
+    example:          # command paths are placeholders; the installer writes "<python> <judge dir>/hooks/<name>.py"
+      hooks:
+        pre_tool_call:
+          - {matcher: "terminal|write_file|patch|read_file", command: "/usr/bin/python3 /opt/agent-judge/judge/hooks/gate.py",
+             timeout: 10, fail_closed: true, managed_by: agent-judge}
+        post_tool_call:
+          - {matcher: "write_file|patch|terminal|memory|skill_manage|read_file",
+             command: "/usr/bin/python3 /opt/agent-judge/judge/hooks/enqueue.py", managed_by: agent-judge}
+        on_session_start:
+          - {command: "/usr/bin/python3 /opt/agent-judge/judge/hooks/enqueue.py", managed_by: agent-judge}
+        on_session_end:
+          - {command: "/usr/bin/python3 /opt/agent-judge/judge/hooks/enqueue.py", managed_by: agent-judge}
+        pre_verify:
+          - {command: "/usr/bin/python3 /opt/agent-judge/judge/hooks/verify.py", timeout: 60, managed_by: agent-judge}
+        pre_llm_call:
+          - {command: "/usr/bin/python3 /opt/agent-judge/judge/hooks/inject.py", timeout: 10, managed_by: agent-judge}

@@ -1,0 +1,60 @@
+# C2: the edge <-> backend seam (owner: local-inference-deck). Covenant (edge nginx + oauth2-proxy) and Walter
+# (compose, firewall, the apps behind the edge) must agree on everything here. Values are site.env KEY NAMES or
+# fixed literals; no site values. Tests: walter/tests/test_port_invariants.py (ports, rendered with
+# site.env.example) and contracts/tests/test_c2_edge.py (trusted proxy, OIDC clients and groups, auth headers).
+# Versioning (contracts/README.md): minor = additive; major = a changed port, a removed or renamed key or header,
+# or a changed meaning.
+contract: edge
+contract_version: "1.0"
+
+# Backend ports on BACKEND_WG_IP that edge nginx proxies to. FIXED INVARIANTS: site.env carries them for the
+# templates, but no other value is supported (walter/deploy.sh pins DIGEST_PORT; compose and firewall use them).
+backend_bind: BACKEND_WG_IP
+ports:
+  WEBUI_PORT:     {port: 3000, edge_site: 20-chat,      host: SPARK_CHAT_HOST,      stack: webui,     backend: published}
+  POCKETID_PORT:  {port: 1411, edge_site: 30-id,        host: SPARK_ID_HOST,        stack: webui,     backend: published}
+  LITELLM_PORT:   {port: 4000, edge_site: 40-api,       host: SPARK_API_HOST,       stack: gateway,   backend: published}
+  TELEMETRY_PORT: {port: 3200, edge_site: 50-telemetry, host: SPARK_TELEMETRY_HOST, stack: telemetry, backend: host-network}
+  DIGEST_PORT:    {port: 3300, edge_site: 60-digest,    host: SPARK_DIGEST_HOST,    stack: digest,    backend: host-network,
+                   optional: "SPARK_DIGEST_HOST empty = off (both deploy.sh skip every digest part)"}
+
+# The only peer the backend accepts proxied traffic (and X-Forwarded-*) from.
+trusted_proxy:
+  key: EDGE_WG_IP
+  backend_settings:     # file -> the setting that must name ${EDGE_WG_IP} (and nothing else)
+    walter/gateway/litellm.yaml.tmpl: "trusted_proxy_ranges: [\"${EDGE_WG_IP}/32\"]"
+    walter/webui/.env.example.tmpl: "FORWARDED_ALLOW_IPS=${EDGE_WG_IP}"
+    walter/webui/pocket-id.env.example.tmpl: "TRUST_PROXY=${EDGE_WG_IP}"
+
+# Pocket-ID (SPARK_ID_HOST) OIDC clients. id: a literal, or id_key: the site.env key holding it.
+oidc:
+  issuer: "https://${SPARK_ID_HOST}"
+  scopes: "openid email profile groups"
+  groups_claim: groups
+  clients:
+    open-webui:
+      id: open-webui
+      group_key: CHAT_GROUP
+      callback: "https://${SPARK_CHAT_HOST}/oauth/oidc/callback"
+      relying_party: walter/webui (Open WebUI's own OIDC login)
+    telemetry:
+      id_key: OAUTH2_PROXY_CLIENT_ID
+      group_key: TELEMETRY_GROUP
+      callback: "https://${SPARK_TELEMETRY_HOST}/oauth2/callback"
+      relying_party: covenant/oauth2-proxy/oauth2-proxy.cfg.tmpl
+      edge_listener: "127.0.0.1:4180"
+    digest:
+      id_key: OAUTH2_PROXY_DIGEST_CLIENT_ID
+      group_key: DIGEST_GROUP
+      callback: "https://${SPARK_DIGEST_HOST}/oauth2/callback"
+      relying_party: covenant/oauth2-proxy/oauth2-proxy-digest.cfg.tmpl
+      edge_listener: "127.0.0.1:4181"
+      optional: SPARK_DIGEST_HOST
+
+# Identity headers on the oauth2-proxy-gated sites (50-telemetry, 60-digest). The edge sets them only from
+# auth_request_set and blanks the oauth2-proxy originals; the backend apps display them and never authorise on them.
+auth_headers:
+  gated_sites: [50-telemetry, 60-digest]
+  set: [X-Forwarded-User, X-Forwarded-Email]
+  cleared: [X-Auth-Request-User, X-Auth-Request-Email]
+  gateway: "Authorization: Bearer <key> is passed through to LiteLLM (40-api); the edge adds no identity header"

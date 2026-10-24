@@ -1,0 +1,26 @@
+{
+  "contract": "frontier-env",
+  "contract_version": "1.0",
+  "owner": "agent-judge",
+  "about": "C9: what is removed from the environment of a frontier CLI child (judge/runner/run_judge.py frontier_env), so nothing can point the frontier CLI at the local gateway or swap its credentials or provider. sec-evals keeps its own copy of the list in evals/run.py (a harness file) and tests parity against a vendored copy of this file. Versioning: minor = a variable added; major = a variable removed or a rule changed.",
+  "endpoint_vars": ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_URL", "ANTHROPIC_BEDROCK_BASE_URL",
+                    "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_FOUNDRY_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE"],
+  "strip_vars": ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                 "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                 "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
+                 "OPENAI_API_KEY"],
+  "rules": {
+    "strip": "every endpoint_vars and strip_vars entry is removed",
+    "api_key_with_endpoint": "ANTHROPIC_API_KEY is also removed when any ANTHROPIC_* endpoint var was set (non-empty)",
+    "gateway_host": "any variable whose value contains SPARK_API_HOST is removed"
+  },
+  "vectors": [
+    {"env": {"ANTHROPIC_BASE_URL": "https://api.example.com/v1", "ANTHROPIC_API_KEY": "k", "HOME": "/home/u",
+             "OPENAI_API_KEY": "o", "CLAUDE_CODE_USE_BEDROCK": "1", "NOTE": "via api.example.com"},
+     "spark_api_host": "api.example.com", "keeps": ["HOME"]},
+    {"env": {"ANTHROPIC_API_KEY": "k", "OPENAI_BASE_URL": "http://127.0.0.1:4000", "PATH": "/usr/bin"},
+     "spark_api_host": "api.example.com", "keeps": ["ANTHROPIC_API_KEY", "PATH"]},
+    {"env": {"ANTHROPIC_API_KEY": "k", "ANTHROPIC_VERTEX_BASE_URL": "", "PATH": "/usr/bin"},
+     "spark_api_host": "", "keeps": ["ANTHROPIC_API_KEY", "PATH"]}
+  ]
+}
