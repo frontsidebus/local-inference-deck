@@ -51,7 +51,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # Pinned by major tag only (no verified sha at hand): pin to a commit sha before relying on it.
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9 (= v2)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
