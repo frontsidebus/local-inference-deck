@@ -444,17 +444,30 @@ def check_yaml(paths: List[str], res: Result, budget: Budget) -> None:
 
 
 def check_sanitized(roots: List[str], res: Result, budget: Budget) -> None:
+    """scripts/check-sanitized.sh exit codes: 0 clean, 1 findings, 2 no real-value source (no site env to check
+    against: fail closed). Any other non-zero exit is a failure too."""
     for root in roots:
         r = run(["bash", "scripts/check-sanitized.sh"], budget, cwd=root, timeout=30)
         res.ran.append(f"check-sanitized.sh in {root}")
         if r is None:
             res.notes.append(f"budget exhausted before check-sanitized.sh in {root}")
-        else:
-            res.record(root, "check-sanitized", r[0] == 0, r[1] if r[0] != 0 else "clean")
-        if r is not None and r[0] != 0:
+            continue
+        rc, out = r
+        if rc == 0:
+            res.record(root, "check-sanitized", True, "clean")
+            continue
+        res.record(root, "check-sanitized", False, out)
+        if rc == 2:
             res.fail("check-sanitized",
-                     f"{root}/scripts/check-sanitized.sh failed (public repo: no real hosts/IPs/names/"
-                     f"secrets; use site.env variables and example values):\n    {_excerpt(r[1], 600)}")
+                     f"{root}/scripts/check-sanitized.sh: no real-value source (create ~/.config/deck/site.env); "
+                     f"nothing was checked:\n    {_excerpt(out, 600)}")
+        elif rc == 1:
+            res.fail("check-sanitized",
+                     f"{root}/scripts/check-sanitized.sh found real values (public repo: no real hosts/IPs/names/"
+                     f"secrets; use site.env variables and example values):\n    {_excerpt(out, 600)}")
+        else:
+            res.fail("check-sanitized",
+                     f"{root}/scripts/check-sanitized.sh failed (exit {rc}):\n    {_excerpt(out, 600)}")
 
 
 # --- ssh config

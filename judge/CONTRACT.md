@@ -6,8 +6,14 @@ Design and history: `docs/agent-judge.md`. Operator reference, including every s
 part that depends on it. Where this file and the code disagree, the code is right and this file is the bug.
 
 ## Ground rules
-- **Self-contained.** Nothing in `judge/` imports or sources files outside `judge/` except `site.env`
-  (read via `judge/lib/config.py` / `judge/lib/config.sh`). This keeps it extractable into its own repo.
+- **Self-contained.** Nothing in `judge/` imports or sources files outside `judge/` except the site env and
+  judge.env (parsed via `judge/lib/config.py` / `judge/lib/config.sh`). This keeps it extractable into its own repo.
+- **Fail closed on location (0a).** The site env is `SITE_ENV` (environment, else `SITE_ENV=` in judge.env:
+  `$JUDGE_ENV`, else `~/.config/judge/judge.env`), else `~/.config/deck/site.env`; never a file next to the
+  checkout. `JUDGE_REPO_DIR` is never guessed (empty stays empty, never the cwd). With `JUDGE_MODE=frontier` no
+  frontier call is made while the site env is unresolved or yields no site value to mask
+  (`lib/config.frontier_refusal`): checked in `choose_mode` (main stage -> local, with a note), the claims stage,
+  rejudge, `_judge_loop`, `frontier_messages` (an empty mask raises, never passes through) and `call_frontier`.
 - **Python 3.10+ stdlib only** for runtime code (Hermes' venv is NOT assumed). Tests use pytest.
   Bash allowed for thin wrappers; must pass `bash -n` (shellcheck if available).
 - **Public repo**: follow `/CONVENTIONS.md`; no real hosts/IPs/names/secrets; run `scripts/check-sanitized.sh`.
@@ -845,7 +851,8 @@ Audit CLI: `collector/claims_only.py <evidence-dir>` prints the message for a st
   Never masked: values under 3 chars, `walter`, `covenant`, and loopback or any-addresses. Ports, groups, model
   names and paths are not identifiers.
 - **How.**
-  - The mapping is built from site.env + environment at run time (`SM.build(C._site())`). The reverse map lives
+  - The mapping is built from site.env + judge.env + environment at run time (`SM.build(C._site())`); an empty
+    mask refuses the call (nothing sent). The reverse map lives
     only in memory; it is never written or sent.
   - Matching is longest value first, case-insensitive, at word boundaries: a name is not part of a longer
     `[A-Za-z0-9_-]` run, and an address is not part of a longer dotted number. So it works inside URLs,
@@ -1251,7 +1258,7 @@ notes, *, probes_allowed, use_budget=True)` (returns `{finding, raw_record, inpu
 - Exit 0 ok, 1 when any request failed, 64 usage.
 
 ## Settings
-Every setting, its default, where it is read (environment > site.env > default, with the exceptions listed) and
+Every setting, its default, where it is read (environment > judge.env > site.env > default, with the exceptions listed) and
 what it does: `judge/README.md`, "Configuration". Defaults live in `lib/config.py` `DEFAULTS` or at the point of
 use (`run_judge.py`, `inject.py`, `enqueue.py`, `verify.py`, `collect.py`, `alert.py`, `bin/*`); new settings go
 into `site.env.example` under `# --- judge` with a comment. The judge also reads the existing site variables

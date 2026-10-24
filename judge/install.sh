@@ -3,7 +3,8 @@
 #
 # Usage:
 #   judge/install.sh [--dry-run]            show what would change (default; changes nothing)
-#   judge/install.sh --apply                merge the hooks block, create the review dir, render the gate policy
+#   judge/install.sh --apply                merge the hooks block, merge SITE_ENV= into judge.env, create the
+#                                           review dir, render the gate policy
 #   judge/install.sh --uninstall [--dry-run]  remove only the judge-managed hook entries (review data is kept)
 #
 # Options:
@@ -13,7 +14,8 @@
 #   --hermes-src DIR      hermes-agent source tree, used to check event names against VALID_HOOKS
 #                         (default: next to --hermes-python, else $HERMES_HOME/hermes-agent)
 #   --python PATH         Python 3.10+ that runs the hooks (default: python3 on PATH). Stdlib only.
-#   --site-env FILE       site values (default: $SITE_ENV, else <judge>/../site.env, else <judge>/site.env)
+#   --site-env FILE       site values (default: $SITE_ENV, else SITE_ENV= in judge.env, else ~/.config/deck/site.env;
+#                         never the checkout's own directory). --apply records it as SITE_ENV= in judge.env.
 #   --review-dir DIR      review data dir (default: $JUDGE_REVIEW_DIR, else site.env, else $HERMES_HOME/review)
 #   --with-units          also install the systemd user units from runner/units/ and watch/
 #   --unit-dir DIR        where units go (default: ${XDG_CONFIG_HOME:-~/.config}/systemd/user)
@@ -26,6 +28,12 @@
 # (.../judge/hooks/{gate,verify,enqueue,inject}.py). Entries you added yourself are never touched.
 # Comments outside the `hooks:` block are preserved; comments inside it are not (a backup is kept).
 # This script never sets hooks_auto_accept: Hermes asks for consent on first use of each hook.
+#
+# judge.env ($JUDGE_ENV, else ~/.config/judge/judge.env; the units always read ~/.config/judge/judge.env) is MERGED,
+# never overwritten: --apply sets only its SITE_ENV= line (to the resolved site env) and keeps every other line.
+# It holds SITE_ENV= and non-identifying policy knobs only (judge/judge.env.example); JUDGE_SSH_ALIASES,
+# JUDGE_INFRA_REPOS and JUDGE_REPO_DIR belong in site.env. Without a resolved site env the frontier judge is refused
+# (every request is judged locally).
 set -euo pipefail
 
 JUDGE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -72,13 +80,28 @@ if ((START)) && ! ((WITH_UNITS)); then die "--start only makes sense with --with
 PRE_HERMES_HOME=${ARG_HERMES_HOME:-${HERMES_HOME:-}}
 PRE_REVIEW=${ARG_REVIEW:-${JUDGE_REVIEW_DIR:-}}
 
+BOOT_PY=${ARG_PY:-python3}
+JUDGE_ENV_FILE=${JUDGE_ENV:-$HOME/.config/judge/judge.env}
+JUDGE_ENV_FILE=${JUDGE_ENV_FILE/#\~/$HOME}
 SITE_ENV_FILE=${ARG_SITE_ENV:-${SITE_ENV:-${JUDGE_SITE_ENV:-}}}
 if [[ -z $SITE_ENV_FILE ]]; then
-  for f in "$JUDGE_DIR/../site.env" "$JUDGE_DIR/site.env"; do
-    if [[ -f $f ]]; then SITE_ENV_FILE=$(cd "$(dirname "$f")" && pwd)/site.env; break; fi
-  done
+  # judge.env's SITE_ENV=, else ~/.config/deck/site.env (the lib/config.py order; no repo-root search: 0a, fail
+  # closed). The inline parse below is for a checkout without lib/config.py.
+  if [[ -f $JUDGE_DIR/lib/config.py ]]; then
+    SITE_ENV_FILE=$("$BOOT_PY" "$JUDGE_DIR/lib/config.py" --site-env-path) || SITE_ENV_FILE=""
+  else
+    if [[ -f $JUDGE_ENV_FILE ]]; then
+      SITE_ENV_FILE=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?SITE_ENV=['\"]?([^'\"#]*)['\"]?.*$/\\2/p" \
+        "$JUDGE_ENV_FILE" | tail -n1 | sed 's/[[:space:]]*$//')
+      SITE_ENV_FILE=${SITE_ENV_FILE/#\~/$HOME}
+    fi
+    if [[ -z $SITE_ENV_FILE && -f $HOME/.config/deck/site.env ]]; then SITE_ENV_FILE=$HOME/.config/deck/site.env; fi
+  fi
 fi
 [[ -z $SITE_ENV_FILE || -f $SITE_ENV_FILE ]] || die "site env not found: $SITE_ENV_FILE"
+if [[ -n $SITE_ENV_FILE ]]; then   # absolute, keeping a symlink's own name (~/.config/deck/site.env -> ...)
+  SITE_ENV_FILE=$(cd "$(dirname "$SITE_ENV_FILE")" && pwd)/$(basename "$SITE_ENV_FILE")
+fi
 if [[ -n $SITE_ENV_FILE ]]; then export SITE_ENV=$SITE_ENV_FILE; fi
 if [[ -n $ARG_HERMES_HOME ]]; then export HERMES_HOME=$ARG_HERMES_HOME; fi
 if [[ -n $ARG_REVIEW ]]; then export JUDGE_REVIEW_DIR=$ARG_REVIEW; fi
@@ -103,6 +126,10 @@ if ((!loaded)) && [[ -n $SITE_ENV_FILE ]]; then
     esac
     [[ -n ${!k:-} ]] || export "$k=$v"
   done < "$SITE_ENV_FILE"
+fi
+if [[ -z ${JUDGE_REPO_DIR:-} ]]; then
+  warn "JUDGE_REPO_DIR is not set (site.env): no repo is infra by location, so deck-repo work is judged locally." \
+       "Set JUDGE_REPO_DIR to the deck checkout in site.env (it is never guessed from this checkout's location)."
 fi
 : "${JUDGE_MODE:=frontier}" "${JUDGE_LOCAL_MODEL:=big}" "${JUDGE_FRONTIER_CMD:=claude}"
 : "${JUDGE_RUNAWAY_TOKENS:=20000}" "${JUDGE_RUNAWAY_MINUTES:=10}"
@@ -137,7 +164,8 @@ echo "   judge dir     $JUDGE_DIR"
 echo "   HERMES_HOME   $HERMES_HOME"
 echo "   config        $CONFIG"
 echo "   review dir    $JUDGE_REVIEW_DIR"
-echo "   site.env      ${SITE_ENV_FILE:-(none; defaults only)}"
+echo "   site.env      ${SITE_ENV_FILE:-(none; defaults only: the frontier judge will be refused)}"
+echo "   judge.env     $JUDGE_ENV_FILE"
 echo "   hook python   $JUDGE_PYTHON"
 echo "   yaml python   $HERMES_PY"
 echo
@@ -321,6 +349,71 @@ print(f"config.yaml: written; backup at {backup}")
 PY
 }
 
+# ---------------------------------------------------------------- judge.env merge (SITE_ENV= only)
+merge_judge_env() { # $1 = dry-run|apply
+  "$JUDGE_PYTHON" - "$1" "$JUDGE_ENV_FILE" "$SITE_ENV_FILE" <<'PY'
+import os, re, shlex, sys, time
+mode, path, site = sys.argv[1:4]
+IDENTIFYING = ("JUDGE_SSH_ALIASES", "JUDGE_INFRA_REPOS", "JUDGE_REPO_DIR")
+line_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+try:
+    with open(path, encoding="utf-8") as fh:
+        old = fh.read()
+except FileNotFoundError:
+    old = None
+lines = (old or "").splitlines(keepends=True)
+keys = [m.group(1) for m in (line_re.match(l) for l in lines) if m]
+for k in IDENTIFYING:
+    if k in keys:
+        print(f"install: WARNING: {path} sets {k}: site-identifying keys belong in site.env (where the sanitizer "
+              f"checks them); move it there by hand", file=sys.stderr)
+if not site:
+    print(f"install: WARNING: no site env resolved: judge.env gets no SITE_ENV= and the frontier judge is refused "
+          f"(every request judged locally). Pass --site-env FILE or create ~/.config/deck/site.env.", file=sys.stderr)
+    print(f"judge.env: {'unchanged' if old is not None else 'not created'} ({path})")
+    sys.exit(0)
+want = f"SITE_ENV={shlex.quote(site)}\n"
+idx = [i for i, l in enumerate(lines) if (m := line_re.match(l)) and m.group(1) == "SITE_ENV"]
+new_lines = list(lines)
+if idx:
+    new_lines[idx[0]] = want
+    for i in reversed(idx[1:]):      # a duplicate SITE_ENV= would be ambiguous: keep one
+        del new_lines[i]
+else:
+    if new_lines and not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+    if old is None:
+        new_lines.append("# judge.env: SITE_ENV= and non-identifying policy knobs only (judge/judge.env.example).\n")
+    new_lines.append(want)
+new = "".join(new_lines)
+if new == old:
+    print(f"judge.env: no change needed ({path})")
+    sys.exit(0)
+if mode != "apply":
+    print(f"judge.env: would {'set' if old is not None else 'create with'} SITE_ENV={site} in {path} "
+          f"(other lines kept)")
+    sys.exit(0)
+d = os.path.dirname(path)
+if d:
+    os.makedirs(d, mode=0o700, exist_ok=True)
+if old is not None:
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backup, n = f"{path}.bak-judge-{ts}", 1
+    while os.path.exists(backup):
+        backup, n = f"{path}.bak-judge-{ts}-{n}", n + 1
+    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(old)
+tmp = f"{path}.tmp-judge-{os.getpid()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(new)
+os.replace(tmp, path)
+print(f"judge.env: {'merged' if old is not None else 'created'} SITE_ENV={site} in {path}"
+      + (f"; backup at {backup}" if old is not None else ""))
+PY
+}
+
 # ---------------------------------------------------------------- gate policy rendering
 render_policy() { # $1 = dry-run|apply
   local tmpl=$JUDGE_DIR/policy/gate-policy.json.tmpl out=$JUDGE_REVIEW_DIR/gate-policy.json
@@ -467,6 +560,10 @@ if [[ $MODE == apply ]]; then
   echo "review dir: $JUDGE_REVIEW_DIR (mode 700)"
 else
   echo "review dir: would create $JUDGE_REVIEW_DIR and its queue/ queue/deferred/ evidence/ findings/ acks/ done/ snapshots/ (mode 700)"
+fi
+merge_judge_env "$MODE"
+if ((WITH_UNITS)) && [[ $JUDGE_ENV_FILE != "$HOME/.config/judge/judge.env" ]]; then
+  warn "the units read ~/.config/judge/judge.env, not \$JUDGE_ENV ($JUDGE_ENV_FILE)"
 fi
 render_policy "$MODE"
 ((WITH_UNITS)) && { echo; install_units "$MODE"; }

@@ -141,8 +141,13 @@ def _snapdir(cfg, session, cwd, root):
 
 # ---------------------------------------------------------------- handlers
 def on_session_start(payload, cfg, root):
-    from lib import snapshot
+    from lib import config, snapshot
     session = payload.get("session_id") or ""
+    if (cfg.get("JUDGE_MODE") or "frontier").strip().lower() == "frontier":
+        why = config.frontier_refusal(cfg)
+        if why:  # 0a: once per session, a clear line for the operator (judge-findings warns too)
+            _log_error(root, f"frontier judge refused for this session ({session or 'unknown'}), requests are "
+                             f"judged locally: {why}")
     if session:
         snapshot.take(session, payload.get("cwd") or None, cfg, root=root)
     return None

@@ -43,7 +43,7 @@ def check_ids(request_id: str, item_id: Optional[str] = None) -> None:
 
 # ---------------------------------------------------------------- config / paths
 def _site() -> Dict[str, str]:
-    """Merged config (defaults < site.env < env) from lib/config.load_config(); {} when unavailable.
+    """Merged config (defaults < site.env < judge.env < env) from lib/config.load_config(); {} when unavailable.
     Not cached: hooks are short-lived and tests change the environment between calls."""
     if _config is not None:
         try:

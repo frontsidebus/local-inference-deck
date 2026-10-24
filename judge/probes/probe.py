@@ -242,7 +242,11 @@ def p_file_hash(ctx: Ctx, host: str, path: str) -> None:
 
 
 def p_render_and_diff(ctx: Ctx, template: str, live: Optional[str] = None) -> None:
-    repo = ctx.cfg.get("JUDGE_REPO_DIR") or str(config.REPO_ROOT)
+    repo = ctx.cfg.get("JUDGE_REPO_DIR") or ""
+    if not repo:  # 0a: never guess the deck repo from this checkout's location
+        ctx.note("JUDGE_REPO_DIR is not set (set it in site.env); render_and_diff needs the deck repo")
+        ctx.rc = ctx.rc or 1
+        return
     render = os.path.join(repo, "scripts", "render.sh")
     src = os.path.join(repo, template)
     if not os.path.isfile(src):
@@ -279,7 +283,12 @@ def p_render_and_diff(ctx: Ctx, template: str, live: Optional[str] = None) -> No
 
 
 def p_check_sanitized(ctx: Ctx, repo_path: str) -> None:
-    script = os.path.join(ctx.cfg.get("JUDGE_REPO_DIR") or str(config.REPO_ROOT), "scripts", "check-sanitized.sh")
+    repo = ctx.cfg.get("JUDGE_REPO_DIR") or ""
+    if not repo:  # 0a: never guess the deck repo from this checkout's location
+        ctx.note("JUDGE_REPO_DIR is not set (set it in site.env); check_sanitized needs the deck repo's script")
+        ctx.rc = ctx.rc or 1
+        return
+    script = os.path.join(repo, "scripts", "check-sanitized.sh")
     if not os.path.isfile(script):
         ctx.note(f"check-sanitized.sh not found at {script}")
         ctx.rc = ctx.rc or 1

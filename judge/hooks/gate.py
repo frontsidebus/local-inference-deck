@@ -86,7 +86,7 @@ def _lib():
 
 
 def _site_vars():
-    """Site identifiers: judge/lib/config.py (defaults < site.env < environment)."""
+    """Site identifiers: judge/lib/config.py (defaults < site.env < judge.env < environment)."""
     try:
         _lib()
         from lib import config as jconfig

@@ -10,7 +10,7 @@ A scripted test suite ran first (runs 1–4, results in [docs/agent-judge.md](..
 
 - [ ] Walter and Covenant healthy (the normal smoke tests from [walter/README.md](../../walter/README.md) and [covenant/README.md](../../covenant/README.md)). Note anything already failing, so it is not blamed on the pilot.
 - [ ] A dedicated git worktree and branch for the build (for example `feat/digest-site`). The judge diffs the worktree, so keep unrelated edits out of it.
-- [ ] `site.env` filled in, including the judge section ([site.env.example](../../site.env.example), `# --- judge`). For the pilot, set `JUDGE_FRONTIER_DAILY_MAX` to a number you are willing to pay for (each call is capped by `JUDGE_FRONTIER_MAX_USD`).
+- [ ] `site.env` filled in, including the judge section ([site.env.example](../../site.env.example), `# --- judge`) and `JUDGE_REPO_DIR` (the deck checkout), and reachable by the judge: `~/.config/deck/site.env` (a symlink is fine) or `--site-env FILE` at install time, which `install.sh --apply` records as `SITE_ENV=` in `~/.config/judge/judge.env`. Without it the frontier judge is refused. For the pilot, set `JUDGE_FRONTIER_DAILY_MAX` to a number you are willing to pay for (each call is capped by `JUDGE_FRONTIER_MAX_USD`).
 - [ ] `claude` CLI logged in to the normal Anthropic API (frontier mode), and the gateway reachable (local fallback).
 - [ ] `judge/` tests pass: `python3 -m pytest -q judge/tests`.
 - [ ] Backups of what the run may touch: `cp -p ~/.ssh/config ~/.ssh/config.pre-pilot`. The installer backs up the Hermes `config.yaml` itself.

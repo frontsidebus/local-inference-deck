@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# judge/lib/config.sh: bash access to the judge config (site.env + judge defaults).
+# judge/lib/config.sh: bash access to the judge config (site.env + judge.env + judge defaults).
 #
 # Source it, then call judge_load_config:
 #   . "$(dirname "$0")/../lib/config.sh"; judge_load_config
-# Exports every key from judge/lib/config.py (defaults < site.env < environment), including the resolved
-# HERMES_HOME and JUDGE_REVIEW_DIR. site.env is parsed by config.py, never sourced, so it cannot run code.
+# Exports every key from judge/lib/config.py (defaults < site.env < judge.env < environment), including the
+# resolved HERMES_HOME, JUDGE_REVIEW_DIR, SITE_ENV and JUDGE_ENV. site.env and judge.env are parsed by config.py,
+# never sourced, so they cannot run code.
 #
 #   judge_load_config         export all config keys into the current shell
 #   judge_get KEY             print one value

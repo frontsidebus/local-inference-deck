@@ -6,9 +6,16 @@ Stdlib only. Import with judge/ on sys.path:  ``from lib import config``.
 Public API (other judge parts depend on it; keep it stable):
 
     load_config(site_env=None, environ=None) -> dict[str, str]
-        defaults < site.env < process environment.  Every value is a string.  Always present:
-        HERMES_HOME, JUDGE_REVIEW_DIR (absolute, ~ expanded), JUDGE_REPO_DIR, JUDGE_DIR, SITE_ENV
-        (path of the file that was read, or "" when none) and every key in DEFAULTS.
+        DEFAULTS < site.env < judge.env < process environment.  Every value is a string.  Always present:
+        HERMES_HOME, JUDGE_REVIEW_DIR (absolute, ~ expanded), JUDGE_REPO_DIR (absolute, or "" when not
+        configured: never a guess), JUDGE_DIR, SITE_ENV (path of the site env that was read, or "" when none),
+        JUDGE_ENV (path of the judge.env that was read, or "") and every key in DEFAULTS.
+    judge_env_path(environ=None) -> Path | None      $JUDGE_ENV, else ~/.config/judge/judge.env (if it is a file)
+    site_env_path(environ=None) -> Path | None       SITE_ENV (environment, else judge.env), else
+                                                     ~/.config/deck/site.env. An explicit SITE_ENV that is not
+                                                     a file resolves to None (no fallback). No repo-root lookup.
+    frontier_refusal(cfg=None) -> str                why a frontier call must not be made ("" = allowed):
+                                                     the site env is unresolved or yields no site value to mask
     hermes_home(cfg=None) -> Path
     review_dir(cfg=None, create=False) -> Path       create=True makes it (mode 700)
     classify(paths, cfg=None, cwd=None, max_mixed=None) -> "infra" | "sensitive"   per-path rules, see below (#43)
@@ -29,6 +36,8 @@ Public API (other judge parts depend on it; keep it stable):
 CLI (used by lib/config.sh):
     config.py --export          print `export KEY='value'` lines (shell-quoted) for eval
     config.py --get KEY         print one value
+    config.py --site-env-path   print the resolved site env path ("" when unresolved)
+    config.py --judge-env-path  print the judge.env path that would be read ($JUDGE_ENV or the default)
     config.py --review-dir      print the review dir
     config.py --classify PATH.. print infra|sensitive
     config.py --explain PATH..  print classify_detail() as JSON (per-path classes)
@@ -45,7 +54,14 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
 JUDGE_DIR = Path(__file__).resolve().parent.parent
-REPO_ROOT = JUDGE_DIR.parent
+# No REPO_ROOT: the checkout's location never decides which site env is read or which repo is infra (step 0a,
+# fail closed). A relocated or split-out checkout has no site values until judge.env / site.env say so.
+
+# judge.env: SITE_ENV= (where the site env is) plus non-identifying policy knobs (JUDGE_MODE, caps ...);
+# see judge/judge.env.example. Site-identifying judge keys (JUDGE_SSH_ALIASES, JUDGE_INFRA_REPOS,
+# JUDGE_REPO_DIR) belong in site.env, where the sanitizer checks them.
+JUDGE_ENV_DEFAULT = "~/.config/judge/judge.env"
+DECK_SITE_ENV = "~/.config/deck/site.env"
 
 HOSTS = ("walter", "covenant")
 
@@ -127,14 +143,45 @@ def parse_env_file(path) -> Dict[str, str]:
     return out
 
 
-def site_env_path(environ: Optional[Mapping[str, str]] = None) -> Optional[Path]:
+def _expanduser(p: str, env: Mapping[str, str]) -> str:
+    """expanduser against env's HOME (so environ= mappings and tests with HOME=tmp agree)."""
+    if p.startswith("~") and env.get("HOME"):
+        return env["HOME"].rstrip("/") + p[1:] if p == "~" or p.startswith("~/") else os.path.expanduser(p)
+    return os.path.expanduser(p)
+
+
+def judge_env_file(environ: Optional[Mapping[str, str]] = None) -> Path:
+    """The judge.env that would be read: $JUDGE_ENV, else ~/.config/judge/judge.env (it need not exist)."""
     env = os.environ if environ is None else environ
-    p = env.get("SITE_ENV")
-    if p:
-        p = Path(os.path.expanduser(p))
-        return p if p.is_file() else None
-    p = REPO_ROOT / "site.env"
+    return Path(_expanduser(env.get("JUDGE_ENV") or JUDGE_ENV_DEFAULT, env))
+
+
+def judge_env_path(environ: Optional[Mapping[str, str]] = None) -> Optional[Path]:
+    p = judge_env_file(environ)
     return p if p.is_file() else None
+
+
+def site_env_path(environ: Optional[Mapping[str, str]] = None,
+                  judge_env: Optional[Mapping[str, str]] = None) -> Optional[Path]:
+    """SITE_ENV from the environment, else from judge.env (*judge_env*: its parsed keys; read when None), else
+    ~/.config/deck/site.env. An explicit SITE_ENV that is not a file is unresolved (None): no fallback, and never
+    a repo-root guess. A relative SITE_ENV in judge.env is relative to judge.env's directory."""
+    env = os.environ if environ is None else environ
+    jp = judge_env_path(env)
+    p = env.get("SITE_ENV") or ""
+    base: Optional[Path] = None
+    if not p:
+        if judge_env is None:
+            judge_env = parse_env_file(jp) if jp else {}
+        p = judge_env.get("SITE_ENV") or ""
+        base = jp.parent if jp else None
+    if p:
+        path = Path(_expanduser(p, env))
+        if not path.is_absolute():
+            path = (base / path) if base is not None else Path(os.path.abspath(path))
+        return path if path.is_file() else None
+    path = Path(_expanduser(DECK_SITE_ENV, env))
+    return path if path.is_file() else None
 
 
 def _expand(p: str) -> str:
@@ -142,22 +189,58 @@ def _expand(p: str) -> str:
 
 
 def load_config(site_env=None, environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
-    """Merged config dict: DEFAULTS < site.env < environment. All values are strings."""
+    """Merged config dict: DEFAULTS < site.env < judge.env < environment. All values are strings.
+
+    Empty values in judge.env and in the environment do not override. JUDGE_REPO_DIR is never guessed: unset or
+    empty stays "" (no repo is infra by location, every bundle stays local)."""
     env = os.environ if environ is None else environ
-    path = Path(os.path.expanduser(str(site_env))) if site_env else site_env_path(env)
+    jpath = judge_env_path(env)
+    judge = {k: v for k, v in (parse_env_file(jpath) if jpath else {}).items() if v != ""}
+    path = Path(_expanduser(str(site_env), env)) if site_env else site_env_path(env, judge)
     site = parse_env_file(path) if path and path.is_file() else {}
     cfg: Dict[str, str] = dict(DEFAULTS)
     cfg.update(site)
-    for k in _ENV_KEYS | set(site):
+    cfg.update(judge)
+    for k in _ENV_KEYS | set(site) | set(judge):
         v = env.get(k)
         if v not in (None, ""):
             cfg[k] = v
-    cfg["HERMES_HOME"] = _expand(cfg.get("HERMES_HOME") or "~/.hermes")
-    cfg["JUDGE_REVIEW_DIR"] = _expand(cfg.get("JUDGE_REVIEW_DIR") or os.path.join(cfg["HERMES_HOME"], "review"))
-    cfg["JUDGE_REPO_DIR"] = _expand(cfg.get("JUDGE_REPO_DIR") or str(REPO_ROOT))
+    cfg["HERMES_HOME"] = _expand(_expanduser(cfg.get("HERMES_HOME") or "~/.hermes", env))
+    cfg["JUDGE_REVIEW_DIR"] = _expand(_expanduser(cfg.get("JUDGE_REVIEW_DIR")
+                                                  or os.path.join(cfg["HERMES_HOME"], "review"), env))
+    # 0a: never _expand an empty value (abspath("") is the cwd: that would make the cwd infra, failing open)
+    repo = (cfg.get("JUDGE_REPO_DIR") or "").strip()
+    cfg["JUDGE_REPO_DIR"] = _expand(_expanduser(repo, env)) if repo else ""
     cfg["JUDGE_DIR"] = str(JUDGE_DIR)
     cfg["SITE_ENV"] = str(path) if path and path.is_file() else ""
+    cfg["JUDGE_ENV"] = str(jpath) if jpath else ""
     return cfg
+
+
+SITE_ENV_HINT = ("set SITE_ENV= in ~/.config/judge/judge.env (judge/install.sh --apply writes it) "
+                 "or create ~/.config/deck/site.env")
+
+
+def frontier_refusal(cfg: Optional[Mapping[str, str]] = None) -> str:
+    """Why a frontier judge call must NOT be made with *cfg* ("" = allowed). The data boundary (PR #28, 0a): the
+    frontier judge only ever gets masked text, and the mask is built from the site env, so with no site env, or
+    one that yields no site value beyond the generic defaults, nothing could be masked and nothing is sent."""
+    c = _cfg(cfg)
+    if not c.get("SITE_ENV"):
+        return "site env unresolved: " + SITE_ENV_HINT
+    try:
+        from lib import sitemask as _SM  # judge/ on sys.path
+    except ImportError:  # pragma: no cover
+        import importlib
+        _SM = importlib.import_module("sitemask")
+    try:
+        mask = _SM.build(c)
+    except Exception as exc:
+        return f"site mask could not be built ({type(exc).__name__})"
+    generic = {v.lower() for v in DEFAULTS.values() if v}
+    if not any(e.value.lower() not in generic for e in mask.entries):
+        return f"site mask is empty (no site value to mask in {c.get('SITE_ENV')})"
+    return ""
 
 
 def _cfg(cfg: Optional[Mapping[str, str]]) -> Mapping[str, str]:
@@ -215,7 +298,7 @@ def infra_rules(cfg: Optional[Mapping[str, str]] = None) -> List[str]:
         "/etc/*",
         "/srv/*",
     ]
-    repos = [c["JUDGE_REPO_DIR"]] + (c.get("JUDGE_INFRA_REPOS") or "").split()
+    repos = [c.get("JUDGE_REPO_DIR") or ""] + (c.get("JUDGE_INFRA_REPOS") or "").split()  # "" entries skipped
     for r in repos:
         if r:
             rules.append(_real(r).rstrip("/") + "/*")
@@ -552,6 +635,12 @@ def _main(argv: List[str]) -> int:
             if _KEY_RE.match(k):
                 print(f"export {k}={shlex.quote(cfg[k])}")
         return 0
+    if cmd == "--site-env-path":
+        print(cfg.get("SITE_ENV", ""))
+        return 0
+    if cmd == "--judge-env-path":
+        print(judge_env_file())
+        return 0
     if cmd == "--get" and len(rest) == 1:
         print(cfg.get(rest[0], ""))
         return 0
@@ -572,7 +661,7 @@ def _main(argv: List[str]) -> int:
             print(f"config: {e}", file=sys.stderr)
             return 2
         return 0
-    print("usage: config.py --export | --get KEY | --review-dir | --classify PATH... | --ssh HOST", file=sys.stderr)
+    print("usage: config.py --export | --get KEY | --site-env-path | --judge-env-path | --review-dir | --classify PATH... | --ssh HOST", file=sys.stderr)
     return 64
 
 

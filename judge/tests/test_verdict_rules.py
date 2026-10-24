@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import validate as V  # noqa: E402
 import run_judge as RJ  # noqa: E402
 import rejudge as RG  # noqa: E402
-from test_runner import enqueue, env, finding, frontier, local, rid  # noqa: E402,F401  (fixtures)
+from test_runner import FRONTIER_SITE_ENV, enqueue, env, finding, frontier, local, rid  # noqa: E402,F401  (fixtures)
 
 RID = "20261003T133415Z-95e0c3-completion"
 LOG_HEAD = ("# Hermes log lines for session 20261003_082327_95e0c3, window 2026-10-03T13:33:45Z .. "
@@ -461,6 +461,9 @@ def _costly_claude(tmp_path, monkeypatch, reply):
         f"'modelUsage': {{'claude-test-model': {{'outputTokens': 10}}}}}}))\n")
     script.chmod(0o755)
     monkeypatch.setenv("JUDGE_FRONTIER_CMD", str(script))
+    site = tmp_path / "frontier-site.env"  # 0a: no frontier call without a resolved, non-empty site env
+    site.write_text(FRONTIER_SITE_ENV)
+    monkeypatch.setenv("SITE_ENV", str(site))
 
 
 def test_rejudge_no_budget_leaves_usage_untouched_even_with_cost(env, tmp_path, monkeypatch):

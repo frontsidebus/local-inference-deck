@@ -60,11 +60,11 @@ Runtime code is Python 3.10+ stdlib only. The installer uses the Hermes venv's P
 
 ## Install and reinstall
 
-Prerequisites: Hermes with its venv at `$HERMES_HOME/hermes-agent/venv`, `python3` 3.10 or newer, a filled-in `site.env` at the repo root (see [Configuration](#configuration)), and the `claude` CLI logged in if you use frontier mode.
+Prerequisites: Hermes with its venv at `$HERMES_HOME/hermes-agent/venv`, `python3` 3.10 or newer, a filled-in site env (`~/.config/deck/site.env`, or any file named by `--site-env` / `SITE_ENV`; see [Configuration](#configuration)) that sets `JUDGE_REPO_DIR` to the deck checkout, and the `claude` CLI logged in if you use frontier mode.
 
 ```bash
 judge/install.sh                                 # dry run: the hooks block and a diff of config.yaml
-judge/install.sh --apply                         # back up config.yaml, merge, create the review dir, render the policy
+judge/install.sh --apply                         # back up config.yaml, merge, merge SITE_ENV= into judge.env, create the review dir, render the policy
 judge/install.sh --apply --with-units --start    # ...and install, enable and (re)start the user units
 ```
 
@@ -120,13 +120,20 @@ Non-TTY runs (the gateway, cron) never prompt; they skip unapproved hooks with a
 
 ### After pulling judge changes
 
+- **Step 0a (fail-closed boundaries), once:** run `judge/install.sh --apply --with-units` **in the same session as updating the checkout.** The judge no longer looks for `site.env` next to the checkout, and no longer treats the checkout's own repo as infra: hooks and units find the site env only through `SITE_ENV` (environment), `SITE_ENV=` in `~/.config/judge/judge.env`, or `~/.config/deck/site.env`. `install.sh --apply` merges `SITE_ENV=<the resolved site env>` into judge.env (other lines kept). Until it has run, every frontier call is refused (nothing is sent) and every request is judged locally: safe, but noisy. Also set `JUDGE_REPO_DIR` to the deck checkout in `site.env` (it is never guessed any more; unset means no repo is infra by location). This change also moves `code_version` once (the tree id of `judge/` changes): findings of requests queued before the update carry a one-time `code version: ...` note; that is expected and needs no action.
 - **Code only** (gate rules, collector, runner, prompts): nothing to do. Hooks and the runner load the code on every call. Requests record the code that wrote them (`code_version`: git tree id of `judge/` + dirty flag, read from `.git` without running git; a copy outside git can carry a `judge/VERSION` file), so a finding notes when a request was written by older code. `hermes hooks doctor` shows the mtime drift; review the diff. The C6 watcher is long-running: `systemctl --user restart judge-runaway-watch` after a change under `watch/`.
 - **A matcher, a hook entry or the policy template changed:** re-run `judge/install.sh --apply`, then restart Hermes and the gateway (they read hooks at start). No new consent: it is keyed on `(event, command)`, not on the matcher or the script's contents.
 - **A unit changed:** `judge/install.sh --apply --with-units --start` (it also clears a `failed` state).
 
 ## Configuration
 
-Settings come from `site.env` at the repo root (template: [site.env.example](../site.env.example), section `# --- judge`). Unless a row says otherwise, a setting is read **environment > `site.env` > default**, on every hook call or runner run, so a change needs no restart. The units also read `~/.config/judge/judge.env` (optional, `KEY=value`), which is environment and so **overrides** `site.env` for the units only; leave it absent unless you want a unit-only override. Check what the judge resolves with `python3 judge/lib/config.py --get KEY`.
+Settings come from the site env (template: [site.env.example](../site.env.example), section `# --- judge`) and from `~/.config/judge/judge.env` (`$JUDGE_ENV` overrides the path; template: [judge.env.example](judge.env.example)). Unless a row says otherwise, a setting is read **environment > `judge.env` > site env > default**, on every hook call or runner run, so a change needs no restart. The units load the same judge.env as their environment, so hooks and units resolve the same values.
+
+- **Which site env:** `SITE_ENV` from the environment, else `SITE_ENV=` in judge.env, else `~/.config/deck/site.env`. An explicit `SITE_ENV` that is not a file is unresolved (no fallback). The checkout's own directory is never searched, so a relocated or split-out checkout has no site values until one of these says so.
+- **judge.env holds only `SITE_ENV=` and non-identifying policy knobs** (`JUDGE_MODE`, caps, timeouts: the list in `judge.env.example`). Site-identifying keys stay in the site env, where `scripts/check-sanitized.sh` checks them: `JUDGE_SSH_ALIASES`, `JUDGE_INFRA_REPOS`, `JUDGE_REPO_DIR`. `install.sh --apply` merges into an existing judge.env (sets only `SITE_ENV=`, keeps every other line, backs up a changed file) and warns about identifying keys it finds there.
+- **Data boundary (fail closed):** with `JUDGE_MODE=frontier`, no frontier call is made while the site env is unresolved or yields no site value to mask (the mask is built from it). The main stage is then judged locally with a note saying why, the claims stage is skipped, an explicit `rejudge.py --mode frontier|frontier-claims` is refused, and `judge-findings` and `hook-errors.log` (once per session) say so.
+
+Check what the judge resolves with `python3 judge/lib/config.py --get KEY` and `python3 judge/lib/config.py --site-env-path`.
 
 ### Policy as deployed
 
@@ -175,7 +182,7 @@ JUDGE_SENSITIVE_FRONTIER_CLAIMS=1    # sensitive completions also get a frontier
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `JUDGE_REPO_DIR` | the repo containing `judge/` | The deck repo; it and every git worktree of it are infra. |
+| `JUDGE_REPO_DIR` | empty | The deck repo; it and every git worktree of it are infra. Set it in the site env. Never guessed from the judge checkout's location; empty means no repo is infra by location (an empty value is never resolved to the cwd). |
 | `JUDGE_INFRA_REPOS` | empty | Extra directories (space-separated) whose files are infra. Name only the directory itself. Plain dirs are snapshotted at session start; git repos are diffed through git. Worktrees of `JUDGE_REPO_DIR` need no entry. |
 | `JUDGE_SECRET_GLOBS` | empty | Extra basename globs of secret files, never infra, on top of the built-in list (`site.env`, `*.env`, `*.key`, `*.pem`, `*secret*`, `secrets/`, `.sanitize-*`, ...). |
 | `JUDGE_SCRATCH_GLOBS` | empty | Extra globs over absolute paths (`*` crosses `/`) of agent scratch dirs, on top of `$HERMES_HOME/cache`, `$HERMES_HOME/tmp`, `~/.cache` and tool caches. They never decide the class and are metadata only. |
@@ -249,7 +256,8 @@ JUDGE_SENSITIVE_FRONTIER_CLAIMS=1    # sensitive completions also get a frontier
 |---|---|---|
 | `HERMES_HOME` | `~/.hermes` | Hermes profile. |
 | `JUDGE_REVIEW_DIR` | `$HERMES_HOME/review` | Review data. |
-| `SITE_ENV` (or `JUDGE_SITE_ENV` for `install.sh`) | `<repo>/site.env` | Path of the site file, for an extracted judge or another checkout. |
+| `SITE_ENV` (or `JUDGE_SITE_ENV` for `install.sh`) | `SITE_ENV=` in judge.env, else `~/.config/deck/site.env` | Path of the site file. Environment or judge.env; never looked up next to the checkout. |
+| `JUDGE_ENV` | `~/.config/judge/judge.env` | Environment only. Path of judge.env (tests, other profiles). The units always read `~/.config/judge/judge.env`. |
 | `JUDGE_ACK_AGENT_ENV` | empty | Environment only. Extra env names (comma-separated) that mark an agent session for `judge-ack`; it can only add markers. |
 | `JUDGE_ALERT_MIN_INTERVAL_S` | `900` | Environment only (`judge.env`). Seconds between two desktop alerts for the same failed unit; `runner.log` gets every alert. |
 | `JUDGE_CHECK_UNITS` | `1` | Environment only. `0`: `judge-findings` skips `systemctl --user is-failed` (the tests set it). |
@@ -367,7 +375,7 @@ Uninstall removes the managed hook entries, and the `hooks:` key itself if nothi
 
 ## Extracting to its own repo
 
-`judge/` is built to be lifted out. Nothing under `judge/` imports or sources anything outside it, except `site.env`, which only `lib/config.py` and `lib/config.sh` read, by path. The one deliberate soft link is `verify.py` running a repo's `scripts/check-sanitized.sh` when the changed file is inside such a repo, found at run time and skipped when absent.
+`judge/` is built to be lifted out. Nothing under `judge/` imports or sources anything outside it, except the site env, which only `lib/config.py` and `lib/config.sh` read, by path (`SITE_ENV`, judge.env, `~/.config/deck/site.env`; never relative to the checkout). The one deliberate soft link is `verify.py` running a repo's `scripts/check-sanitized.sh` when the changed file is inside such a repo, found at run time and skipped when absent.
 
 ```bash
 git clone <this repo> agent-judge && cd agent-judge
@@ -375,4 +383,4 @@ git filter-repo --subdirectory-filter judge     # judge/ becomes the repo root, 
 cp ../<this repo>/site.env.example site.env.example   # then keep only the judge and existing-var lines
 ```
 
-Afterwards point the judge at your site values with `SITE_ENV=/path/to/site.env` in the environment Hermes runs with, in the units (`judge.env`) and when running `install.sh`. Managed hook entries are recognised by their `managed_by` tag, so re-running `install.sh --apply` from the new location replaces the old entries. Approve the new command paths at the next consent prompt, and `hermes hooks revoke` the old ones.
+Afterwards point the judge at your site values: `judge/install.sh --apply --site-env /path/to/site.env` records `SITE_ENV=` in `~/.config/judge/judge.env`, which hooks and units both read (or rely on `~/.config/deck/site.env`). Keep `JUDGE_REPO_DIR` in the site env pointing at the deck checkout. Managed hook entries are recognised by their `managed_by` tag, so re-running `install.sh --apply` from the new location replaces the old entries. Approve the new command paths at the next consent prompt, and `hermes hooks revoke` the old ones.

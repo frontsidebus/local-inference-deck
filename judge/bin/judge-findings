@@ -134,6 +134,14 @@ def health_warnings(root):
     if bad:
         out.append(f"WARNING: judge runner is not running: {' '.join(bad)} failed. Fix: systemctl --user "
                    "reset-failed judge-review.service judge-review.path && systemctl --user start judge-review.path")
+    try:  # 0a data boundary: say plainly when the frontier judge is off because no site env resolves
+        from lib import config as LC
+        cfg = LC.load_config()
+        why = LC.frontier_refusal(cfg) if cfg.get("JUDGE_MODE", "frontier").strip().lower() == "frontier" else ""
+    except Exception as exc:
+        why = f"judge config could not be loaded ({type(exc).__name__})"
+    if why:
+        out.append(f"WARNING: frontier judge refused, every request is judged locally: {why}")
     try:
         st = Q.stall_status(root)
     except Exception:
