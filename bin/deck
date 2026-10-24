@@ -178,7 +178,7 @@ cmd_env() {
     esac
   done
   # refuse the judge before resolving anything (tools/site_keys.py refuses it too)
-  [ "$comp" != judge ] || die "refusing to slice 'judge': the judge is exempt from slicing; judge/lib/sitemask.py can only mask the site values it knows, so the judge must read the full site env"
+  [ "$comp" != judge ] || die "refusing to slice 'judge': the judge is exempt from slicing; its judge/lib/sitemask.py (agent-judge repo) can only mask the site values it knows, so the judge must read the full site env"
   local f; f="$(resolve_site_env "$explicit")"
   exec python3 -B "$SITE_KEYS" slice "$comp" --site-env "$f" ${out:+-o "$out"}
 }
