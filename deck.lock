@@ -8,7 +8,8 @@
 # - mode "pinned": the checkout must be at `commit`.
 # - mode "minimum": a working checkout; `commit` must be an ancestor of its HEAD. deck warns otherwise and never
 #   moves HEAD (sec-evals commits its attempts ledger after each confirmatory run).
-# repo/tag/commit stay null until the repo is published and tagged; a null commit skips the ancestor check.
+# repo and tag stay null until the repo is published and tagged (commit: the prepared sec-evals tip, which a push
+# keeps); a null commit skips the ancestor check.
 lock_format: 1
 components:
-  - {"name": "sec-evals", "repo": null, "tag": null, "commit": null, "mode": "minimum", "path": "~/src/deck/sec-evals", "requires_contracts": {"serving-identity": "1", "eval-liveness": "1", "gate-cli": "1"}}
+  - {"name": "sec-evals", "repo": null, "tag": null, "commit": "778840bcf8c4900844ed57b5019c1436a8531447", "mode": "minimum", "path": "~/src/deck/sec-evals", "requires_contracts": {"serving-identity": "1", "eval-liveness": "1", "gate-cli": "1"}}
