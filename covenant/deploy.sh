@@ -7,6 +7,9 @@
 #   sudo covenant/deploy.sh --set-client-secret [--instance digest] [--force]
 #   DESTDIR=/tmp/stage covenant/deploy.sh --env FILE   # stage files locally, run nothing
 #
+#   --env FILE                  site values (default: ../site.env next to covenant/). Usually the covenant
+#                               slice from the workstation: bin/deck env slice covenant -o FILE
+#
 # Order: packages (+ sshd, unattended-upgrades, secrets) -> wireguard -> ufw ->
 #        nginx base + bootstrap + certs -> full sites -> oauth2-proxy -> fail2ban
 #
@@ -50,7 +53,7 @@ while (($#)); do
     --set-client-secret) SET_SECRET=1 ;;
     --instance) need_value "$@"; INSTANCE=$2; shift ;;
     --force) FORCE=1 ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -230,9 +233,13 @@ if put "$HERE/ssh/sshd_config.d/10-hardening.conf" /etc/ssh/sshd_config.d/10-har
 fi
 run systemctl enable --now unattended-upgrades
 
+# The secrets spec reads SPARK_DIGEST_HOST from the same env file as this run (a full site.env or the
+# `bin/deck env slice covenant` slice), never from another site.env it might find.
 if live && [[ -x $REPO/scripts/gen-secrets.sh ]]; then
-  "$REPO/scripts/gen-secrets.sh" covenant
+  "$REPO/scripts/gen-secrets.sh" covenant --site-env "$ENV_FILE"
 else
+  # shellcheck disable=SC2034  # read by the sourced secrets spec
+  GS_SITE_ENV=$ENV_FILE
   # shellcheck source=../scripts/secrets.d/covenant.sh
   source "$REPO/scripts/secrets.d/covenant.sh"
 fi

@@ -13,12 +13,17 @@ hypervisor/  requirements for the host layer (managed in a separate IaC project)
 evals/       security eval harness (run.py, scorers, report); benchmark data and results are gitignored
 docs/        decisions, agent-judge design, runbooks, history (old Ollama-era docs live in docs/history/)
 scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh
+contracts/   machine-readable seams: site-keys.yaml (the site.env key registry), sanitize-policy.yaml (generated)
+tools/       site_keys.py: registry checks, the sanitize-policy generator, `deck env slice` and `deck check`
+bin/deck     one entry point: deck evals, deck env slice, deck check
 site.env.example
 ```
 Each deployable component dir has its own `README.md` (what it is, deploy steps, verify, rollback) and an entry point: `walter/deploy.sh`, `covenant/deploy.sh`, `clients/install.sh` (wrapped by `clients/deploy.sh`), `judge/install.sh`. `hypervisor/` has a README only.
 
 ## Site values → `site.env` (gitignored), template in `site.env.example`
-Use these names. If you need a new one, add it to `site.env.example` under your component's section with a comment and a safe example value. The block below is the shared core; [site.env.example](site.env.example) is the complete, authoritative list (it also has the edge, backend, client and `JUDGE_*` settings).
+Use these names. If you need a new one, add it to `site.env.example` under your component's section with a comment and a safe example value, **and** add its entry to [contracts/site-keys.yaml](contracts/site-keys.yaml) at the same position: owner, consumers (every component whose code or templates read it), required, the default exactly as written in the example, and its sanitize class. Then run `python3 tools/site_keys.py policy` to regenerate `contracts/sanitize-policy.yaml`. `tools/tests/test_site_keys.py` (CI) fails until the example and the registry agree, and when a template, a secrets spec or a deploy script reads a key that the registry does not assign to its component. Renaming or removing a key is a major `contract_version` change. The block below is the shared core; [site.env.example](site.env.example) is the complete, authoritative list (it also has the edge, backend, client and `JUDGE_*` settings).
+
+A host gets only its **slice** of `site.env`: `bin/deck env slice <component> -o FILE` writes the keys the registry assigns to that component (mode 600, lines copied verbatim; it prints key names, never values). Covenant deploys from one (`covenant/deploy.sh --env FILE`). The judge is exempt: it reads the full `site.env`, because its sitemask can only mask values it knows. `bin/deck check` checks `site.env` against the registry and `judge.env` against its allowed keys.
 
 ```
 # --- identity / DNS

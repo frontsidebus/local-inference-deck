@@ -35,6 +35,11 @@ jobs:
         run: python3 -m pytest walter/gateway/tests -q -p no:cacheprovider
       - name: sanitizer tests
         run: python3 -m pytest scripts/tests -q -p no:cacheprovider
+      - name: site-key registry (C1) and deck env/check tests
+        run: |
+          python3 -B tools/site_keys.py validate
+          python3 -B tools/site_keys.py policy --check
+          python3 -m pytest tools/tests -q -p no:cacheprovider
       - name: check-sanitized (generic secret shapes; no real values in CI)
         run: CI=true bash scripts/check-sanitized.sh --all --regex-only
       - name: shellcheck

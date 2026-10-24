@@ -64,6 +64,32 @@ is exactly the six-site one, plus a single `digest: off` line.
 Both client ids must be the ids Pocket-ID really has, which are not always the client names (see
 [Pocket-ID clients and groups](#pocket-id-clients-and-groups)). They are not secrets.
 
+### The edge's site values: a covenant slice
+
+The edge needs only the keys above, not the whole `site.env` (judge, client, lab and Walter-only
+keys). The workstation writes a **slice** with exactly the keys that
+[`contracts/site-keys.yaml`](../contracts/site-keys.yaml) assigns to covenant, and `deploy.sh` reads
+it with `--env`:
+
+```bash
+# workstation: reads the site env in the deck order (--site-env > $SITE_ENV > ~/.config/deck/site.env
+# > <repo>/site.env); writes mode 600; prints key names and counts, never values
+bin/deck env slice covenant -o ~/covenant.env
+scp -p ~/covenant.env <edge>:covenant.env && ssh <edge> chmod 600 covenant.env
+sha256sum ~/covenant.env; ssh <edge> sha256sum covenant.env        # must match
+# edge, from the repo checkout
+sudo covenant/deploy.sh --env ~/covenant.env --dry-run
+```
+
+Every `deploy.sh` command in this README passes the same `--env ~/covenant.env`, including
+`--set-client-secret`, which checks the env like a full run. `deploy.sh` hands that file to the
+secrets spec too (`gen-secrets.sh covenant --site-env FILE`), so a digest switched on in the slice
+gets its cookie secret. After any change to `site.env`, slice again and copy the new file. A slice
+renders exactly what the full `site.env` renders (the lines are copied verbatim, and `deck env
+slice` refuses a value that would change, such as one that refers to a key outside the slice).
+Without `--env`, `deploy.sh` reads `site.env` next to `covenant/` as before; once the slice works,
+the full `site.env` no longer needs to be on the edge (`shred -u` it).
+
 ## Secrets
 
 Generated on the host by `scripts/gen-secrets.sh covenant` (`scripts/secrets.d/covenant.sh`),
@@ -84,7 +110,8 @@ unprivileged `oauth2-proxy` user a private copy under `%d`.
 
 `--set-client-secret` (with `--instance digest` for the second instance) reads the secret from
 stdin with no echo, writes it root 0600 without a trailing newline, and restarts the instance. It
-checks `site.env` like a full run, so run it from the checkout that holds the edge's `site.env`. It
+checks the env file like a full run, so pass the same `--env ~/covenant.env` (or run it from the
+checkout that holds the edge's `site.env`). It
 refuses to replace an existing secret unless `--force` is given. Piped input needs a trailing
 newline: without one, `read` fails at the end of the input and the script exits without storing
 anything. Rotation of every secret here: [docs/runbooks/rotate-secrets.md](../docs/runbooks/rotate-secrets.md).
@@ -146,12 +173,14 @@ group and client are created in the UI (or with the API method in walter/README.
 ## First deploy (fresh instance)
 
 1. AWS as above; DNS resolving to the Elastic IP for all five names (six with the digest).
-2. On the edge: clone the repo, `cp site.env.example site.env`, fill it in.
+2. On the edge: clone the repo. On the workstation: fill in `site.env` (from `site.env.example`),
+   then slice it and copy the slice to the edge as `~/covenant.env`
+   ([a covenant slice](#the-edges-site-values-a-covenant-slice)).
    `WG_BACKEND_PUBLIC_KEY` comes from the backend (`wg pubkey < /etc/wireguard/privatekey` there).
    It must be the real key: with `CHANGEME` the dry run only warns, and the live run stops at step
    2/7.
-3. `sudo covenant/deploy.sh --dry-run`, read it, then
-   `sudo covenant/deploy.sh --setup-lock` (the lock is only for step 5's window). It runs, in order:
+3. `sudo covenant/deploy.sh --env ~/covenant.env --dry-run`, read it, then
+   `sudo covenant/deploy.sh --env ~/covenant.env --setup-lock` (the lock is only for step 5's window). It runs, in order:
    1. packages, sshd hardening (`sshd -t` then reload), unattended-upgrades, secrets;
    2. WireGuard `wg0` (enabled + started);
    3. ufw (22, 80, 443/tcp, `WG_PORT`/udp; default deny in);
@@ -177,13 +206,13 @@ group and client are created in the UI (or with the API method in walter/README.
    `PersistentKeepalive`; the edge's peer entry deliberately has no `Endpoint`. Check: `sudo wg show`
    shows a recent handshake; `ping BACKEND_WG_IP`.
 5. **Immediately** claim the Pocket-ID admin at `https://SPARK_ID_HOST/setup` from an admin IP
-   (everyone else gets 403 while the lock is on), then `sudo covenant/deploy.sh` without
+   (everyone else gets 403 while the lock is on), then `sudo covenant/deploy.sh --env ~/covenant.env` without
    `--setup-lock` (or `covenant/scripts/setup-lock.sh disable`).
 6. In Pocket-ID create the OIDC client for the telemetry gate: client id `OAUTH2_PROXY_CLIENT_ID`,
    callback `https://SPARK_TELEMETRY_HOST/oauth2/callback`, confidential, PKCE on, allowed group
    `TELEMETRY_GROUP` (`walter/webui/pocketid-bootstrap.py` does this). Check the id with the `/meta`
    probe ([Pocket-ID clients and groups](#pocket-id-clients-and-groups)), then
-   `sudo covenant/deploy.sh --set-client-secret` (paste; no echo) - this starts oauth2-proxy.
+   `sudo covenant/deploy.sh --env ~/covenant.env --set-client-secret` (paste; no echo) - this starts oauth2-proxy.
    The digest gate (optional) is set up the same way - see the Digest section below.
 
 **Re-running on a live edge.** `deploy.sh` converges the whole edge, not just what you changed, so
@@ -217,7 +246,8 @@ is otherwise identical to a deploy without the feature. If the digest is off but
 Enabling it on a live edge:
 
 1. `site.env`: set `SPARK_DIGEST_HOST` (and `DIGEST_GROUP` / `OAUTH2_PROXY_DIGEST_CLIENT_ID` if
-   the defaults do not suit). The DNS A record must already resolve to `EDGE_PUBLIC_IP`. Create the
+   the defaults do not suit), then slice it again and copy the new `~/covenant.env` to the edge
+   ([a covenant slice](#the-edges-site-values-a-covenant-slice)). The DNS A record must already resolve to `EDGE_PUBLIC_IP`. Create the
    Pocket-ID group and client (step 4) **before** the deploy, so that the client id in `site.env` is
    the real one (`/meta` probe) and the client secret is at hand for step 5.
 2. **Do not issue the cert by hand first.** `00-default` does not answer ACME for the digest
@@ -225,7 +255,7 @@ Enabling it on a live edge:
    and id names. The digest's own `:80` ACME block lives in `60-digest`, next to a `:443` server
    that needs the cert, so linking the full site before the cert exists fails `nginx -t`.
    `deploy.sh` resolves this itself, with no downtime and no manual nginx edit (step 3).
-3. `sudo covenant/deploy.sh --dry-run`, read it, then `sudo covenant/deploy.sh`. With the core
+3. `sudo covenant/deploy.sh --env ~/covenant.env --dry-run`, read it, then `sudo covenant/deploy.sh --env ~/covenant.env`. With the core
    certs present and only the digest cert missing, step 4/7 prints
    `no cert yet for optional site(s): 60-digest (...); ACME-only stub, no downtime`, links
    `sites-enabled/60-digest` to the port-80-only stub `60-digest-acme`, runs `nginx -t` and a
@@ -249,7 +279,7 @@ Enabling it on a live edge:
    If Pocket-ID gave it a UUID id, that UUID is `OAUTH2_PROXY_DIGEST_CLIENT_ID`. A wrong id is only
    fixed by correcting `site.env` and re-running `deploy.sh`: `--set-client-secret` does not
    re-render the config.
-5. `sudo covenant/deploy.sh --set-client-secret --instance digest` (paste; no echo). It stores
+5. `sudo covenant/deploy.sh --env ~/covenant.env --set-client-secret --instance digest` (paste; no echo). It stores
    `/etc/oauth2-proxy-digest/client-secret` (root 0600) and restarts `oauth2-proxy-digest`, which
    ends the 500 window.
 
@@ -300,6 +330,8 @@ webroot, and the installer only reloads nginx afterwards).
 ```
 DESTDIR=/tmp/covenant-stage covenant/deploy.sh --env /path/to/test-site.env
 ```
+(a covenant slice of it stages the same files: `bin/deck env slice covenant --site-env
+/path/to/test-site.env -o /tmp/covenant.env`, then `--env /tmp/covenant.env`)
 installs every rendered file under the prefix (staging-quality dummy secrets, oauth2-proxy
 downloaded and checksum-verified) and only prints the host commands. `--dry-run` shows unified
 diffs against an existing tree (never for `wg0.conf`, which holds the private key).

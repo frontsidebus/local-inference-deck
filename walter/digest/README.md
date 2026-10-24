@@ -463,7 +463,7 @@ The route tests need `starlette` and `httpx` and are skipped without them.
 | progress stalls in the UI | SSE needs the unbuffered `location` in `60-digest`. Check `docker compose logs app` for the run |
 | 409 on RUN NOW | that watch is still running; wait for `done` |
 | the UI loads unstyled, or the browser console shows 404s for `/static/...` | the running image predates the `/static` mount: rebuild ([redeploy](#redeploy-only-the-digest)) |
-| login fails at Pocket-ID with "OIDC client not found" | `OAUTH2_PROXY_DIGEST_CLIENT_ID` is not the client's real id (usually a UUID). Fix it in Covenant's `site.env` and re-run `covenant/deploy.sh` (`--set-client-secret` does not re-render the cfg) |
+| login fails at Pocket-ID with "OIDC client not found" | `OAUTH2_PROXY_DIGEST_CLIENT_ID` is not the client's real id (usually a UUID). Fix it in `site.env`, slice it again for Covenant (`bin/deck env slice covenant`) and re-run `covenant/deploy.sh --env ~/covenant.env` (`--set-client-secret` does not re-render the cfg) |
 
 ## Rollback
 
