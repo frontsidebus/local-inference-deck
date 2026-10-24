@@ -1,0 +1,13 @@
+{
+  "contract": "infra-repo",
+  "contract_version": "1.0",
+  "owner": "agent-judge",
+  "about": "C10: what agent-judge requires of every repo in JUDGE_REPO_DIR and JUDGE_INFRA_REPOS. The verify hook finds a repo root by these files (judge/hooks/verify.py find_repo) and runs its sanitizer there; the render_and_diff and check_sanitized probes resolve their scripts under JUDGE_REPO_DIR only (judge/probes/probe.py). Versioning: minor = a new optional file; major = a new required file, a renamed path, or changed exit codes.",
+  "repo_root_files": ["CONVENTIONS.md", "scripts/check-sanitized.sh"],
+  "executable": ["scripts/check-sanitized.sh"],
+  "sanitizer": {
+    "invocation": "bash scripts/check-sanitized.sh (cwd = the repo root)",
+    "exit_codes": {"0": "clean", "1": "real values found", "2": "no real-value source (fail closed)"}
+  },
+  "resolved_under_judge_repo_dir": ["scripts/render.sh", "scripts/check-sanitized.sh"]
+}
