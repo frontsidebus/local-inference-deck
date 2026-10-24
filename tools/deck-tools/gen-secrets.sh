@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# gen-secrets.sh -- generate a component's secrets ON THE TARGET HOST.
+# gen-secrets.sh -- generate a component's secrets ON THE TARGET HOST. (deck-tools engine; callers use
+# the scripts/gen-secrets.sh shim, which passes --repo.)
 #
-# Usage: scripts/gen-secrets.sh <component> [--dry-run] [--destdir DIR] [--site-env FILE]
-#   component   name of a file in scripts/secrets.d/<component>.sh (walter, covenant, ...)
+# Usage: gen-secrets.sh <component> [--dry-run] [--destdir DIR] [--site-env FILE] [--repo DIR] [--spec-dir DIR]
+#   component   name of a file in <spec-dir>/<component>.sh (walter, covenant, ...)
+#   --repo      the repo the specs belong to; exported to them as REPO (default: two levels above
+#               this file, i.e. the repo that vendors tools/deck-tools/)
+#   --spec-dir  where the specs live (default: <repo>/scripts/secrets.d)
 #   --dry-run   report what would be created; write nothing (also: DRY_RUN=1)
 #   --destdir   operate under a prefix instead of / (local tests; also: DESTDIR=...)
 #   --site-env  site env for specs that read a site value (covenant: SPARK_DIGEST_HOST when it is
@@ -13,6 +17,8 @@
 #   - NEVER overwrite an existing secret. Existing files / env values are kept as is.
 #   - NEVER print a secret value (names, paths and modes only).
 #   - Idempotent: a second run changes nothing.
+#
+# Options may come in any order; a repeated option's last value wins.
 #
 # secrets.d files are sourced (bash) with DESTDIR, DRY_RUN, REPO, GS_SITE_ENV and the helpers below
 # available. They may also be self-contained (covenant.sh defines its own helpers).
@@ -29,17 +35,20 @@
 #   gs_note MSG                             log to stderr
 set -euo pipefail
 
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-export REPO
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
-component="" GS_SITE_ENV=""
+component="" GS_SITE_ENV="" SPEC_DIR=""
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --repo) REPO=${2:?--repo needs a directory}; shift ;;
+    --repo=?*) REPO=${1#--repo=} ;;
+    --spec-dir) SPEC_DIR=${2:?--spec-dir needs a directory}; shift ;;
+    --spec-dir=?*) SPEC_DIR=${1#--spec-dir=} ;;
     --dry-run) export DRY_RUN=1 ;;
     --destdir) export DESTDIR=${2:?--destdir needs a directory}; shift ;;
     --site-env) GS_SITE_ENV=${2:?--site-env needs a file}; shift
                 [[ -f $GS_SITE_ENV ]] || { echo "gen-secrets: site env not found: $GS_SITE_ENV" >&2; exit 2; } ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/!p}' "$0"; exit 0 ;;
     -*) echo "gen-secrets: unknown option $1" >&2; exit 2 ;;
     *) component=$1 ;;
   esac
@@ -47,6 +56,10 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n $component ]] || { echo "usage: gen-secrets.sh <component> [--dry-run] [--destdir DIR] [--site-env FILE]" >&2; exit 2; }
 [[ $component =~ ^[a-z0-9_-]+$ ]] || { echo "gen-secrets: bad component name" >&2; exit 2; }
+[[ -d $REPO ]] || { echo "gen-secrets: --repo: not a directory: $REPO" >&2; exit 2; }
+REPO=$(cd "$REPO" && pwd)
+export REPO
+SPEC_DIR=${SPEC_DIR:-$REPO/scripts/secrets.d}
 export DESTDIR=${DESTDIR:-}
 export DRY_RUN=${DRY_RUN:-0}
 DESTDIR=${DESTDIR%/}
@@ -62,7 +75,7 @@ if [[ -z $GS_SITE_ENV ]]; then
 fi
 export GS_SITE_ENV
 
-SPEC=$REPO/scripts/secrets.d/$component.sh
+SPEC=$SPEC_DIR/$component.sh
 [[ -f $SPEC ]] || { echo "gen-secrets: no secrets spec $SPEC" >&2; exit 1; }
 
 if [[ -z $DESTDIR && $DRY_RUN != 1 && $EUID -ne 0 ]]; then

@@ -1,4 +1,5 @@
-"""walter/deploy.sh and scripts/render.sh, exercised with --destdir only.
+"""walter/deploy.sh and scripts/render.sh (the shim) / tools/deck-tools/render.sh (the engine), exercised with
+--destdir only.
 
 --destdir installs under a temp prefix and skips every system action (apt, systemctl, docker, ufw),
 so these tests never touch the host. Site values come from site.env.example (offsite and digest off)
@@ -38,7 +39,7 @@ def repo_copy(tmp_path):
     """A throwaway copy of the parts deploy.sh needs, so tests can edit "repo" files."""
     dst = tmp_path / "repo"
     ign = shutil.ignore_patterns("__pycache__", "tests", ".pytest_cache")
-    for d in ("walter", "scripts"):
+    for d in ("walter", "scripts", "tools"):   # tools/: the deck-tools engines behind the scripts/ shims
         shutil.copytree(REPO / d, dst / d, ignore=ign, symlinks=True)
     shutil.copy2(EXAMPLE, dst / "site.env.example")
     return dst
@@ -53,8 +54,17 @@ def deploy(root, env, *args, repo=REPO, check=True):
     return r.stdout + r.stderr
 
 
-def render(env, *args, repo=REPO):
-    return subprocess.run(["bash", str(repo / "scripts" / "render.sh"), "-e", str(env), *args],
+RENDER_ENTRY = {"shim": Path("scripts/render.sh"), "engine": Path("tools/deck-tools/render.sh")}
+
+
+@pytest.fixture(params=sorted(RENDER_ENTRY))
+def entry(request):
+    """The render tests run through the scripts/ shim and through the engine it execs."""
+    return request.param
+
+
+def render(env, *args, repo=REPO, entry="shim"):
+    return subprocess.run(["bash", str(repo / RENDER_ENTRY[entry]), "-e", str(env), *args],
                           capture_output=True, text=True, timeout=60)
 
 
@@ -76,10 +86,11 @@ def compose_lines(out, stack):
 
 # ---- render.sh: optional blocks and excludes ---------------------------------------------------
 
-def test_render_backup_offsite_off_with_excludes(tmp_path):
+def test_render_backup_offsite_off_with_excludes(tmp_path, entry):
     env = write_env(tmp_path)  # RESTIC_BUCKET="" as in site.env.example
     out = tmp_path / "out"
-    r = render(env, "-x", "spark-offsite*", "-x", "offsite-*", str(REPO / "walter/backup"), str(out))
+    r = render(env, "-x", "spark-offsite*", "-x", "offsite-*", str(REPO / "walter/backup"), str(out),
+               entry=entry)
     assert r.returncode == 0, r.stderr
     assert not list(out.glob("*offsite*.json")) and not list(out.glob("spark-offsite*"))
     restore = (out / "RESTORE.md").read_text()
@@ -87,17 +98,17 @@ def test_render_backup_offsite_off_with_excludes(tmp_path):
     assert "no offsite copy" in restore and "@@" not in restore and "restic restore" not in restore
 
 
-def test_render_backup_offsite_off_without_excludes_still_refuses_iam_policy(tmp_path):
+def test_render_backup_offsite_off_without_excludes_still_refuses_iam_policy(tmp_path, entry):
     # Strictness is kept: the IAM policy really needs the bucket, so only deploy's -x skips it.
-    r = render(write_env(tmp_path), str(REPO / "walter/backup"), str(tmp_path / "out"))
+    r = render(write_env(tmp_path), str(REPO / "walter/backup"), str(tmp_path / "out"), entry=entry)
     assert r.returncode != 0 and "offsite-iam-policy.json.tmpl" in r.stderr
     assert "RESTORE.md.tmpl" not in r.stderr
 
 
 @pytest.mark.parametrize("bucket,on", [("spark-backups-example", True), ("CHANGEME", False)])
-def test_render_restore_md_bucket_set_or_changeme(tmp_path, bucket, on):
+def test_render_restore_md_bucket_set_or_changeme(tmp_path, entry, bucket, on):
     env = write_env(tmp_path, RESTIC_BUCKET=bucket)
-    r = render(env, str(REPO / "walter/backup"), str(tmp_path / "out"))
+    r = render(env, str(REPO / "walter/backup"), str(tmp_path / "out"), entry=entry)
     assert r.returncode == 0, r.stderr
     restore = (tmp_path / "out/RESTORE.md").read_text()
     assert "@@" not in restore
@@ -105,12 +116,12 @@ def test_render_restore_md_bucket_set_or_changeme(tmp_path, bucket, on):
     assert ("## 7. Offsite copy (not configured)" in restore) is not on
 
 
-def test_render_cond_blocks(tmp_path):
+def test_render_cond_blocks(tmp_path, entry):
     env = write_env(tmp_path, RESTIC_BUCKET="", SPARK_DIGEST_HOST="digest.example.com")
     t = tmp_path / "x.tmpl"
     t.write_text("a\n# @@if SPARK_DIGEST_HOST@@\nhost=${SPARK_DIGEST_HOST}\n# @@else@@\nno digest\n"
                  "# @@endif@@\n<!-- @@if RESTIC_BUCKET@@ -->\nb=${RESTIC_BUCKET}\n<!-- @@endif@@ -->\nz\n")
-    r = render(env, str(t), str(tmp_path / "x"))
+    r = render(env, str(t), str(tmp_path / "x"), entry=entry)
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "x").read_text() == "a\nhost=digest.example.com\nz\n"
 
@@ -120,17 +131,17 @@ def test_render_cond_blocks(tmp_path):
     ("# @@if RESTIC_BUCKET@@\nx\n", "unterminated"),
     ("x\n# @@endif@@\n", "without"),
 ])
-def test_render_cond_errors(tmp_path, body, msg):
+def test_render_cond_errors(tmp_path, entry, body, msg):
     t = tmp_path / "bad.tmpl"
     t.write_text(body)
-    r = render(write_env(tmp_path), str(t), str(tmp_path / "bad"))
+    r = render(write_env(tmp_path), str(t), str(tmp_path / "bad"), entry=entry)
     assert r.returncode != 0 and msg in r.stderr
 
 
-def test_render_without_blocks_is_byte_for_byte(tmp_path):
+def test_render_without_blocks_is_byte_for_byte(tmp_path, entry):
     t = tmp_path / "plain.tmpl"
     t.write_bytes(b"user=${BACKEND_SSH_USER} keep=${NOT_A_SITE_VAR} $host\nno newline at end")
-    r = render(write_env(tmp_path), str(t), str(tmp_path / "plain"))
+    r = render(write_env(tmp_path), str(t), str(tmp_path / "plain"), entry=entry)
     assert r.returncode == 0, r.stderr
     assert (tmp_path / "plain").read_bytes() == b"user=operator keep=${NOT_A_SITE_VAR} $host\nno newline at end"
 

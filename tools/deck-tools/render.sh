@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# render.sh -- render *.tmpl files with site values from site.env.
+# render.sh -- render *.tmpl files with site values from site.env. (deck-tools engine; callers use the
+# scripts/render.sh shim, which passes --repo.)
 #
 # Usage:
-#   scripts/render.sh [-e SITE_ENV] [-x GLOB]... SRC DST
+#   render.sh [--repo DIR] [--keys FILE] [-e SITE_ENV] [-x GLOB]... SRC DST
+#     --repo DIR   the repo whose site.env.example and site.env are used (default: two levels above this
+#                  file, i.e. the repo that vendors tools/deck-tools/)
+#     --keys FILE  the key list (default <repo>/site.env.example); see "Substitution" below
 #     SRC is a file or a directory.
 #       file  *.tmpl   -> rendered to DST (DST is the output file path)
 #       file  other    -> copied verbatim to DST
@@ -11,14 +15,16 @@
 #                         verbatim (mode bits preserved).
 #     -x GLOB  (directory SRC only, repeatable) skip files whose name matches GLOB, e.g. the
 #              files of an optional feature that is off.
-#   scripts/render.sh [-e SITE_ENV] --vars       print the variable list and exit
-#   scripts/render.sh [-e SITE_ENV] --check SRC  list site vars used by SRC that are empty
+#   render.sh [--repo DIR] [--keys FILE] [-e SITE_ENV] --vars       print the variable list and exit
+#   render.sh [--repo DIR] [--keys FILE] [-e SITE_ENV] --check SRC  list site vars used by SRC that are empty
+#   The options before SRC/--vars/--check may come in any order; a repeated option's last value wins.
 #
 # Site env: -e FILE, else $SITE_ENV, else ~/.config/deck/site.env, else <repo>/site.env
 # (a dangling ~/.config/deck/site.env symlink is an error, not a fall-through).
 #
 # Substitution uses envsubst with an EXPLICIT variable list: only the names that are
-# defined in site.env.example (the contract) or site.env are replaced. Everything else
+# defined in the --keys file (default site.env.example, the contract) or site.env are replaced:
+# the list is the UNION of both, so a name that is only in the site env still expands. Everything else
 # (${PORT} in llama-swap, $host in nginx, ${POSTGRES_PASSWORD:?} in compose files,
 # shell variables in scripts) passes through untouched. Templates must use ${NAME}.
 # A template that references a site variable which is unset or empty is an error.
@@ -30,8 +36,8 @@
 # dropped block are not required. Templates without @@if are rendered byte for byte as before.
 set -euo pipefail
 
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-SITE_ENV_FILE=""
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+SITE_ENV_FILE="" KEYS_FILE=""
 
 die() { echo "render: $*" >&2; exit 1; }
 
@@ -43,17 +49,33 @@ default_site_env() { # $SITE_ENV > ~/.config/deck/site.env > <repo>/site.env
 }
 
 EXCLUDES=()
-while [[ ${1:-} == -e || ${1:-} == -x ]]; do
+while [[ ${1:-} == -e || ${1:-} == -x || ${1:-} == --repo || ${1:-} == --keys || ${1:-} == --repo=* || ${1:-} == --keys=* ]]; do
+  case $1 in
+    --repo=*) REPO=${1#--repo=}; shift; continue ;;
+    --keys=*) KEYS_FILE=${1#--keys=}; shift; continue ;;
+  esac
   [[ -n ${2:-} ]] || die "$1 needs an argument"
-  if [[ $1 == -e ]]; then SITE_ENV_FILE=$2; else EXCLUDES+=("$2"); fi
+  case $1 in
+    -e) SITE_ENV_FILE=$2 ;;
+    -x) EXCLUDES+=("$2") ;;
+    --repo) REPO=$2 ;;
+    --keys) KEYS_FILE=$2 ;;
+  esac
   shift 2
 done
+[[ -d $REPO ]] || die "--repo: not a directory: $REPO"
+REPO=$(cd "$REPO" && pwd)
+if [[ -n $KEYS_FILE ]]; then
+  [[ -f $KEYS_FILE ]] || die "--keys: no such file: $KEYS_FILE"
+else
+  KEYS_FILE=$REPO/site.env.example   # may be absent: then only the site env's names are used, as before
+fi
 [[ -n $SITE_ENV_FILE ]] || SITE_ENV_FILE=$(default_site_env)
 command -v envsubst >/dev/null || die "envsubst not found (apt-get install gettext-base)"
 [[ -f $SITE_ENV_FILE ]] || die "site env not found: $SITE_ENV_FILE (copy site.env.example to site.env)"
 
-# Variable names: the union of names assigned in site.env.example and site.env.
-mapfile -t VARS < <(cat "$REPO/site.env.example" "$SITE_ENV_FILE" 2>/dev/null \
+# Variable names: the union of names assigned in the keys file (site.env.example) and site.env.
+mapfile -t VARS < <(cat "$KEYS_FILE" "$SITE_ENV_FILE" 2>/dev/null \
   | sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Z][A-Z0-9_]*)=.*/\2/p' | sort -u)
 ((${#VARS[@]})) || die "no variables found in site.env(.example)"
 

@@ -11,12 +11,20 @@
 #                    key-pair names, old hostnames, ...); read from ~/.config/deck/ and the repo root
 #   .sanitize-words  optional, whole words matched case-insensitively (real first names);
 #                    read from ~/.config/deck/ and the repo root
-# The example baseline is <repo>/site.env.example: a value equal to its example is public.
+# The repo checked: --repo DIR, else the git work tree of the current directory (so one repo's script can
+# check another checkout when run from there). The baseline, policy and repo-root files are read from that
+# repo, never from the repo this script is vendored in.
+# Example baseline (a value equal to its example default is public), first found of:
+#   --keys FILE  >  <repo>/contracts/site-keys.yaml (`default` of each active key)  >  the union of
+#   <repo>/*.env.example. FILE is a registry like contracts/site-keys.yaml when it ends in .yaml/.yml, else an
+#   env-style example. With none of them, every site value counts as real (stricter, never looser), and a
+#   note on stderr says so.
 # Per-key policy (which keys are checked): <repo>/contracts/sanitize-policy.yaml when present (generated from
 # contracts/site-keys.yaml by tools/site_keys.py), else the built-in table in builtin_action below. Both give
 # every key the same action; a malformed policy file is an error (exit 2), never a silent fallback.
 #
-# Usage: scripts/check-sanitized.sh [--all | --history] [--regex-only] [--site-env FILE]
+# Usage: check-sanitized.sh [--all | --history] [--regex-only] [--site-env FILE] [--repo DIR] [--keys FILE]
+#   (deck-tools engine; in a repo, run it through its scripts/check-sanitized.sh shim)
 #   (default)      staged + untracked files (working-tree contents)
 #   --all          every tracked file (working-tree contents of `git ls-files`)
 #   --history      every commit (git rev-list --all): real values, .sanitize-extra and
@@ -30,8 +38,10 @@ set -euo pipefail
 
 die2() { echo "check-sanitized: $*" >&2; exit 2; }
 abs() { [[ $1 == /* ]] && printf '%s\n' "$1" || printf '%s\n' "$PWD/$1"; }
+# A dangling symlink is an error, never a silent fall-through: it means the operator's pointer is broken.
+dangling() { [[ -L $1 && ! -e $1 ]]; }
 
-mode=staged regex_only=0 site_flag=""
+mode=staged regex_only=0 site_flag="" repo_flag="" keys_flag=""
 while (($#)); do
   case $1 in
     --all) mode=all ;;
@@ -39,7 +49,11 @@ while (($#)); do
     --regex-only) regex_only=1 ;;
     --site-env) [[ -n ${2:-} ]] || die2 "--site-env needs a file"; site_flag=$(abs "$2"); shift ;;
     --site-env=?*) site_flag=$(abs "${1#--site-env=}") ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    --repo) [[ -n ${2:-} ]] || die2 "--repo needs a directory"; repo_flag=$(abs "$2"); shift ;;
+    --repo=?*) repo_flag=$(abs "${1#--repo=}") ;;
+    --keys) [[ -n ${2:-} ]] || die2 "--keys needs a file"; keys_flag=$(abs "$2"); shift ;;
+    --keys=?*) keys_flag=$(abs "${1#--keys=}") ;;
+    -h|--help) sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/!p}' "$0"; exit 0 ;;
     *) die2 "unknown argument: $1 (usage: check-sanitized.sh [--all|--history] [--regex-only] [--site-env FILE])" ;;
   esac
   shift
@@ -47,7 +61,17 @@ done
 # Relative $SITE_ENV / $JUDGE_ENV are relative to the caller's directory, not the repo root.
 [[ -z ${SITE_ENV:-} ]] || SITE_ENV=$(abs "$SITE_ENV")
 [[ -z ${JUDGE_ENV:-} ]] || JUDGE_ENV=$(abs "$JUDGE_ENV")
-cd "$(git rev-parse --show-toplevel)"
+if [[ -n $repo_flag ]]; then
+  [[ -d $repo_flag ]] || die2 "--repo: not a directory: $repo_flag"
+  top=$(git -C "$repo_flag" rev-parse --show-toplevel 2>/dev/null) || die2 "--repo: not a git work tree: $repo_flag"
+  cd "$top"
+else
+  cd "$(git rev-parse --show-toplevel)"
+fi
+if [[ -n $keys_flag ]]; then
+  dangling "$keys_flag" && die2 "--keys is a dangling symlink: $keys_flag"
+  [[ -f $keys_flag ]] || die2 "--keys: no such file: $keys_flag"
+fi
 
 if ((regex_only)); then
   [[ ${CI:-} == true ]] || die2 "--regex-only checks no real values and is refused outside CI (CI=true)"
@@ -56,8 +80,7 @@ fi
 
 # ---- real-value sources ---------------------------------------------------------------------
 # A candidate is usable when it is a regular file (or a symlink to one). A dangling symlink is an
-# error, never a silent fall-through: it means the operator's pointer is broken.
-dangling() { [[ -L $1 && ! -e $1 ]]; }
+# error, never a silent fall-through (dangling() is defined at the top).
 
 resolve_site_env() {
   local c how
@@ -141,15 +164,75 @@ labels=$tmp/labels       # "LABEL<TAB>literal" per pattern, for --history report
 words=$tmp/words         # .sanitize-words
 : >"$patterns"; : >"$labels"; : >"$words"
 
-# Values from an env file that differ from site.env.example (i.e. the real ones), with the
+# ---- example baseline -------------------------------------------------------------------------
+# $baseline holds "KEY=default" lines as written in an env example. The registry's `default` is copied from
+# site.env.example exactly as written, so both normalise the same way. A value equal to any baseline line of
+# its key is public; with one line per key (the norm) this is the plain "differs from the example" test.
+baseline=$tmp/baseline
+registry_baseline() { # REGISTRY: append KEY=default for each active key of a contracts/site-keys.yaml file
+  python3 -I -c '
+import json, re, sys
+path, out, section = sys.argv[1], [], None
+for n, line in enumerate(open(path, encoding="utf-8"), 1):
+    line = line.rstrip("\n")
+    if not line.strip() or line.startswith("#"):
+        continue
+    m = re.match(r"([a-z_]+):", line)
+    if m:
+        section = m.group(1)
+    elif section == "keys" and line.startswith("  - {"):
+        try:
+            k = json.loads(line[4:])
+        except ValueError:
+            sys.exit(f"{path}:{n}: a keys entry is not one JSON object")
+        if not (isinstance(k, dict) and isinstance(k.get("name"), str) and isinstance(k.get("default", ""), str)):
+            sys.exit(f"{path}:{n}: a keys entry needs a string name and default")
+        if k.get("active", True):
+            out.append(k["name"] + "=" + k.get("default", "").replace("\n", " "))
+if not out:
+    sys.exit(f"{path}: no active keys")
+print("\n".join(out))
+' "$1" >>"$baseline" || die2 "cannot read the key registry $1 (see the format in its header)"
+}
+load_baseline() {
+  local f found=0
+  : >"$baseline"
+  if [[ -n $keys_flag ]]; then
+    case $keys_flag in
+      *.yaml|*.yml) registry_baseline "$keys_flag" ;;
+      *) cat "$keys_flag" >>"$baseline" ;;
+    esac
+    return 0
+  fi
+  f=contracts/site-keys.yaml
+  dangling "$f" && die2 "key registry is a dangling symlink: $PWD/$f"
+  if [[ -f $f ]]; then registry_baseline "$f"; return 0; fi
+  for f in ./*.env.example; do
+    dangling "$f" && die2 "example is a dangling symlink: $PWD/${f#./}"
+    [[ -f $f ]] || continue
+    cat "$f" >>"$baseline"; found=1
+  done
+  ((found)) || echo "check-sanitized: note: no example baseline in $PWD (tried --keys, contracts/site-keys.yaml," \
+    "*.env.example): every site value counts as real" >&2
+}
+is_example() { # KEY VALUE: true when VALUE equals a baseline default of KEY
+  local line ex
+  while IFS= read -r line; do
+    ex=$(sed 's/#.*//; s/"//g' <<<"$line" | xargs)
+    [[ $2 != "$ex" ]] || return 0
+  done < <(sed -n "s/^$1=//p" "$baseline")
+  return 1
+}
+
+# Values from an env file that differ from the example baseline (i.e. the real ones), with the
 # per-key policy below. Emits "KEY<TAB>value" lines.
 real_values() { # ENV_FILE
-  local k v ex w items
+  local k v w items
   while IFS='=' read -r k v; do
     [[ $k =~ ^[A-Z_]+$ ]] || continue
     v=${v%%#*}; v=${v//\"/}; v=$(xargs <<<"$v")
-    ex=$(sed -n "s/^$k=//p" site.env.example | sed 's/#.*//; s/"//g' | xargs)
-    [[ -n $v && $v != "$ex" ]] || continue
+    [[ -n $v ]] || continue
+    ! is_example "$k" "$v" || continue
     key_action "$k"
     [[ $act != skip ]] || continue
     # shellcheck disable=SC2206  # a split key (ADMIN_SOURCE_IPS) is a space-separated list
@@ -169,7 +252,7 @@ if ((!regex_only)); then
   judge_env=$(resolve_judge_env)
   extra=$(extra_files .sanitize-extra)
   wordfiles=$(extra_files .sanitize-words)
-  [[ -f site.env.example ]] || die2 "no site.env.example at the repo root (the example baseline)"
+  load_baseline
   real_values "$site_env" >>"$labels"
   [[ -z $judge_env ]] || real_values "$judge_env" >>"$labels"
   while IFS= read -r f; do

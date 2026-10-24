@@ -16,7 +16,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 TEMPLATE = REPO / "walter" / "firewall" / "ufw-rules.sh.tmpl"
-RENDER = REPO / "scripts" / "render.sh"
+RENDER = REPO / "scripts" / "render.sh"               # the shim; it execs ENGINE with --repo <this checkout>
+ENGINE = REPO / "tools" / "deck-tools" / "render.sh"
 LEGACY = "ufw allow 22/tcp"
 
 
@@ -66,7 +67,15 @@ def site(request, tmp_path):
     vals = _load(env_file)
     # The bridge subnet as the kernel would report it: BACKEND_LAN_IP's /24 (libvirt default).
     lan_net = str(ipaddress.ip_network(vals["BACKEND_LAN_IP"] + "/24", strict=False))
-    return {"script": rendered, "vals": vals, "lan_net": lan_net, "tmp": tmp_path}
+    return {"script": rendered, "vals": vals, "lan_net": lan_net, "tmp": tmp_path, "env_file": env_file}
+
+
+def test_shim_and_engine_render_the_same_script(site):
+    direct = site["tmp"] / "ufw-rules.engine.sh"
+    subprocess.run([str(ENGINE), "--repo", str(REPO), "-e", str(site["env_file"]), str(TEMPLATE), str(direct)],
+                   check=True, capture_output=True)
+    assert direct.read_bytes() == site["script"].read_bytes()
+    assert direct.stat().st_mode == site["script"].stat().st_mode     # both copy the template's mode
 
 
 def run(site, *, legacy=True, route="default"):
