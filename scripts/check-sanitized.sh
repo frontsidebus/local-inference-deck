@@ -2,27 +2,109 @@
 # Fail if any site-specific value or secret-looking string is about to be committed.
 #
 # The forbidden values themselves must never live in this public repo, so they are
-# read at runtime from files that are gitignored:
-#   site.env              every non-example value in it is forbidden in tracked files
-#   .sanitize-extra       optional, one literal string per line (emails, user names,
-#                         home IP, key-pair names, old hostnames, ...)
+# read at runtime from files that are gitignored or outside the checkout:
+#   site env         every non-example value in it is forbidden in tracked files. First found of:
+#                      --site-env FILE  >  $SITE_ENV  >  ~/.config/deck/site.env  >  <repo>/site.env
+#   judge.env        when present ($JUDGE_ENV, else ~/.config/judge/judge.env): checked under the
+#                    same per-key policy, so a value that lives only there is still caught
+#   .sanitize-extra  optional, one literal string per line (emails, user names, home IP,
+#                    key-pair names, old hostnames, ...); read from ~/.config/deck/ and the repo root
+#   .sanitize-words  optional, whole words matched case-insensitively (real first names);
+#                    read from ~/.config/deck/ and the repo root
+# The example baseline is <repo>/site.env.example: a value equal to its example is public.
 #
-# Usage: scripts/check-sanitized.sh [--all]   (default: staged + untracked files)
+# Usage: scripts/check-sanitized.sh [--all | --history] [--regex-only] [--site-env FILE]
+#   (default)      staged + untracked files (working-tree contents)
+#   --all          every tracked file (working-tree contents of `git ls-files`)
+#   --history      every commit (git rev-list --all): real values, .sanitize-extra and
+#                  .sanitize-words. Hits are reported as commit, path and key name; the matched
+#                  value is never printed.
+#   --regex-only   only the generic secret-shape regexes, no real values. CI only (CI=true).
+#
+# Exit codes: 0 clean, 1 finding(s), 2 no real-value source found, a dangling symlink, or a
+# refused/invalid invocation. The message for 2 names the paths that were tried.
 set -euo pipefail
+
+die2() { echo "check-sanitized: $*" >&2; exit 2; }
+abs() { [[ $1 == /* ]] && printf '%s\n' "$1" || printf '%s\n' "$PWD/$1"; }
+
+mode=staged regex_only=0 site_flag=""
+while (($#)); do
+  case $1 in
+    --all) mode=all ;;
+    --history) mode=history ;;
+    --regex-only) regex_only=1 ;;
+    --site-env) [[ -n ${2:-} ]] || die2 "--site-env needs a file"; site_flag=$(abs "$2"); shift ;;
+    --site-env=?*) site_flag=$(abs "${1#--site-env=}") ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    *) die2 "unknown argument: $1 (usage: check-sanitized.sh [--all|--history] [--regex-only] [--site-env FILE])" ;;
+  esac
+  shift
+done
+# Relative $SITE_ENV / $JUDGE_ENV are relative to the caller's directory, not the repo root.
+[[ -z ${SITE_ENV:-} ]] || SITE_ENV=$(abs "$SITE_ENV")
+[[ -z ${JUDGE_ENV:-} ]] || JUDGE_ENV=$(abs "$JUDGE_ENV")
 cd "$(git rev-parse --show-toplevel)"
 
-mode=${1:-}
-if [[ $mode == --all ]]; then
-  mapfile -t files < <(git ls-files)
-else
-  mapfile -t files < <( { git diff --cached --name-only --diff-filter=ACMR; git ls-files --others --exclude-standard; } | sort -u)
+if ((regex_only)); then
+  [[ ${CI:-} == true ]] || die2 "--regex-only checks no real values and is refused outside CI (CI=true)"
+  [[ $mode != history ]] || die2 "--regex-only and --history cannot be combined"
 fi
-((${#files[@]})) || { echo "check-sanitized: nothing to check"; exit 0; }
 
-patterns=$(mktemp); trap 'rm -f "$patterns"' EXIT
+# ---- real-value sources ---------------------------------------------------------------------
+# A candidate is usable when it is a regular file (or a symlink to one). A dangling symlink is an
+# error, never a silent fall-through: it means the operator's pointer is broken.
+dangling() { [[ -L $1 && ! -e $1 ]]; }
 
-# Values from site.env that differ from site.env.example (i.e. the real ones).
-if [[ -f site.env ]]; then
+resolve_site_env() {
+  local c how
+  if [[ -n $site_flag || -n ${SITE_ENV:-} ]]; then
+    if [[ -n $site_flag ]]; then c=$site_flag how=--site-env; else c=$SITE_ENV how=\$SITE_ENV; fi
+    dangling "$c" && die2 "site env is a dangling symlink: $c (from $how)"
+    [[ -f $c ]] || die2 "site env not found: $c (from $how)"
+    printf '%s\n' "$c"; return 0
+  fi
+  local tried=()
+  for c in "${HOME:-/nonexistent}/.config/deck/site.env" "$PWD/site.env"; do
+    tried+=("$c")
+    dangling "$c" && die2 "site env is a dangling symlink: $c"
+    [[ -f $c ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  die2 "no real-value source found; tried: --site-env (not given), \$SITE_ENV (unset), ${tried[*]}." \
+       "Create ~/.config/deck/site.env (for example a symlink to your site.env)."
+}
+
+resolve_judge_env() { # prints the judge.env path, or nothing when there is none
+  local c
+  if [[ -n ${JUDGE_ENV:-} ]]; then
+    c=$JUDGE_ENV
+    dangling "$c" && die2 "judge env is a dangling symlink: $c (from \$JUDGE_ENV)"
+    [[ -f $c ]] || die2 "judge env not found: $c (from \$JUDGE_ENV)"
+    printf '%s\n' "$c"; return 0
+  fi
+  c=${HOME:-/nonexistent}/.config/judge/judge.env
+  dangling "$c" && die2 "judge env is a dangling symlink: $c"
+  [[ ! -f $c ]] || printf '%s\n' "$c"
+}
+
+extra_files() { # NAME: ~/.config/deck/NAME and <repo>/NAME (both, when both exist)
+  local c
+  for c in "${HOME:-/nonexistent}/.config/deck/$1" "$PWD/$1"; do
+    dangling "$c" && die2 "dangling symlink: $c"
+    [[ ! -f $c ]] || printf '%s\n' "$c"
+  done
+}
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+patterns=$tmp/patterns   # one literal per line (real values + .sanitize-extra)
+labels=$tmp/labels       # "LABEL<TAB>literal" per pattern, for --history reports
+words=$tmp/words         # .sanitize-words
+: >"$patterns"; : >"$labels"; : >"$words"
+
+# Values from an env file that differ from site.env.example (i.e. the real ones), with the
+# per-key policy below. Emits "KEY<TAB>value" lines.
+real_values() { # ENV_FILE
+  local k v ex w items
   while IFS='=' read -r k v; do
     [[ $k =~ ^[A-Z_]+$ ]] || continue
     v=${v%%#*}; v=${v//\"/}; v=$(xargs <<<"$v")
@@ -31,20 +113,102 @@ if [[ -f site.env ]]; then
     case $k in
       SPARK_USERS|HARNESS_KEYS) continue;;           # names: whole-word list in .sanitize-words
       *_PORT|*_IF|*_GROUP|*_CLIENT_ID|MODELS_DIR|BACKEND_SSH_USER) continue;;  # generic, not identifying
-      JUDGE_SSH_ALIASES|JUDGE_INFRA_REPOS) ;;          # site-identifying judge settings: still checked
+      JUDGE_SSH_ALIASES|JUDGE_INFRA_REPOS|JUDGE_REPO_DIR) ;;  # site-identifying judge settings: still checked
       JUDGE_*) continue;;                               # judge policy knobs (modes, model aliases, caps): public values
     esac
+    # shellcheck disable=SC2206  # ADMIN_SOURCE_IPS is a space-separated list
     if [[ $k == ADMIN_SOURCE_IPS ]]; then items=($v); else items=("$v"); fi
     for w in "${items[@]}"; do
       [[ ${#w} -ge 6 && ! $w =~ ^[0-9]+$ ]] || continue   # skip tiny/numeric tokens
       case $w in 10.100.0.*) continue;; esac              # WireGuard defaults are the examples
-      printf '%s\n' "$w"
+      printf '%s\t%s\n' "$k" "$w"
     done
-  done < site.env >> "$patterns"
-else
-  echo "check-sanitized: WARNING no site.env; only generic secret patterns are checked" >&2
+  done <"$1"
+}
+
+if ((!regex_only)); then
+  site_env=$(resolve_site_env)
+  judge_env=$(resolve_judge_env)
+  extra=$(extra_files .sanitize-extra)
+  wordfiles=$(extra_files .sanitize-words)
+  [[ -f site.env.example ]] || die2 "no site.env.example at the repo root (the example baseline)"
+  real_values "$site_env" >>"$labels"
+  [[ -z $judge_env ]] || real_values "$judge_env" >>"$labels"
+  while IFS= read -r f; do
+    [[ -z $f ]] || { grep -v '^\s*\(#\|$\)' "$f" | sed 's/^/sanitize-extra\t/' >>"$labels" || true; }
+  done <<<"$extra"
+  while IFS= read -r f; do
+    [[ -z $f ]] || { grep -v '^\s*\(#\|$\)' "$f" >>"$words" || true; }
+  done <<<"$wordfiles"
+  cut -f2- "$labels" | grep -v '^$' | sort -u >"$patterns" || true
 fi
-[[ -f .sanitize-extra ]] && grep -v '^\s*\(#\|$\)' .sanitize-extra >> "$patterns" || true
+
+# ---- --history: every commit ------------------------------------------------------------------
+if [[ $mode == history ]]; then
+  git rev-list --all >"$tmp/revs"
+  [[ -s $tmp/revs ]] || { echo "check-sanitized: no commits"; exit 0; }
+  # hist KIND GREP_OPTS...: git grep -z prints "rev:path\0line\0content"; report rev, path and the
+  # label of each pattern that matched, never the content. A hit no label explains is still reported.
+  hist() {
+    local kind=$1; shift
+    # xargs splits long rev lists; git grep exits 1 on "no match".
+    xargs -r git grep -z -n -I "$@" <"$tmp/revs" >"$tmp/raw.$kind" 2>/dev/null || true
+    : >"$tmp/hist.$kind"
+    [[ -s $tmp/raw.$kind ]] || return 0
+    python3 -I - "$tmp/raw.$kind" "$labels" "$words" "$kind" >"$tmp/hist.$kind" <<'PY'
+import re, sys
+raw, labels_f, words_f, kind = sys.argv[1:5]
+pats = []
+if kind == "fixed":
+    for l in open(labels_f, encoding="utf-8", errors="replace"):
+        k, sep, v = l.rstrip("\n").partition("\t")
+        if sep and v:
+            pats.append((k, lambda s, v=v: v in s))
+else:
+    for i, w in enumerate(open(words_f, encoding="utf-8", errors="replace"), 1):
+        w = w.rstrip("\n")
+        if w:
+            rx = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(w) + r"(?![A-Za-z0-9_])", re.I)
+            pats.append((f"sanitize-words entry {i}", lambda s, rx=rx: rx.search(s) is not None))
+out = set()
+for rec in open(raw, "rb").read().decode("utf-8", "replace").split("\n"):
+    parts = rec.split("\0")
+    if len(parts) < 3:
+        continue
+    rev, _, path = parts[0].partition(":")
+    content = "\0".join(parts[2:])
+    got = [label for label, match in pats if match(content)] or ["(unidentified pattern)"]
+    for label in got:
+        out.add(f"{rev[:12]} {path}: {label}")
+print("\n".join(sorted(out)))
+PY
+    sed -i '/^$/d' "$tmp/hist.$kind"
+  }
+  fail=0
+  if [[ -s $patterns ]]; then
+    hist fixed -F -f "$patterns"
+    if [[ -s $tmp/hist.fixed ]]; then
+      echo "FORBIDDEN site-specific values in history (commit path: key):"; cat "$tmp/hist.fixed"; fail=1
+    fi
+  fi
+  if [[ -s $words ]]; then
+    hist words -w -F -i -f "$words"
+    if [[ -s $tmp/hist.words ]]; then
+      echo "FORBIDDEN names in history (commit path: entry):"; cat "$tmp/hist.words"; fail=1
+    fi
+  fi
+  if ((fail)); then echo "check-sanitized: FAILED (history)"; exit 1; fi
+  echo "check-sanitized: OK (history, $(wc -l <"$tmp/revs") commits)"
+  exit 0
+fi
+
+# ---- working-tree files -----------------------------------------------------------------------
+if [[ $mode == all ]]; then
+  mapfile -t files < <(git ls-files)
+else
+  mapfile -t files < <( { git diff --cached --name-only --diff-filter=ACMR; git ls-files --others --exclude-standard; } | sort -u)
+fi
+((${#files[@]})) || { echo "check-sanitized: nothing to check"; exit 0; }
 
 fail=0
 if [[ -s $patterns ]]; then
@@ -52,10 +216,10 @@ if [[ -s $patterns ]]; then
     echo "FORBIDDEN site-specific values found:"; echo "$hits" | cut -c1-200; fail=1
   fi
 fi
-# .sanitize-words (gitignored): short names matched as whole words, case-insensitive
+# .sanitize-words: short names matched as whole words, case-insensitive
 # (e.g. real user first names that would false-positive as substrings).
-if [[ -f .sanitize-words ]]; then
-  if hits=$(grep -nwFIi -f <(grep -v '^\s*\(#\|$\)' .sanitize-words) -- "${files[@]}" 2>/dev/null); then
+if [[ -s $words ]]; then
+  if hits=$(grep -nwFIi -f "$words" -- "${files[@]}" 2>/dev/null); then
     echo "FORBIDDEN names found:"; echo "$hits" | cut -c1-200; fail=1
   fi
 fi
@@ -67,4 +231,8 @@ if hits=$(grep -nEIi "$secret_re" -- "${files[@]}" 2>/dev/null | grep -viE 'CHAN
 fi
 
 if ((fail)); then echo "check-sanitized: FAILED"; exit 1; fi
-echo "check-sanitized: OK (${#files[@]} files)"
+if ((regex_only)); then
+  echo "check-sanitized: OK (${#files[@]} files, generic secret regexes only)"
+else
+  echo "check-sanitized: OK (${#files[@]} files)"
+fi

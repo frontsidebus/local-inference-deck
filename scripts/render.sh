@@ -14,7 +14,8 @@
 #   scripts/render.sh [-e SITE_ENV] --vars       print the variable list and exit
 #   scripts/render.sh [-e SITE_ENV] --check SRC  list site vars used by SRC that are empty
 #
-# Site env: -e FILE, else $SITE_ENV, else <repo>/site.env.
+# Site env: -e FILE, else $SITE_ENV, else ~/.config/deck/site.env, else <repo>/site.env
+# (a dangling ~/.config/deck/site.env symlink is an error, not a fall-through).
 #
 # Substitution uses envsubst with an EXPLICIT variable list: only the names that are
 # defined in site.env.example (the contract) or site.env are replaced. Everything else
@@ -30,9 +31,16 @@
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-SITE_ENV_FILE=${SITE_ENV:-$REPO/site.env}
+SITE_ENV_FILE=""
 
 die() { echo "render: $*" >&2; exit 1; }
+
+default_site_env() { # $SITE_ENV > ~/.config/deck/site.env > <repo>/site.env
+  local c=${HOME:-/nonexistent}/.config/deck/site.env
+  if [[ -n ${SITE_ENV:-} ]]; then printf '%s\n' "$SITE_ENV"; return 0; fi
+  if [[ -L $c && ! -e $c ]]; then die "site env is a dangling symlink: $c"; fi
+  if [[ -f $c ]]; then printf '%s\n' "$c"; else printf '%s\n' "$REPO/site.env"; fi
+}
 
 EXCLUDES=()
 while [[ ${1:-} == -e || ${1:-} == -x ]]; do
@@ -40,6 +48,7 @@ while [[ ${1:-} == -e || ${1:-} == -x ]]; do
   if [[ $1 == -e ]]; then SITE_ENV_FILE=$2; else EXCLUDES+=("$2"); fi
   shift 2
 done
+[[ -n $SITE_ENV_FILE ]] || SITE_ENV_FILE=$(default_site_env)
 command -v envsubst >/dev/null || die "envsubst not found (apt-get install gettext-base)"
 [[ -f $SITE_ENV_FILE ]] || die "site env not found: $SITE_ENV_FILE (copy site.env.example to site.env)"
 
