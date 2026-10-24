@@ -1,16 +1,18 @@
 # Contracts between the deck's components
 
-The seams between local-inference-deck, agent-judge (`judge/`) and sec-evals (its own repo since plan step 3,
-checked out at `$SEC_EVALS_DIR`, else `~/src/deck/sec-evals`) are written down as versioned contract files, so each
-side can be tested on its own (plan step 0b). The
+The seams between local-inference-deck, agent-judge (its own repo since plan step 2, `judge/` there, checked out at
+`$AGENT_JUDGE_DIR`, else `~/src/deck/agent-judge`) and sec-evals (its own repo since plan step 3, checked out at
+`$SEC_EVALS_DIR`, else `~/src/deck/sec-evals`) are written down as versioned contract files, so each side can be
+tested on its own (plan step 0b). The
 contracts are C1-C10 of the repo-split plan. C1 (the site-key registry: `site-keys.yaml`,
 `site-keys.schema.json`, `sanitize-policy.yaml`) is described with its own files.
 
 ## Rules
 
 - **The producing component owns the contract file and its provider test.** Deck-owned contracts live here.
-  A contract owned by agent-judge or sec-evals lives in that component's tree (`judge/contracts/`, sec-evals'
-  `evals/contracts/`), so `git filter-repo --path judge/` or `--path evals/` carries it along at the split.
+  A contract owned by agent-judge or sec-evals lives in that component's tree (agent-judge's `judge/contracts/`,
+  sec-evals' `evals/contracts/`), so `git filter-repo --path judge/` or `--path evals/` carried it along at the
+  split. The deck keeps byte-identical copies under `vendored/agent-judge/` and `vendored/sec-evals/`.
 - **Consumers test against a vendored copy**, a byte-identical copy in the consumer's own test fixtures. No
   vendored copy may be in an integrity-pinned set: none is an evals `HARNESS_FILES` entry, so refreshing one never
   forces a re-baseline (`tests/test_vendored.py` checks this against a sec-evals checkout when one is present).
@@ -32,22 +34,27 @@ contracts are C1-C10 of the repo-split plan. C1 (the site-key registry: `site-ke
 | C5 | eval liveness | sec-evals `evals/contracts/eval-liveness.json` | sec-evals `evals/tests/test_contract_liveness.py` (argv, pid layout). Guard liveness: sec-evals `evals/tests/test_gate.py` (`test_guard_that_dies_at_start_refuses_the_run` and the three after it). Site-env resolution: sec-evals `evals/tests/test_site_env.py` (lib.sh); `bin/deck evals` / `install evals`: `tools/tests/test_deck_evals.py` | `tests/test_c5_eval_liveness.py` (`clients/bin/spark-model` `live_runs`, `SPARK_EVAL_REPOS`). The fake-pid test `walter/tests/test_spark_model_client.py::test_live_run_detection` already existed |
 | C6 | gate CLI: exit codes 0-4, `gate.json` | sec-evals `evals/contracts/gate-cli.json` | sec-evals `evals/tests/test_contract_gate_cli.py` (constants, docstring, end-to-end records against the schema) | `tests/test_c6_gate_cli.py` (`bin/deck evals gate` execs gate.py; `docs/runbooks/upgrade.md` states the codes) |
 | C7 | backend observability: label `llama-swap=1`, `/slots`, unit names | `observability.yaml` (deck) | `tests/test_c7_observability.py` (every rendered model, lab models included: label, name, loopback port, `cmdStop`; deployed units) | `judge/tests/test_contract_observability.py` (probe `slots_summary`, runaway watcher, `KNOWN_UNITS`) |
-| C8 | Hermes profile `managed_by` blocks | `hermes-profile.yaml` (deck) | `tests/test_c8_hermes_profile.py` (`clients/install.sh` on a config holding the judge block; both real installers in both orders while `judge/` is here) | `judge/tests/test_contract_hermes_profile.py` (`judge/install.sh` on a config holding the clients block; uninstall leaves it) |
-| C9 | frontier env strip list | `judge/contracts/frontier-env.json` (agent-judge) | `judge/tests/test_contract_frontier_env.py` (`run_judge` lists and vectors) | sec-evals `evals/tests/test_contract_frontier_env_parity.py`: parity only, `run.py` keeps its own list |
-| C10 | judge ↔ infra repos: `CONVENTIONS.md`, executable `scripts/check-sanitized.sh` | `judge/contracts/infra-repo.json` (agent-judge) | `judge/tests/test_contract_infra_repo.py` (`find_repo` over a multi-repo layout; probe paths). Exit-code handling: already covered by `judge/tests/test_verify.py` (`test_sanitizer_*`); resolution under `JUDGE_REPO_DIR`: `judge/tests/test_probes.py` and `test_boundary_0a.py` | `tests/test_c10_infra_repo.py` (this repo's root, git mode `100755`). Sanitizer exit codes 0/1/2: `scripts/tests/test_check_sanitized.py`. sec-evals has its own consumer test (its root has `CONVENTIONS.md` and the shim since step 3) |
+| C8 | Hermes profile `managed_by` blocks | `hermes-profile.yaml` (deck) | `tests/test_c8_hermes_profile.py` (`clients/install.sh` on a config holding the judge block; both real installers in both orders when an agent-judge checkout is present, `$AGENT_JUDGE_DIR` or `~/src/deck/agent-judge`) | `judge/tests/test_contract_hermes_profile.py` (`judge/install.sh` on a config holding the clients block; uninstall leaves it) |
+| C9 | frontier env strip list | `judge/contracts/frontier-env.json` (agent-judge; deck copy `vendored/agent-judge/frontier-env.json`) | `judge/tests/test_contract_frontier_env.py` (`run_judge` lists and vectors) | sec-evals `evals/tests/test_contract_frontier_env_parity.py`: parity only, `run.py` keeps its own list |
+| C10 | judge ↔ infra repos: `CONVENTIONS.md`, executable `scripts/check-sanitized.sh` | `judge/contracts/infra-repo.json` (agent-judge; deck copy `vendored/agent-judge/infra-repo.json`) | `judge/tests/test_contract_infra_repo.py` (`find_repo` over a multi-repo layout; probe paths). Exit-code handling: already covered by `judge/tests/test_verify.py` (`test_sanitizer_*`); resolution under `JUDGE_REPO_DIR`: `judge/tests/test_probes.py` and `test_boundary_0a.py` | `tests/test_c10_infra_repo.py` (this repo's root, git mode `100755`). Sanitizer exit codes 0/1/2: `scripts/tests/test_check_sanitized.py`. sec-evals has its own consumer test (its root has `CONVENTIONS.md` and the shim since step 3) |
 
-Vendored copies, by consumer (the full lists are `VENDORED`, `SEC_EVALS_IN` and `SEC_EVALS_OUT` in
-`tools/contracts.py`):
+Vendored copies, by consumer (the full lists are `SEC_EVALS_IN` / `SEC_EVALS_OUT` and `AGENT_JUDGE_IN` /
+`AGENT_JUDGE_OUT` in `tools/contracts.py`; `VENDORED`, for pairs with both sides here, is empty since step 2):
 - sec-evals (in its repo, refreshed from a deck tag): `evals/tests/fixtures/llama-swap.contract.yaml` and
-  `evals/tests/fixtures/contracts/` (aliases, serving vectors and schema, frontier-env);
-- agent-judge: `judge/tests/fixtures/contracts/` (aliases, observability, hermes-profile);
+  `evals/tests/fixtures/contracts/` (aliases, serving vectors and schema, frontier-env; the last is copied from the
+  deck's `vendored/agent-judge/frontier-env.json`);
+- agent-judge (in its repo, refreshed from a deck tag): `judge/tests/fixtures/contracts/` (aliases, observability,
+  hermes-profile);
 - deck: `contracts/vendored/sec-evals/` (eval-liveness, gate-cli, and `evals.env.example`, sec-evals' C1 example
   baseline: `tools/tests/test_site_keys.py` checks it equals the registry's `evals` keys and defaults) and
-  `contracts/vendored/agent-judge/` (infra-repo).
+  `contracts/vendored/agent-judge/` (frontier-env, infra-repo).
 
 `tests/test_vendored.py` fails when a copy differs from its source, a generated file is stale, or a contract has
-no `contract_version`. The sec-evals copies are compared in both directions only when a sec-evals checkout is
-present (`$SEC_EVALS_DIR`, else `~/src/deck/sec-evals`); otherwise the deck's copies only have to exist.
+no `contract_version`. Each component's copies are compared with its checkout when one is present, in both
+directions; without one, the deck's copies only have to exist (and carry a `contract_version`). `vendor --write`
+refreshes the deck's copies from the checkouts and never writes into them. Do not edit `observability.yaml` or
+`hermes-profile.yaml` (or the agent-judge copies) without a version bump: agent-judge keeps byte-identical copies
+under `judge/`, so a refresh there changes its `code_version`.
 
 ## Changing a contract
 
@@ -73,8 +80,8 @@ present (`$SEC_EVALS_DIR`, else `~/src/deck/sec-evals`); otherwise the deck's co
 
    ```sh
    python3 -m pytest contracts/tests walter/tests tools/tests -q -p no:cacheprovider
-   python3 -m pytest judge/tests/test_contract_*.py -q -p no:cacheprovider
-   # in the sec-evals checkout:  python3 -m pytest evals/tests/test_contract_*.py -q -p no:cacheprovider
+   # in the sec-evals checkout:   python3 -m pytest evals/tests/test_contract_*.py -q -p no:cacheprovider
+   # in the agent-judge checkout: python3 -m pytest judge/tests/test_contract_*.py -q -p no:cacheprovider
    ```
 
 The C4 vectors change only when the fixture template or the hash rule changes. A change to the real walter

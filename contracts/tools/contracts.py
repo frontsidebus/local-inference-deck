@@ -27,17 +27,9 @@ FIXTURE_TEMPLATE = SERVING / "llama-swap.contract.yaml"
 
 # (source owned by the producing component, vendored copy a consumer tests against). Paths are repo-relative.
 # A copy must be byte-identical to its source; refresh with `vendor --write` in the same commit as the source
-# change (contracts/README.md). Only pairs with both sides in this repo are listed here; the sec-evals seams are
-# in SEC_EVALS_IN / SEC_EVALS_OUT below.
-VENDORED = (
-    # C3 gateway aliases: agent-judge consumes them (sec-evals: SEC_EVALS_OUT)
-    ("contracts/aliases.json", "judge/tests/fixtures/contracts/aliases.json"),
-    # C7 backend observability and C8 Hermes profile: agent-judge consumes them
-    ("contracts/observability.yaml", "judge/tests/fixtures/contracts/observability.yaml"),
-    ("contracts/hermes-profile.yaml", "judge/tests/fixtures/contracts/hermes-profile.yaml"),
-    # C10 infra-repo requirements: agent-judge owns them
-    ("judge/contracts/infra-repo.json", "contracts/vendored/agent-judge/infra-repo.json"),
-)
+# change (contracts/README.md). Only pairs with both sides in this repo are listed here (none since plan step 2);
+# the seams with the component repos are in SEC_EVALS_IN / SEC_EVALS_OUT and AGENT_JUDGE_IN / AGENT_JUDGE_OUT below.
+VENDORED = ()
 
 # sec-evals is its own repo (plan step 3), checked out at $SEC_EVALS_DIR, else ~/src/deck/sec-evals.
 # SEC_EVALS_IN: (path in sec-evals, the deck's vendored copy): C5 eval liveness, C6 gate CLI and the C1 example
@@ -56,16 +48,44 @@ SEC_EVALS_OUT = (
     ("contracts/serving-identity/vectors.json", "evals/tests/fixtures/contracts/serving-vectors.json"),
     ("contracts/serving-identity/llama-swap.contract.yaml", "evals/tests/fixtures/llama-swap.contract.yaml"),
     ("contracts/serving-identity/serving.schema.json", "evals/tests/fixtures/contracts/serving.schema.json"),
-    ("judge/contracts/frontier-env.json", "evals/tests/fixtures/contracts/frontier-env.json"),
+    # C9: agent-judge owns it; sec-evals tests parity against the deck's vendored copy
+    ("contracts/vendored/agent-judge/frontier-env.json", "evals/tests/fixtures/contracts/frontier-env.json"),
 )
+
+# agent-judge is its own repo (plan step 2), checked out at $AGENT_JUDGE_DIR, else ~/src/deck/agent-judge.
+# AGENT_JUDGE_IN: (path in agent-judge, the deck's vendored copy): C9 frontier env and C10 infra-repo, which
+# agent-judge owns and the deck tests against.
+# AGENT_JUDGE_OUT: (deck source, path in agent-judge): the copies agent-judge's consumer tests read (C3, C7, C8);
+# agent-judge refreshes them from a deck tag. Same rules as sec-evals above.
+AGENT_JUDGE_IN = (
+    ("judge/contracts/frontier-env.json", "contracts/vendored/agent-judge/frontier-env.json"),
+    ("judge/contracts/infra-repo.json", "contracts/vendored/agent-judge/infra-repo.json"),
+)
+AGENT_JUDGE_OUT = (
+    ("contracts/aliases.json", "judge/tests/fixtures/contracts/aliases.json"),
+    ("contracts/observability.yaml", "judge/tests/fixtures/contracts/observability.yaml"),
+    ("contracts/hermes-profile.yaml", "judge/tests/fixtures/contracts/hermes-profile.yaml"),
+)
+
+
+def _checkout(env: str, name: str, marker: str):
+    import os
+    p = Path(os.environ.get(env) or os.path.join(os.path.expanduser("~"), "src", "deck", name))
+    return p if (p / marker).is_file() else None
 
 
 def sec_evals_dir():
     """The sec-evals checkout, or None when there is none (it must hold evals/run.py)."""
-    import os
-    d = os.environ.get("SEC_EVALS_DIR") or os.path.join(os.path.expanduser("~"), "src", "deck", "sec-evals")
-    p = Path(d)
-    return p if (p / "evals" / "run.py").is_file() else None
+    return _checkout("SEC_EVALS_DIR", "sec-evals", "evals/run.py")
+
+
+def agent_judge_dir():
+    """The agent-judge checkout, or None when there is none (it must hold judge/contracts/infra-repo.json)."""
+    return _checkout("AGENT_JUDGE_DIR", "agent-judge", "judge/contracts/infra-repo.json")
+
+
+# (name, IN, OUT) per component repo; vendor_drift and `vendor` walk them in this order
+COMPONENTS = (("sec-evals", SEC_EVALS_IN, SEC_EVALS_OUT), ("agent-judge", AGENT_JUDGE_IN, AGENT_JUDGE_OUT))
 
 
 def dump_json(data) -> str:
@@ -145,9 +165,9 @@ def cmd_texts(text: str, swapcmd) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ vendoring
-def vendor_drift(repo: Path = REPO, sec_evals=None):
-    """[(source, copy, why)] for every vendored copy that is missing or differs from its source. sec_evals: the
-    sec-evals checkout to compare against (default: sec_evals_dir(); pass False for none)."""
+def vendor_drift(repo: Path = REPO, sec_evals=None, agent_judge=None):
+    """[(source, copy, why)] for every vendored copy that is missing or differs from its source. sec_evals,
+    agent_judge: the checkout to compare against (default: sec_evals_dir() / agent_judge_dir(); False for none)."""
     out = []
     for src, dst in VENDORED:
         s, d = repo / src, repo / dst
@@ -157,23 +177,29 @@ def vendor_drift(repo: Path = REPO, sec_evals=None):
             out.append((src, dst, "copy missing"))
         elif s.read_bytes() != d.read_bytes():
             out.append((src, dst, "copy differs"))
-    se = sec_evals_dir() if sec_evals is None else (sec_evals or None)
-    for src, dst in SEC_EVALS_IN:
-        d = repo / dst
-        if not d.is_file():
-            out.append((f"sec-evals:{src}", dst, "copy missing"))
-        elif se is not None and not (se / src).is_file():
-            out.append((f"sec-evals:{src}", dst, "source missing"))
-        elif se is not None and (se / src).read_bytes() != d.read_bytes():
-            out.append((f"sec-evals:{src}", dst, "copy differs"))
-    if se is not None:
-        for src, dst in SEC_EVALS_OUT:
-            d = se / dst
+    given = {"sec-evals": sec_evals, "agent-judge": agent_judge}
+    for name, ins, outs in COMPONENTS:
+        co = _component_dir(name) if given[name] is None else (given[name] or None)
+        for src, dst in ins:
+            d = repo / dst
             if not d.is_file():
-                out.append((src, f"sec-evals:{dst}", "copy missing"))
-            elif (repo / src).read_bytes() != d.read_bytes():
-                out.append((src, f"sec-evals:{dst}", "copy differs"))
+                out.append((f"{name}:{src}", dst, "copy missing"))
+            elif co is not None and not (co / src).is_file():
+                out.append((f"{name}:{src}", dst, "source missing"))
+            elif co is not None and (co / src).read_bytes() != d.read_bytes():
+                out.append((f"{name}:{src}", dst, "copy differs"))
+        if co is not None:
+            for src, dst in outs:
+                d = co / dst
+                if not d.is_file():
+                    out.append((src, f"{name}:{dst}", "copy missing"))
+                elif (repo / src).read_bytes() != d.read_bytes():
+                    out.append((src, f"{name}:{dst}", "copy differs"))
     return out
+
+
+def _component_dir(name: str):
+    return {"sec-evals": sec_evals_dir, "agent-judge": agent_judge_dir}[name]()
 
 
 def _check_or_write(path: Path, want: str, write: bool) -> int:
@@ -199,24 +225,27 @@ def main(argv=None) -> int:
     if a.what == "vectors":
         return _check_or_write(VECTORS, gen_vectors(FIXTURE_TEMPLATE.read_text(encoding="utf-8")), a.write)
     rc = 0
-    se = sec_evals_dir()
-    for src, dst, why in vendor_drift(sec_evals=se or False):
-        if a.write and why != "source missing" and not dst.startswith("sec-evals:"):
-            from_path = (se / src.split(":", 1)[1]) if src.startswith("sec-evals:") and se else REPO / src
-            if src.startswith("sec-evals:") and se is None:
-                print(f"{why.upper():<9} {src} -> {dst} (no sec-evals checkout to copy from)")
+    cos = {name: _component_dir(name) for name, _, _ in COMPONENTS}
+    for src, dst, why in vendor_drift(sec_evals=cos["sec-evals"] or False, agent_judge=cos["agent-judge"] or False):
+        dst_co, src_co = dst.split(":", 1)[0] if ":" in dst else None, src.split(":", 1)[0] if ":" in src else None
+        if a.write and why != "source missing" and dst_co is None:
+            if src_co is not None and cos[src_co] is None:
+                print(f"{why.upper():<9} {src} -> {dst} (no {src_co} checkout to copy from)")
                 rc = 1
                 continue
+            from_path = cos[src_co] / src.split(":", 1)[1] if src_co else REPO / src
             (REPO / dst).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(from_path, REPO / dst)
             print(f"copied    {src} -> {dst}")
         else:
-            hint = " (refresh it in sec-evals from a deck tag)" if dst.startswith("sec-evals:") else ""
+            hint = f" (refresh it in {dst_co} from a deck tag)" if dst_co else ""
             print(f"{why.upper():<9} {src} -> {dst}{hint}")
             rc = 1
     if rc == 0 and not a.write:
-        where = f"; sec-evals checkout compared: {se}" if se else "; no sec-evals checkout (its copies: existence only)"
-        print(f"ok        {len(VENDORED) + len(SEC_EVALS_IN)} vendored copies match their sources{where}")
+        where = "".join(f"; {n} checkout compared: {c}" if c else f"; no {n} checkout (its copies: existence only)"
+                        for n, c in cos.items())
+        n_in = len(VENDORED) + sum(len(ins) for _, ins, _ in COMPONENTS)
+        print(f"ok        {n_in} vendored copies match their sources{where}")
     return rc
 
 
