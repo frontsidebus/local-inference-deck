@@ -24,7 +24,7 @@ if [ -z "$GPU_SSH" ]; then
   u="$(site_value BACKEND_SSH_USER)"; h="$(site_value BACKEND_LAN_IP)"
   [ -n "$h" ] && GPU_SSH="${u:+$u@}$h"
 fi
-[ -n "$GPU_SSH" ] || { echo "set EVAL_GPU_SSH or BACKEND_LAN_IP in site.env" >&2; exit 2; }
+[ -n "$GPU_SSH" ] || { echo "set EVAL_GPU_SSH or BACKEND_LAN_IP in site.env (read: $(site_env_path))" >&2; exit 2; }
 INTERVAL="${INTERVAL:-30}"
 STOP_TEMP_C="${STOP_TEMP_C:-88}"
 WARN_TEMP_C="${WARN_TEMP_C:-84}"

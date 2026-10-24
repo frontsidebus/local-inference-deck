@@ -254,6 +254,10 @@ python3 evals/gate.py check --model coder --yes       # after it: compare with t
 python3 evals/gate.py compare <baseline-dir> <candidate-dir>   # offline, no model calls
 ```
 
+**Recommended entry: `bin/deck evals gate …`** (for example `bin/deck evals gate check --model coder --yes`; `bin/deck evals run …` does the same for run.py). It takes the same arguments as `gate.py`, resolves the site.env in the deck-wide order (`--site-env PATH` > `$SITE_ENV` > `~/.config/deck/site.env` > the repo-root `site.env`), exports it as `SITE_ENV` so the GPU guard and the gateway tunnel read the same file, passes it as `--site-env`, and passes `--llama-swap-config walter/llama-swap/config.yaml.tmpl` unless you give one. It exits 2 if no site.env resolves or a named one is missing. It runs `python3 -B evals/gate.py` from the repo root, so the guard and `stop.sh` match as before. The commands above still work: with no flag they read the repo-root `site.env`.
+
+**GPU guard liveness:** the guard's output goes to `guard.log` in the gate dir, and the gate refuses (exit 4, `GPU guard exited rc=N; see …/guard.log`) if the guard is not still running about 5 s after it starts, for example when it cannot read `BACKEND_LAN_IP`. `--no-guard` is the only way to run without it. The shell tools (`tools/lib.sh` `site_value`) use the same lookup order without the flag: `$SITE_ENV` (as given, even if missing), then `~/.config/deck/site.env`, then the repo-root `site.env`.
+
 **Suites** (`plans/gate-v1-<model>.json`; a model without a manifest is refused). Margins confirmed by the owner on 2026-10-12:
 
 | Suite | Items | Metric | Margin | n coder / coder-fast |

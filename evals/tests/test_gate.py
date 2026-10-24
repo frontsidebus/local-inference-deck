@@ -934,3 +934,65 @@ def test_report_notes_mixed_identity_sources(gw, live_env, gate_env, tmp_path, c
     assert "not comparable" in res["report"] and "| llama_swap_source | repo template | live config | **yes** |" \
         in res["report"]
     assert res["identity"]["candidate"]["llama_swap_cmd_sha256"] == "c" * 64
+
+
+# ------------------------------------------------------------------------------------------- GPU guard liveness
+def _guard_stub(tmp_path: Path, body: str) -> Path:
+    p = tmp_path / "gpu-guard-stub.sh"
+    p.write_text("#!/usr/bin/env bash\n" + body)
+    return p
+
+
+@pytest.fixture
+def guard_env(gate_env, tmp_path, monkeypatch):
+    """gate_env with a backend host in site.env (so the gate starts the guard) and without --no-guard."""
+    (tmp_path / "site.env").write_text("SPARK_API_HOST=api.example.com\nBACKEND_LAN_IP=192.0.2.10\n")
+    monkeypatch.delenv("EVAL_GPU_SSH", raising=False)
+    monkeypatch.delenv("SITE_ENV", raising=False)
+    gate_env["args"] = [x for x in gate_env["args"] if x != "--no-guard"]
+    return gate_env
+
+
+def test_guard_that_dies_at_start_refuses_the_run(gw, guard_env, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(G, "GUARD", _guard_stub(tmp_path, 'echo "set EVAL_GPU_SSH or BACKEND_LAN_IP" >&2\nexit 2\n'))
+    rc = G.main(["baseline", "--model", "coder", "--yes", "--base-url", gw.url, *guard_env["args"]])
+    assert rc == G.EXIT_REFUSED
+    assert not guard_env["calls"] and not gw.requests          # run.py never started
+    err = capsys.readouterr().err
+    assert "GPU guard exited rc=2" in err and "guard.log" in err
+    gd = next((guard_env["root"] / "coder").glob("baseline-*"))
+    assert "BACKEND_LAN_IP" in (gd / G.GUARD_LOG).read_text()
+
+
+def test_live_guard_runs_with_the_gates_site_env_and_is_stopped(gw, guard_env, tmp_path, monkeypatch):
+    monkeypatch.setattr(G, "GUARD", _guard_stub(tmp_path, 'echo "site=$SITE_ENV run=$EVAL_RUN"\nexec sleep 60\n'))
+    monkeypatch.setattr(G, "GUARD_STARTUP_S", 0.3)
+    started = []
+    real_popen = G.subprocess.Popen
+
+    def popen(*a, **k):
+        p = real_popen(*a, **k)
+        if a and a[0][:2] == ["bash", str(G.GUARD)]:
+            started.append(p)
+        return p
+    monkeypatch.setattr(G.subprocess, "Popen", popen)
+    assert G.main(["baseline", "--model", "coder", "--yes", "--base-url", gw.url, *guard_env["args"]]) == 0
+    assert len(started) == 1 and started[0].wait(timeout=10) is not None     # terminate()d after the run
+    gd = next((guard_env["root"] / "coder").glob("baseline-*"))
+    assert (gd / G.GUARD_LOG).read_text().strip() == f"site={tmp_path / 'site.env'} run=gate"
+
+
+def test_no_guard_is_the_only_bypass(guard_env, tmp_path, monkeypatch):
+    import argparse
+    monkeypatch.setattr(G, "GUARD", _guard_stub(tmp_path, "exit 3\n"))
+    a = argparse.Namespace(no_guard=True, site_env=str(tmp_path / "site.env"))
+    assert G.start_guard(a, tmp_path) is None
+    a.no_guard = False
+    with pytest.raises(G.GateError, match="rc=3"):
+        G.start_guard(a, tmp_path)
+    assert (tmp_path / G.GUARD_LOG).exists()
+
+
+def test_guard_liveness_is_not_part_of_the_harness_signature():
+    assert set(G.harness_signature({"harness_sha256": {"evals/gate.py": "x"}})) == {"run.py", "scorers.py"}
+    assert "evals/gate.py" not in RUN.HARNESS_FILES

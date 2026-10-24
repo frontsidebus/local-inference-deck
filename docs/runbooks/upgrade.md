@@ -90,6 +90,8 @@ Afterwards: `nvidia-smi --query-gpu=index,pcie.link.gen.max,pcie.link.width.curr
 
 For a new llama.cpp build (`server-cuda` digest), a new GGUF or quant behind an alias, or changed serving flags, run the [upgrade gate](../../evals/README.md#upgrade-gate) for each affected alias that has a manifest (`coder`, `coder-fast`). The owner approves the GPU time, and `--yes` is required. One run takes about 2.0 h for `coder` and 1.3 h for `coder-fast`, so run it with no other traffic.
 
+Recommended entry: **`bin/deck evals gate <calibrate|baseline|check> --model <alias> --yes`** from the repo root. It takes the same arguments as the `python3 evals/gate.py` commands below, and makes sure the gate, the GPU guard and the gateway tunnel all read the same site.env (`--site-env` > `$SITE_ENV` > `~/.config/deck/site.env` > repo-root `site.env`; exit 2 if none). The gate refuses (exit 4) if the GPU guard dies at start; read `guard.log` in the gate dir. The plain commands below still work.
+
 1. **Once per model**, and again after any caching or batching change (`-np`, prompt cache): `python3 evals/gate.py calibrate --model <alias> --yes` (two runs). It also stores a baseline. If the A/A does not pass, fix determinism first; `check` refuses until it passes.
 2. **Before the change**, if the alias has no current baseline: `python3 evals/gate.py baseline --model <alias> --yes`.
 3. Make the change.

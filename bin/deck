@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# deck: one entry point for the deck's tools, so every tool reads the same site.env.
+#
+# Usage: bin/deck evals run  [--site-env PATH] [run.py args...]
+#        bin/deck evals gate <calibrate|baseline|check> [--site-env PATH] [gate.py args...]
+#        bin/deck evals gate compare ...          (offline; no site.env needed)
+#        bin/deck --help
+#
+# The site.env is resolved in the deck-wide order: --site-env PATH > $SITE_ENV > ~/.config/deck/site.env >
+# <repo>/site.env. A path named by --site-env or $SITE_ENV must exist (no silent fallback); when nothing resolves,
+# deck exits 2. The path is exported as SITE_ENV, so the GPU guard and the gateway tunnel that gate.py and the
+# plans start read the same file, and passed to the tool as --site-env. deck also passes
+# --llama-swap-config <repo>/walter/llama-swap/config.yaml.tmpl unless one is given. It runs
+# `python3 -B evals/<tool>.py` from the repo root: the GPU guard, stop.sh and the spark-model live-run check match
+# that command line.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+TEMPLATE="$REPO/walter/llama-swap/config.yaml.tmpl"
+
+usage() { sed -n '2,15p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; }
+die() { echo "deck: $1" >&2; exit "${2:-2}"; }
+
+# resolve_site_env EXPLICIT: prints the absolute site.env path, or exits 2
+resolve_site_env() {
+  local f="" from=""
+  if [ -n "$1" ]; then f="$1"; from="--site-env"
+  elif [ -n "${SITE_ENV:-}" ]; then f="$SITE_ENV"; from="\$SITE_ENV"
+  elif [ -n "${HOME:-}" ] && [ -e "$HOME/.config/deck/site.env" ]; then f="$HOME/.config/deck/site.env"; from="~/.config/deck/site.env"
+  elif [ -e "$REPO/site.env" ]; then f="$REPO/site.env"; from="the repo root"
+  else
+    die "no site.env: pass --site-env PATH, set SITE_ENV, or create ~/.config/deck/site.env or $REPO/site.env (from site.env.example)"
+  fi
+  [ -f "$f" ] && [ -r "$f" ] || die "site.env from $from is not a readable file: $f"
+  readlink -f "$f"
+}
+
+cmd_evals() {
+  local tool="${1:-}"
+  case "$tool" in
+    run|gate) shift ;;
+    -h|--help) usage; return 0 ;;
+    "") usage >&2; exit 2 ;;
+    *) die "unknown evals command '$tool' (run or gate)" ;;
+  esac
+  # pull --site-env out of the arguments; it is re-added once, resolved
+  local explicit="" have_swap=0 args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --site-env) [ $# -ge 2 ] || die "--site-env needs a path"; explicit="$2"; shift 2; continue ;;
+      --site-env=*) explicit="${1#--site-env=}"; [ -n "$explicit" ] || die "--site-env needs a path"; shift; continue ;;
+      --llama-swap-config|--llama-swap-config=*) have_swap=1 ;;
+    esac
+    args+=("$1"); shift
+  done
+  # gate compare (offline) and --help take no site flags
+  local site_flags=1
+  if [ "$tool" = gate ]; then
+    case "${args[0]:-}" in calibrate|baseline|check) ;; *) site_flags=0 ;; esac
+  fi
+  for x in ${args[@]+"${args[@]}"}; do case "$x" in -h|--help) site_flags=0 ;; esac; done
+  local extra=()
+  if [ "$site_flags" = 1 ]; then
+    SITE_ENV="$(resolve_site_env "$explicit")"
+    export SITE_ENV
+    extra+=(--site-env "$SITE_ENV")
+    if [ "$have_swap" = 0 ]; then
+      [ -f "$TEMPLATE" ] || die "llama-swap template not found: $TEMPLATE (pass --llama-swap-config)"
+      extra+=(--llama-swap-config "$TEMPLATE")
+    fi
+  elif [ -n "$explicit" ]; then
+    die "--site-env does not apply here"
+  fi
+  cd "$REPO"
+  if [ "$tool" = gate ]; then
+    # subcommand first: gate.py's flags belong to the subcommand
+    exec python3 -B evals/gate.py ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"}
+  fi
+  exec python3 -B evals/run.py ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"}
+}
+
+case "${1:-}" in
+  evals) shift; cmd_evals "$@" ;;
+  -h|--help|help) usage ;;
+  "") usage >&2; exit 2 ;;
+  *) die "unknown command '$1' (try: deck evals run|gate ...)" ;;
+esac
