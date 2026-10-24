@@ -29,7 +29,7 @@ When to use this: a key has leaked (pasted into a chat, committed, left in a bac
 | Pocket-ID temporary `STATIC_API_KEY` | Walter `/srv/webui/pocket-id.env` | admin scripts | Remove it as soon as the task is done | Full Pocket-ID admin |
 | hermes-gateway `API_SERVER_KEY` | workstation `~/.hermes/.env`; Walter `/srv/webui/.env` (`OPENAI_API_KEYS`) | Open WebUI → Hermes Agent | Replace both, restart `hermes-gateway` (user unit) and `open-webui` | Hermes Agent model |
 | Grafana admin password | Walter `/srv/monitoring/grafana-admin-password` | Grafana | `grafana cli admin reset-admin-password` in the container, update file | Monitoring |
-| WireGuard keys | Walter and Covenant `/etc/wireguard/` (600) | the tunnel | New keypair on one side, update the peer's `PublicKey` (on Covenant: `WG_BACKEND_PUBLIC_KEY` in `site.env`, then `covenant/deploy.sh`), restart `wg-quick@wg0` on both | Everything, briefly |
+| WireGuard keys | Walter and Covenant `/etc/wireguard/` (600) | the tunnel | New keypair on one side, update the peer's `PublicKey` (on Covenant: `WG_BACKEND_PUBLIC_KEY` in `site.env`, then a new covenant slice and `covenant/deploy.sh --env ~/covenant.env`), restart `wg-quick@wg0` on both | Everything, briefly |
 | Let's Encrypt keys | Covenant `/etc/letsencrypt/` | nginx | `certbot renew --force-renewal --cert-name <host>` | One host |
 
 ## Rotate a LiteLLM virtual key
@@ -126,10 +126,12 @@ new logins to that site fail until step 2 is done.
 1. Pocket-ID admin UI → **OIDC clients** → the client (`${OAUTH2_PROXY_CLIENT_ID}` for telemetry,
    `${OAUTH2_PROXY_DIGEST_CLIENT_ID}` for the digest) → regenerate the client secret. The UI shows
    it once.
-2. On Covenant, from a repo checkout with the edge's `site.env` (the script checks it):
+2. On Covenant, from a repo checkout, with the edge's covenant slice (`bin/deck env slice covenant`;
+   see [covenant/README.md](../../covenant/README.md#the-edges-site-values-a-covenant-slice)), which
+   the script checks:
    ```bash
-   sudo covenant/deploy.sh --set-client-secret --force                     # telemetry: /etc/oauth2-proxy/client-secret
-   sudo covenant/deploy.sh --set-client-secret --instance digest --force   # digest: /etc/oauth2-proxy-digest/client-secret
+   sudo covenant/deploy.sh --env ~/covenant.env --set-client-secret --force                     # telemetry: /etc/oauth2-proxy/client-secret
+   sudo covenant/deploy.sh --env ~/covenant.env --set-client-secret --instance digest --force   # digest: /etc/oauth2-proxy-digest/client-secret
    ```
    It reads the secret from stdin with no echo, replaces the file (root 0600) and restarts the
    matching unit (`oauth2-proxy` or `oauth2-proxy-digest`). Without `--force` it refuses to replace
