@@ -20,10 +20,7 @@ LITELLM = load_yaml(REPO / "walter/gateway/litellm.yaml.tmpl")
 LLAMA_SWAP = load_yaml(REPO / "walter/llama-swap/config.yaml.tmpl")
 # Known differences, each with its reason. A fixed one must be removed from here (the test fails while it is listed
 # but no longer differs), so the list only shrinks.
-KNOWN_DRIFT = {
-    ("opencode", "vision", "output"): "opencode asks for 32768 output tokens on vision; the gateway caps it at "
-                                      "16384 (spark_hooks.py MODEL_MAX_OUTPUT), so a request is clamped, not refused",
-}
+KNOWN_DRIFT = {}   # (client, alias, field) -> reason; empty: the clients agree with the gateway
 
 
 def test_contract_header():
