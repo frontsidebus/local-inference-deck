@@ -1,0 +1,43 @@
+{
+  "contract": "gate-cli",
+  "contract_version": "1.0",
+  "owner": "sec-evals",
+  "about": "C6: the upgrade gate's command line (python3 -B evals/gate.py, or bin/deck evals gate, which execs it and passes the exit code through) and its per-run record gate.json. Consumers: the deck runbooks (docs/runbooks/upgrade.md) and any automation that reads a gate dir. Versioning: minor = an added optional field or verdict detail; major = a changed exit code, a renamed or removed field, or a changed meaning.",
+  "commands": ["calibrate", "baseline", "check", "compare"],
+  "exit_codes": {
+    "0": {"name": "PASS", "meaning": "every row equivalent or different-better"},
+    "1": {"name": "FAIL", "meaning": "a row is different-worse: roll back"},
+    "2": {"name": "INCONCLUSIVE", "meaning": "hold: the owner decides"},
+    "3": {"name": "INVALID", "meaning": "the run is invalid (a stopping rule, serving identity changed mid-run, api errors, incomplete)"},
+    "4": {"name": "REFUSED", "meaning": "the gate refused before or instead of judging (bad or missing manifest, no compatible baseline, no passing A/A, no --yes, STOP file, the GPU guard died at start)"}
+  },
+  "record": {"file": "gate.json", "dir": "<results root>/<model>/<kind>-<UTC stamp>/"},
+  "record_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "required": ["schema", "kind", "model", "created", "manifest", "status", "run_dir", "items"],
+    "properties": {
+      "schema": {"const": "gate-record-v1"},
+      "kind": {"enum": ["baseline", "aa", "check"]},
+      "model": {"type": "string"},
+      "created": {"type": "string", "pattern": "^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$"},
+      "ended": {"type": "string"},
+      "manifest": {"type": "object", "required": ["path", "sha256", "name"],
+                   "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                                  "name": {"type": "string"}}},
+      "status": {"enum": ["running", "complete", "invalid", "interrupted", "failed", "refused"]},
+      "run_dir": {"type": "string"},
+      "items": {"type": "integer", "minimum": 0},
+      "verdict": {"enum": ["PASS", "FAIL", "INCONCLUSIVE", "INVALID"]},
+      "exit": {"enum": [0, 1, 2, 3, 4]},
+      "baseline": {"type": "string"},
+      "invalid": {"type": ["array", "null"], "items": {"type": "string"}},
+      "serving_identity": {"type": "object"},
+      "harness": {"type": "object"},
+      "routes": {"type": "array", "items": {"type": "string"}},
+      "run_exits": {"type": "array", "items": {"type": "integer"}},
+      "llama_swap_live": {"type": "array", "items": {"type": "object", "required": ["when", "at"]}},
+      "aa": {"type": "object"}
+    }
+  }
+}

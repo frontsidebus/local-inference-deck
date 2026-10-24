@@ -1,0 +1,45 @@
+{
+  "contract": "gateway",
+  "contract_version": "1.0",
+  "generated_from": "contracts/gateway.yaml (python3 contracts/tools/contracts.py aliases --write)",
+  "frontier_safety_net": "claude-*",
+  "lab_prefix": "lab-",
+  "aliases": {
+    "coder": {
+      "max_output_tokens": 32768,
+      "context_window": 131072,
+      "vision": false,
+      "evicts_coding_pair": false
+    },
+    "coder-fast": {
+      "max_output_tokens": 32768,
+      "context_window": 131072,
+      "vision": false,
+      "evicts_coding_pair": false
+    },
+    "big": {
+      "max_output_tokens": 32768,
+      "context_window": 131072,
+      "vision": false,
+      "evicts_coding_pair": true
+    },
+    "flash": {
+      "max_output_tokens": 32768,
+      "context_window": 131072,
+      "vision": false,
+      "evicts_coding_pair": true
+    },
+    "vision": {
+      "max_output_tokens": 16384,
+      "context_window": 131072,
+      "vision": true,
+      "evicts_coding_pair": true
+    },
+    "hermes": {
+      "max_output_tokens": 16384,
+      "context_window": 65536,
+      "vision": false,
+      "evicts_coding_pair": true
+    }
+  }
+}

@@ -1,0 +1,29 @@
+# C3: the gateway API and its stable aliases (owner: local-inference-deck).
+# Source of truth for contracts/aliases.json (generated: python3 contracts/tools/contracts.py aliases --write).
+# Agreement tests: contracts/tests/test_c3_gateway.py (litellm.yaml.tmpl, the llama-swap template's router sets
+# and capabilities, spark_hooks.py, the codex/opencode/hermes client configs, JUDGE_LOCAL_MODEL, evals/run.py).
+# Versioning (contracts/README.md): minor = additive (a new alias, a new optional field); major = a rename or
+# removal of an alias or field, or a changed meaning (for example a smaller max_output_tokens).
+contract: gateway
+contract_version: "1.0"
+
+api:
+  public_base_url: "https://${SPARK_API_HOST}/v1"     # through the edge (C2: LITELLM_PORT)
+  auth: "Authorization: Bearer <LiteLLM virtual key>"   # one key per harness or user (walter/gateway/provision-keys.py)
+  endpoints: ["/v1/chat/completions", "/v1/responses", "/v1/messages"]
+  models_endpoint: "/v1/models"
+
+routes:
+  local: "local/*"          # local/<llama-swap model id> -> that model id
+  frontier_safety_net: "claude-*"   # real Claude model names (Claude Code background tasks) are answered by coder
+  lab_prefix: "lab-"        # lab model ids; the gateway refuses them to keys without metadata.lab
+
+# Stable alias -> what a client may rely on. evicts_coding_pair: the alias loads on both GPUs and unloads the
+# default coding pair (coder + coder-fast) while it runs.
+aliases:
+  coder:      {max_output_tokens: 32768, context_window: 131072, vision: false, evicts_coding_pair: false}
+  coder-fast: {max_output_tokens: 32768, context_window: 131072, vision: false, evicts_coding_pair: false}
+  big:        {max_output_tokens: 32768, context_window: 131072, vision: false, evicts_coding_pair: true}
+  flash:      {max_output_tokens: 32768, context_window: 131072, vision: false, evicts_coding_pair: true}
+  vision:     {max_output_tokens: 16384, context_window: 131072, vision: true,  evicts_coding_pair: true}
+  hermes:     {max_output_tokens: 16384, context_window: 65536,  vision: false, evicts_coding_pair: true}
