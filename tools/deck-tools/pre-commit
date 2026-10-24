@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# pre-commit (deck-tools): blocks the commit unless
+#   1. tools/deck-tools/ matches tools/tools.lock (content and executable bits: `deck-tools verify`), and
+#   2. check-sanitized passes on the staged (and untracked) files: exit 1 is a finding, exit 2 means no
+#      real-value source (create ~/.config/deck/site.env, for example a symlink to your site.env).
+# The repo is the work tree being committed. Its scripts/check-sanitized.sh shim is used when present, else the
+# engine next to this file. Install: tools/deck-tools/deck-tools install-hooks (see tools/deck-tools/README.md).
+set -uo pipefail
+root=$(git rev-parse --show-toplevel) || exit 1
+dt=$root/tools/deck-tools
+if ! python3 "$dt/deck-tools" verify --quiet --repo "$root"; then
+  echo "pre-commit: tools/deck-tools does not match tools/tools.lock (an engine edit needs \`tools/deck-tools/deck-tools lock\`" \
+       "in the same commit; a vendored copy is changed only by \`deck-tools sync\`); commit blocked" >&2
+  exit 1
+fi
+cs=$root/scripts/check-sanitized.sh
+[[ -e $cs ]] || cs=$dt/check-sanitized.sh
+"$cs"
+rc=$?
+case $rc in
+  0) exit 0 ;;
+  1) echo "pre-commit: check-sanitized found site values or secret-shaped strings; commit blocked" >&2 ;;
+  2) echo "pre-commit: check-sanitized has no real-value source (or a dangling symlink); commit blocked" >&2 ;;
+  *) echo "pre-commit: check-sanitized failed (exit $rc); commit blocked" >&2 ;;
+esac
+exit "$rc"

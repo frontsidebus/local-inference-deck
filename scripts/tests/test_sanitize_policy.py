@@ -40,7 +40,9 @@ def env(tmp_path):
 def make_repo(root, env, with_policy, keys):
     r = root / ("with-policy" if with_policy else "builtin")
     (r / "scripts").mkdir(parents=True)
-    shutil.copy2(SCRIPT, r / "scripts" / "check-sanitized.sh")
+    shutil.copy2(SCRIPT, r / "scripts" / "check-sanitized.sh")       # the shim, and the engine it execs
+    shutil.copytree(REPO / "tools" / "deck-tools", r / "tools" / "deck-tools",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(REPO / "site.env.example", r / "site.env.example")   # example values only
     if with_policy:
         (r / "contracts").mkdir()

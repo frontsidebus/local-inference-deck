@@ -1,6 +1,7 @@
 """scripts/check-sanitized.sh: site-env lookup, judge.env, fail-closed exit codes, --regex-only,
 --history. Every test builds a throwaway git repo with example-valued fake "real" values; HOME is a
-temp dir, so the operator's ~/.config is never read. Run:
+temp dir, so the operator's ~/.config is never read. Each test runs twice: through the scripts/ shim and
+through the tools/deck-tools/ engine it execs. Run:
     python3 -m pytest scripts/tests -q -p no:cacheprovider
 """
 import os
@@ -12,6 +13,23 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "check-sanitized.sh"
+DECK_TOOLS = REPO / "tools" / "deck-tools"
+ENTRY = {"rel": "scripts/check-sanitized.sh"}      # set per test by the `entry` fixture
+
+
+@pytest.fixture(autouse=True, params=["shim", "engine"])
+def entry(request):
+    ENTRY["rel"] = ("scripts/check-sanitized.sh" if request.param == "shim"
+                    else "tools/deck-tools/check-sanitized.sh")
+    return request.param
+
+
+def copy_tools(r):
+    """The shim, the deck-tools engines it execs and their lock, as a vendoring repo has them."""
+    (r / "scripts").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(SCRIPT, r / "scripts" / "check-sanitized.sh")
+    shutil.copytree(DECK_TOOLS, r / "tools" / "deck-tools", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy2(REPO / "tools" / "tools.lock", r / "tools" / "tools.lock")
 
 EXAMPLE = """\
 SPARK_DOMAIN=example.com              # public example
@@ -49,8 +67,7 @@ def env(tmp_path):
 @pytest.fixture
 def repo(tmp_path, env):
     r = tmp_path / "repo"
-    (r / "scripts").mkdir(parents=True)
-    shutil.copy2(SCRIPT, r / "scripts" / "check-sanitized.sh")
+    copy_tools(r)
     (r / "site.env.example").write_text(EXAMPLE)
     (r / ".gitignore").write_text("site.env\n*.env\n!*.env.example\n.sanitize-extra\n.sanitize-words\n")
     (r / "README.md").write_text("Domain: example.com\n")
@@ -62,7 +79,7 @@ def repo(tmp_path, env):
 
 def run(repo, env, *args, **extra):
     e = dict(env, **extra)
-    return subprocess.run(["bash", str(repo / "scripts" / "check-sanitized.sh"), *args],
+    return subprocess.run(["bash", str(repo / ENTRY["rel"]), *args],
                           cwd=repo, env=e, capture_output=True, text=True, timeout=60)
 
 

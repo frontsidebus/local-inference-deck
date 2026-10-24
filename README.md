@@ -66,7 +66,7 @@ Every Walter port binds to `BACKEND_WG_IP` (or loopback) and only accepts traffi
 | [judge/](judge/README.md) | A reviewer for the local agent: Hermes shell hooks gate risky tool calls and queue reviews; a frontier (or local) judge checks the agent's claims against collected evidence. See [docs/agent-judge.md](docs/agent-judge.md). |
 | [hypervisor/](hypervisor/README.md) | Requirements only. The host layer (VFIO, libvirt domain, disk passthrough) lives in a private infrastructure repo. |
 | [docs/](docs/) | [Decisions](docs/decisions.md), the [agent judge design](docs/agent-judge.md), [runbooks](docs/runbooks/) and [history](docs/history/gen2/INDEX.md). See the [docs map](#docs-map). |
-| `scripts/` | `render.sh` (templates), `gen-secrets.sh` (secrets on the target host), `check-sanitized.sh` (pre-commit guard). |
+| `scripts/` | `render.sh` (templates), `gen-secrets.sh` (secrets on the target host), `check-sanitized.sh` (pre-commit guard): shims into the shared engines in [tools/deck-tools/](tools/deck-tools/README.md), pinned by `tools/tools.lock`. |
 
 Site-specific values (domain, IPs, user list) live in `site.env`, which is gitignored. Copy [site.env.example](site.env.example) and fill it in. Templates (`*.tmpl`) are rendered by `scripts/render.sh` with an explicit variable list. Secrets are never in the repo: `scripts/gen-secrets.sh` creates them on the host and never overwrites an existing one. See [CONVENTIONS.md](CONVENTIONS.md).
 

@@ -29,11 +29,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
             python3-pytest python3-yaml python3-jsonschema gettext-base shellcheck
+      # deck-tools (tools/deck-tools/README.md): every file matches tools/tools.lock (content and mode), and on a
+      # pull request an engine change since the base must come with a version bump
+      - name: deck-tools verify
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 tools/deck-tools/deck-tools verify
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags --depth=1 origin "$BASE_REF"
+            python3 tools/deck-tools/deck-tools verify --base FETCH_HEAD
+          fi
       - name: walter tests
         run: python3 -m pytest walter/tests walter/firewall/tests -q -p no:cacheprovider
       - name: gateway tests
         run: python3 -m pytest walter/gateway/tests -q -p no:cacheprovider
-      - name: sanitizer tests
+      - name: sanitizer tests (scripts/ shims and tools/deck-tools engines)
         run: python3 -m pytest scripts/tests -q -p no:cacheprovider
       - name: site-key registry (C1) and deck env/check tests
         run: |
@@ -59,7 +70,7 @@ jobs:
       - name: check-sanitized (generic secret shapes; no real values in CI)
         run: CI=true bash scripts/check-sanitized.sh --all --regex-only
       - name: shellcheck
-        run: shellcheck -S warning scripts/*.sh scripts/secrets.d/*.sh hooks/pre-commit
+        run: shellcheck -S warning scripts/*.sh scripts/secrets.d/*.sh hooks/pre-commit tools/deck-tools/*.sh tools/deck-tools/pre-commit
 
   gitleaks:
     runs-on: ubuntu-24.04
