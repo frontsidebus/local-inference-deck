@@ -119,6 +119,8 @@ rules:
   - {"key": "JUDGE_ACK_AGENT_ENV", "action": "skip", "class": "judge-knob"}
   - {"key": "JUDGE_ENQUEUE_ALWAYS", "action": "skip", "class": "judge-knob"}
   - {"key": "JUDGE_CHECK_UNITS", "action": "skip", "class": "judge-knob"}
+  - {"key": "EVAL_BASE_URL", "action": "check", "class": "check"}
+  - {"key": "SPARK_EVAL_KEY_FILE", "action": "check", "class": "check"}
   - {"key": "*_PORT", "action": "skip", "class": "generic"}
   - {"key": "*_IF", "action": "skip", "class": "generic"}
   - {"key": "*_GROUP", "action": "skip", "class": "generic"}

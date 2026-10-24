@@ -148,3 +148,5 @@ keys:
   - {"name": "JUDGE_ACK_AGENT_ENV", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
   - {"name": "JUDGE_ENQUEUE_ALWAYS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
   - {"name": "JUDGE_CHECK_UNITS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "0", "sanitize": "judge-knob"}
+  - {"name": "EVAL_BASE_URL", "active": false, "owner": "evals", "consumers": ["evals"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "SPARK_EVAL_KEY_FILE", "active": false, "owner": "evals", "consumers": ["evals"], "required": false, "default": "\"\"", "sanitize": "check"}
