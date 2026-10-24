@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            python3-pytest python3-yaml gettext-base shellcheck
+            python3-pytest python3-yaml python3-jsonschema gettext-base shellcheck
       - name: walter tests
         run: python3 -m pytest walter/tests walter/firewall/tests -q -p no:cacheprovider
       - name: gateway tests
@@ -40,6 +40,22 @@ jobs:
           python3 -B tools/site_keys.py validate
           python3 -B tools/site_keys.py policy --check
           python3 -m pytest tools/tests -q -p no:cacheprovider
+      # 0b contracts (contracts/README.md): vendored copies and generated files current, the deck's provider and
+      # consumer tests, and the judge/evals contract tests (offline: temp dirs and a loopback fake gateway only)
+      - name: contract artifacts current
+        run: |
+          python3 contracts/tools/contracts.py vendor
+          python3 contracts/tools/contracts.py aliases
+          python3 contracts/tools/contracts.py vectors
+      - name: contract tests (deck)
+        run: python3 -m pytest contracts/tests -q -p no:cacheprovider
+      - name: contract tests (agent-judge, sec-evals)
+        run: python3 -m pytest judge/tests/test_contract_*.py evals/tests/test_contract_*.py -q -p no:cacheprovider
+      # R2: the evals test reads a vendored fixture by default; here it also covers the real template
+      - name: evals llama-swap entry against the walter template (R2)
+        env:
+          SPARK_LLAMA_SWAP_TEMPLATE: ${{ github.workspace }}/walter/llama-swap/config.yaml.tmpl
+        run: python3 -m pytest evals/tests/test_run.py -k llama_swap_entry_from_template -q -p no:cacheprovider
       - name: check-sanitized (generic secret shapes; no real values in CI)
         run: CI=true bash scripts/check-sanitized.sh --all --regex-only
       - name: shellcheck
