@@ -12,9 +12,12 @@ judge/       agent judge: gates, evidence collector and reviewer for a local age
 hypervisor/  requirements for the host layer (managed in a separate IaC project)
 evals/       security eval harness (run.py, scorers, report); benchmark data and results are gitignored
 docs/        decisions, agent-judge design, runbooks, history (old Ollama-era docs live in docs/history/)
-scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh
+scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh (executable shims into tools/deck-tools/),
+             secrets.d/<component>.sh (the secrets specs)
 contracts/   machine-readable seams: site-keys.yaml (the site.env key registry), sanitize-policy.yaml (generated)
-tools/       site_keys.py: registry checks, the sanitize-policy generator, `deck env slice` and `deck check`
+tools/       site_keys.py: registry checks, the sanitize-policy generator, `deck env slice` and `deck check`;
+             deck-tools/: the shared engines (render, gen-secrets, check-sanitized), the `deck-tools` CLI and the
+             pre-commit hook, released as deck-tools-v<VERSION> tags; tools.lock pins them (sha256 and mode)
 bin/deck     one entry point: deck evals, deck env slice, deck check
 site.env.example
 ```
@@ -68,14 +71,25 @@ CHAT_GROUP=chat-users
 Real domain names of the live site, real public IPs, the admin's home IP, real email addresses, real user names from the live user list, real hostnames/usernames of the operator's machines, AWS key-pair names, Pocket-ID/OIDC client UUIDs, LiteLLM key aliases tied to real people, anything from `/home/<user>` paths. Use the example values above. Codenames "Walter" (backend) and "Covenant" (edge) ARE allowed — they're the project's lore.
 
 ## Before every commit
-- Run `scripts/check-sanitized.sh` (staged and untracked files) or `scripts/check-sanitized.sh --all` (every tracked file). It reads the real site values from the first site env it finds: `--site-env FILE`, `$SITE_ENV`, `~/.config/deck/site.env`, then the gitignored `site.env` at the repo root. It adds `judge.env` when present (`$JUDGE_ENV`, else `~/.config/judge/judge.env`) and the optional `.sanitize-extra` (literal strings) and `.sanitize-words` (whole words such as real user names) from `~/.config/deck/` and the repo root. It also flags secret-shaped strings.
+- Run `scripts/check-sanitized.sh` (staged and untracked files) or `scripts/check-sanitized.sh --all` (every tracked file). It reads the real site values from the first site env it finds: `--site-env FILE`, `$SITE_ENV`, `~/.config/deck/site.env`, then the gitignored `site.env` at the repo root. It adds `judge.env` when present (`$JUDGE_ENV`, else `~/.config/judge/judge.env`) and the optional `.sanitize-extra` (literal strings) and `.sanitize-words` (whole words such as real user names) from `~/.config/deck/` and the repo root. A real value equal to its example default is public; the defaults come from `contracts/site-keys.yaml` (the same values as `site.env.example`). It also flags secret-shaped strings.
 - **Check its exit code**, not only its last line: `scripts/check-sanitized.sh --all; echo "exit=$?"`. It exits 0 when clean, 1 on any finding, and 2 when it finds no real-value source or a dangling symlink (the message names the paths it tried). Never pipe it into `tail` or `head`, which hides the status. Make `~/.config/deck/site.env` a symlink to your site.env once, so every worktree is checked: `mkdir -p ~/.config/deck && ln -s <path-to>/site.env ~/.config/deck/site.env`.
 - `--history` scans every commit for the real values and names and reports commit, path and key name (never the value). `--regex-only` (generic secret shapes only) is for CI and refused unless `CI=true`.
-- Install the pre-commit hook once per clone. It runs `check-sanitized.sh` on staged and untracked files and blocks the commit on exit 1 or 2. Either `git config core.hooksPath hooks` (this replaces `.git/hooks` for this clone and its worktrees), or keep other hooks and link just this one: `ln -s ../../hooks/pre-commit "$(git rev-parse --git-common-dir)/hooks/pre-commit"` (adjust the relative path if the common dir is not `<clone>/.git`; an absolute path also works).
+- Install the pre-commit hook once per clone: `tools/deck-tools/deck-tools install-hooks`. The hook runs `deck-tools verify --index` (the staged `tools/deck-tools/` matches the staged `tools/tools.lock`) and then `check-sanitized.sh` on staged and untracked files, and blocks the commit on any failure (check-sanitized: exit 1 or 2). `install-hooks` puts a small stub in the clone's common hooks dir that runs the committing worktree's own `hooks/pre-commit`, so it serves every worktree and keeps any other hook you have (it refuses to replace one unless `--force`). `git config core.hooksPath hooks` still works too (it replaces `.git/hooks` for this clone and its worktrees), as does a symlink to `hooks/pre-commit`.
 - Run gitleaks on the changed files as a second, independent check, for example `docker run --rm -v "$PWD:/scan" zricethezav/gitleaks:latest dir /scan/<path>` for each changed path (or `gitleaks dir <path>` if it is installed).
 - Grep the added lines (`git diff --cached -U0 | grep '^+'`) for the real domain, IPs, user names and home paths. The expected count is 0.
 - Pin everything: image digests, binary versions with sha256.
 - When capturing a change made on a live host, render the templates with your real `site.env` and diff against the live files. The only differences should be secret placeholders.
+
+## Shared tooling: `tools/deck-tools/` and `tools/tools.lock`
+The engines behind `scripts/render.sh`, `scripts/gen-secrets.sh` and `scripts/check-sanitized.sh` live in `tools/deck-tools/` ([README](tools/deck-tools/README.md)). This repo is their origin; agent-judge and sec-evals vendor a tagged release with `deck-tools sync`. The `scripts/` paths stay as executable two-line shims (`covenant/deploy.sh` runs `scripts/gen-secrets.sh` only when it is executable), so callers never change. `tools/tools.lock` lists every file in `tools/deck-tools/` with its sha256 and mode.
+
+Changing a file in `tools/deck-tools/` is one commit with four parts:
+1. the edit;
+2. a `VERSION` bump (patch: a fix; minor: a new option; major: a changed exit code, output contract or a removed option);
+3. a `tools/deck-tools/CHANGELOG.md` entry `## <version>`;
+4. `python3 tools/deck-tools/deck-tools lock`, which rewrites `tools/tools.lock`.
+
+The pre-commit hook (`verify --index`) blocks a commit whose staged files do not match the staged lock. CI runs `deck-tools verify` (contents, modes, VERSION and CHANGELOG) and, on a pull request, `verify --base <base>`, which fails when the locked files changed but the version did not go up. So a forgotten lock or version bump never merges. After the owner merges, the lead tags the merge commit `deck-tools-v<VERSION>`; consumer repos sync from that tag. Nothing outside `tools/deck-tools/` (the shims, the secrets specs, `contracts/`) is in the lock.
 
 ## Branches, worktrees and PRs
 - `main` is protected by convention: no direct commits. Work on a topic branch (`feat/...`, `fix/...`, `docs/...`).
