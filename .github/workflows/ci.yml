@@ -54,8 +54,8 @@ jobs:
           python3 -B tools/site_keys.py policy --check
           python3 -m pytest tools/tests -q -p no:cacheprovider
       # 0b contracts (contracts/README.md): vendored copies and generated files current, the deck's provider and
-      # consumer tests, and the judge contract tests (offline: temp dirs and a loopback fake gateway only). sec-evals
-      # is its own repo since step 3: its tests run in its CI, and here only the deck's side of C3-C6/C9 runs.
+      # consumer tests (offline: temp dirs and a loopback fake gateway only). agent-judge (step 2) and sec-evals (step 3)
+      # are their own repos: their contract tests run in their CI, and here only the deck's side of C3-C10 runs.
       - name: contract artifacts current
         run: |
           python3 contracts/tools/contracts.py vendor
@@ -63,8 +63,6 @@ jobs:
           python3 contracts/tools/contracts.py vectors
       - name: contract tests (deck)
         run: python3 -m pytest contracts/tests -q -p no:cacheprovider
-      - name: contract tests (agent-judge)
-        run: python3 -m pytest judge/tests/test_contract_*.py -q -p no:cacheprovider
       - name: check-sanitized (generic secret shapes; no real values in CI)
         run: CI=true bash scripts/check-sanitized.sh --all --regex-only
       - name: shellcheck
