@@ -55,9 +55,14 @@ def _coder_checks(entries, cmds):
 
 
 def test_fixture_and_real_template_carry_the_coder_fields():
-    """The real-template assertion that evals/tests/test_run.py made before R2 (it now reads a fixture)."""
+    """The real-template assertion that sec-evals' test_run.py::test_llama_swap_entry_from_template made against
+    walter/llama-swap/config.yaml.tmpl while evals/ was in this repo (plan step 3 moved it here): coder resolves to
+    the contract's model id, its cmd has a digest-pinned image and no unexpanded ${image}, --temp is pinned, and an
+    unknown alias resolves to nothing. sec-evals now checks its reader against the vendored fixture only."""
     for text in (FIXTURE, TEMPLATE.read_text()):
-        _coder_checks(swapcmd.entries(text), TOOL.cmd_texts(text, swapcmd))
+        entries = swapcmd.entries(text)
+        _coder_checks(entries, TOOL.cmd_texts(text, swapcmd))
+        assert not [m for m, e in entries.items() if "no-such-alias" == m or "no-such-alias" in e["aliases"]]
 
 
 def test_rendered_template_keeps_the_coder_fields(tmp_path):

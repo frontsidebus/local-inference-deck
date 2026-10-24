@@ -15,7 +15,8 @@
 Add --json for machine-readable output. Every verb but search/fit runs on the backend as
     ssh -o BatchMode=yes $BACKEND_SSH_USER@$BACKEND_LAN_IP sudo -n /usr/local/sbin/spark-model-agent <verb> --json ...
 (values from site.env). `rm --yes` refuses while an eval or gate run is live on this workstation (a running
-evals/run.py or gpu-guard.sh, or a live *.pid under evals/results/_runs/*/); --force overrides and says what.
+evals/run.py or gpu-guard.sh, or a live *.pid under evals/results/_runs/*/ in this checkout or a checkout listed in
+SPARK_EVAL_REPOS (colon-separated; list the sec-evals checkout there); --force overrides and says what.
 Runbook: walter/models/README.md.
 """
 import json

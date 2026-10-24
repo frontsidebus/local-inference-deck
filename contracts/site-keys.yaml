@@ -24,7 +24,7 @@ components:
   - {"name": "digest", "description": "optional digest app: walter/digest (deployed by walter/deploy.sh, gated on the edge by covenant)"}
   - {"name": "clients", "description": "workstation harnesses: clients/install.sh, clients/bin/spark-model, clients/hermes templates"}
   - {"name": "judge", "description": "agent judge: judge/lib/config.py and sitemask.py read the full site env", "slice": false, "slice_refusal": "the judge is exempt from slicing: judge/lib/sitemask.py can only mask the site values it knows, so the judge must read the full site env"}
-  - {"name": "evals", "description": "eval harness: evals/tools/lib.sh site_value, evals/gate.py, evals/run.py"}
+  - {"name": "evals", "description": "eval harness, the sec-evals repo (its example: evals.env.example, vendored in contracts/vendored/sec-evals/): evals/tools/lib.sh site_value, evals/gate.py, evals/run.py"}
   - {"name": "hypervisor", "description": "host layer (docs only): hypervisor/README.md"}
 sanitize_classes:
   - {"name": "check", "action": "check", "description": "a real value that differs from the example is forbidden in tracked files"}

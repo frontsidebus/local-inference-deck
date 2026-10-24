@@ -225,8 +225,8 @@ enable refuses flagged + unreviewed). The heuristics are deliberately simple:
 - `render`: the diff; from the workstation it is dry only (deploy.sh applies).
 - `status`: paths, settings, whether config.yaml equals base + registry, lab models in `/running`.
 - `serving`: read-only. For each model in the live config.yaml: the cmd sha256, aliases and a few server flags
-  (`-c -n -sm -m` basename and sampling), parsed exactly as `evals/run.py` parses the template (`lib/swapcmd.py`).
-  No paths and no keys are printed. The eval gate records it as the serving identity (`evals/README.md`).
+  (`-c -n -sm -m` basename and sampling), parsed exactly as sec-evals' `evals/run.py` parses the template (`lib/swapcmd.py`; contract C4).
+  No paths and no keys are printed. The eval gate records it as the serving identity (sec-evals README).
 
 All verbs take `--json` (the client always uses it; the human text is in its `"text"` field).
 
@@ -235,7 +235,12 @@ All verbs take `--json` (the client always uses it; the human text is in its `"t
 - **Live eval/gate runs** (client side): `spark-model rm --yes` refuses while an eval or gate run is live on the
   workstation: a process running `evals/run.py` or `evals/tools/gpu-guard.sh`, or a `*.pid` file under
   `evals/results/_runs/*/` whose process is alive (this checkout plus `SPARK_EVAL_REPOS`, colon-separated).
-  `--force` overrides and prints what it overrode. (`render --apply` is not offered by the client in Phase 1.)
+  `--force` overrides and prints what it overrode.
+  - The harness is the sec-evals repo. **Add its checkout (`~/src/deck/sec-evals`, or your `$SEC_EVALS_DIR`) to
+    `SPARK_EVAL_REPOS` before any model swap**, for example `export SPARK_EVAL_REPOS=$HOME/src/deck/sec-evals` in
+    the shell profile. While an old monorepo checkout still holds gate state under its gitignored `evals/results/`,
+    keep it listed too (`SPARK_EVAL_REPOS=<sec-evals>:<old checkout>`). The process check matches the
+    `evals/run.py` argv suffix wherever the checkout is. (`render --apply` is not offered by the client in Phase 1.)
 - **Server side**: `rm` and `render --apply` refuse while a lab model is in llama-swap's `/running`.
 - One registry writer at a time (`flock` on `/run/spark-model-agent.lock`; a pull holds it for its whole
   download); read-only verbs never wait.

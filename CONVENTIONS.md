@@ -10,7 +10,8 @@ covenant/    edge: nginx sites/snippets, oauth2-proxy, fail2ban, ufw, wireguard,
 clients/     workstation harness wrappers/configs (claude/codex/hermes/opencode) + hermes-gateway
 judge/       agent judge: gates, evidence collector and reviewer for a local agent (self-contained; see judge/CONTRACT.md)
 hypervisor/  requirements for the host layer (managed in a separate IaC project)
-evals/       security eval harness (run.py, scorers, report); benchmark data and results are gitignored
+evals/       pointer README only: the security eval harness is the sec-evals repo (~/src/deck/sec-evals); old
+             checkouts' gitignored evals/data/ and evals/results/ stay ignored
 docs/        decisions, agent-judge design, runbooks, history (old Ollama-era docs live in docs/history/)
 scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh (executable shims into tools/deck-tools/),
              secrets.d/<component>.sh (the secrets specs)
@@ -18,7 +19,9 @@ contracts/   machine-readable seams: site-keys.yaml (the site.env key registry),
 tools/       site_keys.py: registry checks, the sanitize-policy generator, `deck env slice` and `deck check`;
              deck-tools/: the shared engines (render, gen-secrets, check-sanitized), the `deck-tools` CLI and the
              pre-commit hook, released as deck-tools-v<VERSION> tags; tools.lock pins them (sha256 and mode)
-bin/deck     one entry point: deck evals, deck env slice, deck check
+bin/deck     one entry point: deck evals (runs the sec-evals checkout), deck install evals, deck env slice,
+             deck check
+deck.lock    the components in their own repos (sec-evals, mode minimum); checked by deck check
 site.env.example
 ```
 Each deployable component dir has its own `README.md` (what it is, deploy steps, verify, rollback) and an entry point: `walter/deploy.sh`, `covenant/deploy.sh`, `clients/install.sh` (wrapped by `clients/deploy.sh`), `judge/install.sh`. `hypervisor/` has a README only.

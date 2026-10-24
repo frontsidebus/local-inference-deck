@@ -31,6 +31,8 @@ __pycache__/
 .pytest_cache/
 site.env.bak-*
 
-# evals: converted benchmark data and run results (regenerate with evals/datasets/*/fetch.py)
+# evals: the harness moved to the sec-evals repo (evals/README.md). Checkouts made before the split still hold
+# its gitignored benchmark data and run results here (a rollback to pre-split-3 runs gates with them); they must
+# never be committed, so the patterns stay.
 evals/data/
 evals/results/

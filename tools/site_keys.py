@@ -7,7 +7,7 @@ Stdlib only. Never prints a site value: output names keys, counts and paths, not
     python3 tools/site_keys.py policy [--check]         write contracts/sanitize-policy.yaml (--check: compare only)
     python3 tools/site_keys.py keys COMPONENT           names of the keys a component owns or consumes
     python3 tools/site_keys.py slice COMPONENT --site-env FILE [-o FILE]
-    python3 tools/site_keys.py check --site-env FILE [--judge-env FILE]
+    python3 tools/site_keys.py check --site-env FILE [--judge-env FILE] [--sec-evals DIR] [--lock FILE]
 
 `bin/deck env slice` and `bin/deck check` resolve the site env (--site-env > $SITE_ENV > ~/.config/deck/site.env >
 <repo>/site.env) and call `slice` / `check` with it.
@@ -32,6 +32,8 @@ REGISTRY = REPO / "contracts" / "site-keys.yaml"
 SCHEMA = REPO / "contracts" / "site-keys.schema.json"
 POLICY = REPO / "contracts" / "sanitize-policy.yaml"
 EXAMPLE = REPO / "site.env.example"
+LOCK = REPO / "deck.lock"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # a site.env assignment line, as render.sh and the deploy scripts see it (bash `.`)
@@ -390,13 +392,81 @@ def check_judge_env(reg, judge_env, origin, out):
     return fails
 
 
-def cmd_check(reg, site_env, judge_env_flag):
+def check_evals_link(site_env, sec_evals, out):
+    """The sec-evals checkout's gitignored site.env symlink (`deck install evals`) resolves to the site env deck
+    resolved: run.py's --site-env default and the plan scripts read it. No checkout: a note, not a failure."""
+    if not sec_evals:
+        out("sec-evals: no checkout given (skipped)")
+        return 0
+    se = Path(sec_evals)
+    if not (se / "evals" / "run.py").is_file():
+        out(f"sec-evals: no checkout at {se} (ok; `deck evals` and `deck install evals` need one)")
+        return 0
+    link = se / "site.env"
+    if not link.is_symlink():
+        what = "a regular file, not a symlink" if link.exists() else "missing"
+        out(f"sec-evals: FAIL {link} is {what}; run: bin/deck install evals")
+        return 1
+    if not link.exists():
+        out(f"sec-evals: FAIL {link} is a dangling symlink; run: bin/deck install evals --force")
+        return 1
+    if link.resolve() != Path(site_env).resolve():
+        out(f"sec-evals: FAIL {link} points at a different file than the resolved site env; "
+            "run: bin/deck install evals --force")
+        return 1
+    out(f"sec-evals: site.env link ok ({link})")
+    return 0
+
+
+def check_lock(sec_evals, out, lock=LOCK):
+    """deck.lock: for sec-evals (mode minimum) the locked commit must be an ancestor of the checkout's HEAD. Only
+    warns, and never moves HEAD: sec-evals is a working checkout (the attempts ledger is committed there)."""
+    if not Path(lock).is_file():
+        out("deck.lock: none (skipped)")
+        return 0
+    try:
+        data = load_registry(lock)
+    except RegistryError as e:
+        out(f"deck.lock: FAIL {e}")
+        return 1
+    fails = 0
+    for c in data.get("components", []):
+        name, mode, commit = c.get("name"), c.get("mode"), c.get("commit")
+        if mode not in ("pinned", "minimum"):
+            out(f"deck.lock: FAIL {name}: mode must be pinned or minimum")
+            fails += 1
+            continue
+        if name != "sec-evals":
+            out(f"deck.lock: {name}: not checked here")
+            continue
+        if not (isinstance(commit, str) and SHA_RE.match(commit)):
+            out(f"deck.lock: {name}: no commit locked yet (skipped)")
+            continue
+        se = Path(sec_evals) if sec_evals else None
+        if se is None or not (se / "evals" / "run.py").is_file():
+            out(f"deck.lock: {name}: no checkout (skipped)")
+            continue
+        r = subprocess.run(["git", "-C", str(se), "merge-base", "--is-ancestor", commit, "HEAD"],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            out(f"deck.lock: {name}: checkout contains the locked commit ({mode})")
+        elif r.returncode == 1:
+            out(f"deck.lock: {name}: WARN the checkout's HEAD does not contain the locked commit {commit[:12]}"
+                " (update the checkout; deck never moves its HEAD)")
+        else:
+            out(f"deck.lock: {name}: WARN the locked commit {commit[:12]} is not in the checkout (git fetch?)")
+    return fails
+
+
+def cmd_check(reg, site_env, judge_env_flag, sec_evals=None, lock=LOCK):
     out = print
     fails = 0
     # Each check prints names and counts only and returns its failure count. Add new checks here.
     fails += check_site_env(reg, Path(site_env), out)
     jpath, origin = resolve_judge_env(judge_env_flag)
     fails += check_judge_env(reg, jpath, origin, out)
+    fails += check_evals_link(site_env, sec_evals, out)
+    fails += check_lock(sec_evals, out, lock)
     print(f"deck check: {'FAILED' if fails else 'OK'}{f' ({fails} failure(s))' if fails else ''}")
     return 1 if fails else 0
 
@@ -417,6 +487,8 @@ def main(argv=None):
     p = sub.add_parser("check")
     p.add_argument("--site-env", required=True)
     p.add_argument("--judge-env")
+    p.add_argument("--sec-evals", help="the sec-evals checkout (bin/deck passes $SEC_EVALS_DIR or ~/src/deck/sec-evals)")
+    p.add_argument("--lock", default=str(LOCK), help="deck.lock (default: the repo's)")
     a = ap.parse_args(argv)
     try:
         reg = load_registry()
@@ -450,7 +522,7 @@ def main(argv=None):
     if a.cmd == "slice":
         return cmd_slice(reg, a.component, a.site_env, a.output)
     if a.cmd == "check":
-        return cmd_check(reg, a.site_env, a.judge_env)
+        return cmd_check(reg, a.site_env, a.judge_env, a.sec_evals, a.lock)
     return 2
 
 

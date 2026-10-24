@@ -1,12 +1,11 @@
 """swapcmd.py and ``spark-model-agent serving``: the live config's cmd hashes, as the eval gate records them.
 
-swapcmd.entries must hash a cmd exactly as evals/run.py's llama_swap_entry does, or the gate's serving identity
-would change with the reader instead of the config. The contract between the two readers is C4
+swapcmd.entries must hash a cmd exactly as sec-evals' evals/run.py llama_swap_entry does, or the gate's serving
+identity would change with the reader instead of the config. The contract between the two readers is C4
 (contracts/serving-identity/vectors.json): the deck's provider test (contracts/tests/test_c4_serving_identity.py)
-and the sec-evals consumer test (evals/tests/test_contract_serving_identity.py) each reproduce the vectors, so
-neither side imports the other. The direct cross-check below (swapcmd vs run.py over the real rendered template and
-lab entries) is kept only while evals/ is in this checkout, behind the vectors: it skips once evals/run.py is gone.
-No root, no network.
+and the sec-evals consumer test (evals/tests/test_contract_serving_identity.py in the sec-evals repo) each reproduce
+the vectors, so neither side imports the other. This file checks the deck's side over the real template, its
+rendered form and the lab entries. No root, no network.
 Run: python3 -B -m pytest -q walter/tests/test_spark_model_serving.py
 """
 import json
@@ -24,14 +23,6 @@ import registry as R  # noqa: E402
 import swapcmd        # noqa: E402
 
 VECTORS = json.loads((REPO / "contracts" / "serving-identity" / "vectors.json").read_text())
-RUN_PY = REPO / "evals" / "run.py"
-if RUN_PY.is_file():          # monorepo only (C4: the vectors are the contract; see the module docstring)
-    sys.path.insert(0, str(RUN_PY.parent))
-    import run as RUN     # noqa: E402
-else:
-    RUN = None
-needs_run_py = pytest.mark.skipif(RUN is None, reason="evals/run.py is not in this checkout (C4 vectors cover it)")
-
 AGENT = REPO / "walter" / "models" / "spark-model-agent"
 TEMPLATE = REPO / "walter" / "llama-swap" / "config.yaml.tmpl"
 
@@ -58,24 +49,6 @@ def test_entries_parse_every_model(rendered, which):
     assert all(e["cmd_sha256"] != swapcmd.sha256_text("") for e in got.values())   # every model has a cmd
     if which == "lab":
         assert any(mid.startswith("lab-") for mid in got)
-
-
-@needs_run_py
-@pytest.mark.parametrize("which", ["template", "base", "lab"])
-def test_entries_hash_like_run_py(rendered, which):
-    path = rendered[which]
-    got = swapcmd.entries(path.read_text())
-    assert got and set(swapcmd.FLAGS) == {"-c", "-n", "-sm", "-m", *RUN.SERVER_FLAG_FOR.values()}
-    if which == "lab":
-        assert any(mid.startswith("lab-") for mid in got)
-    for mid, e in got.items():
-        want = RUN.llama_swap_entry(mid, path)
-        assert want is not None, mid
-        assert e["cmd_sha256"] == RUN.sha256_text(want["cmd"]), mid
-        assert e["server_flags"] == want["server_flags"] and e["aliases"] == want["aliases"], mid
-        assert e["name"] == want["name"], mid
-        for al in e["aliases"]:
-            assert RUN.llama_swap_entry(al, path)["model_id"] == mid
 
 
 def agent(tmp_path, *args):

@@ -4,6 +4,7 @@
 # Usage: bin/deck evals run  [--site-env PATH] [run.py args...]
 #        bin/deck evals gate <calibrate|baseline|check> [--site-env PATH] [gate.py args...]
 #        bin/deck evals gate compare ...          (offline; no site.env needed)
+#        bin/deck install evals [--site-env PATH] [--force]
 #        bin/deck env slice <component> [--site-env PATH] [-o FILE]
 #        bin/deck check [--site-env PATH]
 #        bin/deck --help
@@ -12,28 +13,41 @@
 # <repo>/site.env. A path named by --site-env or $SITE_ENV must exist (no silent fallback); when nothing resolves,
 # deck exits 2.
 #
-# evals: the path is exported as SITE_ENV, so the GPU guard and the gateway tunnel that gate.py and the plans start
-# read the same file, and passed to the tool as --site-env. deck also passes
-# --llama-swap-config <repo>/walter/llama-swap/config.yaml.tmpl unless one is given. It runs
-# `python3 -B evals/<tool>.py` from the repo root: the GPU guard, stop.sh and the spark-model live-run check match
-# that command line.
+# evals: the harness is the sec-evals repo, checked out at $SEC_EVALS_DIR, else ~/src/deck/sec-evals (deck.lock).
+# The site.env path is exported as SITE_ENV, so the GPU guard and the gateway tunnel that gate.py and the plans
+# start read the same file, and passed to the tool as --site-env. deck also passes
+# --llama-swap-config <repo>/walter/llama-swap/config.yaml.tmpl (this deck checkout) unless one is given. It runs
+# `python3 -B evals/<tool>.py` from the sec-evals root: the GPU guard, stop.sh and the spark-model live-run check
+# match that command line.
+#
+# install evals: creates the gitignored <sec-evals>/site.env as a symlink to the resolved site.env, which run.py's
+# --site-env default and the plan scripts read. Refuses when site.env is not gitignored there, is a regular file,
+# or is a symlink to another file (--force replaces a symlink, never a file).
 #
 # env slice: writes only the keys contracts/site-keys.yaml assigns to <component> (owner or consumer), lines copied
 # verbatim, mode 600, to FILE (default ~/.config/deck/slices/<component>.env). It refuses a FILE that is not a
 # regular file, and refuses the judge (its sitemask needs the full site.env). Components: global walter covenant
 # digest clients evals hypervisor. Use it for covenant (`covenant/deploy.sh --env FILE`) and for staged checkouts.
 #
-# check: site.env against the registry (unknown keys warn, a missing or empty required key fails) and judge.env
-# (only SITE_ENV= and judge policy knobs). Exit 0 ok, 1 failure, 2 no site.env.
+# check: site.env against the registry (unknown keys warn, a missing or empty required key fails), judge.env
+# (only SITE_ENV= and judge policy knobs), the sec-evals site.env link (fails when a checkout exists and the link
+# does not resolve to the same site.env) and deck.lock (warns when the sec-evals HEAD lacks the locked commit).
+# Exit 0 ok, 1 failure, 2 no site.env.
 #
 # deck never prints a site value: only key names, counts and paths.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 TEMPLATE="$REPO/walter/llama-swap/config.yaml.tmpl"
+EVALS_DIR="${SEC_EVALS_DIR:-${HOME:-/nonexistent}/src/deck/sec-evals}"
 
-usage() { sed -n '2,29p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,37p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; }
 die() { echo "deck: $1" >&2; exit "${2:-2}"; }
+
+# need_evals: the sec-evals checkout must exist
+need_evals() {
+  [ -f "$EVALS_DIR/evals/run.py" ] || die "no sec-evals checkout at $EVALS_DIR (clone it there or set SEC_EVALS_DIR)"
+}
 
 # resolve_site_env EXPLICIT: prints the absolute site.env path, or exits 2
 resolve_site_env() {
@@ -85,7 +99,8 @@ cmd_evals() {
   elif [ -n "$explicit" ]; then
     die "--site-env does not apply here"
   fi
-  cd "$REPO"
+  need_evals
+  cd "$EVALS_DIR"
   if [ "$tool" = gate ]; then
     # subcommand first: gate.py's flags belong to the subcommand
     exec python3 -B evals/gate.py ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"}
@@ -94,6 +109,38 @@ cmd_evals() {
 }
 
 SITE_KEYS="$REPO/tools/site_keys.py"
+
+cmd_install() {
+  local what="${1:-}"
+  case "$what" in
+    evals) shift ;;
+    -h|--help) usage; return 0 ;;
+    "") usage >&2; exit 2 ;;
+    *) die "unknown install target '$what' (evals)" ;;
+  esac
+  local explicit rest force=0
+  site_flag_args "$@"
+  for x in ${rest[@]+"${rest[@]}"}; do
+    case "$x" in --force) force=1 ;; -h|--help) usage; return 0 ;; *) die "unknown argument for install evals: $x" ;; esac
+  done
+  need_evals
+  local f; f="$(resolve_site_env "$explicit")"
+  local link="$EVALS_DIR/site.env"
+  git -C "$EVALS_DIR" check-ignore -q site.env \
+    || die "refusing: site.env is not gitignored in $EVALS_DIR (it must never be committed)"
+  if [ -L "$link" ]; then
+    if [ "$(readlink -f "$link" 2>/dev/null || true)" = "$f" ]; then
+      echo "deck: $link -> $f (already in place)"
+      return 0
+    fi
+    [ "$force" = 1 ] || die "refusing: $link is a symlink to another file (pass --force to replace it)"
+    rm -f "$link"
+  elif [ -e "$link" ]; then
+    die "refusing: $link is a regular file; move it away first (deck never replaces a file)"
+  fi
+  ln -s "$f" "$link"
+  echo "deck: $link -> $f"
+}
 
 # site_flag_args ARGS...: splits --site-env PATH out of ARGS into $explicit; the rest go to $rest
 site_flag_args() {
@@ -143,14 +190,15 @@ cmd_check() {
     case "$x" in -h|--help) usage; return 0 ;; *) die "unknown argument for check: $x" ;; esac
   done
   local f; f="$(resolve_site_env "$explicit")"
-  exec python3 -B "$SITE_KEYS" check --site-env "$f"
+  exec python3 -B "$SITE_KEYS" check --site-env "$f" --sec-evals "$EVALS_DIR"
 }
 
 case "${1:-}" in
   evals) shift; cmd_evals "$@" ;;
+  install) shift; cmd_install "$@" ;;
   env) shift; cmd_env "$@" ;;
   check) shift; cmd_check "$@" ;;
   -h|--help|help) usage ;;
   "") usage >&2; exit 2 ;;
-  *) die "unknown command '$1' (try: deck evals run|gate, deck env slice, deck check)" ;;
+  *) die "unknown command '$1' (try: deck evals run|gate, deck install evals, deck env slice, deck check)" ;;
 esac
