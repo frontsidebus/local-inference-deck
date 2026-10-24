@@ -1,0 +1,150 @@
+# contracts/site-keys.yaml: the C1 site-config registry (deck-owned). One entry per key in site.env.example,
+# active or commented out. Edit this file AND site.env.example together when you add, rename or remove a key:
+# tools/tests/test_site_keys.py fails until both agree. No site values here: `default` is the example value,
+# copied exactly as written in site.env.example (quotes included).
+#
+# Format: a constrained YAML subset, so the stdlib can read it (tools/site_keys.py) and any YAML parser
+# agrees. Only these line shapes are allowed:
+#   `# comment` / blank lines;   `name: <JSON scalar>` (top level);   `name:` opening a list;
+#   `  - {JSON object on one line}` (a list item).
+# Each list item is one JSON object, which is also a valid YAML flow mapping.
+#
+# Key fields: name; active (false = commented out in site.env.example); owner (the component that defines the
+# key's meaning); consumers (the components whose code, templates or docs read it); required (a deploy refuses
+# to run when it is absent or empty); default (the example value); sanitize (a class from sanitize_classes:
+# how scripts/check-sanitized.sh treats a real value); note (optional).
+#
+# Derived files: contracts/sanitize-policy.yaml (python3 tools/site_keys.py policy). `bin/deck env slice
+# <component>` writes the keys a component owns or consumes; `bin/deck check` checks site.env against this file.
+contract_version: 1
+components:
+  - {"name": "global", "description": "shared core (identity, network); scripts/render.sh, gen-secrets.sh and check-sanitized.sh read the whole site env"}
+  - {"name": "walter", "description": "backend VM: walter/deploy.sh and the walter/**/*.tmpl templates it renders (the digest app included)"}
+  - {"name": "covenant", "description": "edge: covenant/deploy.sh (--env FILE), its scripts and scripts/secrets.d/covenant.sh"}
+  - {"name": "digest", "description": "optional digest app: walter/digest (deployed by walter/deploy.sh, gated on the edge by covenant)"}
+  - {"name": "clients", "description": "workstation harnesses: clients/install.sh, clients/bin/spark-model, clients/hermes templates"}
+  - {"name": "judge", "description": "agent judge: judge/lib/config.py and sitemask.py read the full site env", "slice": false, "slice_refusal": "the judge is exempt from slicing: judge/lib/sitemask.py can only mask the site values it knows, so the judge must read the full site env"}
+  - {"name": "evals", "description": "eval harness: evals/tools/lib.sh site_value, evals/gate.py, evals/run.py"}
+  - {"name": "hypervisor", "description": "host layer (docs only): hypervisor/README.md"}
+sanitize_classes:
+  - {"name": "check", "action": "check", "description": "a real value that differs from the example is forbidden in tracked files"}
+  - {"name": "check-list", "action": "split", "description": "space-separated list: each item is checked on its own"}
+  - {"name": "names", "action": "skip", "description": "user/key names: list the real ones in .sanitize-words (whole words) instead"}
+  - {"name": "generic", "action": "skip", "description": "ports, interfaces, group and client ids, generic paths and users: not identifying"}
+  - {"name": "judge-knob", "action": "skip", "description": "judge policy knobs (modes, model aliases, caps): public values"}
+# For keys that are not listed below (first match wins; `key` is a shell glob; anything else is checked).
+sanitize_fallback:
+  - {"key": "*_PORT", "sanitize": "generic"}
+  - {"key": "*_IF", "sanitize": "generic"}
+  - {"key": "*_GROUP", "sanitize": "generic"}
+  - {"key": "*_CLIENT_ID", "sanitize": "generic"}
+  - {"key": "JUDGE_*", "sanitize": "judge-knob"}
+keys:
+  - {"name": "SPARK_DOMAIN", "active": true, "owner": "global", "consumers": ["covenant", "judge"], "required": true, "default": "example.com", "sanitize": "check"}
+  - {"name": "SPARK_CHAT_HOST", "active": true, "owner": "global", "consumers": ["walter", "covenant", "judge"], "required": true, "default": "chat.example.com", "sanitize": "check"}
+  - {"name": "SPARK_API_HOST", "active": true, "owner": "global", "consumers": ["walter", "covenant", "clients", "judge", "evals"], "required": true, "default": "api.example.com", "sanitize": "check"}
+  - {"name": "SPARK_ID_HOST", "active": true, "owner": "global", "consumers": ["walter", "covenant", "judge"], "required": true, "default": "id.example.com", "sanitize": "check"}
+  - {"name": "SPARK_TELEMETRY_HOST", "active": true, "owner": "global", "consumers": ["walter", "covenant", "judge"], "required": true, "default": "telemetry.example.com", "sanitize": "check"}
+  - {"name": "SPARK_DIGEST_HOST", "active": true, "owner": "digest", "consumers": ["walter", "covenant", "digest", "judge"], "required": false, "default": "\"\"", "sanitize": "check", "note": "empty = digest off; read by covenant/deploy.sh, scripts/secrets.d/covenant.sh, walter/deploy.sh and the walter firewall and digest templates"}
+  - {"name": "LETSENCRYPT_EMAIL", "active": true, "owner": "covenant", "consumers": ["covenant", "judge"], "required": true, "default": "admin@example.com", "sanitize": "check"}
+  - {"name": "ADMIN_EMAIL", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": false, "default": "admin@example.com", "sanitize": "check", "note": "no code reads it: the Open WebUI break-glass login named in walter/README.md"}
+  - {"name": "EDGE_PUBLIC_IP", "active": true, "owner": "global", "consumers": ["walter", "judge"], "required": true, "default": "203.0.113.10", "sanitize": "check"}
+  - {"name": "EDGE_WG_IP", "active": true, "owner": "global", "consumers": ["walter", "covenant", "digest", "judge"], "required": true, "default": "10.100.0.1", "sanitize": "check"}
+  - {"name": "BACKEND_WG_IP", "active": true, "owner": "global", "consumers": ["walter", "covenant", "digest", "judge", "evals"], "required": true, "default": "10.100.0.2", "sanitize": "check"}
+  - {"name": "WG_PORT", "active": true, "owner": "global", "consumers": ["walter", "covenant"], "required": true, "default": "51820", "sanitize": "generic"}
+  - {"name": "BACKEND_LAN_IP", "active": true, "owner": "hypervisor", "consumers": ["walter", "clients", "judge", "evals", "hypervisor"], "required": true, "default": "192.168.122.10", "sanitize": "check", "note": "walter renders it into walter/monitoring/README.md"}
+  - {"name": "HYPERVISOR_BRIDGE_IP", "active": true, "owner": "hypervisor", "consumers": ["walter", "clients", "judge", "hypervisor"], "required": true, "default": "192.168.122.1", "sanitize": "check"}
+  - {"name": "ADMIN_SOURCE_IPS", "active": true, "owner": "global", "consumers": ["covenant", "judge"], "required": true, "default": "198.51.100.7", "sanitize": "check-list"}
+  - {"name": "GATEWAY_DOCKER_SUBNET", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": true, "default": "172.30.40.0/24", "sanitize": "check"}
+  - {"name": "MODELS_DIR", "active": true, "owner": "walter", "consumers": ["walter", "hypervisor"], "required": true, "default": "/models", "sanitize": "generic"}
+  - {"name": "BACKEND_SSH_USER", "active": true, "owner": "walter", "consumers": ["walter", "clients", "judge", "evals", "hypervisor"], "required": true, "default": "operator", "sanitize": "generic"}
+  - {"name": "SPARK_USERS", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": true, "default": "\"alice bob\"", "sanitize": "names"}
+  - {"name": "HARNESS_KEYS", "active": true, "owner": "walter", "consumers": ["walter"], "required": true, "default": "\"claude-code codex hermes opencode open-webui\"", "sanitize": "names"}
+  - {"name": "LAB_KEY_ALIASES", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "LAB_WEBUI", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "TELEMETRY_GROUP", "active": true, "owner": "walter", "consumers": ["walter", "covenant"], "required": true, "default": "telemetry-viewers", "sanitize": "generic"}
+  - {"name": "DIGEST_GROUP", "active": true, "owner": "digest", "consumers": ["covenant"], "required": false, "default": "digest-viewers", "sanitize": "generic", "note": "covenant/deploy.sh defaults it when the digest is on"}
+  - {"name": "CHAT_GROUP", "active": true, "owner": "walter", "consumers": ["walter"], "required": true, "default": "chat-users", "sanitize": "generic"}
+  - {"name": "WG_SUBNET", "active": true, "owner": "covenant", "consumers": ["walter", "covenant", "judge"], "required": true, "default": "10.100.0.0/24", "sanitize": "check"}
+  - {"name": "WG_BACKEND_PUBLIC_KEY", "active": true, "owner": "covenant", "consumers": ["covenant", "judge"], "required": true, "default": "CHANGEME", "sanitize": "check"}
+  - {"name": "WEBUI_PORT", "active": true, "owner": "covenant", "consumers": ["covenant"], "required": true, "default": "3000", "sanitize": "generic"}
+  - {"name": "POCKETID_PORT", "active": true, "owner": "covenant", "consumers": ["covenant"], "required": true, "default": "1411", "sanitize": "generic"}
+  - {"name": "LITELLM_PORT", "active": true, "owner": "covenant", "consumers": ["covenant", "evals"], "required": true, "default": "4000", "sanitize": "generic"}
+  - {"name": "TELEMETRY_PORT", "active": true, "owner": "covenant", "consumers": ["covenant"], "required": true, "default": "3200", "sanitize": "generic"}
+  - {"name": "DIGEST_PORT", "active": true, "owner": "digest", "consumers": ["walter", "covenant"], "required": false, "default": "3300", "sanitize": "generic", "note": "must stay 3300; covenant/deploy.sh defaults it, walter/deploy.sh refuses any other value"}
+  - {"name": "OAUTH2_PROXY_CLIENT_ID", "active": true, "owner": "covenant", "consumers": ["walter", "covenant", "judge"], "required": true, "default": "telemetry", "sanitize": "generic"}
+  - {"name": "OAUTH2_PROXY_DIGEST_CLIENT_ID", "active": true, "owner": "covenant", "consumers": ["covenant", "judge"], "required": false, "default": "digest", "sanitize": "generic", "note": "covenant/deploy.sh defaults it when the digest is on"}
+  - {"name": "SPARK_SITE_NAME", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": true, "default": "\"spark\"", "sanitize": "check"}
+  - {"name": "TELEMETRY_GPU_EXPECTED_WIDTH", "active": false, "owner": "walter", "consumers": ["walter", "hypervisor"], "required": false, "default": "8", "sanitize": "check"}
+  - {"name": "MODELS_FS_UUID", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": true, "default": "CHANGEME", "sanitize": "check"}
+  - {"name": "BACKEND_LAN_IF", "active": true, "owner": "walter", "consumers": ["walter"], "required": true, "default": "enp1s0", "sanitize": "generic"}
+  - {"name": "WG_EDGE_PUBLIC_KEY", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": true, "default": "CHANGEME", "sanitize": "check"}
+  - {"name": "RESTIC_BUCKET", "active": true, "owner": "walter", "consumers": ["walter", "judge"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "RESTIC_REGION", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "us-east-1", "sanitize": "check"}
+  - {"name": "LAB_HF_ORGS", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "LAB_MODELS_QUOTA_GB", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "1500", "sanitize": "check"}
+  - {"name": "LAB_FREE_RESERVE_GB", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "300", "sanitize": "check"}
+  - {"name": "HERMES_GATEWAY_PORT", "active": true, "owner": "clients", "consumers": ["walter", "clients"], "required": true, "default": "8642", "sanitize": "generic", "note": "walter renders it into the Open WebUI env"}
+  - {"name": "JUDGE_MODE", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "frontier", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_MODEL", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "big", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_FRONTIER_CMD", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "claude", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_FRONTIER_DAILY_MAX", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "20", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_FRONTIER_MAX_USD", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "2", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_FRONTIER_MODEL", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_FRONTIER_EXTRA_ARGS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_FRONTIER_TIMEOUT", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "900", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_URL", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_KEY_FILE", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "~/.config/spark/hermes.key", "sanitize": "judge-knob", "note": "path only"}
+  - {"name": "JUDGE_LOCAL_TIMEOUT", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "600", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_BUNDLE_MAX_CHARS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_PROBES", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_MAX_ATTEMPTS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "3", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SSH_ALIASES", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"edge-alias\"", "sanitize": "check"}
+  - {"name": "EDGE_SSH_USER", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "ubuntu", "sanitize": "check"}
+  - {"name": "EDGE_SSH_KEY", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "~/.ssh/edge.pem", "sanitize": "check", "note": "path only"}
+  - {"name": "JUDGE_RUNAWAY_TOKENS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "24000", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_RUNAWAY_MINUTES", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "10", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_PROBE_TIMEOUT", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "20", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SSH_CONNECT_TIMEOUT", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "8", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_REPO_DIR", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "JUDGE_INFRA_REPOS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "check"}
+  - {"name": "JUDGE_LOG_TZ", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_COMPLETION_DEDUPE_SECONDS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "900", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_PLAN_DEBOUNCE_S", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "120", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_WINDOW_GRACE_SECONDS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "10", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_HOST_PROBES", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_NOISE_GLOBS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOG_NOISE_LOGGERS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SNAPSHOT_MAX_FILES", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "2000", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SNAPSHOT_MAX_BYTES", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1048576", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_MAX_SEVERITY", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "medium", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_CODE_REVIEW", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_DATA_FILES", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_DATA_FILES_MAX", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "3", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_CODE_REVIEW", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "0", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_LOCAL", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "0", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_RELATED", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_RELATED_HOURS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "6", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_RELATED_SCOPE", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "worktree", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_MIN_SEVERITY", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "medium", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_WINDOW_HOURS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "24", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_MAX_CHARS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "2000", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_VERIFY_BUDGET", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "45", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_CLAIM_MTIME_WINDOW", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "3600", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_INJECT_REFUSAL_REMINDER", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_STALL_MINUTES", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "15", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SECRET_GLOBS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SCRATCH_GLOBS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_MIXED_MAX_SENSITIVE", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "3", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_REFUSAL_NEXT_CALLS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "6", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SENSITIVE_FRONTIER_CLAIMS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_REVIEW_TEXT_ONLY", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_REVIEW_TEXT_ONLY_MIN_CHARS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "200", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_REVIEW_TEXT_ONLY_REQUIRE_CLAIMS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_SKIP_INTERRUPTED_NOOP", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_MAX_TOKENS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "4096", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_LOCAL_RETRY_MAX_TOKENS", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "8192", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_ALERT_MIN_INTERVAL_S", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "900", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_ACK_AGENT_ENV", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "\"\"", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_ENQUEUE_ALWAYS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "1", "sanitize": "judge-knob"}
+  - {"name": "JUDGE_CHECK_UNITS", "active": false, "owner": "judge", "consumers": ["judge"], "required": false, "default": "0", "sanitize": "judge-knob"}

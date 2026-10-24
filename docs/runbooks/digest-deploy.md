@@ -15,7 +15,7 @@ a secret into a command line or a chat.
 
 | Step | Where | Result |
 |---|---|---|
-| 1 | every `site.env` | digest switched on; the rest of each `site.env` complete |
+| 1 | `site.env`, then both slices | digest switched on; the rest of `site.env` complete |
 | 2 | DNS provider | `${SPARK_DIGEST_HOST}` resolves to the edge |
 | 3 | Pocket-ID admin UI | group `${DIGEST_GROUP}` with its members, then the OIDC client; its id checked |
 | 4 | `site.env` | `digest` in `HARNESS_KEYS` (its LiteLLM key) |
@@ -37,21 +37,28 @@ what to look for). Then either reconcile the drifted files first, or schedule th
 when the side effects are acceptable. The digest part on its own restarts nothing that already
 exists.
 
-The deploy scripts read `site.env` from the root of the checkout they run from (`../site.env` next
-to `walter/` or `covenant/`). If a host has no checkout, stage one first and put the same `site.env`
-next to it, mode 0600:
+Neither host needs the whole `site.env`. Each deploy reads a **slice** of it with only the keys that
+[`contracts/site-keys.yaml`](../../contracts/site-keys.yaml) assigns to that host: `walter` for Walter
+(its deploy renders the digest too) and `covenant` for Covenant. Write each slice on the workstation
+and copy it over, mode 0600. If a host has no checkout, stage one first:
 
 ```bash
-git archive --prefix=lid-digest/ <commit> | ssh <host> tar -x -C '~'
-scp -p site.env <host>:lid-digest/site.env && ssh <host> chmod 600 lid-digest/site.env
-sha256sum site.env; ssh <host> sha256sum lid-digest/site.env       # must match
+# workstation; <c> is walter for Walter, covenant for Covenant
+git archive --prefix=lid-digest/ <commit> | ssh <host> tar -x -C '~'     # only if <host> has no checkout
+bin/deck env slice <c> -o ~/<c>.env          # mode 600; prints key names and counts, never values
+scp -p ~/<c>.env <host>:<c>.env && ssh <host> chmod 600 <c>.env
+sha256sum ~/<c>.env; ssh <host> sha256sum <c>.env                       # must match
 ```
 
-Step 9 removes these staged copies again.
+The deploys below read the slice through `walter/deploy.sh --site-env ~/walter.env` and
+`covenant/deploy.sh --env ~/covenant.env`. A slice renders exactly what the full `site.env` renders;
+`deck env slice` refuses a value that would change in it. Whenever `site.env` changes (steps 1, 3
+and 4), slice and copy again. Step 9 removes the staged checkouts again.
 
 ## 1. site.env
 
-In the real `site.env` on the workstation and in the checkout on **each** host (Walter, Covenant):
+In the real `site.env` on the workstation, then slice it again for **each** host (Walter, Covenant)
+and copy the slices over ([Before you start](#before-you-start-both-deploys-converge-the-whole-host)):
 
 ```bash
 SPARK_DIGEST_HOST=digest.example.com          # your real name; this switches the digest on
@@ -61,7 +68,7 @@ SPARK_DIGEST_HOST=digest.example.com          # your real name; this switches th
 # OAUTH2_PROXY_DIGEST_CLIENT_ID=digest        # step 3 tells you whether to set it
 ```
 
-`site.env.example` documents each variable. Check that each copy is otherwise complete and matches
+`site.env.example` documents each variable. Check that `site.env` is otherwise complete and matches
 what is live, because both deploys stop or misbehave on a stale value:
 - **Walter:** `scripts/render.sh` refuses to render any template whose variables are empty (for
   example `RESTIC_BUCKET` / `RESTIC_REGION` for `walter/backup`), so the deploy stops at "render".
@@ -101,7 +108,7 @@ UI at `https://${SPARK_ID_HOST}`:
 
 **Find out the real client id.** oauth2-proxy-digest sends the client id, not the name. Pocket-ID
 generates a random id (a UUID) unless you set a custom one when you create the client. If the id is
-not `digest`, put the real one in every `site.env` as `OAUTH2_PROXY_DIGEST_CLIENT_ID` (it is not a
+not `digest`, put the real one in `site.env` as `OAUTH2_PROXY_DIGEST_CLIENT_ID` (it is not a
 secret). Check it with Pocket-ID's public metadata endpoint, which needs no login:
 
 ```bash
@@ -111,8 +118,8 @@ curl -s -w ' %{http_code}\n' "https://${SPARK_ID_HOST}/api/oidc/clients/${OAUTH2
 ```
 
 The edge config takes the id from `site.env` at deploy time, and `--set-client-secret` does not
-re-render the config. A wrong id is therefore only fixed by correcting `site.env` and running
-`covenant/deploy.sh` again.
+re-render the config. A wrong id is therefore only fixed by correcting `site.env`, slicing it again
+for Covenant, and running `covenant/deploy.sh` again.
 
 **Without the UI.** `/srv/webui/pocketid-bootstrap.py` does **not** create this group or client: it
 only knows `open-webui` and the telemetry client. Use the API method in
@@ -125,7 +132,8 @@ read-only look at the Pocket-ID database, use `python3`'s `sqlite3` module with 
 
 ## 4. LiteLLM key `digest`
 
-Append `digest` to `HARNESS_KEYS` in `site.env` (the same copies as step 1):
+Append `digest` to `HARNESS_KEYS` in `site.env`, then slice it again for Walter and copy it (as in
+step 1):
 
 ```bash
 HARNESS_KEYS="claude-code codex hermes opencode open-webui digest"
@@ -138,7 +146,7 @@ writes it to `/srv/gateway/keys/digest.key`. The deploy then copies it for the c
 
 ```bash
 ss -ltn 'sport = :3300'                       # expected: only the header line (port free)
-sudo walter/deploy.sh --dry-run --skip-packages
+sudo walter/deploy.sh --site-env ~/walter.env --dry-run --skip-packages
 ```
 
 The dry run should show the digest items:
@@ -165,7 +173,7 @@ Then read it for **non-digest** changes:
 Then the live run:
 
 ```bash
-sudo walter/deploy.sh --skip-packages
+sudo walter/deploy.sh --site-env ~/walter.env --skip-packages
 ```
 
 Expected in the output:
@@ -215,12 +223,12 @@ the window short.
 On the edge, from the repo checkout:
 
 ```bash
-set -a; . ./site.env; set +a
+set -a; . ~/covenant.env; set +a      # the covenant slice from "Before you start"
 sudo tar -czpf /root/pre-digest-$(date -u +%Y%m%dT%H%M%SZ).tar.gz \
   /etc/nginx /etc/oauth2-proxy* /etc/letsencrypt/renewal /etc/systemd/system/oauth2-proxy*   # rollback point
 
 # 6a. dry run: read it
-sudo covenant/deploy.sh --dry-run
+sudo covenant/deploy.sh --env ~/covenant.env --dry-run
 #   4/7: no cert yet for optional site(s): 60-digest (<digest host>); ACME-only stub, no downtime
 #        install .../sites-available/60-digest-acme, link sites-enabled/60-digest -> 60-digest-acme,
 #        + nginx -t, + systemctl reload nginx, + certbot certonly ... -d <digest host> --key-type ecdsa ...
@@ -256,7 +264,7 @@ Then deploy, and set the secret:
 
 ```bash
 # 6b. deploy: stub -> cert -> full site in one run
-sudo covenant/deploy.sh
+sudo covenant/deploy.sh --env ~/covenant.env
 #   4/7: the same lines as the dry run, then certbot's "Successfully received certificate"
 #   5/7: link /etc/nginx/sites-enabled/60-digest -> /etc/nginx/sites-available/60-digest
 #        remove /etc/nginx/sites-available/60-digest-acme
@@ -265,12 +273,12 @@ readlink /etc/nginx/sites-enabled/60-digest                                     
 sudo certbot certificates --cert-name "$SPARK_DIGEST_HOST" | grep 'Key Type'   # Key Type: ECDSA
 
 # 6c. right away: the client secret from step 3
-sudo covenant/deploy.sh --set-client-secret --instance digest
+sudo covenant/deploy.sh --env ~/covenant.env --set-client-secret --instance digest
 ```
 
 `--set-client-secret` reads the secret from stdin with no echo. It stores it as
 `/etc/oauth2-proxy-digest/client-secret` (root 0600) and restarts `oauth2-proxy-digest`, which ends
-the 500 window. It checks `site.env` like a full run, so run it from the same checkout.
+the 500 window. It checks the env file like a full run, so pass the same `--env ~/covenant.env`.
 
 It can also read from a pipe, for example from a root-only file, without printing the secret. The
 input then needs a trailing newline; without one, `read` fails at the end of the input, and the
@@ -283,7 +291,7 @@ the deploy does not stop and takes nothing down. The digest stays on the stub, s
 window, and deploy warns `60-digest: no cert for <digest host> yet, so only its ACME stub is linked`,
 with the next step. Fix the cause, then run
 `sudo LETSENCRYPT_EMAIL="$LETSENCRYPT_EMAIL" covenant/scripts/certs.sh "$SPARK_DIGEST_HOST"` (the stub
-now answers the challenge), and `sudo covenant/deploy.sh` again. That run prints
+now answers the challenge), and `sudo covenant/deploy.sh --env ~/covenant.env` again. That run prints
 `certs present for all 6 names` and links the full site.
 
 ## 7. Firewall
@@ -340,7 +348,8 @@ rotation, or a redeploy of either host.
 ## 9. Clean up
 
 - Remove the staged checkouts on both hosts (`rm -rf ~/lid-digest`), but keep the Covenant one
-  until 6c has run.
+  until 6c has run. Keep the slices (`~/walter.env`, `~/covenant.env`) for later deploys, or
+  `shred -u` them and slice again next time.
 - `shred -u` any file that the client secret passed through.
 - Keep the backups (Covenant `/root/pre-digest-*.tar.gz`, any `*.bak-*` files on Walter) until the
   digest has run for a while, then delete them.
@@ -368,7 +377,8 @@ ssh ${BACKEND_SSH_USER}@${BACKEND_LAN_IP} 'cd /srv/digest && sudo docker compose
 are lost; `state/` and the run history stay. If a run is in progress, wait for `done` first.
 
 A change to `walter/digest/compose.yaml.tmpl` also changes `/srv/digest/compose.yaml`, which is
-rendered from `site.env`. Render it with `scripts/render.sh walter/digest/compose.yaml.tmpl <out>`,
+rendered from `site.env`. Render it from the digest slice (it renders the same as the full file):
+`bin/deck env slice digest -o ~/digest.env && scripts/render.sh -e ~/digest.env walter/digest/compose.yaml.tmpl <out>`,
 back up the live file, install the render as root 0644, and run the same `up -d --build`. Anything
 outside `walter/digest/` (the firewall scripts, the gateway key, the edge) needs the full deploy of
 that host.

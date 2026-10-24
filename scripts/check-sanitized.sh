@@ -12,6 +12,9 @@
 #   .sanitize-words  optional, whole words matched case-insensitively (real first names);
 #                    read from ~/.config/deck/ and the repo root
 # The example baseline is <repo>/site.env.example: a value equal to its example is public.
+# Per-key policy (which keys are checked): <repo>/contracts/sanitize-policy.yaml when present (generated from
+# contracts/site-keys.yaml by tools/site_keys.py), else the built-in table in builtin_action below. Both give
+# every key the same action; a malformed policy file is an error (exit 2), never a silent fallback.
 #
 # Usage: scripts/check-sanitized.sh [--all | --history] [--regex-only] [--site-env FILE]
 #   (default)      staged + untracked files (working-tree contents)
@@ -36,7 +39,7 @@ while (($#)); do
     --regex-only) regex_only=1 ;;
     --site-env) [[ -n ${2:-} ]] || die2 "--site-env needs a file"; site_flag=$(abs "$2"); shift ;;
     --site-env=?*) site_flag=$(abs "${1#--site-env=}") ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) die2 "unknown argument: $1 (usage: check-sanitized.sh [--all|--history] [--regex-only] [--site-env FILE])" ;;
   esac
   shift
@@ -95,6 +98,43 @@ extra_files() { # NAME: ~/.config/deck/NAME and <repo>/NAME (both, when both exi
   done
 }
 
+# ---- per-key policy ----------------------------------------------------------------------------
+# key_action KEY sets $act to check, split (check each space-separated item) or skip.
+builtin_action() {
+  case $1 in
+    SPARK_USERS|HARNESS_KEYS) act=skip;;                  # names: whole-word list in .sanitize-words
+    *_PORT|*_IF|*_GROUP|*_CLIENT_ID|MODELS_DIR|BACKEND_SSH_USER) act=skip;;  # generic, not identifying
+    JUDGE_SSH_ALIASES|JUDGE_INFRA_REPOS|JUDGE_REPO_DIR) act=check;;  # site-identifying judge settings: still checked
+    JUDGE_*) act=skip;;                                   # judge policy knobs (modes, model aliases, caps): public values
+    ADMIN_SOURCE_IPS) act='split';;                       # space-separated list of addresses
+    *) act=check;;
+  esac
+}
+pol_keys=() pol_acts=() pol_default=check
+policy=contracts/sanitize-policy.yaml
+load_policy() { # the generated file's fixed line shapes only; anything else is an error, not a fallback
+  local line n=0
+  local rule_re='^  - \{"key": "([A-Z0-9_*]+)", "action": "(check|split|skip)", "class": "[a-z-]+"\}$'
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    if [[ $line =~ $rule_re ]]; then pol_keys+=("${BASH_REMATCH[1]}"); pol_acts+=("${BASH_REMATCH[2]}")
+    elif [[ $line =~ ^default:\ (check|skip)$ ]]; then pol_default=${BASH_REMATCH[1]}
+    elif [[ -z $line || $line == \#* || $line == rules: || $line =~ ^contract_version:\ [0-9]+$ ]]; then :
+    else die2 "$policy:$n: unexpected line (regenerate it: python3 tools/site_keys.py policy)"
+    fi
+  done <"$policy"
+  ((${#pol_keys[@]})) || die2 "$policy has no rules (regenerate it: python3 tools/site_keys.py policy)"
+}
+key_action() {
+  if ((${#pol_keys[@]} == 0)); then builtin_action "$1"; return; fi
+  local i
+  for i in "${!pol_keys[@]}"; do
+    # shellcheck disable=SC2053  # the rule key is a glob
+    if [[ $1 == ${pol_keys[$i]} ]]; then act=${pol_acts[$i]}; return; fi
+  done
+  act=$pol_default
+}
+
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 patterns=$tmp/patterns   # one literal per line (real values + .sanitize-extra)
 labels=$tmp/labels       # "LABEL<TAB>literal" per pattern, for --history reports
@@ -110,14 +150,10 @@ real_values() { # ENV_FILE
     v=${v%%#*}; v=${v//\"/}; v=$(xargs <<<"$v")
     ex=$(sed -n "s/^$k=//p" site.env.example | sed 's/#.*//; s/"//g' | xargs)
     [[ -n $v && $v != "$ex" ]] || continue
-    case $k in
-      SPARK_USERS|HARNESS_KEYS) continue;;           # names: whole-word list in .sanitize-words
-      *_PORT|*_IF|*_GROUP|*_CLIENT_ID|MODELS_DIR|BACKEND_SSH_USER) continue;;  # generic, not identifying
-      JUDGE_SSH_ALIASES|JUDGE_INFRA_REPOS|JUDGE_REPO_DIR) ;;  # site-identifying judge settings: still checked
-      JUDGE_*) continue;;                               # judge policy knobs (modes, model aliases, caps): public values
-    esac
-    # shellcheck disable=SC2206  # ADMIN_SOURCE_IPS is a space-separated list
-    if [[ $k == ADMIN_SOURCE_IPS ]]; then items=($v); else items=("$v"); fi
+    key_action "$k"
+    [[ $act != skip ]] || continue
+    # shellcheck disable=SC2206  # a split key (ADMIN_SOURCE_IPS) is a space-separated list
+    if [[ $act == split ]]; then items=($v); else items=("$v"); fi
     for w in "${items[@]}"; do
       [[ ${#w} -ge 6 && ! $w =~ ^[0-9]+$ ]] || continue   # skip tiny/numeric tokens
       case $w in 10.100.0.*) continue;; esac              # WireGuard defaults are the examples
@@ -127,6 +163,8 @@ real_values() { # ENV_FILE
 }
 
 if ((!regex_only)); then
+  dangling "$policy" && die2 "policy file is a dangling symlink: $policy"
+  [[ ! -f $policy ]] || load_policy
   site_env=$(resolve_site_env)
   judge_env=$(resolve_judge_env)
   extra=$(extra_files .sanitize-extra)

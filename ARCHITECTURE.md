@@ -255,7 +255,7 @@ Hermes turn
 
 ### Deploy model
 
-Every component converges from this repo plus a gitignored `site.env`. The scripts are idempotent, never delete, and never overwrite an existing secret. Each supports a dry run.
+Every component converges from this repo plus a gitignored `site.env`. [contracts/site-keys.yaml](contracts/site-keys.yaml) lists every key with its owner and the components that read it; a host can get only its slice of the file (`bin/deck env slice <component>`, used for Covenant and staged checkouts; the judge always reads the full file), and `bin/deck check` checks `site.env` against the registry. The scripts are idempotent, never delete, and never overwrite an existing secret. Each supports a dry run.
 
 | Script | Runs on | Converges |
 |---|---|---|
@@ -366,7 +366,7 @@ The flags are checked for every model by `walter/tests/test_llama_swap_config.py
 
 ### Public-repo sanitization
 
-This repo is public. Real site values (domain, IPs, user names, hostnames, OIDC client IDs) live only in the gitignored `site.env`, `.sanitize-extra` and `.sanitize-words`; committed files use the placeholders in [site.env.example](site.env.example). `scripts/check-sanitized.sh --all` fails on any real value or secret-shaped string, and gitleaks scans changed files before a commit. Templates are rendered with an explicit variable list. See [CONVENTIONS.md](CONVENTIONS.md).
+This repo is public. Real site values (domain, IPs, user names, hostnames, OIDC client IDs) live only in the gitignored `site.env`, `.sanitize-extra` and `.sanitize-words`; committed files use the placeholders in [site.env.example](site.env.example). `scripts/check-sanitized.sh --all` fails on any real value or secret-shaped string (which keys count as identifying comes from `contracts/sanitize-policy.yaml`, generated from the registry's sanitize classes), and gitleaks scans changed files before a commit. Templates are rendered with an explicit variable list. See [CONVENTIONS.md](CONVENTIONS.md).
 
 ### The judge's data boundary
 

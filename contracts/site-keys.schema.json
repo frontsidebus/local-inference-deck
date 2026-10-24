@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/site-keys.schema.json",
+  "title": "C1 site-key registry (contracts/site-keys.yaml)",
+  "description": "Validated by tools/site_keys.py with a stdlib subset of JSON Schema (type, const, enum, pattern, required, properties, additionalProperties, items, minItems, uniqueItems, minimum). Keep to those keywords.",
+  "type": "object",
+  "required": ["contract_version", "components", "sanitize_classes", "sanitize_fallback", "keys"],
+  "additionalProperties": false,
+  "properties": {
+    "contract_version": {"type": "integer", "minimum": 1},
+    "components": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+          "description": {"type": "string"},
+          "slice": {"type": "boolean"},
+          "slice_refusal": {"type": "string"}
+        }
+      }
+    },
+    "sanitize_classes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "action", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "enum": ["check", "check-list", "names", "generic", "judge-knob"]},
+          "action": {"type": "string", "enum": ["check", "split", "skip"]},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "sanitize_fallback": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["key", "sanitize"],
+        "additionalProperties": false,
+        "properties": {
+          "key": {"type": "string", "pattern": "^[A-Z0-9_*]+$"},
+          "sanitize": {"type": "string", "enum": ["check", "check-list", "names", "generic", "judge-knob"]}
+        }
+      }
+    },
+    "keys": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "active", "owner", "consumers", "required", "default", "sanitize"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$"},
+          "active": {"type": "boolean"},
+          "owner": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+          "consumers": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"}},
+          "required": {"type": "boolean"},
+          "default": {"type": "string"},
+          "sanitize": {"type": "string", "enum": ["check", "check-list", "names", "generic", "judge-knob"]},
+          "note": {"type": "string"}
+        }
+      }
+    }
+  }
+}
