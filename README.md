@@ -63,9 +63,9 @@ Every Walter port binds to `BACKEND_WG_IP` (or loopback) and only accepts traffi
 | [walter/](walter/README.md) | Backend VM: llama-swap config, gateway (LiteLLM + Postgres + hooks), webui (Open WebUI + Pocket-ID + theme), monitoring, telemetry app, the optional [digest app](walter/digest/README.md), backups, update-check, systemd units and drop-ins, firewall. |
 | [covenant/](covenant/README.md) | Edge: nginx sites and snippets, oauth2-proxy (plus a second instance for the optional digest), fail2ban, ufw, WireGuard, certbot hooks. |
 | [clients/](clients/README.md) | Workstation wrappers and configs for Claude Code, Codex, Hermes and OpenCode, plus the hermes-gateway service. |
-| [judge/](judge/README.md) | A reviewer for the local agent: Hermes shell hooks gate risky tool calls and queue reviews; a frontier (or local) judge checks the agent's claims against collected evidence. See [docs/agent-judge.md](docs/agent-judge.md). |
+| [judge/](judge/README.md) | Pointer only: the reviewer for the local agent (Hermes shell hooks gate risky tool calls and queue reviews; a frontier or local judge checks the agent's claims against collected evidence) is its own repo, **agent-judge**, checked out at `~/src/deck/agent-judge` and pinned in [deck.lock](deck.lock). |
 | [hypervisor/](hypervisor/README.md) | Requirements only. The host layer (VFIO, libvirt domain, disk passthrough) lives in a private infrastructure repo. |
-| [docs/](docs/) | [Decisions](docs/decisions.md), the [agent judge design](docs/agent-judge.md), [runbooks](docs/runbooks/) and [history](docs/history/gen2/INDEX.md). See the [docs map](#docs-map). |
+| [docs/](docs/) | [Decisions](docs/decisions.md), [runbooks](docs/runbooks/) and [history](docs/history/gen2/INDEX.md) (the agent judge's design doc and runbooks moved to agent-judge). See the [docs map](#docs-map). |
 | `scripts/` | `render.sh` (templates), `gen-secrets.sh` (secrets on the target host), `check-sanitized.sh` (pre-commit guard): shims into the shared engines in [tools/deck-tools/](tools/deck-tools/README.md), pinned by `tools/tools.lock`. |
 
 Site-specific values (domain, IPs, user list) live in `site.env`, which is gitignored. Copy [site.env.example](site.env.example) and fill it in. Templates (`*.tmpl`) are rendered by `scripts/render.sh` with an explicit variable list. Secrets are never in the repo: `scripts/gen-secrets.sh` creates them on the host and never overwrites an existing one. See [CONVENTIONS.md](CONVENTIONS.md).
@@ -80,7 +80,7 @@ The order matters; each step assumes the one before works. Deploy steps live in 
 4. **DNS and TLS.** Point A records for `chat`, `api`, `id` and `telemetry` (and the digest host, if used) at `EDGE_PUBLIC_IP`. `covenant/deploy.sh` serves an ACME-only port-80 stub, issues one certificate per host with certbot, then enables the full sites. The deploy hook reloads nginx on renewal.
 5. **Identity bootstrap.** Pocket-ID's `/setup` page is locked to `ADMIN_SOURCE_IPS` until you claim the admin account. Claim it **immediately**, then remove the lock. Create the OIDC clients (`open-webui`, `telemetry`) and the groups `${CHAT_GROUP}` and `${TELEMETRY_GROUP}`, then add users ([runbook](docs/runbooks/add-user.md)).
 6. **Clients.** Run `clients/install.sh` ([clients/](clients/README.md)), put each harness key in `~/.config/spark/<harness>.key` (mode 600), and run each wrapper's smoke test. Add `--with-hermes-gateway` for the admin-only Hermes Agent model in Open WebUI.
-7. **Optional.** Offsite backups: set `RESTIC_BUCKET` and follow [OFFSITE.md](walter/backup/OFFSITE.md). Digest site: set `SPARK_DIGEST_HOST` and follow the [digest runbook](docs/runbooks/digest-deploy.md). Agent judge for Hermes: `judge/install.sh --apply --with-units --start` ([judge/](judge/README.md)).
+7. **Optional.** Offsite backups: set `RESTIC_BUCKET` and follow [OFFSITE.md](walter/backup/OFFSITE.md). Digest site: set `SPARK_DIGEST_HOST` and follow the [digest runbook](docs/runbooks/digest-deploy.md). Agent judge for Hermes: clone agent-judge to `~/src/deck/agent-judge`, set `JUDGE_REPO_DIR` and `JUDGE_INFRA_REPOS` in `site.env`, and run its `judge/install.sh --apply --with-units --start` ([pointer](judge/README.md)).
 
 ## Hardware and what it taught us
 
@@ -136,7 +136,6 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Topology, the four request paths, ports, model placement, the gateway hook, the judge in brief, deploy model, secrets, backups, monitoring, security model, known issues. |
 | [CONVENTIONS.md](CONVENTIONS.md) | Public-repo rules, `site.env` names, templating, secrets, sanitization checks, PR flow. |
 | [docs/decisions.md](docs/decisions.md) | Why llama.cpp and not vLLM, why nginx, why LiteLLM, why Pocket-ID, and more. |
-| [docs/agent-judge.md](docs/agent-judge.md) | Why and how a judge reviews the local agent; rubric, data boundary, pilot results. |
 | **Components** | |
 | [walter/README.md](walter/README.md) | Backend VM: layout, pinned versions, deploy, OIDC bootstrap, secrets, output cap, verify, rollback. |
 | [walter/llama-swap/BENCHMARKS.md](walter/llama-swap/BENCHMARKS.md) | Model throughput, MTP, layer vs. tensor split. |
@@ -144,9 +143,7 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [walter/digest/README.md](walter/digest/README.md) | The optional digest app: pipeline, API, security model, operations. |
 | [covenant/README.md](covenant/README.md) | The edge: layout, secrets, AWS setup, first deploy, digest instance, verify, rollback. |
 | [clients/README.md](clients/README.md) | Harness wrappers and configs, keys, smoke tests, the optional hermes-gateway. |
-| [judge/README.md](judge/README.md) | Installing and operating the judge: hooks, units, gate rules, configuration, data boundary, troubleshooting. |
-| [judge/CONTRACT.md](judge/CONTRACT.md) | The binding interfaces between the judge's parts. |
-| [judge/runner/units/README.md](judge/runner/units/README.md) | The judge's systemd user units. |
+| [judge/README.md](judge/README.md) | Where the agent judge went (agent-judge repo: its `judge/README.md`, `judge/CONTRACT.md`, `docs/agent-judge.md`, decisions #10/#11 and the pilot and rejudge runbooks). |
 | [hypervisor/README.md](hypervisor/README.md) | What the host layer must provide. |
 | [evals/README.md](evals/README.md) | Pointer: the security eval harness and its roadmap moved to the sec-evals repo; run it with `bin/deck evals`, set it up with `bin/deck install evals`. |
 | **Runbooks** | |
@@ -156,8 +153,6 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [add-model.md](docs/runbooks/add-model.md) | Adding a model and alias. |
 | [upgrade.md](docs/runbooks/upgrade.md) | Acting on the weekly update report. |
 | [digest-deploy.md](docs/runbooks/digest-deploy.md) | Deploying the optional digest site. |
-| [agent-judge-pilot.md](docs/runbooks/agent-judge-pilot.md) | Running a judge pilot. |
-| [agent-judge-rejudge.md](docs/runbooks/agent-judge-rejudge.md) | Re-judging stored bundles. |
 | **History** | |
 | [docs/history/gen2](docs/history/gen2/INDEX.md) | The retired Ollama-era setup and why it was replaced. |
 

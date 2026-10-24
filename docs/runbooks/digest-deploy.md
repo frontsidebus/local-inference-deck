@@ -6,7 +6,7 @@ works: [walter/digest/README.md](../../walter/digest/README.md). The edge side:
 [covenant/README.md](../../covenant/README.md#digest-optional-second-oauth2-proxy-instance).
 
 The app was built by the local Hermes agent under the agent judge, as the judge's pilot build
-([docs/agent-judge.md](../agent-judge.md)), then reviewed and fixed by hand.
+(agent-judge repo, `docs/agent-judge.md`), then reviewed and fixed by hand.
 
 Until step 1 is done, nothing changes: with `SPARK_DIGEST_HOST` empty, both `walter/deploy.sh` and
 `covenant/deploy.sh` print one `digest: off` line and otherwise behave exactly as before the app

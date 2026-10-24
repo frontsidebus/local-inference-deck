@@ -8,23 +8,25 @@ walter/      backend VM: llama-swap, gateway (LiteLLM+Postgres), webui (Open Web
              monitoring, telemetry app, backups, update-check, systemd units/drop-ins, firewall
 covenant/    edge: nginx sites/snippets, oauth2-proxy, fail2ban, ufw, wireguard, certbot hooks
 clients/     workstation harness wrappers/configs (claude/codex/hermes/opencode) + hermes-gateway
-judge/       agent judge: gates, evidence collector and reviewer for a local agent (self-contained; see judge/CONTRACT.md)
+judge/       pointer README only: the agent judge is its own repo, agent-judge (~/src/deck/agent-judge, deck.lock)
 hypervisor/  requirements for the host layer (managed in a separate IaC project)
 evals/       pointer README only: the security eval harness is the sec-evals repo (~/src/deck/sec-evals); old
              checkouts' gitignored evals/data/ and evals/results/ stay ignored
-docs/        decisions, agent-judge design, runbooks, history (old Ollama-era docs live in docs/history/)
+docs/        decisions, runbooks, history (old Ollama-era docs live in docs/history/)
 scripts/     repo-level: render.sh, gen-secrets.sh, check-sanitized.sh (executable shims into tools/deck-tools/),
              secrets.d/<component>.sh (the secrets specs)
-contracts/   machine-readable seams: site-keys.yaml (the site.env key registry), sanitize-policy.yaml (generated)
+contracts/   machine-readable seams: site-keys.yaml (the site.env key registry), sanitize-policy.yaml (generated),
+             C2-C10 (contracts/README.md); vendored/ holds the copies of contracts other repos own
 tools/       site_keys.py: registry checks, the sanitize-policy generator, `deck env slice` and `deck check`;
              deck-tools/: the shared engines (render, gen-secrets, check-sanitized), the `deck-tools` CLI and the
              pre-commit hook, released as deck-tools-v<VERSION> tags; tools.lock pins them (sha256 and mode)
 bin/deck     one entry point: deck evals (runs the sec-evals checkout), deck install evals, deck env slice,
              deck check
-deck.lock    the components in their own repos (sec-evals, mode minimum); checked by deck check
+deck.lock    the components in their own repos (sec-evals, mode minimum; agent-judge, mode pinned), their pins
+             and required contracts; checked by deck check
 site.env.example
 ```
-Each deployable component dir has its own `README.md` (what it is, deploy steps, verify, rollback) and an entry point: `walter/deploy.sh`, `covenant/deploy.sh`, `clients/install.sh` (wrapped by `clients/deploy.sh`), `judge/install.sh`. `hypervisor/` has a README only.
+Each deployable component dir has its own `README.md` (what it is, deploy steps, verify, rollback) and an entry point: `walter/deploy.sh`, `covenant/deploy.sh`, `clients/install.sh` (wrapped by `clients/deploy.sh`); the agent judge's `judge/install.sh` is in the agent-judge repo. `hypervisor/` has a README only.
 
 ## Site values → `site.env` (gitignored), template in `site.env.example`
 Use these names. If you need a new one, add it to `site.env.example` under your component's section with a comment and a safe example value, **and** add its entry to [contracts/site-keys.yaml](contracts/site-keys.yaml) at the same position: owner, consumers (every component whose code or templates read it), required, the default exactly as written in the example, and its sanitize class. Then run `python3 tools/site_keys.py policy` to regenerate `contracts/sanitize-policy.yaml`. `tools/tests/test_site_keys.py` (CI) fails until the example and the registry agree, and when a template, a secrets spec or a deploy script reads a key that the registry does not assign to its component. Renaming or removing a key is a major `contract_version` change. The block below is the shared core; [site.env.example](site.env.example) is the complete, authoritative list (it also has the edge, backend, client and `JUDGE_*` settings).
