@@ -304,11 +304,25 @@ def test_suite_system_file_and_item_override(tmp_path):
     assert RUN.build_messages(items[1])[0]["content"] == "ITEM SYS"
 
 
-def test_llama_swap_entry_from_repo_template():
-    e = RUN.llama_swap_entry("coder", RUN.LLAMA_SWAP_TEMPLATE)
+# R2: this test no longer reads walter/'s template by default. It reads $SPARK_LLAMA_SWAP_TEMPLATE when set (the deck
+# CI sets it to walter/llama-swap/config.yaml.tmpl while the template is in this repo), else the vendored C4 fixture
+# (a copy of contracts/serving-identity/llama-swap.contract.yaml; the deck's C4 provider test asserts the same
+# fields on the real template).
+LLAMA_SWAP_FIXTURE = EVALS / "tests" / "fixtures" / "llama-swap.contract.yaml"
+
+
+def llama_swap_template() -> Path:
+    env = os.environ.get("SPARK_LLAMA_SWAP_TEMPLATE")
+    return Path(env) if env else LLAMA_SWAP_FIXTURE
+
+
+def test_llama_swap_entry_from_template():
+    path = llama_swap_template()
+    assert path.is_file(), f"SPARK_LLAMA_SWAP_TEMPLATE={path} does not exist"
+    e = RUN.llama_swap_entry("coder", path)
     assert e["model_id"] == "qwen3.8-27b" and "${image}" not in e["cmd"] and "llama.cpp:server-cuda@sha256" in e["cmd"]
     assert e["server_flags"]["--temp"] == "0.6"
-    assert RUN.llama_swap_entry("no-such-alias", RUN.LLAMA_SWAP_TEMPLATE) is None
+    assert RUN.llama_swap_entry("no-such-alias", path) is None
 
 
 def test_gateway_client_repr_hides_key():
