@@ -4,21 +4,35 @@
 # Usage: bin/deck evals run  [--site-env PATH] [run.py args...]
 #        bin/deck evals gate <calibrate|baseline|check> [--site-env PATH] [gate.py args...]
 #        bin/deck evals gate compare ...          (offline; no site.env needed)
+#        bin/deck env slice <component> [--site-env PATH] [-o FILE]
+#        bin/deck check [--site-env PATH]
 #        bin/deck --help
 #
 # The site.env is resolved in the deck-wide order: --site-env PATH > $SITE_ENV > ~/.config/deck/site.env >
 # <repo>/site.env. A path named by --site-env or $SITE_ENV must exist (no silent fallback); when nothing resolves,
-# deck exits 2. The path is exported as SITE_ENV, so the GPU guard and the gateway tunnel that gate.py and the
-# plans start read the same file, and passed to the tool as --site-env. deck also passes
+# deck exits 2.
+#
+# evals: the path is exported as SITE_ENV, so the GPU guard and the gateway tunnel that gate.py and the plans start
+# read the same file, and passed to the tool as --site-env. deck also passes
 # --llama-swap-config <repo>/walter/llama-swap/config.yaml.tmpl unless one is given. It runs
 # `python3 -B evals/<tool>.py` from the repo root: the GPU guard, stop.sh and the spark-model live-run check match
 # that command line.
+#
+# env slice: writes only the keys contracts/site-keys.yaml assigns to <component> (owner or consumer), lines copied
+# verbatim, mode 600, to FILE (default ~/.config/deck/slices/<component>.env). It refuses a FILE that is not a
+# regular file, and refuses the judge (its sitemask needs the full site.env). Components: global walter covenant
+# digest clients evals hypervisor. Use it for covenant (`covenant/deploy.sh --env FILE`) and for staged checkouts.
+#
+# check: site.env against the registry (unknown keys warn, a missing or empty required key fails) and judge.env
+# (only SITE_ENV= and judge policy knobs). Exit 0 ok, 1 failure, 2 no site.env.
+#
+# deck never prints a site value: only key names, counts and paths.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 TEMPLATE="$REPO/walter/llama-swap/config.yaml.tmpl"
 
-usage() { sed -n '2,15p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,29p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; }
 die() { echo "deck: $1" >&2; exit "${2:-2}"; }
 
 # resolve_site_env EXPLICIT: prints the absolute site.env path, or exits 2
@@ -79,9 +93,64 @@ cmd_evals() {
   exec python3 -B evals/run.py ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"}
 }
 
+SITE_KEYS="$REPO/tools/site_keys.py"
+
+# site_flag_args ARGS...: splits --site-env PATH out of ARGS into $explicit; the rest go to $rest
+site_flag_args() {
+  explicit="" rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --site-env) [ $# -ge 2 ] || die "--site-env needs a path"; explicit="$2"; shift 2; continue ;;
+      --site-env=*) explicit="${1#--site-env=}"; [ -n "$explicit" ] || die "--site-env needs a path"; shift; continue ;;
+    esac
+    rest+=("$1"); shift
+  done
+}
+
+cmd_env() {
+  local sub="${1:-}"
+  case "$sub" in
+    slice) shift ;;
+    -h|--help) usage; return 0 ;;
+    "") usage >&2; exit 2 ;;
+    *) die "unknown env command '$sub' (slice)" ;;
+  esac
+  local comp="${1:-}"
+  case "$comp" in
+    ""|-*) die "usage: deck env slice <component> [--site-env PATH] [-o FILE]" ;;
+  esac
+  shift
+  local explicit rest out=""
+  site_flag_args "$@"
+  set -- ${rest[@]+"${rest[@]}"}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o|--output) [ $# -ge 2 ] && [ -n "$2" ] || die "$1 needs a file"; out="$2"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown argument for env slice: $1" ;;
+    esac
+  done
+  # refuse the judge before resolving anything (tools/site_keys.py refuses it too)
+  [ "$comp" != judge ] || die "refusing to slice 'judge': the judge is exempt from slicing; judge/lib/sitemask.py can only mask the site values it knows, so the judge must read the full site env"
+  local f; f="$(resolve_site_env "$explicit")"
+  exec python3 -B "$SITE_KEYS" slice "$comp" --site-env "$f" ${out:+-o "$out"}
+}
+
+cmd_check() {
+  local explicit rest
+  site_flag_args "$@"
+  for x in ${rest[@]+"${rest[@]}"}; do
+    case "$x" in -h|--help) usage; return 0 ;; *) die "unknown argument for check: $x" ;; esac
+  done
+  local f; f="$(resolve_site_env "$explicit")"
+  exec python3 -B "$SITE_KEYS" check --site-env "$f"
+}
+
 case "${1:-}" in
   evals) shift; cmd_evals "$@" ;;
+  env) shift; cmd_env "$@" ;;
+  check) shift; cmd_check "$@" ;;
   -h|--help|help) usage ;;
   "") usage >&2; exit 2 ;;
-  *) die "unknown command '$1' (try: deck evals run|gate ...)" ;;
+  *) die "unknown command '$1' (try: deck evals run|gate, deck env slice, deck check)" ;;
 esac
