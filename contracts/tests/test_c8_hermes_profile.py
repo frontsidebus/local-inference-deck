@@ -1,6 +1,7 @@
 """C8 provider (deck): clients/install.sh merges its Hermes block idempotently into a config that already holds
-the judge's block (contracts/hermes-profile.yaml), and leaves that block alone; while judge/ is in this repo, both
-real installers are run together, in both orders.
+the judge's block (the `judge` example in contracts/hermes-profile.yaml), and leaves that block alone. With an
+agent-judge checkout ($AGENT_JUDGE_DIR, else ~/src/deck/agent-judge; its own repo since plan step 2), both real
+installers are also run together, in both orders; without one that test is skipped.
 
 Every run uses a temp HOME (so $HOME/.hermes is a temp HERMES_HOME), a temp judge.env, review dir and site.env
 copied from site.env.example. Nothing outside tmp_path is read for config or written. Needs bash, envsubst and a
@@ -14,7 +15,7 @@ import sys
 
 import pytest
 
-from contract_helpers import CONTRACTS, EXAMPLE, REPO, load_yaml
+from contract_helpers import CONTRACTS, EXAMPLE, REPO, TOOL, load_yaml
 
 yaml = pytest.importorskip("yaml")
 C8 = load_yaml(CONTRACTS / "hermes-profile.yaml")
@@ -25,6 +26,7 @@ PERSONAL = {"model": {"default": "big", "personal": "kept"}, "agent": {"max_turn
             "custom_providers": [{"name": "other", "base_url": "https://other.example.org/v1"}],
             "hooks_auto_accept": False}
 pytestmark = pytest.mark.skipif(shutil.which("envsubst") is None, reason="envsubst (gettext-base) is needed")
+AGENT_JUDGE = TOOL.agent_judge_dir()
 
 
 @pytest.fixture
@@ -52,12 +54,13 @@ def clients_install(home):
 
 
 def _judge_checkout(tmp):
-    """A throwaway judge checkout: the real install.sh and lib/, stub hook scripts, a stub policy template."""
+    """A throwaway judge checkout: agent-judge's real install.sh and lib/ (read only), stub hook scripts, a stub
+    policy template."""
     j = tmp / "checkout" / "judge"
     if not j.is_dir():
         (j / "hooks").mkdir(parents=True)
-        shutil.copy2(REPO / "judge/install.sh", j / "install.sh")
-        shutil.copytree(REPO / "judge/lib", j / "lib", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy2(AGENT_JUDGE / "judge/install.sh", j / "install.sh")
+        shutil.copytree(AGENT_JUDGE / "judge/lib", j / "lib", ignore=shutil.ignore_patterns("__pycache__"))
         for h in ("gate", "verify", "enqueue", "inject"):
             (j / "hooks" / f"{h}.py").write_text("import sys; sys.stdin.read(); print('{}')\n")
         (j / "policy").mkdir()
@@ -120,7 +123,7 @@ def test_clients_install_keeps_the_judge_block_and_is_idempotent(home):
     assert "unchanged  " + str(_cfg(home)) in out and _cfg(home).read_bytes() == first
 
 
-@pytest.mark.skipif(not (REPO / "judge/install.sh").is_file(), reason="judge/ is not in this checkout")
+@pytest.mark.skipif(AGENT_JUDGE is None, reason="no agent-judge checkout ($AGENT_JUDGE_DIR or ~/src/deck/agent-judge)")
 @pytest.mark.parametrize("order", [("clients", "judge"), ("judge", "clients")])
 def test_both_installers_in_either_order(home, order):
     run = {"clients": clients_install, "judge": judge_install}

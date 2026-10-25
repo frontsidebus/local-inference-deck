@@ -23,7 +23,7 @@ components:
   - {"name": "covenant", "description": "edge: covenant/deploy.sh (--env FILE), its scripts and scripts/secrets.d/covenant.sh"}
   - {"name": "digest", "description": "optional digest app: walter/digest (deployed by walter/deploy.sh, gated on the edge by covenant)"}
   - {"name": "clients", "description": "workstation harnesses: clients/install.sh, clients/bin/spark-model, clients/hermes templates"}
-  - {"name": "judge", "description": "agent judge: judge/lib/config.py and sitemask.py read the full site env", "slice": false, "slice_refusal": "the judge is exempt from slicing: judge/lib/sitemask.py can only mask the site values it knows, so the judge must read the full site env"}
+  - {"name": "judge", "description": "agent judge (the agent-judge repo): its judge/lib/config.py and sitemask.py read the full site env", "slice": false, "slice_refusal": "the judge is exempt from slicing: its judge/lib/sitemask.py (agent-judge repo) can only mask the site values it knows, so the judge must read the full site env"}
   - {"name": "evals", "description": "eval harness, the sec-evals repo (its example: evals.env.example, vendored in contracts/vendored/sec-evals/): evals/tools/lib.sh site_value, evals/gate.py, evals/run.py"}
   - {"name": "hypervisor", "description": "host layer (docs only): hypervisor/README.md"}
 sanitize_classes:

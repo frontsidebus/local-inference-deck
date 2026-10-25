@@ -420,7 +420,9 @@ def check_evals_link(site_env, sec_evals, out):
 
 def check_lock(sec_evals, out, lock=LOCK):
     """deck.lock: for sec-evals (mode minimum) the locked commit must be an ancestor of the checkout's HEAD. Only
-    warns, and never moves HEAD: sec-evals is a working checkout (the attempts ledger is committed there)."""
+    warns, and never moves HEAD: sec-evals is a working checkout (the attempts ledger is committed there).
+    For agent-judge (mode pinned) the checkout's HEAD must be the locked commit, a failure otherwise: the live hooks
+    and units run from that checkout ($AGENT_JUDGE_DIR, else the lock's path). No checkout: skipped."""
     if not Path(lock).is_file():
         out("deck.lock: none (skipped)")
         return 0
@@ -436,11 +438,14 @@ def check_lock(sec_evals, out, lock=LOCK):
             out(f"deck.lock: FAIL {name}: mode must be pinned or minimum")
             fails += 1
             continue
-        if name != "sec-evals":
+        if name not in ("sec-evals", "agent-judge"):
             out(f"deck.lock: {name}: not checked here")
             continue
         if not (isinstance(commit, str) and SHA_RE.match(commit)):
             out(f"deck.lock: {name}: no commit locked yet (skipped)")
+            continue
+        if name == "agent-judge":
+            fails += check_pinned(name, commit, c.get("path") or "", out)
             continue
         se = Path(sec_evals) if sec_evals else None
         if se is None or not (se / "evals" / "run.py").is_file():
@@ -456,6 +461,22 @@ def check_lock(sec_evals, out, lock=LOCK):
         else:
             out(f"deck.lock: {name}: WARN the locked commit {commit[:12]} is not in the checkout (git fetch?)")
     return fails
+
+
+def check_pinned(name, commit, path, out):
+    """agent-judge (mode pinned): its checkout's HEAD must be the locked commit. Never moves HEAD."""
+    aj = Path(os.environ.get("AGENT_JUDGE_DIR") or os.path.expanduser(path))
+    if not (aj / "judge" / "contracts" / "infra-repo.json").is_file():
+        out(f"deck.lock: {name}: no checkout (skipped)")
+        return 0
+    r = subprocess.run(["git", "-C", str(aj), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)
+    head = r.stdout.strip()
+    if r.returncode == 0 and head == commit:
+        out(f"deck.lock: {name}: checkout is at the locked commit (pinned)")
+        return 0
+    out(f"deck.lock: {name}: FAIL the checkout's HEAD {head[:12] or '?'} is not the locked commit {commit[:12]}"
+        " (check out the locked tag there, or update deck.lock; deck never moves its HEAD)")
+    return 1
 
 
 def cmd_check(reg, site_env, judge_env_flag, sec_evals=None, lock=LOCK):

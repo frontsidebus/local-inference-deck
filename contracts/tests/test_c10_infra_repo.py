@@ -1,6 +1,6 @@
 """C10 consumer (deck): this repo is a valid agent-judge infra repo (JUDGE_REPO_DIR), per the vendored
-contracts/vendored/agent-judge/infra-repo.json (source: judge/contracts/infra-repo.json; agent-judge's provider
-test is judge/tests/test_contract_infra_repo.py). The sanitizer's exit codes 0/1/2 are tested by
+contracts/vendored/agent-judge/infra-repo.json (source: judge/contracts/infra-repo.json in the agent-judge repo;
+its provider test is judge/tests/test_contract_infra_repo.py there). The sanitizer's exit codes 0/1/2 are tested by
 scripts/tests/test_check_sanitized.py.
 Run: python3 -m pytest contracts/tests -q -p no:cacheprovider
 """

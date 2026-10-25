@@ -37,7 +37,7 @@ the first certificate is issued through an ACME-only port-80 stub with no downti
 ([runbook step 6](../../docs/runbooks/digest-deploy.md#6-covenant-deploy-issues-the-cert-client-secret)).
 
 **Provenance.** The app was built by the local Hermes agent (on the `coder` model) under the agent
-judge, as the judge's pilot build ([docs/agent-judge.md](../../docs/agent-judge.md)). Every Hermes
+judge, as the judge's pilot build (agent-judge repo, `docs/agent-judge.md`). Every Hermes
 commit was reviewed and re-verified by hand. The defects found then (a run route a GET could
 trigger, one global cutoff for all sources, a rollback command that removed every published-port
 rule) are fixed and covered by the tests in `tests/`.
@@ -221,7 +221,7 @@ seen.items.<title key>:     first_seen, title, url, date, source                
 
 **Agents changing state handling should read `state-sample/`** (the agent judge's R8 review sees
 these files), not the live state files: those live outside the repo, and the judge never shows
-them to the reviewer ([docs/agent-judge.md](../../docs/agent-judge.md)).
+them to the reviewer (agent-judge repo, `docs/agent-judge.md`).
 
 ## Configuration
 
