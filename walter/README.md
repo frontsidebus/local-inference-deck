@@ -429,7 +429,7 @@ can still read the other model files (all public weights) and use its GPUs.
 
 The change restarts **every model**: llama-swap reloads the new config at once (`--watch-config`) and the
 containers come back with new arguments. It also changes the **serving identity** the eval gate records
-(`llama_swap_cmd_sha256`), and the C1 D8 pins in `evals/plans/c1-interventions.json` were re-pinned to the
+(`llama_swap_cmd_sha256`), and the C1 D8 pins in sec-evals' `evals/plans/c1-interventions.json` were re-pinned to the
 hardened flash command.
 
 1. **When:** after the gate calibration scheduled for 2026-10-13 (`gate.py calibrate` for `coder` and
@@ -450,8 +450,8 @@ hardened flash command.
    sudo cp -a /etc/llama-swap/config.yaml /etc/llama-swap/config.yaml.bak-harden-$(date +%Y%m%d-%H%M%S)
    sudo install -m 0640 -o root -g llamaswap "$R/llama-swap/config.yaml" /etc/llama-swap/config.yaml
    ```
-4. **Verify** (next section), then run the gate: `python3 evals/gate.py check --model coder --yes` and
-   `python3 evals/gate.py check --model coder-fast --yes` (about 2.0 h and 1.3 h). The weights and server flags
+4. **Verify** (next section), then run the gate: `bin/deck evals gate check --model coder --yes` and
+   `bin/deck evals gate check --model coder-fast --yes` (about 2.0 h and 1.3 h). The weights and server flags
    are unchanged, so the expected verdict is PASS or a hold with no per-suite regression.
 5. **Rollback:** restore the `config.yaml.bak-harden-*` copy (`install -m 0640 -o root -g llamaswap`); llama-swap
    reloads it. The network and the egress chain are harmless without it and can stay.

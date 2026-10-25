@@ -194,13 +194,40 @@ def test_clients_and_evals_readers(reg, by_name):
     spark_model = (REPO / "clients/bin/spark-model").read_text()
     got = {k for k in re.findall(r'site_value\("([A-Z][A-Z0-9_]*)"\)', spark_model) if k in by_name}
     assert got and got <= clients
+    # sec-evals is its own repo (plan step 3): its readers are checked in a checkout when one is present, and its
+    # example (vendored, test_evals_example_matches_the_registry) always
     evals = set(sk.component_keys(reg, "evals"))
-    got = set()
-    for f in tracked("evals/tools/*.sh", "evals/plans/*.sh"):
-        got |= {k for k in re.findall(r"site_value ([A-Z][A-Z0-9_]*)", f.read_text()) if k != "KEY"}  # KEY: usage text
-    for f in (REPO / "evals/gate.py", REPO / "evals/run.py"):
-        got |= {k for k in re.findall(r'setting\("([A-Z][A-Z0-9_]*)"', f.read_text()) if k in by_name}
-    assert got and got <= evals
+    se = sec_evals_dir()
+    if se is not None:
+        got = set()
+        for f in sorted((se / "evals").glob("tools/*.sh")) + sorted((se / "evals").glob("plans/*.sh")):
+            got |= {k for k in re.findall(r"site_value ([A-Z][A-Z0-9_]*)", f.read_text()) if k != "KEY"}  # usage
+        for f in (se / "evals/gate.py", se / "evals/run.py"):
+            got |= {k for k in re.findall(r'setting\("([A-Z][A-Z0-9_]*)"', f.read_text()) if k in by_name}
+        assert got and got <= evals
+
+
+EVALS_EXAMPLE = REPO / "contracts" / "vendored" / "sec-evals" / "evals.env.example"
+
+
+def sec_evals_dir():
+    import os
+    d = Path(os.environ.get("SEC_EVALS_DIR") or Path.home() / "src" / "deck" / "sec-evals")
+    return d if (d / "evals" / "run.py").is_file() else None
+
+
+def test_evals_example_matches_the_registry(reg, by_name):
+    """C1 coverage for sec-evals: its evals.env.example (vendored copy) holds exactly the registry keys with "evals"
+    among their consumers, with the registry's example defaults; and it matches a sec-evals checkout when present."""
+    rows = sk.parse_example(EVALS_EXAMPLE)
+    active = {name: raw for name, act, raw in rows if act}
+    assert len(active) == len([r for r in rows if r[1]]), "a key is listed twice"
+    assert set(active) == {k["name"] for k in reg["keys"] if "evals" in k["consumers"] and k["active"]}
+    for name, raw in active.items():
+        assert by_name[name]["default"] == raw, name
+    se = sec_evals_dir()
+    if se is not None and (se / "evals.env.example").is_file():
+        assert (se / "evals.env.example").read_bytes() == EVALS_EXAMPLE.read_bytes()
 
 
 def test_judge_reads_what_sitemask_masks(by_name):

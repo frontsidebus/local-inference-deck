@@ -1,0 +1,15 @@
+# deck.lock: the components that live in their own repos, as local-inference-deck composes them (plan §3).
+# No site values. Format: the constrained YAML subset of contracts/site-keys.yaml (one JSON object per list
+# item), so tools/site_keys.py reads it with the stdlib. `bin/deck check` checks it.
+#
+# Fields: name; repo (clone URL; a relative one such as ../sec-evals.git resolves against this repo's origin URL,
+# as git does for submodules); tag (release); commit (the tag's commit); mode; path (the stable checkout path:
+# SPARK_EVAL_REPOS, JUDGE_INFRA_REPOS and the liveness guard rely on it); requires_contracts (contract name ->
+# accepted major version).
+# - mode "pinned": the checkout must be at `commit`.
+# - mode "minimum": a working checkout; `commit` must be an ancestor of its HEAD. deck warns otherwise and never
+#   moves HEAD (sec-evals commits its attempts ledger after each confirmatory run).
+# A null commit skips the ancestor check.
+lock_format: 1
+components:
+  - {"name": "sec-evals", "repo": "../sec-evals.git", "tag": "v1.0.0", "commit": "2fdc054cb064f44366d4493d82ca9b11fa2f3101", "mode": "minimum", "path": "~/src/deck/sec-evals", "requires_contracts": {"serving-identity": "1", "eval-liveness": "1", "gate-cli": "1"}}

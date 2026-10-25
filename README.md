@@ -136,7 +136,6 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Topology, the four request paths, ports, model placement, the gateway hook, the judge in brief, deploy model, secrets, backups, monitoring, security model, known issues. |
 | [CONVENTIONS.md](CONVENTIONS.md) | Public-repo rules, `site.env` names, templating, secrets, sanitization checks, PR flow. |
 | [docs/decisions.md](docs/decisions.md) | Why llama.cpp and not vLLM, why nginx, why LiteLLM, why Pocket-ID, and more. |
-| [docs/evals-roadmap.md](docs/evals-roadmap.md) | What the security evals have shown so far, the options for developing them further (routing, upgrade gate, triage vetting, a methods write-up), the work each needs, and the recommended order. |
 | [docs/agent-judge.md](docs/agent-judge.md) | Why and how a judge reviews the local agent; rubric, data boundary, pilot results. |
 | **Components** | |
 | [walter/README.md](walter/README.md) | Backend VM: layout, pinned versions, deploy, OIDC bootstrap, secrets, output cap, verify, rollback. |
@@ -149,7 +148,7 @@ The stack is model-agnostic. For security work (code review, log triage, data th
 | [judge/CONTRACT.md](judge/CONTRACT.md) | The binding interfaces between the judge's parts. |
 | [judge/runner/units/README.md](judge/runner/units/README.md) | The judge's systemd user units. |
 | [hypervisor/README.md](hypervisor/README.md) | What the host layer must provide. |
-| [evals/README.md](evals/README.md) | Security eval harness: running suites against the local models (and an optional frontier baseline), scorers, reports with confidence intervals, adding a suite, GPU disruption. |
+| [evals/README.md](evals/README.md) | Pointer: the security eval harness and its roadmap moved to the sec-evals repo; run it with `bin/deck evals`, set it up with `bin/deck install evals`. |
 | **Runbooks** | |
 | [power-loss-recovery.md](docs/runbooks/power-loss-recovery.md) | Bringing everything back after an outage. |
 | [rotate-secrets.md](docs/runbooks/rotate-secrets.md) | Rotating keys and secrets. |

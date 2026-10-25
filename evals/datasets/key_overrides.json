@@ -1,4 +1,0 @@
-{
-  "_doc": "Human answer-key corrections. Empty by default. Each entry needs suite, id, answer, justification (>= 20 chars, the reason the key is wrong, NOT that models disagree with it), source (an external reference: standard, vendor advisory, NVD record, textbook), reviewer and date (YYYY-MM-DD). Loaded only with --key-overrides; the original key is kept in meta.rigor.key_override.original and reports show results with and without overrides.",
-  "overrides": []
-}
