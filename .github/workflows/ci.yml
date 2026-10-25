@@ -68,6 +68,43 @@ jobs:
       - name: shellcheck
         run: shellcheck -S warning scripts/*.sh scripts/secrets.d/*.sh hooks/pre-commit tools/deck-tools/*.sh tools/deck-tools/pre-commit
 
+  # sec-evals at the commit deck.lock names, against this repo's real llama-swap template: its needs_deck_template
+  # tests (the C1 D8 pins in plans/c1-interventions.json are the template's flash cmd) skip in sec-evals' own CI,
+  # so a template change that breaks a pinned intervention fails here, in the PR that makes it.
+  sec-evals-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+      - name: sec-evals commit from deck.lock
+        id: lock
+        run: |
+          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import site_keys as sk
+          (c,) = [c for c in sk.load_registry("deck.lock")["components"] if c["name"] == "sec-evals"]
+          print("commit=" + c["commit"])' >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: ${{ github.repository_owner }}/sec-evals
+          ref: ${{ steps.lock.outputs.commit }}
+          path: sec-evals
+          persist-credentials: false
+      - name: Install tools (Ubuntu packages)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends python3-pytest python3-numpy
+      - name: sec-evals tests against the deck's walter template
+        working-directory: sec-evals
+        env:
+          SPARK_LLAMA_SWAP_TEMPLATE: ${{ github.workspace }}/walter/llama-swap/config.yaml.tmpl
+        run: |
+          set -o pipefail
+          test -f "$SPARK_LLAMA_SWAP_TEMPLATE"
+          python3 -m pytest evals/tests -q -p no:cacheprovider -rs | tee "$RUNNER_TEMP/sec-evals.txt"
+          # the point of this job: the template tests must have run, not skipped
+          ! grep -q "needs the deck's walter llama-swap template" "$RUNNER_TEMP/sec-evals.txt"
+
   gitleaks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
