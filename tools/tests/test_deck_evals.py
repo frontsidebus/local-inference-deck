@@ -55,7 +55,8 @@ def layout(tmp_path):
 
 
 def _env(home, se, **extra):
-    e = {k: v for k, v in os.environ.items() if k not in ("SITE_ENV", "SEC_EVALS_DIR", "JUDGE_ENV", "EVAL_GPU_SSH")}
+    e = {k: v for k, v in os.environ.items()
+         if k not in ("SITE_ENV", "SEC_EVALS_DIR", "AGENT_JUDGE_DIR", "JUDGE_ENV", "EVAL_GPU_SSH")}
     e.update(HOME=str(home), LC_ALL="C")
     if se is not None:
         e["SEC_EVALS_DIR"] = str(se)
@@ -309,6 +310,43 @@ def test_check_lock_rejects_an_unknown_mode(layout):
     assert r.returncode == 1 and "mode must be pinned or minimum" in r.stdout
 
 
+def _fake_agent_judge(tmp_path):
+    aj = tmp_path / "agent-judge"
+    (aj / "judge" / "contracts").mkdir(parents=True)
+    (aj / "judge" / "contracts" / "infra-repo.json").write_text('{"contract_version": "1.0"}\n')
+    _git(aj, "init", "-q")
+    return aj, _commit(aj, "v1")
+
+
+def _lock_aj(deck, commit):
+    (deck / "deck.lock").write_text(
+        "lock_format: 1\ncomponents:\n"
+        f'  - {{"name": "agent-judge", "repo": null, "tag": null, "commit": "{commit}", "mode": "pinned", '
+        '"path": "~/src/deck/agent-judge", "requires_contracts": {"site-keys": "1"}}\n')
+
+
+def test_check_lock_pinned_fails_off_the_locked_commit_and_never_moves_head(layout, tmp_path):
+    deck, se, home = layout
+    _full_site(deck, home / ".config" / "deck" / "site.env")
+    assert run_deck(deck, home, se, "install", "evals").returncode == 0
+    aj, first = _fake_agent_judge(tmp_path)
+    _lock_aj(deck, first)
+    r = run_deck(deck, home, se, "check")                               # no checkout at the lock's path
+    assert r.returncode == 0 and "agent-judge: no checkout (skipped)" in r.stdout
+    r = run_deck(deck, home, se, "check", AGENT_JUDGE_DIR=aj)
+    assert r.returncode == 0 and "checkout is at the locked commit (pinned)" in r.stdout
+    (aj / "judge" / "README.md").write_text("x\n")
+    second = _commit(aj, "v2")                                          # the checkout moved past the pin
+    r = run_deck(deck, home, se, "check", AGENT_JUDGE_DIR=aj)
+    assert r.returncode == 1 and "is not the locked commit" in r.stdout
+    assert _git(aj, "rev-parse", "HEAD") == second                     # deck never moved HEAD
+    (home / "src" / "deck").mkdir(parents=True)
+    (aj).rename(home / "src" / "deck" / "agent-judge")                  # the lock's path, under HOME
+    _lock_aj(deck, second)
+    r = run_deck(deck, home, se, "check")
+    assert r.returncode == 0 and "checkout is at the locked commit (pinned)" in r.stdout
+
+
 def test_the_committed_lock_parses():
     import sys
     sys.path.insert(0, str(REPO / "tools"))
@@ -317,3 +355,5 @@ def test_the_committed_lock_parses():
     (se,) = [c for c in lock["components"] if c["name"] == "sec-evals"]
     assert se["mode"] == "minimum" and se["path"] == "~/src/deck/sec-evals"
     assert set(se["requires_contracts"]) == {"serving-identity", "eval-liveness", "gate-cli"}
+    (aj,) = [c for c in lock["components"] if c["name"] == "agent-judge"]
+    assert aj["mode"] == "pinned" and aj["path"] == "~/src/deck/agent-judge" and len(aj["commit"]) == 40
