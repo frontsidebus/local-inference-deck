@@ -13,4 +13,4 @@
 lock_format: 1
 components:
   - {"name": "sec-evals", "repo": "../sec-evals.git", "tag": "v1.0.0", "commit": "2fdc054cb064f44366d4493d82ca9b11fa2f3101", "mode": "minimum", "path": "~/src/deck/sec-evals", "requires_contracts": {"serving-identity": "1", "eval-liveness": "1", "gate-cli": "1"}}
-  - {"name": "agent-judge", "repo": "../agent-judge.git", "tag": "v1.0.0", "commit": "237e4c2ca938ed1aae80a1a8b65d75b4b7da05fe", "mode": "pinned", "path": "~/src/deck/agent-judge", "requires_contracts": {"site-keys": "1", "gateway": "1", "observability": "1", "hermes-profile": "1"}}
+  - {"name": "agent-judge", "repo": "../agent-judge.git", "tag": "v1.0.1", "commit": "1388ed8b183349bdee855fd4a120a9ec8a43dcbf", "mode": "pinned", "path": "~/src/deck/agent-judge", "requires_contracts": {"site-keys": "1", "gateway": "1", "observability": "1", "hermes-profile": "1"}}
