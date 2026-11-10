@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# Hand GPU1 between Walter and the linux-gaming VM (split mode). See hypervisor/gaming/README.md.
+# Runs as the operator (group libvirt); no sudo. Root-side safety lives in the libvirt hooks installed by
+# gaming-setup.sh (allow-list, gaming_guard check, host CPUs off the game's cores).
+#
+#   game-mode            (= gpu-mode game)   Walter -> GPU0 only, less RAM, host cores; start linux-gaming on GPU1
+#   ai-mode              (= gpu-mode ai)     stop linux-gaming; Walter back to both GPUs and its full RAM
+#   gpu-mode status                          show the current state, change nothing
+#   gpu-mode check                           run game mode's pre-checks only, change nothing
+#   --yes                                    don't ask before starting
+#
+# Game mode costs: coder-fast is off while you play; Walter (chat, API, telemetry) restarts once on the
+# way in and once on the way out (a few minutes each); the judge is paused. coder keeps running on GPU0.
+# Every step is checked; on a failure it stops and tells you what state it left. ai-mode restores from
+# any partial state, so "something went wrong" is always followed by: ai-mode.
+
+set -euo pipefail
+
+SITE=${SITE_ENV:-$HOME/.config/deck/site.env}
+GDOM=linux-gaming
+NET=gaming-nat
+BK=$HOME/vm-backups
+STATE=$HOME/.local/state/gpu-mode
+JUDGE_UNITS=(judge-review.path judge-review.timer judge-runaway-watch.service)
+# The model ids behind the coder / coder-fast aliases (walter/llama-swap/config.yaml.tmpl). Update with it.
+CODER_ID=qwen3.8-27b CODER_FAST_ID=qwen3.6-35b-a3b
+VIRSH=(virsh -q -c qemu:///system)
+
+YES=0 CMD=
+for a in "$@"; do
+    case $a in
+        --yes) YES=1 ;;
+        game|ai|status|check) CMD=$a ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        *) echo "unknown argument: $a" >&2; exit 2 ;;
+    esac
+done
+case $(basename "$0") in game-mode) CMD=${CMD:-game} ;; ai-mode) CMD=${CMD:-ai} ;; esac
+[[ -n $CMD ]] || { sed -n '2,16p' "$0"; exit 2; }
+
+say()  { printf '  %s\n' "$*"; }
+ok()   { printf '  ok:   %s\n' "$*"; }
+step() { printf '\n=== %s\n' "$*"; }
+die()  { printf '  !! %s\n' "$*" >&2; exit 1; }
+
+[[ -r $SITE ]] || die "cannot read $SITE"
+# site KEY [DEFAULT]: the last KEY= line of site.env, quotes and a trailing comment removed (never sourced)
+site() { local v; v=$(sed -n "s/^$1=//p" "$SITE" | tail -1 | sed -E 's/[[:space:]]+#.*$//' | tr -d '"'"'"); printf '%s' "${v:-${2:-}}"; }
+# Site values (site.env.example, "hypervisor: GPU modes"); the defaults match that file.
+DOM=$(site WALTER_DOMAIN walter)
+read -ra GPU1 <<<"$(site GAMING_GPU_PCI '0000:03:00.0 0000:03:00.1')"
+read -ra BUS <<<"$(site WALTER_GPU_BUS_IDS '00000000:05:00.0 00000000:09:00.0')"   # Walter's CUDA 0 and 1
+WALTER_MEM_GIB=$(site WALTER_MEM_GIB 80) SPLIT_MEM_GIB=$(site WALTER_SPLIT_MEM_GIB 64)
+WALTER_CPUS=$(site GAMING_HOST_CPUS 8-15,24-31)   # Walter and the host in game mode; the game gets the rest
+GUEST_IP="$(site GAMING_SUBNET 192.168.150).10"
+BASELINE=$BK/$DOM-baseline.xml
+((${#GPU1[@]} >= 1 && ${#BUS[@]} == 2)) || die "GAMING_GPU_PCI or WALTER_GPU_BUS_IDS malformed in $SITE"
+WALTER_SSH="$(site BACKEND_SSH_USER)@$(site BACKEND_LAN_IP)"
+LS="http://$(site BACKEND_WG_IP):8080"
+[[ $WALTER_SSH != @ && $WALTER_SSH != *@ && $WALTER_SSH != @* && $LS != http://:8080 ]] \
+    || die "BACKEND_SSH_USER, BACKEND_LAN_IP or BACKEND_WG_IP missing in $SITE"
+
+walter() { ssh -o ConnectTimeout=5 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes "$WALTER_SSH" "$@"; }
+
+# Runs on Walter: llama-swap queries with the API key read there. The key goes to curl through a file
+# descriptor, never on a command line (visible in /proc) and never back over ssh.
+# $1 = running | idle | ask <model>. idle exits 0 idle, 1 busy (prints the busy models), 3 unreachable.
+ls_remote() {
+    walter "LS=$LS bash -s -- $*" <<'EOF'
+set -euo pipefail
+K=$(sudo -n cat /etc/llama-swap/api-key)
+auth() { printf 'Authorization: Bearer %s\n' "$K"; }
+get() { curl -sf -m 10 -H @<(auth) "$LS$1"; }
+case $1 in
+  running)   # "<model> <state>" per loaded model
+    get /running | python3 -c 'import sys, json
+for m in json.load(sys.stdin)["running"]: print(m["model"], m["state"])' ;;
+  idle)      # asks each loaded server directly, so it never triggers a load; a model still loading counts as busy
+    r=$(get /running) || exit 3
+    printf '%s' "$r" | python3 -c 'import sys, json, urllib.request
+busy = []
+for m in json.load(sys.stdin)["running"]:
+    if m["state"] != "ready": busy.append(m["model"] + "(" + m["state"] + ")"); continue
+    try:
+        with urllib.request.urlopen(m["proxy"] + "/slots", timeout=10) as r:
+            if any(s.get("is_processing") for s in json.load(r)): busy.append(m["model"])
+    except OSError:
+        busy.append(m["model"] + "(no answer)")
+print(" ".join(busy)); sys.exit(1 if busy else 0)' ;;
+  ask)       # a tiny completion; prints the model that answered (llama-swap loads the model if needed)
+    curl -sf -m 240 -H @<(auth) -H "Content-Type: application/json" "$LS/v1/chat/completions" \
+      -d "{\"model\":\"$2\",\"messages\":[{\"role\":\"user\",\"content\":\"Say ok\"}],\"max_tokens\":200}" \
+      | python3 -c 'import sys, json; d = json.load(sys.stdin); assert d["choices"]; print(d["model"])' ;;
+esac
+EOF
+}
+
+# hostdev "source-bdf>guest-bus:slot.fn" lines of a domain XML on stdin, sorted.
+hostdevs_of() {
+    python3 -I -c '
+import sys, xml.etree.ElementTree as ET
+for h in ET.parse(sys.stdin).getroot().iter("hostdev"):
+    s, g = h.find("source/address"), h.find("address")
+    src = "%04x:%02x:%02x.%x" % tuple(int(s.get(k), 16) for k in ("domain", "bus", "slot", "function"))
+    dst = "%02x:%02x.%x" % tuple(int(g.get(k), 16) for k in ("bus", "slot", "function")) if g is not None else "?"
+    print(src + ">" + dst)' | sort
+}
+# "<memory GiB> <currentMemory GiB>" of a domain XML on stdin
+mem_gib_of() { python3 -I -c '
+import sys, xml.etree.ElementTree as ET
+r = ET.parse(sys.stdin).getroot()
+def g(t):
+    m = r.find(t)
+    return round(int(m.text) * {"KiB": 1 / 1048576, "MiB": 1 / 1024, "GiB": 1}[m.get("unit", "KiB")])
+print(g("memory"), g("currentMemory"))'; }
+
+want_full()  { hostdevs_of <"$BASELINE"; }
+want_split() { hostdevs_of <"$BASELINE" | awk -F'>' -v g=" ${GPU1[*]} " 'index(g, " " $1 " ") == 0'; }
+have_cfg()   { "${VIRSH[@]}" dumpxml --inactive "$DOM" | hostdevs_of; }
+have_live()  { "${VIRSH[@]}" dumpxml "$DOM" | hostdevs_of; }
+cfg_mem()    { "${VIRSH[@]}" dumpxml --inactive "$DOM" | mem_gib_of; }
+state_of()   { "${VIRSH[@]}" domstate "$1" 2>/dev/null || echo missing; }
+gpu1_on_vfio() {
+    local d
+    for d in "${GPU1[@]}"; do
+        [[ $(basename "$(readlink "/sys/bus/pci/devices/$d/driver" 2>/dev/null)") == vfio-pci ]] || return 1
+    done
+}
+
+# All waits are wall-clock deadlines (an ssh timeout inside a loop doesn't stretch them).
+wait_state() {   # domain, wanted state, seconds
+    local end=$((SECONDS + $3))
+    while ((SECONDS < end)); do [[ $(state_of "$1") == "$2" ]] && return 0; sleep 5; done
+    [[ $(state_of "$1") == "$2" ]]
+}
+wait_walter_idle() {   # seconds; returns 0 idle, 1 still busy, 3 llama-swap unreachable for 2 min straight
+    local end=$((SECONDS + $1)) busy rc last=0 down_since=
+    while ((SECONDS < end)); do
+        rc=0; busy=$(ls_remote idle 2>/dev/null) || rc=$?
+        case $rc in
+            0) return 0 ;;
+            1) down_since=; ((SECONDS - last >= 60)) && { say "waiting for: $busy"; last=$SECONDS; } ;;
+            *) down_since=${down_since:-$SECONDS}; ((SECONDS - down_since >= 120)) && return 3 ;;
+        esac
+        sleep 15
+    done
+    return 1
+}
+wait_walter_up() {   # seconds; until ssh works and llama-swap answers (callers then ask coder, which loads it)
+    local end=$((SECONDS + $1))
+    while ((SECONDS < end)); do ls_remote running >/dev/null 2>&1 && return 0; sleep 5; done
+    return 1
+}
+# $1 = game | ai. Game mode stops at anything unexpected (ai-mode restores); ai-mode can go on.
+walter_shutdown() {
+    [[ $(state_of "$DOM") == "shut off" ]] && return 0
+    if [[ $(state_of "$DOM") == running ]]; then
+        say "waiting for Walter to be idle (up to 10 min)..."
+        local rc=0
+        wait_walter_idle 600 || rc=$?
+        if ((rc == 1)); then
+            [[ $1 == game ]] && die "Walter still busy after 10 min. Only the judge was paused: run ai-mode to resume it, then try again later."
+            ask "Walter is still busy after 10 min. Shut it down anyway (in-flight requests fail)?" || die "left Walter running; re-run ai-mode later"
+        elif ((rc == 3)); then
+            [[ $1 == game ]] && die "Walter's llama-swap stopped answering. Run ai-mode."
+            say "Walter's llama-swap is unreachable, so there are no requests to protect; shutting down"
+        fi
+        [[ $1 == game ]] && write_state walter-shutdown
+        "${VIRSH[@]}" shutdown "$DOM" >/dev/null
+    fi
+    say "Walter shutting down (ACPI, up to 5 min)..."
+    wait_state "$DOM" "shut off" 300 \
+        || die "Walter did not shut down within 5 min (state: $(state_of "$DOM")). Not forcing it: check its console (virt-manager), then run ai-mode."
+    ok "Walter is shut off"
+}
+
+write_state() {   # phase; keeps the paused judge units and the start time, so ai-mode can resume them
+    install -d -m 700 "$(dirname "$STATE")"
+    { echo "mode=${MODE:-split}"; echo "phase=$1"; echo "since=${SINCE:=$(date -Is)}"; echo "judge=${JUDGE_WAS:-}"; } >"$STATE.tmp"
+    mv "$STATE.tmp" "$STATE"
+}
+read_state() { [[ -e $STATE ]] && sed -n "s/^$1=//p" "$STATE" || true; }
+
+confirm() {   # skipped by --yes
+    ((YES)) && return 0
+    ask "$1"
+}
+ask() {       # always asks, even with --yes
+    local r=
+    read -r -p "  $1 [y/N] " r </dev/tty || die "no terminal to ask on"
+    [[ $r == [yY]* ]]
+}
+
+lock() {   # one switch at a time
+    install -d -m 700 "$(dirname "$STATE")"
+    exec 9>"$STATE.lock"
+    flock -n 9 || die "another game-mode/ai-mode is running"
+}
+
+# ---------------------------------------------------------------------------------------------
+precheck() {
+    local fail=0 m now
+    chk() { if eval "$2"; then ok "$1"; else printf '  FAIL: %s\n' "$1"; fail=1; fi; }
+    [[ -r $BASELINE ]] || die "no baseline $BASELINE"
+    chk "no gpu-mode state (not already in game mode; after a failure run ai-mode first)" '[[ ! -e $STATE ]]'
+    chk "$GDOM is defined with GPU1 (setup or final variant)" '"${VIRSH[@]}" dumpxml --inactive $GDOM 2>/dev/null | grep -qE "\[(setup|final)\]</title>"'
+    chk "$GDOM is shut off" '[[ $(state_of $GDOM) == "shut off" ]]'
+    chk "Walter is running" '[[ $(state_of $DOM) == running ]]'
+    chk "Walter's running hostdevs match the baseline (both GPUs)" '[[ $(have_live) == "$(want_full)" ]]'
+    chk "Walter's saved config matches the baseline and has ${WALTER_MEM_GIB} GiB" '[[ $(have_cfg) == "$(want_full)" && $(cfg_mem) == "$WALTER_MEM_GIB $WALTER_MEM_GIB" ]]'
+    chk "GPU1 (${GPU1[*]}) is on vfio-pci" 'gpu1_on_vfio'
+    chk "gaming-guard.service is active (the hooks re-check the table as root)" 'systemctl is-active -q gaming-guard.service'
+    chk "no eval run or GPU guard running" '! pgrep -f "^[^ ]*python[0-9.]*( [^ ]+)* [^ ]*evals/run\.py|^[^ ]*(ba)?sh [^ ]*(evals/tools/gpu-guard|run-b-day[^ ]*)\.sh" >/dev/null'
+    # shellcheck disable=SC2034  # read by the chk expression below
+    now=$((10#$(date -u +%H%M)))
+    chk "outside Walter's backup window (03:25-04:45 UTC)" '((now < 325 || now > 445))'
+    m=$(( $(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1048576 ))
+    chk "host RAM: ${m} GiB available; needs 16 (24 for the game - 16 freed by Walter + 8 reserve)" '((m >= 16))'
+    chk "Walter reachable over ssh and coder loaded" 'ls_remote running | grep -qx "$CODER_ID ready"'
+    return $fail
+}
+
+cmd_status() {
+    step "gpu-mode status"
+    say "state file: $( [[ -e $STATE ]] && tr '\n' ' ' <"$STATE" || echo 'none (AI mode)')"
+    say "Walter: $(state_of "$DOM"); running hostdevs: $(have_live | tr '\n' ' ')"
+    say "Walter config: $(cfg_mem | sed 's/ / GiB, current /') GiB; hostdevs: $(have_cfg | tr '\n' ' ')"
+    say "$GDOM: $(state_of "$GDOM"); $NET: $("${VIRSH[@]}" net-info "$NET" 2>/dev/null | awk '/^Active:/{print $2}')"
+    say "GPU1 driver: $(for d in "${GPU1[@]}"; do basename "$(readlink "/sys/bus/pci/devices/$d/driver" 2>/dev/null)"; done | tr '\n' ' ')"
+    say "judge: $(systemctl --user is-active "${JUDGE_UNITS[@]}" | tr '\n' ' ')"
+    say "host CPUs: $(for u in system.slice user.slice init.scope; do printf '%s=%s ' "$u" "$(cat "/sys/fs/cgroup/$u/cpuset.cpus.effective" 2>/dev/null)"; done)"
+}
+
+cmd_check() { step "game-mode pre-checks (nothing is changed)"; precheck && ok "all pre-checks pass" || die "pre-checks failed"; }
+
+cmd_game() {
+    lock
+    step "game mode (split): pre-checks"
+    precheck || die "pre-checks failed; nothing changed"
+    say ""
+    say "This will: pause the judge; restart Walter with GPU0 only and ${SPLIT_MEM_GIB} GiB (chat/API down for a few"
+    say "minutes; coder comes back, coder-fast stays off); then start $GDOM on GPU1."
+    say "While you play, a request for a two-GPU model (big, vision incl. image chats, hermes, flash, lab) unloads"
+    say "coder and then fails; the next coder request reloads coder (about 20 s)."
+    confirm "go to game mode?" || die "cancelled; nothing changed"
+
+    step "1/5 pause the judge"
+    JUDGE_WAS=$(for u in "${JUDGE_UNITS[@]}"; do systemctl --user is-active -q "$u" && printf '%s ' "$u"; done || true)
+    write_state judge-paused
+    if [[ -n $JUDGE_WAS ]]; then
+        # shellcheck disable=SC2086
+        systemctl --user stop $JUDGE_WAS
+    fi
+    # A review already running keeps going; wait for it, so Walter doesn't go down mid-review.
+    local end=$((SECONDS + 900))
+    while systemctl --user is-active -q judge-review.service && ((SECONDS < end)); do sleep 10; done
+    systemctl --user is-active -q judge-review.service \
+        && die "a judge review is still running after 15 min. Run ai-mode (resumes the judge), try later."
+    ok "paused: ${JUDGE_WAS:-nothing was running}; no review in progress"
+
+    step "2/5 shut Walter down"
+    walter_shutdown game
+
+    step "3/5 Walter's config: drop GPU1, ${SPLIT_MEM_GIB} GiB"
+    write_state walter-reconfig
+    local f
+    for f in gpu1a gpu1; do
+        if have_cfg | grep -q "^$(hostdevs_of <"$BK/hostdev-$f.xml" | cut -d'>' -f1)>"; then
+            "${VIRSH[@]}" detach-device "$DOM" "$BK/hostdev-$f.xml" --config >/dev/null
+        fi
+    done
+    "${VIRSH[@]}" setmem "$DOM" "${SPLIT_MEM_GIB}G" --config
+    "${VIRSH[@]}" setmaxmem "$DOM" "${SPLIT_MEM_GIB}G" --config
+    [[ $(have_cfg) == "$(want_split)" ]] || die "Walter's config hostdevs are not GPU0-only as expected: $(have_cfg | tr '\n' ' '). Run ai-mode."
+    [[ $(cfg_mem) == "$SPLIT_MEM_GIB $SPLIT_MEM_GIB" ]] || die "Walter's config memory is $(cfg_mem), not $SPLIT_MEM_GIB. Run ai-mode."
+    ok "config: $(have_cfg | tr '\n' ' '), ${SPLIT_MEM_GIB} GiB"
+
+    step "4/5 start Walter on GPU0"
+    write_state walter-start
+    "${VIRSH[@]}" start "$DOM" >/dev/null
+    local v n
+    n=$("${VIRSH[@]}" dumpxml "$DOM" | python3 -I -c 'import sys, xml.etree.ElementTree as ET; print(ET.parse(sys.stdin).getroot().find("vcpu").text)')
+    for ((v = 0; v < n; v++)); do
+        "${VIRSH[@]}" vcpupin "$DOM" "$v" "$WALTER_CPUS" --live >/dev/null
+    done
+    "${VIRSH[@]}" emulatorpin "$DOM" "$WALTER_CPUS" --live >/dev/null
+    ok "Walter started, pinned to $WALTER_CPUS for this run"
+    say "waiting for Walter and llama-swap (up to 6 min)..."
+    wait_walter_up 360 || die "Walter or llama-swap did not come up within 6 min. Run ai-mode."
+    [[ $(walter nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader) == "0, ${BUS[0]}" ]] \
+        || die "Walter does not see exactly GPU0 at ${BUS[0]}. Run ai-mode."
+    ok "Walter sees only GPU0 (CUDA 0 = ${BUS[0]})"
+    [[ $(ls_remote ask coder) == "$CODER_ID" ]] || die "coder did not answer. Run ai-mode."
+    ok "coder answers (coder-fast's preload fails without GPU1; expected)"
+
+    step "5/5 start $GDOM on GPU1"
+    write_state gaming-start
+    gpu1_on_vfio || die "GPU1 is not on vfio-pci after Walter released it. Run ai-mode."
+    [[ $("${VIRSH[@]}" net-info "$NET" | awk '/^Active:/{print $2}') == yes ]] || "${VIRSH[@]}" net-start "$NET" >/dev/null
+    "${VIRSH[@]}" start "$GDOM" >/dev/null || die "$GDOM did not start (the hook's reason is above). Run ai-mode."
+    wait_state "$GDOM" running 30 || die "$GDOM is not running. Run ai-mode."
+    write_state "done"
+    ok "$GDOM is running on GPU1"
+    say ""
+    if "${VIRSH[@]}" dumpxml --inactive "$GDOM" | grep -q "\[setup\]</title>"; then
+        say "Setup variant: console via virt-manager (qemu:///system) or virt-viewer --attach -c qemu:///system $GDOM"
+    else
+        say "Play: start Moonlight and connect to $GDOM (add host $GUEST_IP by IP the first time)."
+    fi
+    say "Off while you play: coder-fast, the judge. Back to normal: ai-mode"
+}
+
+cmd_ai() {
+    lock
+    step "AI mode: restore Walter (from state: $( [[ -e $STATE ]] && tr '\n' ' ' <"$STATE" || echo none))"
+    [[ -r $BASELINE ]] || die "no baseline $BASELINE"
+    confirm "restore AI mode?" || die "cancelled"
+    # Keep what game mode recorded (paused judge units, start time) if a step below rewrites the state.
+    # Without a state file, the judge is left as it is.
+    local had_state=0
+    MODE=restoring JUDGE_WAS='' SINCE=''
+    if [[ -e $STATE ]]; then had_state=1; JUDGE_WAS=$(read_state judge); SINCE=$(read_state since); fi
+
+    step "1/5 stop $GDOM"
+    local s
+    s=$(state_of "$GDOM")
+    case $s in
+        "shut off"|missing) ;;
+        running|"in shutdown")
+            [[ $s == running ]] && "${VIRSH[@]}" shutdown "$GDOM" >/dev/null
+            say "waiting for $GDOM to shut down (up to 3 min)..."
+            wait_state "$GDOM" "shut off" 180 || s=stuck ;;
+        *) s=stuck ;;
+    esac
+    if [[ $s == stuck ]]; then
+        ask "$GDOM is '$(state_of "$GDOM")' and not shutting down. Force it off (like pulling the plug; unsaved game state is lost)?" \
+            || die "left $GDOM as it is; GPU1 stays with it. Shut it down from inside, then re-run ai-mode."
+        "${VIRSH[@]}" destroy "$GDOM" >/dev/null
+        wait_state "$GDOM" "shut off" 30 || die "$GDOM is still not off"
+    fi
+    s=$(state_of "$GDOM")
+    [[ $s == "shut off" || $s == missing ]] || die "$GDOM is '$s'; it must be off before Walter gets GPU1 back"
+    ok "$GDOM: $s"
+    gpu1_on_vfio || die "GPU1 is not on vfio-pci. Don't start Walter; reboot the host (vfio-pci claims both cards at boot)."
+    ok "GPU1 is on vfio-pci"
+
+    step "2/5 Walter's config: both GPUs, ${WALTER_MEM_GIB} GiB"
+    if [[ $(have_cfg) == "$(want_full)" && $(cfg_mem) == "$WALTER_MEM_GIB $WALTER_MEM_GIB" && $(state_of "$DOM") == running && $(have_live) == "$(want_full)" ]]; then
+        ok "Walter already has both GPUs and ${WALTER_MEM_GIB} GiB; no restart needed"
+    else
+        walter_shutdown ai
+        local f src
+        for f in gpu1 gpu1a; do
+            src=$(hostdevs_of <"$BK/hostdev-$f.xml" | cut -d'>' -f1)
+            if ! have_cfg | grep -q "^$src>"; then
+                "${VIRSH[@]}" attach-device "$DOM" "$BK/hostdev-$f.xml" --config >/dev/null
+            fi
+        done
+        "${VIRSH[@]}" setmaxmem "$DOM" "${WALTER_MEM_GIB}G" --config
+        "${VIRSH[@]}" setmem "$DOM" "${WALTER_MEM_GIB}G" --config
+        if [[ $(have_cfg) != "$(want_full)" || $(cfg_mem) != "$WALTER_MEM_GIB $WALTER_MEM_GIB" ]]; then
+            say "config hostdevs: $(have_cfg | tr '\n' ' ')  baseline: $(want_full | tr '\n' ' '); memory: $(cfg_mem)"
+            die "Walter's config does not match the baseline. Restore it with: virsh define $BASELINE (then re-run ai-mode)"
+        fi
+        ok "config matches the baseline: $(have_cfg | tr '\n' ' '), ${WALTER_MEM_GIB} GiB"
+
+        step "3/5 start Walter"
+        "${VIRSH[@]}" start "$DOM" >/dev/null
+    fi
+    [[ $("${VIRSH[@]}" dominfo "$DOM" | awk '/^Autostart:/{print $2}') == enable ]] || "${VIRSH[@]}" autostart "$DOM" >/dev/null
+    ok "Walter running, autostart on"
+
+    step "4/5 verify Walter"
+    say "waiting for Walter and llama-swap (up to 6 min)..."
+    wait_walter_up 360 || die "Walter or llama-swap did not come up within 6 min"
+    [[ $(walter nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader | tr '\n' ' ') == "0, ${BUS[0]} 1, ${BUS[1]} " ]] \
+        || die "Walter's GPU order is not CUDA 0 = ${BUS[0]}, 1 = ${BUS[1]}: $(walter nvidia-smi -L | tr '\n' ' ')"
+    ok "CUDA 0 = ${BUS[0]} (coder), 1 = ${BUS[1]} (coder-fast)"
+    [[ $(ls_remote ask coder) == "$CODER_ID" ]] || die "coder did not answer"
+    [[ $(ls_remote ask coder-fast) == "$CODER_FAST_ID" ]] \
+        || die "coder-fast did not answer. On Walter: sudo systemctl restart nvidia-persistenced llama-swap, then re-run ai-mode"
+    ok "coder and coder-fast answer"
+
+    step "5/5 tidy up"
+    if ((had_state)); then
+        if [[ $("${VIRSH[@]}" net-info "$NET" 2>/dev/null | awk '/^Active:/{print $2}') == yes ]]; then
+            "${VIRSH[@]}" net-destroy "$NET" >/dev/null && ok "$NET stopped"
+        fi
+        if [[ -n ${JUDGE_WAS// /} ]]; then
+            # shellcheck disable=SC2086
+            systemctl --user start $JUDGE_WAS || die "could not resume the judge ($JUDGE_WAS); state file kept"
+            ok "judge resumed: $JUDGE_WAS"
+        fi
+        local n=0
+        if [[ -n $SINCE && -d $HOME/.hermes/review/done ]]; then
+            n=$(find "$HOME/.hermes/review/done" -type f -newermt "$SINCE" -exec grep -l 'No review' {} + 2>/dev/null | wc -l || true)
+        fi
+        ((n == 0)) || say "note: $n review(s) written since game mode started are 'No review' placeholders in ~/.hermes/review/done; re-queue them"
+        rm -f "$STATE"
+    fi
+    local online u
+    online=$(cat /sys/devices/system/cpu/online)
+    for u in system.slice user.slice init.scope; do
+        [[ $(cat "/sys/fs/cgroup/$u/cpuset.cpus.effective" 2>/dev/null) == "$online" ]] ||
+            say "warning: $u is still limited to CPUs $(cat "/sys/fs/cgroup/$u/cpuset.cpus.effective"); the hook did not give them back"
+    done
+    ok "AI mode"
+}
+
+"cmd_$CMD"

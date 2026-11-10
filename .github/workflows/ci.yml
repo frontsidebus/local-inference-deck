@@ -66,7 +66,7 @@ jobs:
       - name: check-sanitized (generic secret shapes; no real values in CI)
         run: CI=true bash scripts/check-sanitized.sh --all --regex-only
       - name: shellcheck
-        run: shellcheck -S warning scripts/*.sh scripts/secrets.d/*.sh hooks/pre-commit tools/deck-tools/*.sh tools/deck-tools/pre-commit
+        run: shellcheck -S warning scripts/*.sh scripts/secrets.d/*.sh hooks/pre-commit tools/deck-tools/*.sh tools/deck-tools/pre-commit hypervisor/gaming/gpu-mode hypervisor/gaming/gaming-setup.sh
 
   # sec-evals at the commit deck.lock names, against this repo's real llama-swap template: its needs_deck_template
   # tests (the C1 D8 pins in plans/c1-interventions.json are the template's flash cmd) skip in sec-evals' own CI,

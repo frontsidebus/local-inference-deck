@@ -56,6 +56,15 @@ rules:
   - {"key": "LAB_MODELS_QUOTA_GB", "action": "check", "class": "check"}
   - {"key": "LAB_FREE_RESERVE_GB", "action": "check", "class": "check"}
   - {"key": "HERMES_GATEWAY_PORT", "action": "skip", "class": "generic"}
+  - {"key": "WALTER_DOMAIN", "action": "check", "class": "check"}
+  - {"key": "GAMING_GPU_PCI", "action": "check", "class": "check"}
+  - {"key": "WALTER_GPU_BUS_IDS", "action": "check", "class": "check"}
+  - {"key": "WALTER_MEM_GIB", "action": "check", "class": "check"}
+  - {"key": "WALTER_SPLIT_MEM_GIB", "action": "check", "class": "check"}
+  - {"key": "GAMING_HOST_CPUS", "action": "check", "class": "check"}
+  - {"key": "GAMING_GUEST_CPUS", "action": "check", "class": "check"}
+  - {"key": "GAMING_SUBNET", "action": "check", "class": "check"}
+  - {"key": "GAMING_VMS_DIR", "action": "check", "class": "check"}
   - {"key": "JUDGE_MODE", "action": "skip", "class": "judge-knob"}
   - {"key": "JUDGE_LOCAL_MODEL", "action": "skip", "class": "judge-knob"}
   - {"key": "JUDGE_FRONTIER_CMD", "action": "skip", "class": "judge-knob"}

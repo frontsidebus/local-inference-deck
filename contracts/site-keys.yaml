@@ -25,7 +25,7 @@ components:
   - {"name": "clients", "description": "workstation harnesses: clients/install.sh, clients/bin/spark-model, clients/hermes templates"}
   - {"name": "judge", "description": "agent judge (the agent-judge repo): its judge/lib/config.py and sitemask.py read the full site env", "slice": false, "slice_refusal": "the judge is exempt from slicing: its judge/lib/sitemask.py (agent-judge repo) can only mask the site values it knows, so the judge must read the full site env"}
   - {"name": "evals", "description": "eval harness, the sec-evals repo (its example: evals.env.example, vendored in contracts/vendored/sec-evals/): evals/tools/lib.sh site_value, evals/gate.py, evals/run.py"}
-  - {"name": "hypervisor", "description": "host layer (docs only): hypervisor/README.md"}
+  - {"name": "hypervisor", "description": "host layer: hypervisor/README.md, and hypervisor/gaming (gpu-mode, gaming-setup.sh: GPU modes and the gaming VM, run on the host)"}
 sanitize_classes:
   - {"name": "check", "action": "check", "description": "a real value that differs from the example is forbidden in tracked files"}
   - {"name": "check-list", "action": "split", "description": "space-separated list: each item is checked on its own"}
@@ -85,6 +85,15 @@ keys:
   - {"name": "LAB_MODELS_QUOTA_GB", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "1500", "sanitize": "check"}
   - {"name": "LAB_FREE_RESERVE_GB", "active": true, "owner": "walter", "consumers": ["walter"], "required": false, "default": "300", "sanitize": "check"}
   - {"name": "HERMES_GATEWAY_PORT", "active": true, "owner": "clients", "consumers": ["walter", "clients"], "required": true, "default": "8642", "sanitize": "generic", "note": "walter renders it into the Open WebUI env"}
+  - {"name": "WALTER_DOMAIN", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "walter", "sanitize": "check"}
+  - {"name": "GAMING_GPU_PCI", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "\"0000:03:00.0 0000:03:00.1\"", "sanitize": "check"}
+  - {"name": "WALTER_GPU_BUS_IDS", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "\"00000000:05:00.0 00000000:09:00.0\"", "sanitize": "check"}
+  - {"name": "WALTER_MEM_GIB", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "80", "sanitize": "check"}
+  - {"name": "WALTER_SPLIT_MEM_GIB", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "64", "sanitize": "check"}
+  - {"name": "GAMING_HOST_CPUS", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "8-15,24-31", "sanitize": "check"}
+  - {"name": "GAMING_GUEST_CPUS", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "0-7,16-23", "sanitize": "check"}
+  - {"name": "GAMING_SUBNET", "active": false, "owner": "hypervisor", "consumers": ["hypervisor", "judge"], "required": false, "default": "192.168.150", "sanitize": "check"}
+  - {"name": "GAMING_VMS_DIR", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "/data/vms", "sanitize": "check"}
   - {"name": "JUDGE_MODE", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "frontier", "sanitize": "judge-knob"}
   - {"name": "JUDGE_LOCAL_MODEL", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "big", "sanitize": "judge-knob"}
   - {"name": "JUDGE_FRONTIER_CMD", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "claude", "sanitize": "judge-knob"}

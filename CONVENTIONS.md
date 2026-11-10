@@ -9,7 +9,8 @@ walter/      backend VM: llama-swap, gateway (LiteLLM+Postgres), webui (Open Web
 covenant/    edge: nginx sites/snippets, oauth2-proxy, fail2ban, ufw, wireguard, certbot hooks
 clients/     workstation harness wrappers/configs (claude/codex/hermes/opencode) + hermes-gateway
 judge/       pointer README only: the agent judge is its own repo, agent-judge (~/src/deck/agent-judge, deck.lock)
-hypervisor/  requirements for the host layer (managed in a separate IaC project)
+hypervisor/  requirements for the host layer (managed in a separate IaC project); gaming/: GPU modes and the
+             gaming VM (gpu-mode, gaming-setup.sh), run on the host
 evals/       pointer README only: the security eval harness is the sec-evals repo (~/src/deck/sec-evals); old
              checkouts' gitignored evals/data/ and evals/results/ stay ignored
 docs/        decisions, runbooks, history (old Ollama-era docs live in docs/history/)
@@ -26,7 +27,7 @@ deck.lock    the components in their own repos (sec-evals, mode minimum; agent-j
              and required contracts; checked by deck check
 site.env.example
 ```
-Each deployable component dir has its own `README.md` (what it is, deploy steps, verify, rollback) and an entry point: `walter/deploy.sh`, `covenant/deploy.sh`, `clients/install.sh` (wrapped by `clients/deploy.sh`); the agent judge's `judge/install.sh` is in the agent-judge repo. `hypervisor/` has a README only.
+Each deployable component dir has its own `README.md` (what it is, deploy steps, verify, rollback) and an entry point: `walter/deploy.sh`, `covenant/deploy.sh`, `clients/install.sh` (wrapped by `clients/deploy.sh`); the agent judge's `judge/install.sh` is in the agent-judge repo. `hypervisor/` has no deploy script: `hypervisor/gaming/` has its own entry points (`gpu-mode`, `gaming-setup.sh`).
 
 ## Site values → `site.env` (gitignored), template in `site.env.example`
 Use these names. If you need a new one, add it to `site.env.example` under your component's section with a comment and a safe example value, **and** add its entry to [contracts/site-keys.yaml](contracts/site-keys.yaml) at the same position: owner, consumers (every component whose code or templates read it), required, the default exactly as written in the example, and its sanitize class. Then run `python3 tools/site_keys.py policy` to regenerate `contracts/sanitize-policy.yaml`. `tools/tests/test_site_keys.py` (CI) fails until the example and the registry agree, and when a template, a secrets spec or a deploy script reads a key that the registry does not assign to its component. Renaming or removing a key is a major `contract_version` change. The block below is the shared core; [site.env.example](site.env.example) is the complete, authoritative list (it also has the edge, backend, client and `JUDGE_*` settings).
