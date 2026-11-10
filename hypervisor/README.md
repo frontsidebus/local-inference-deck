@@ -2,6 +2,8 @@
 
 The host that runs Walter is managed outside this repo, by a separate (private) KVM/libvirt infrastructure-as-code project. This page lists what that layer must provide so the rest of the stack works, and the procedures that touch it here (hardware changes, recovery).
 
+**GPU modes:** the host can lend Walter's second GPU to a gaming VM and take it back (`~/bin/game-mode` / `~/bin/ai-mode`). The scripts, the one-time setup and the runbook are in [gaming/](gaming/README.md). In game mode Walter runs on GPU0 only: `coder` stays up, `coder-fast`, the split models and the judge are off until `ai-mode`.
+
 ## Requirements
 
 | Requirement | Why |
@@ -61,6 +63,8 @@ virsh -c qemu:///system autostart <walter-domain>
 Then run the checks in [power-loss-recovery §2](../docs/runbooks/power-loss-recovery.md#2-walter) and load each split model once (`big`, `vision`, `hermes`) to exercise both GPUs.
 
 ## Troubleshooting
+
+Gaming VM and GPU-mode problems: [gaming/README.md](gaming/README.md#troubleshooting).
 
 | Symptom | Check / fix |
 |---|---|
