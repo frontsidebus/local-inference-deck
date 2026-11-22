@@ -59,17 +59,27 @@ body {
 .bg-scan::after {
   content: ""; position: absolute; left: 0; right: 0; height: 120px; top: -120px;
   background: linear-gradient(to bottom, transparent, rgba(0, 240, 255, .045), transparent);
-  animation: sweep 9s linear infinite;
+  will-change: transform;
+  /* compositor-only (transform on its own layer, nothing under it is blurred) and stepped at ~13 Hz: the band is
+     soft enough that the steps don't show, and with software compositing every frame in which it moves costs a
+     full-width re-composite (smooth 60 Hz cost ~45% of a core at 2560x1440 in headless Chrome) */
+  animation: sweep 9s steps(120, end) infinite;
 }
 @keyframes sweep { to { transform: translateY(calc(100vh + 240px)); } }
+
+/* Render budget: every continuous animation below animates only opacity/transform of a small pseudo-element
+   (a glow layer whose opacity pulses instead of an animated box-shadow), so idle frames need no repaint. */
+@keyframes glow { 50% { opacity: 1; } }
+/* blink: visible for the first half of each cycle, hidden for the second (opacity, not visibility) */
+@keyframes blink { 50% { opacity: 0; } }
+.page-hidden *, .page-hidden *::before, .page-hidden *::after { animation-play-state: paused !important; }
 
 /* ---------- header ---------- */
 .top {
   position: sticky; top: 0; z-index: 40;
   display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
   padding: 14px 24px;
-  background: rgba(7, 7, 13, .86);
-  backdrop-filter: blur(8px);
+  background: rgba(7, 7, 13, .95); /* no backdrop-filter: re-blurring on every change underneath was the main cost */
   border-bottom: 1px solid var(--cp-border);
   box-shadow: 0 1px 0 rgba(0, 240, 255, .18), 0 8px 30px rgba(0,0,0,.5);
 }
@@ -99,34 +109,41 @@ h1 .slash { color: var(--cp-magenta); margin: 0 .25em; text-shadow: 0 0 10px rgb
   background: color-mix(in srgb, var(--c) 9%, transparent);
   clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
   box-shadow: inset 0 0 14px color-mix(in srgb, var(--c) 22%, transparent);
-  transition: color .3s, border-color .3s, background .3s;
+  position: relative;
+  transition: color .3s, border-color .3s;
 }
+/* pulsing glow layer (alert / switching): opacity only. The pill's clip-path clips any outer glow anyway. */
+.pill::after { content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0; box-shadow: inset 0 0 20px var(--pg, transparent); }
 .pill-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c); box-shadow: 0 0 10px var(--c); }
 .pill-ok { --c: var(--cp-green); }
 .pill-degraded { --c: var(--cp-yellow); }
-.pill-alert { --c: var(--cp-red); animation: alarm 1.4s ease-in-out infinite; }
-.pill-alert .pill-dot, .pill-degraded .pill-dot, .pill-wait .pill-dot { animation: blink 1s steps(2, start) infinite; }
-@keyframes alarm { 50% { box-shadow: inset 0 0 20px rgba(255, 59, 59, .5), 0 0 22px rgba(255, 59, 59, .55); } }
-@keyframes blink { to { visibility: hidden; } }
+.pill-alert { --c: var(--cp-red); --pg: rgba(255, 59, 59, .5); }
+.pill-alert::after { animation: glow 1.4s ease-in-out infinite; }
+.pill-alert .pill-dot, .pill-degraded .pill-dot, .pill-wait .pill-dot { animation: blink 1s steps(1, end) infinite; }
 
 /* GPU mode pill (hypervisor): ai / game / switching / unknown */
 .mode { cursor: help; }
 .mode-ai { --c: var(--cp-cyan); }
 .mode-game { --c: var(--cp-magenta); }
-.mode-switching { --c: var(--cp-yellow); animation: modepulse 1.6s ease-in-out infinite; }
-.mode-switching .pill-dot { animation: blink 1s steps(2, start) infinite; }
+.mode-switching { --c: var(--cp-yellow); --pg: rgba(252, 238, 10, .35); }
+.mode-switching::after { animation: glow 1.6s ease-in-out infinite; }
+.mode-switching .pill-dot { animation: blink 1s steps(1, end) infinite; }
 .mode-unknown { --c: var(--cp-muted); opacity: .75; }
 .mode-unknown .pill-dot { background: transparent; border: 1px solid var(--c); box-shadow: none; }
 .mode:focus-visible { outline: 1px dashed var(--c); outline-offset: 3px; }
-@keyframes modepulse { 50% { box-shadow: inset 0 0 20px rgba(252, 238, 10, .35), 0 0 18px rgba(252, 238, 10, .35); } }
 
 .fresh { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: var(--cp-muted); }
-.fresh-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cp-muted); }
-.fresh.live .fresh-dot { background: var(--cp-cyan); box-shadow: 0 0 8px var(--cp-cyan); animation: pulse 2s ease-out infinite; }
+.fresh-dot { position: relative; width: 8px; height: 8px; border-radius: 50%; background: var(--cp-muted); }
+.fresh.live .fresh-dot { background: var(--cp-cyan); box-shadow: 0 0 8px var(--cp-cyan); }
+/* expanding ring: scale + fade of a pseudo-element instead of an animated box-shadow spread */
+.fresh.live .fresh-dot::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%; background: rgba(0, 240, 255, .7);
+  opacity: 0; animation: pulse 2s ease-out infinite;
+}
 .fresh.live #fresh-text { color: var(--cp-text); }
-.fresh.stale .fresh-dot { background: var(--cp-yellow); box-shadow: 0 0 8px var(--cp-yellow); animation: blink 1s steps(2, start) infinite; }
+.fresh.stale .fresh-dot { background: var(--cp-yellow); box-shadow: 0 0 8px var(--cp-yellow); animation: blink 1s steps(1, end) infinite; }
 .fresh.stale #fresh-text { color: var(--cp-yellow); }
-@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(0, 240, 255, .7); } 100% { box-shadow: 0 0 0 9px rgba(0, 240, 255, 0); } }
+@keyframes pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(3.25); opacity: 0; } }
 
 .viewer {
   font-size: 12px; color: var(--cp-text);
@@ -143,7 +160,12 @@ h1 .slash { color: var(--cp-magenta); margin: 0 .25em; text-shadow: 0 0 10px rgb
   box-shadow: 0 0 18px rgba(252, 238, 10, .15);
 }
 .banner::before { content: "⚠ "; }
-.banner.banner-switch { color: var(--cp-magenta); border-color: var(--cp-magenta); background: rgba(255, 42, 109, .08); box-shadow: 0 0 18px rgba(255, 42, 109, .22); animation: modepulse 2.4s ease-in-out infinite; }
+.banner.banner-switch { color: var(--cp-magenta); border-color: var(--cp-magenta); background: rgba(255, 42, 109, .08); box-shadow: 0 0 18px rgba(255, 42, 109, .22); }
+.banner.banner-switch::after {
+  content: ""; position: absolute; inset: -1px; pointer-events: none; opacity: 0;
+  box-shadow: inset 0 0 20px rgba(252, 238, 10, .35), 0 0 18px rgba(252, 238, 10, .35);
+  animation: glow 2.4s steps(12, end) infinite; /* full-width layer: 10 Hz steps, same reason as the sweep */
+}
 .banner.banner-switch::before { content: "⟳ "; }
 
 /* ---------- grid ---------- */
@@ -172,7 +194,7 @@ h1 .slash { color: var(--cp-magenta); margin: 0 .25em; text-shadow: 0 0 10px rgb
     var(--cp-panel);
   border: 1px solid var(--cp-border);
   clip-path: polygon(0 0, calc(100% - var(--cut)) 0, 100% var(--cut), 100% 100%, var(--cut) 100%, 0 calc(100% - var(--cut)));
-  transition: border-color .4s, box-shadow .4s;
+  transition: border-color .4s;
 }
 /* neon edge: top-left bracket + bottom-right cut glow */
 .panel::before {
@@ -186,9 +208,12 @@ h1 .slash { color: var(--cp-magenta); margin: 0 .25em; text-shadow: 0 0 10px rgb
   transform-origin: left top; transform: rotate(45deg);
 }
 .panel:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--cp-border)); }
-.panel.crit { --accent: var(--cp-red); border-color: rgba(255, 59, 59, .7); box-shadow: inset 0 0 28px rgba(255, 59, 59, .18); animation: critglow 2s ease-in-out infinite; }
+.panel.crit { --accent: var(--cp-red); border-color: rgba(255, 59, 59, .7); box-shadow: inset 0 0 28px rgba(255, 59, 59, .18); }
+/* crit pulse: app.js keeps one .panel-glow child per panel (::before/::after are the neon edges) */
+.panel-glow { position: absolute; inset: 0; pointer-events: none; opacity: 0; box-shadow: inset 0 0 40px rgba(255, 59, 59, .32); }
+.panel.crit > .panel-glow { animation: glow 2s ease-in-out infinite; }
+.panel:not(.crit) > .panel-glow { display: none; }
 .panel.warn { --accent: var(--cp-yellow); border-color: rgba(252, 238, 10, .45); }
-@keyframes critglow { 50% { box-shadow: inset 0 0 40px rgba(255, 59, 59, .32); } }
 .models { --accent: var(--cp-magenta); }
 .host { --accent: var(--cp-purple); }
 .services { --accent: var(--cp-green); }
@@ -220,9 +245,9 @@ h2::before { content: "▮"; color: var(--accent); margin-right: 8px; text-shado
 .chip-st::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--sc, var(--cp-muted)); box-shadow: 0 0 6px var(--sc, transparent); }
 .chip-st.chip-on { --sc: var(--cp-green); border-color: rgba(57, 255, 20, .4); }
 .chip-st.chip-live { --sc: var(--cp-magenta); border-color: rgba(255, 42, 109, .55); color: var(--cp-magenta); }
-.chip-st.chip-live::before { animation: blink 1.2s steps(2, start) infinite; }
+.chip-st.chip-live::before { animation: blink 1.2s steps(1, end) infinite; }
 .chip-st.chip-wait { --sc: var(--cp-yellow); border-color: rgba(252, 238, 10, .55); color: var(--cp-yellow); }
-.chip-st.chip-wait::before { animation: blink 1s steps(2, start) infinite; }
+.chip-st.chip-wait::before { animation: blink 1s steps(1, end) infinite; }
 .chip-st.chip-off { --sc: var(--cp-red); border-color: rgba(255, 59, 59, .55); color: var(--cp-red); }
 .chip-st.chip-idle { color: var(--cp-muted); }
 .chip-st.chip-unk { color: var(--cp-muted); }
@@ -263,8 +288,12 @@ h2::before { content: "▮"; color: var(--accent); margin-right: 8px; text-shado
 .gauge svg { width: 100%; height: 100%; transform: rotate(135deg); }
 .gauge .g-track { fill: none; stroke: var(--cp-panel-2); stroke-width: 10; }
 .gauge .g-tick { fill: none; stroke: var(--cp-border); stroke-width: 10; stroke-dasharray: 1 7.4; }
-.gauge .g-val { fill: none; stroke: var(--cp-cyan); stroke-width: 10; stroke-linecap: butt; filter: drop-shadow(0 0 6px rgba(0, 240, 255, .7)); transition: stroke-dashoffset .9s cubic-bezier(.2,.8,.2,1), stroke .4s; }
-.gauge.hot .g-val { stroke: var(--cp-magenta); filter: drop-shadow(0 0 6px rgba(255, 42, 109, .8)); }
+.gauge .g-val, .gauge .g-glow { fill: none; stroke: var(--cp-cyan); stroke-width: 10; stroke-linecap: butt; transition: stroke-dashoffset .6s cubic-bezier(.2,.8,.2,1), stroke .4s; }
+/* glow = two wider translucent copies of the arc under it (plain strokes; a CSS/SVG blur filter is re-rasterised
+   on the CPU every frame the arc moves) */
+.gauge .g-glow { stroke-width: 15; stroke-opacity: .28; }
+.gauge .g-glow.g-glow2 { stroke-width: 21; stroke-opacity: .1; }
+.gauge.hot .g-val, .gauge.hot .g-glow { stroke: var(--cp-magenta); }
 .gauge-c { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
 .gauge-c .num { font-size: 40px; }
 .gauge-c .kpi-l { margin: 6px 0 0; }
@@ -273,10 +302,11 @@ h2::before { content: "▮"; color: var(--accent); margin-right: 8px; text-shado
 .meter-l b { color: var(--cp-text); font-weight: 600; }
 .meter { position: relative; height: 10px; background: var(--cp-panel-2); border: 1px solid var(--cp-border); overflow: hidden; }
 .meter > i {
-  position: absolute; inset: 0 auto 0 0; width: 0;
+  position: absolute; inset: 0 auto 0 0; width: 100%;
   background: linear-gradient(90deg, color-mix(in srgb, var(--mc, var(--cp-cyan)) 55%, transparent), var(--mc, var(--cp-cyan)));
   box-shadow: 0 0 10px var(--mc, var(--cp-cyan));
-  transition: width .9s cubic-bezier(.2,.8,.2,1);
+  transform-origin: left center; transform: scaleX(0); /* fill level set by app.js: transform, so no relayout */
+  transition: transform .6s cubic-bezier(.2,.8,.2,1);
 }
 .meter::after { content: ""; position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 9px, var(--cp-panel) 9px 11px); }
 .meter.hot > i { --mc: var(--cp-magenta); }
@@ -349,7 +379,7 @@ a.gpu-lent:focus-visible { outline: 1px dashed var(--cp-cyan); outline-offset: 4
 .st-ready { color: var(--cp-green); }
 .st-ready::before { box-shadow: 0 0 8px var(--cp-green); }
 .st-starting, .st-stopping { color: var(--cp-yellow); }
-.st-starting::before { animation: blink .8s steps(2, start) infinite; }
+.st-starting::before { animation: blink .8s steps(1, end) infinite; }
 .st-unloaded { color: var(--cp-muted); }
 .st-unloaded::before { background: transparent; border: 1px solid currentColor; }
 .busy { color: var(--cp-magenta); }
@@ -420,6 +450,8 @@ a.gpu-lent:focus-visible { outline: 1px dashed var(--cp-cyan); outline-offset: 4
 body.stale .grid { filter: saturate(.35) brightness(.8); transition: filter .6s; }
 body.stale .num, body.stale .num-s, body.stale .gpu-stats dd { color: var(--cp-muted); }
 body.stale .panel::before { background: var(--cp-yellow); box-shadow: none; }
+/* frozen data does not blink: keeps the filtered grid from being re-filtered every blink */
+body.stale .grid *, body.stale .grid *::before, body.stale .grid *::after { animation-play-state: paused; }
 
 /* flash on value change */
 .flash { animation: flash .7s ease-out; }

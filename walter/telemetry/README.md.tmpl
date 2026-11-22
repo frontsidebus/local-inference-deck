@@ -42,6 +42,11 @@ They need starlette, httpx and uvicorn installed locally; otherwise they are ski
   - `· below x8` (yellow): the width is below `TELEMETRY_GPU_EXPECTED_WIDTH` (see Configuration). This is the only warning,
     and with the setting unset there is none.
 - X-Forwarded-User/Email are only displayed, after being sanitised. They are never used for authorisation.
+- Render cost: the page is meant to stay on screen all day, so between snapshots it repaints nothing. app.js writes to the
+  DOM only what changed. Continuous effects (scan sweep, pulses, blinks, glows) animate only `transform`/`opacity` of small
+  layers, and the full-width ones are stepped (~10-13 Hz). There is no `backdrop-filter`. Animations pause while the tab is
+  hidden and are off under `prefers-reduced-motion`. When changing the theme, avoid animating `box-shadow`, `filter` or
+  layout properties, and avoid blur filters on anything that moves.
 
 ## Hypervisor and gaming VM
 The host runs a `gaming-exporter` user service (see `hypervisor/gaming/`) on `${HYPERVISOR_BRIDGE_IP}:9188`. Walter's Prometheus
