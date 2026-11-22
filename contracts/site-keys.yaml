@@ -94,6 +94,7 @@ keys:
   - {"name": "GAMING_GUEST_CPUS", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "0-7,16-23", "sanitize": "check"}
   - {"name": "GAMING_SUBNET", "active": false, "owner": "hypervisor", "consumers": ["hypervisor", "judge"], "required": false, "default": "192.168.150", "sanitize": "check"}
   - {"name": "GAMING_VMS_DIR", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "/data/vms", "sanitize": "check"}
+  - {"name": "GAMING_DATA_DISK", "active": false, "owner": "hypervisor", "consumers": ["hypervisor"], "required": false, "default": "/dev/disk/by-id/nvme-MODEL_SERIAL", "sanitize": "check"}
   - {"name": "JUDGE_MODE", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "frontier", "sanitize": "judge-knob"}
   - {"name": "JUDGE_LOCAL_MODEL", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "big", "sanitize": "judge-knob"}
   - {"name": "JUDGE_FRONTIER_CMD", "active": true, "owner": "judge", "consumers": ["judge"], "required": false, "default": "claude", "sanitize": "judge-knob"}

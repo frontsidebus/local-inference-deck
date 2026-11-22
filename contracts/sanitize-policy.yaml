@@ -65,6 +65,7 @@ rules:
   - {"key": "GAMING_GUEST_CPUS", "action": "check", "class": "check"}
   - {"key": "GAMING_SUBNET", "action": "check", "class": "check"}
   - {"key": "GAMING_VMS_DIR", "action": "check", "class": "check"}
+  - {"key": "GAMING_DATA_DISK", "action": "check", "class": "check"}
   - {"key": "JUDGE_MODE", "action": "skip", "class": "judge-knob"}
   - {"key": "JUDGE_LOCAL_MODEL", "action": "skip", "class": "judge-knob"}
   - {"key": "JUDGE_FRONTIER_CMD", "action": "skip", "class": "judge-knob"}

@@ -18,14 +18,18 @@
 #             (copied, then sha256 and cosign signature checked on the copy)
 #   packages  apt install vainfo (to check the iGPU's HEVC decode for Moonlight)
 #   guests    libvirt-guests SHUTDOWN_TIMEOUT 120 -> 300 s, so a host reboot never cuts Walter's ACPI shutdown short
-#   hook      libvirt qemu hook for linux-gaming: allow-list (GPU1 only, disks under ${GAMING_VMS_DIR},
-#             gaming-nat), guard check, host CPUs off the game's cores while GPU1 is in use (libvirtd reload)
+#   hook      libvirt qemu hook for linux-gaming: allow-list (GPU1 only, disks under ${GAMING_VMS_DIR} plus
+#             the one block device in GAMING_DATA_DISK, gaming-nat), guard check, host CPUs off the game's
+#             cores while GPU1 is in use (libvirtd reload)
 #   vm        define linux-gaming, install variant: no GPU, VNC console on a unix socket, the Bazzite ISO
 #   exporter  nft table inet gaming_exporter_guard (only Walter reaches the gaming exporter on port 9188),
 #             loaded at boot by gaming-exporter-guard.service, and added to the 5-minute nft-guard-check;
 #             the exporter itself is the operator's user unit (README.md, Telemetry)
 #   vm-setup  (only when named, after the install) GPU1 + VNC console, for the first boot with the card
 #   vm-final  (only when named, after the setup) GPU1 only, no console: played through Moonlight
+#             vm-setup and vm-final also attach GAMING_DATA_DISK (optional: a whole spare drive, by its
+#             /dev/disk/by-id path, given to the guest as vdb for a game library); re-run vm-final after
+#             setting or changing it
 #
 # It never touches Walter, its networks, the GPUs or GRUB, and never starts a VM.
 # Files it overwrites are copied to /root/gaming-setup-<time>/ first, with a log of the run; each step
@@ -60,7 +64,7 @@ while (($#)); do
         --apply) APPLY=1 ;;
         --yes) YES=1 ;;
         --site-env) SITE=${2:?--site-env needs a file}; shift ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
         *) [[ " ${ALL_STEPS[*]} " == *" $1 "* ]] || { echo "unknown step: $1" >&2; exit 2; }
            STEPS+=("$1") ;;
     esac
@@ -86,9 +90,52 @@ SUBNET=$(site GAMING_SUBNET 192.168.150)
 VMS=$(site GAMING_VMS_DIR /data/vms)
 IMG=$VMS/linux-gaming.raw
 DATAFS=$(dirname "$VMS")
+# Optional whole spare drive for the guest's game library, by its stable by-id name (never /dev/nvmeN).
+DATA_DISK=$(site GAMING_DATA_DISK '')
 for v in "${GPU_PCI[@]}"; do [[ $v =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || { echo "GAMING_GPU_PCI: bad address '$v'" >&2; exit 2; }; done
 [[ $SUBNET =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ && $VMS == /?* && $WALTER_DOM =~ ^[A-Za-z0-9._-]+$ ]] \
     || { echo "GAMING_SUBNET, GAMING_VMS_DIR or WALTER_DOMAIN malformed in $SITE" >&2; exit 2; }
+[[ -z $DATA_DISK || ( $DATA_DISK =~ ^/dev/disk/by-id/[A-Za-z0-9._:-]+$ && ! $DATA_DISK =~ -part[0-9]+$ ) ]] \
+    || { echo "GAMING_DATA_DISK must be a whole disk's /dev/disk/by-id/... path (got '$DATA_DISK')" >&2; exit 2; }
+
+# data_disk_check: GAMING_DATA_DISK (when set) must be a whole, unused disk that nothing on the host or in
+# another VM touches. Dies with the reason. Run before a VM definition or the hook uses it.
+data_disk_check() {
+    [[ -n $DATA_DISK ]] || return 0
+    local dev b m s dom
+    [[ -b $DATA_DISK ]] || die "GAMING_DATA_DISK $DATA_DISK does not exist (drive missing?)"
+    dev=$(readlink -f "$DATA_DISK"); b=${dev##*/}
+    [[ $(lsblk -ndo TYPE "$dev") == disk ]] || die "GAMING_DATA_DISK resolves to $dev, which is not a whole disk"
+    [[ -z $(lsblk -nro MOUNTPOINTS "$dev" | tr -d '[:space:]') ]] || die "GAMING_DATA_DISK ($dev) has a mounted filesystem"
+    [[ -z $(find "/sys/block/$b/holders" "/sys/block/$b/$b"*/holders -mindepth 1 -maxdepth 1 2>/dev/null) ]] \
+        || die "GAMING_DATA_DISK ($dev) is held by LVM, RAID or device-mapper"
+    for m in / /boot /boot/efi /home "$DATAFS" "$VMS"; do
+        s=$(findmnt -no SOURCE --target "$m" 2>/dev/null) || continue
+        lsblk -nrpso NAME,TYPE "$s" 2>/dev/null | awk '$2=="disk"{print $1}' | grep -qxF "$dev" \
+            && die "GAMING_DATA_DISK ($dev) holds $m"
+    done
+    awk 'NR>1{print $1}' /proc/swaps | while read -r s; do
+        lsblk -nrpso NAME,TYPE "$s" 2>/dev/null | awk '$2=="disk"{print $1}'; done | grep -qxF "$dev" \
+        && die "GAMING_DATA_DISK ($dev) holds swap"
+    for dom in $("${VIRSH[@]}" list --all --name | grep -vx linux-gaming); do
+        "${VIRSH[@]}" dumpxml --inactive "$dom" | grep -qF -e "'$DATA_DISK'" -e "'$dev'" -e "'$dev"p \
+            && die "GAMING_DATA_DISK ($dev) is already used by domain $dom"
+    done
+    ok "GAMING_DATA_DISK $DATA_DISK ($dev, $(lsblk -ndo SIZE "$dev" | xargs)) is a whole, unused disk"
+}
+
+# disks_of: a domain XML on stdin -> its disks as sorted "type source" lines (cdroms left out). define_vm
+# compares these, so setting or changing GAMING_DATA_DISK makes a re-run redefine the VM.
+disks_of() {
+    python3 -I -c '
+import sys, xml.etree.ElementTree as ET
+out = []
+for d in ET.parse(sys.stdin).getroot().findall("devices/disk"):
+    if d.get("device", "disk") != "disk": continue
+    s = d.find("source")
+    out.append("%s %s" % (d.get("type"), (s.get("file") or s.get("dev")) if s is not None else "-"))
+print("\n".join(sorted(out)))'
+}
 
 # smt_pairs LIST: the CPUs in LIST as "cpu sibling" lines (one per physical core, from sysfs)
 smt_pairs() {
@@ -464,13 +511,14 @@ step_packages() {
 write_qemu_hook() {
     {
     printf '#!/bin/sh\n# Installed by gaming-setup.sh (hypervisor/gaming). Site values, fixed at install time:\n'
-    printf "HOST_CPUS='%s'\nGPU_PCI='%s'\nVMS_DIR='%s'\n" "$HOST_CPUS" "${GPU_PCI[*]}" "$VMS"
+    printf "HOST_CPUS='%s'\nGPU_PCI='%s'\nVMS_DIR='%s'\nDATA_DISK='%s'\n" "$HOST_CPUS" "${GPU_PCI[*]}" "$VMS" "$DATA_DISK"
     cat <<'EOF'
-export HOST_CPUS GPU_PCI VMS_DIR
+export HOST_CPUS GPU_PCI VMS_DIR DATA_DISK
 # Acts only on the domain linux-gaming; every other domain (Walter above all) and every other
 # operation exits 0 at once. Must not call the libvirt API.
 #   prepare/begin: refuse to start unless the domain XML is inside a strict allow-list (GPU1 only,
-#     raw disks under VMS_DIR, gaming-nat with clean-traffic, VNC on a unix socket only, no qemu
+#     raw disks under VMS_DIR plus the one whole block device DATA_DISK (unmounted, unheld, not swap),
+#     gaming-nat with clean-traffic, VNC on a unix socket only, no qemu
 #     passthrough, no host files or devices), GPU1 is on vfio-pci, gaming-nat is still the guarded NAT
 #     bridge and nft table inet gaming_guard is loaded. With GPU1: every other VM's threads must already
 #     be on HOST_CPUS, then host processes are moved onto HOST_CPUS too (the game gets the rest).
@@ -529,6 +577,26 @@ for d in D:
     elif t == "disk":
         s = d.find("source"); f = s.get("file") if s is not None else None
         drv = d.find("driver")
+        if d.get("type") == "block":
+            dev = s.get("dev") if s is not None else None
+            dd = os.environ.get("DATA_DISK", "")
+            if not dd or dev != dd: no("block disk %s (only GAMING_DATA_DISK may be a block device)" % dev); continue
+            if d.get("device") != "disk": no("data disk device=%s" % d.get("device"))
+            if drv is None or drv.get("type") != "raw": no("data disk %s is not raw" % dev)
+            for bs in d.findall("backingStore"):
+                if len(bs) or bs.attrib: no("data disk %s has a backing store" % dev)
+            if d.find("dataStore") is not None: no("data disk %s has a data store" % dev)
+            real = os.path.realpath(dev); base = os.path.basename(real)
+            if not os.path.isdir("/sys/block/" + base): no("data disk %s is not a whole disk" % dev); continue
+            parts = {base} | {p for p in os.listdir("/sys/block/" + base) if p.startswith(base)}
+            srcs = [l.split()[0] for l in open("/proc/self/mounts")] + [l.split()[0] for l in list(open("/proc/swaps"))[1:]]
+            if any(os.path.basename(os.path.realpath(x)) in parts for x in srcs if x.startswith("/dev/")):
+                no("data disk %s is mounted or used as swap on the host" % dev)
+            def held(p):
+                h = "/sys/block/%s/holders" % base if p == base else "/sys/block/%s/%s/holders" % (base, p)
+                return os.path.isdir(h) and bool(os.listdir(h))
+            if any(held(p) for p in parts): no("data disk %s is held by LVM, RAID or device-mapper" % dev)
+            continue
         if d.get("type") != "file" or not f: no("disk type=%s" % d.get("type")); continue
         if not os.path.realpath(f).startswith(os.path.realpath(os.environ["VMS_DIR"]) + "/"): no("disk %s outside %s" % (f, os.environ["VMS_DIR"]))
         if drv is None or drv.get("type") != "raw": no("disk %s is not raw" % f)
@@ -616,6 +684,7 @@ step_guests() {
 step_hook() {
     hdr "hook: libvirt qemu hook for linux-gaming"
     local tmp
+    data_disk_check
     tmp=$(mktemp)
     write_qemu_hook "$tmp"
     sh -n "$tmp" || { rm -f "$tmp"; die "the qemu hook does not parse"; }
@@ -640,6 +709,15 @@ step_hook() {
         fi
         ok "hook on the $v variant: ${err:-accepted}"
     done
+    # Any block device other than GAMING_DATA_DISK must be refused, whatever else the XML says.
+    if [[ ${1:-} != skip ]]; then
+        write_vm_xml install "$x"
+        sed -i "s#<disk type='file' device='disk'>#<disk type='block' device='disk'><source dev='/dev/disk/by-id/not-the-data-disk'/>#" "$x"
+        err=$(sh "$tmp" linux-gaming prepare begin - <"$x" 2>&1 >/dev/null) && rc=0 || rc=$?
+        ((rc != 0)) && [[ $err == *"only GAMING_DATA_DISK may be a block device"* ]] \
+            || { rm -f "$tmp" "$x"; die "hook does not refuse a stray block device: ${err:-accepted}"; }
+        ok "hook refuses any other block device"
+    fi
     # A real start must leave the host CPUs alone after each test (the tests above exit before setting them).
     rm -f "$x"
     if [[ -e $QEMU_HOOK ]] && cmp -s "$tmp" "$QEMU_HOOK"; then ok "$QEMU_HOOK is current"; rm -f "$tmp"; return 0; fi
@@ -661,7 +739,7 @@ step_hook() {
 #            Started only through game-mode, like final.
 #   final    GPU1 only, no console: played through Moonlight.
 write_vm_xml() {
-    local mode=$1 mem vcpus hint pins='' hostdevs='' console='' cdrom='' video
+    local mode=$1 mem vcpus hint pins='' hostdevs='' console='' cdrom='' video datadisk=''
     local gpu='' a dom bus slot fn
     for a in "${GPU_PCI[@]}"; do
         IFS=':.' read -r dom bus slot fn <<<"$a"
@@ -687,6 +765,14 @@ write_vm_xml() {
     </disk>"
     else
         mem=24 hint="<hint-dedicated state='on'/>" hostdevs=$gpu
+        # The spare drive for the game library: the guest owns it whole (partitions and formats it itself).
+        # discard='unmap' passes the guest's TRIM to the drive, which QLC flash needs to stay fast.
+        [[ -z $DATA_DISK ]] || datadisk="    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='io_uring' discard='unmap' iothread='1' queues='4'/>
+      <source dev='$DATA_DISK'/>
+      <target dev='vdb' bus='virtio'/>
+      <serial>games</serial>
+    </disk>"
         # One vCPU per guest CPU, SMT siblings kept together; emulator and I/O thread on the first two
         # host cores.
         local c0 c1 n=0 hp
@@ -751,6 +837,7 @@ $pins
       <target dev='vda' bus='virtio'/>
       <boot order='1'/>
     </disk>
+$datadisk
 $cdrom
 $console
 $video
@@ -774,6 +861,7 @@ define_vm() {   # $1 = install | setup | final
     hdr "$CUR: define linux-gaming ($mode variant)"
     [[ -e $IMG ]] || die "$IMG not found: run the storage step first"
     [[ $mode != install || -e $VMS/$ISO_NAME ]] || die "$VMS/$ISO_NAME not found: run the storage step first"
+    [[ $mode == install ]] || data_disk_check
     xml=$(mktemp)
     # A redefine must keep the domain's uuid (libvirt refuses a new uuid for an existing name); the same
     # uuid and NVRAM file also keep the UEFI boot entry the installer wrote.
@@ -785,10 +873,11 @@ define_vm() {   # $1 = install | setup | final
     if "${VIRSH[@]}" dominfo linux-gaming >/dev/null 2>&1; then
         state=$("${VIRSH[@]}" domstate linux-gaming)
         [[ $state == "shut off" ]] || { rm -f "$xml"; die "linux-gaming is '$state': shut it down first"; }
-        if "${VIRSH[@]}" dumpxml --inactive linux-gaming | grep -q "\[$mode\]</title>"; then
+        if "${VIRSH[@]}" dumpxml --inactive linux-gaming | grep -q "\[$mode\]</title>" \
+           && [[ $("${VIRSH[@]}" dumpxml --inactive linux-gaming | disks_of) == "$(disks_of <"$xml")" ]]; then
             ok "linux-gaming is defined as the $mode variant"; rm -f "$xml"; return 0
         fi
-        todo "redefine linux-gaming as the $mode variant"
+        todo "redefine linux-gaming as the $mode variant (disks now: $(disks_of <"$xml" | paste -sd' '))"
     else
         todo "define linux-gaming ($mode variant)"
     fi
