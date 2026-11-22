@@ -58,6 +58,7 @@ Named volumes: `monitoring_prometheus-data` (30 d retention), `monitoring_grafan
 | llama-swap | ${BACKEND_WG_IP}:8080/metrics | Bearer key from `secrets/llama-swap-api-key`. v260 exports host CPU/mem/net/load and per-GPU util/VRAM/temp/power/fan (`llamaswap_*`) |
 | llama-server | 127.0.0.1:<port> of each **ready** model | file_sd written by `llamaswap-sd`, label `model`. Exports `llamacpp:*` (tokens, tokens/s, requests processing/deferred, decode calls) |
 | litellm | ${BACKEND_WG_IP}:4000/metrics/ | unauthenticated (`require_auth_for_metrics_endpoint: false` + `callbacks: [..., "prometheus"]` in litellm.yaml); reachable only from the backend and the edge, and the edge nginx does not expose it |
+| hypervisor | ${HYPERVISOR_BRIDGE_IP}:9188/metrics, every 5 s | host `gaming-exporter` (`hv_*`: GPU mode/switch phase, gaming VM, guest GPU). Only Walter may reach it (host nft table `gaming_exporter_guard`). Down when the exporter isn't installed on the host, which is fine; deliberately no alert |
 | blackbox-http / -401 | chat/id health (public, 2xx), api /v1/models (public, must be 401), LiteLLM/Open WebUI/Pocket-ID/llama-swap health (internal) | TLS expiry from `probe_ssl_earliest_cert_expiry` |
 
 Why llama-server is not scraped via `/upstream/<model>/metrics`: in llama-swap v260 that path **loads the model** if it

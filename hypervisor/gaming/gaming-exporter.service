@@ -1,0 +1,40 @@
+# Gaming VM telemetry for Walter's Prometheus (hypervisor/gaming/README.md, "Telemetry").
+# A systemd --user unit of the operator (group libvirt; lingering, so it runs without a login):
+#   ln -s <checkout>/hypervisor/gaming/gaming-exporter ~/bin/
+#   install -m 644 <checkout>/hypervisor/gaming/gaming-exporter.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now gaming-exporter
+# Only Walter can reach the port once gaming-setup.sh's `exporter` step has loaded the nft guard.
+[Unit]
+Description=Gaming VM telemetry exporter (port 9188, for Walter's Prometheus)
+
+[Service]
+Type=simple
+# Optional overrides (GAMING_GUEST_USER, GAMING_GUEST_KEY, ...), operator-local, never committed.
+EnvironmentFile=-%h/.config/deck/gaming-exporter.env
+ExecStart=%h/bin/gaming-exporter
+Restart=on-failure
+RestartSec=10
+# The ssh control socket lives here ($RUNTIME_DIRECTORY = $XDG_RUNTIME_DIR/gaming-exporter, mode 0700).
+RuntimeDirectory=gaming-exporter
+RuntimeDirectoryMode=0700
+UMask=0077
+# Hardening that works in a user manager without user namespaces (Ubuntu restricts unprivileged
+# userns through AppArmor, so PrivateTmp/ProtectSystem/ProtectHome and friends would fail the unit,
+# and PrivateUsers would hide the libvirt group that virsh needs). The seccomp-based options below
+# only need NoNewPrivileges.
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Small and bounded: the collector thread, a few HTTP threads, virsh and ssh (incl. its master).
+MemoryMax=128M
+TasksMax=64
+CPUQuota=20%
+
+[Install]
+WantedBy=default.target

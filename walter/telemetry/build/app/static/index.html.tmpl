@@ -25,6 +25,9 @@
     </div>
   </div>
   <div class="top-right">
+    <div id="mode-pill" class="pill mode mode-unknown" role="status" aria-live="polite" tabindex="0" hidden>
+      <span class="pill-dot" aria-hidden="true"></span><span class="pill-text">MODE —</span>
+    </div>
     <div id="status-pill" class="pill pill-wait" role="status" aria-live="polite">
       <span class="pill-dot" aria-hidden="true"></span><span class="pill-text">CONNECTING</span>
     </div>
@@ -41,6 +44,66 @@
   <!-- GPU cards -->
   <section class="panel gpu" id="gpu0" data-gpu="0" aria-labelledby="gpu0-h"></section>
   <section class="panel gpu" id="gpu1" data-gpu="1" aria-labelledby="gpu1-h"></section>
+
+  <!-- Gaming VM (shown in game / switching mode or while the VM runs; filled by app.js) -->
+  <section class="panel gaming" id="gaming" aria-labelledby="gaming-h" hidden>
+    <div class="panel-h">
+      <h2 id="gaming-h">Gaming VM</h2>
+      <span class="tag mono" data-g="tag">—</span>
+    </div>
+    <div class="gm-switch mono" data-g="switch" hidden></div>
+    <div class="gm-body">
+      <div class="gm-vm">
+        <div class="gm-chips">
+          <span class="chip chip-st" data-g="guest">guest —</span>
+          <span class="chip chip-st" data-g="sunshine">sunshine —</span>
+          <span class="chip chip-st" data-g="stream">stream —</span>
+        </div>
+        <div class="kpi-row gm-kpis">
+          <div class="kpi">
+            <div class="kpi-l mono">vcpu</div>
+            <div class="kpi-v num" data-g="cpu">—</div><div class="kpi-u mono" data-g="cpu-u">% of — vCPU</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-l mono">ram</div>
+            <div class="kpi-v num" data-g="mem">—</div><div class="kpi-u mono">GiB</div>
+          </div>
+        </div>
+        <dl class="stats gm-stats">
+          <div title="virtual disk: read / write"><dt>disk r / w</dt><dd class="num-s net"><span data-g="disk-r">—</span><span class="muted" data-g="disk-w">—</span></dd></div>
+          <div title="guest network: receive / transmit"><dt>net ↓ / ↑</dt><dd class="num-s net"><span data-g="net-rx">—</span><span class="muted" data-g="net-tx">—</span></dd></div>
+          <div><dt>in game mode</dt><dd class="num-s" data-g="since">—</dd></div>
+        </dl>
+      </div>
+      <div class="gm-gpu" data-g="gpu">
+        <div class="gpu-h">
+          <h3 class="gm-gpu-h">GPU <span class="gpu-name" data-g="gpu-name"></span></h3>
+          <span class="chip chip-info" data-g="pcie" title="PCIe link">PCIe —</span>
+        </div>
+        <div class="gm-off mono" data-g="off" hidden></div>
+        <div class="gpu-main" data-g="gpu-main">
+          <div data-g="gauge-slot"></div>
+          <div class="gpu-side">
+            <div>
+              <div class="meter-l"><span>VRAM</span><span data-g="vramtxt">—</span></div>
+              <div class="meter" data-g="vram"><i></i></div>
+            </div>
+            <div>
+              <div class="meter-l"><span>NVENC</span><span data-g="enctxt">—</span></div>
+              <div class="meter" data-g="enc"><i></i></div>
+            </div>
+            <dl class="gpu-stats">
+              <div data-s="temp"><dt>temp</dt><dd><span data-g="temp">—</span><small>°C</small></dd></div>
+              <div data-s="power"><dt>power</dt><dd><span data-g="power">—</span><small data-g="power-u">W</small></dd></div>
+              <div><dt>fan</dt><dd><span data-g="fan">—</span><small>%</small></dd></div>
+              <div><dt>sm clk</dt><dd><span data-g="clock">—</span><small>MHz</small></dd></div>
+            </dl>
+          </div>
+        </div>
+        <div class="gpu-spark"><div class="spark-wrap" data-spark="gpu_gaming" data-unit="%" data-color="magenta"></div></div>
+      </div>
+    </div>
+  </section>
 
   <!-- Models -->
   <section class="panel models" aria-labelledby="models-h">

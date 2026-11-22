@@ -5,9 +5,11 @@
 #   sudo ./gaming-setup.sh --apply                 # apply the default steps in order, asking before each
 #   sudo ./gaming-setup.sh --apply guard network   # apply only the named steps
 #   --yes skips the per-step questions. --site-env FILE: site values (default: the invoking user's
-#   ~/.config/deck/site.env; keys GAMING_*, WALTER_DOMAIN; read, never sourced).
+#   ~/.config/deck/site.env; keys GAMING_*, WALTER_DOMAIN, and BACKEND_LAN_IP, HYPERVISOR_BRIDGE_IP for the
+#   exporter step; read, never sourced).
 #
-# Steps (default, in this order: guard network storage packages guests hook vm; vm-setup and vm-final only when named):
+# Steps (default, in this order: guard network storage packages guests hook vm exporter; vm-setup and
+# vm-final only when named):
 #   guard     nft table inet gaming_guard (guest -> internet only), loaded at boot by gaming-guard.service,
 #             and added to the 5-minute nft-guard-check
 #   network   libvirt NAT network gaming-nat (virbr-gaming, ${GAMING_SUBNET}.0/24, no IPv6); refuses to run
@@ -19,6 +21,9 @@
 #   hook      libvirt qemu hook for linux-gaming: allow-list (GPU1 only, disks under ${GAMING_VMS_DIR},
 #             gaming-nat), guard check, host CPUs off the game's cores while GPU1 is in use (libvirtd reload)
 #   vm        define linux-gaming, install variant: no GPU, VNC console on a unix socket, the Bazzite ISO
+#   exporter  nft table inet gaming_exporter_guard (only Walter reaches the gaming exporter on port 9188),
+#             loaded at boot by gaming-exporter-guard.service, and added to the 5-minute nft-guard-check;
+#             the exporter itself is the operator's user unit (README.md, Telemetry)
 #   vm-setup  (only when named, after the install) GPU1 + VNC console, for the first boot with the card
 #   vm-final  (only when named, after the setup) GPU1 only, no console: played through Moonlight
 #
@@ -35,6 +40,10 @@ GUARD_NFT=/etc/gaming-guard.nft
 NET_HOOK=/etc/libvirt/hooks/network.d/10-gaming-guard
 QEMU_HOOK=/etc/libvirt/hooks/qemu.d/10-linux-gaming
 CHECK=/usr/local/sbin/nft-guard-check
+EXP_UNIT=gaming-exporter-guard.service
+EXP_NFT=/etc/gaming-exporter-guard.nft
+EXP_TMPL=$(dirname "$(readlink -f "$0")")/gaming-exporter-guard.nft.tmpl
+EXP_PORT=9188        # fixed: gaming-exporter's port (Walter's Prometheus job "hypervisor")
 IMG_GIB=160          # preallocated
 MARGIN_GIB=20        # kept free on the disk's filesystem on top of Walter's possible qcow2 growth
 ISO_NAME=bazzite-nvidia-open-stable-live-amd64.iso
@@ -42,7 +51,7 @@ ISO_NAME=bazzite-nvidia-open-stable-live-amd64.iso
 COSIGN_PUB_SHA256=af78ecfda6eb21c35195af3739341715e9cfc3f2f5911dd9c10b0670547bf6e8
 VIRSH=(virsh -q -c qemu:///system)
 
-DEFAULT_STEPS=(guard network storage packages guests hook vm)
+DEFAULT_STEPS=(guard network storage packages guests hook vm exporter)
 ALL_STEPS=("${DEFAULT_STEPS[@]}" vm-setup vm-final)
 
 APPLY=0 YES=0 STEPS=() SITE=
@@ -51,7 +60,7 @@ while (($#)); do
         --apply) APPLY=1 ;;
         --yes) YES=1 ;;
         --site-env) SITE=${2:?--site-env needs a file}; shift ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
         *) [[ " ${ALL_STEPS[*]} " == *" $1 "* ]] || { echo "unknown step: $1" >&2; exit 2; }
            STEPS+=("$1") ;;
     esac
@@ -807,6 +816,94 @@ define_vm() {   # $1 = install | setup | final
 step_vm() { define_vm install; }
 step_vm-setup() { define_vm setup; }
 step_vm-final() { define_vm final; }
+
+# ---------------------------------------------------------------------------------------------
+exporter_loaded() { nft list table inet gaming_exporter_guard 2>/dev/null | grep -q -- "dport $EXP_PORT"; }
+
+# Renders gaming-exporter-guard.nft.tmpl to $1. Its only variables: BACKEND_LAN_IP, HYPERVISOR_BRIDGE_IP.
+write_exporter_nft() {
+    local lan br ip
+    lan=$(site BACKEND_LAN_IP) br=$(site HYPERVISOR_BRIDGE_IP)
+    for ip in "$lan" "$br"; do
+        [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] \
+            || die "BACKEND_LAN_IP and HYPERVISOR_BRIDGE_IP must be IPv4 addresses in $SITE (got '$ip')"
+    done
+    sed -e "s/\${BACKEND_LAN_IP}/$lan/g" -e "s/\${HYPERVISOR_BRIDGE_IP}/$br/g" "$EXP_TMPL" >"$1"
+    ! grep -q '\${' "$1" || die "$EXP_TMPL has a variable this step does not fill"
+}
+
+step_exporter() {
+    hdr "exporter: nft table inet gaming_exporter_guard (port $EXP_PORT: Walter only)"
+    local need=0 tmp
+    [[ -r $EXP_TMPL ]] || die "$EXP_TMPL not found"
+    tmp=$(mktemp)
+    write_exporter_nft "$tmp"
+    nft -c -f "$tmp" || { rm -f "$tmp"; die "nft rejects the exporter guard (syntax check); nothing changed"; }
+    ok "exporter guard passes 'nft -c' (syntax check)"
+    if [[ -e $EXP_NFT ]] && cmp -s "$tmp" "$EXP_NFT"; then ok "$EXP_NFT is current"
+    else todo "write $EXP_NFT"; need=1; fi
+    if systemctl is-enabled -q "$EXP_UNIT" 2>/dev/null && systemctl is-active -q "$EXP_UNIT"; then ok "$EXP_UNIT enabled and active"
+    else todo "install and enable $EXP_UNIT (oneshot, loads the table at boot)"; need=1; fi
+    if exporter_loaded; then ok "table inet gaming_exporter_guard is loaded"; else todo "load table inet gaming_exporter_guard"; need=1; fi
+    if [[ ! -e $CHECK ]]; then
+        note "$CHECK not found (the security script's guard step installs it); skipping the health-check hook"
+    elif grep -q 'check gaming_exporter_guard' "$CHECK"; then ok "nft-guard-check already covers gaming_exporter_guard"
+    else todo "add gaming_exporter_guard to $CHECK (5-minute timer reloads it if it goes missing)"; need=1; fi
+    if systemctl --user -M "$U@" is-active -q gaming-exporter.service 2>/dev/null; then ok "$U's gaming-exporter.service is active"
+    else note "$U's user unit gaming-exporter.service is not active; $U installs it, not this script (README, Telemetry)"; fi
+    ((need)) || { rm -f "$tmp"; return 0; }
+    confirm || { rm -f "$tmp"; return 0; }
+    if ((APPLY)); then
+        backup "$EXP_NFT"; backup "/etc/systemd/system/$EXP_UNIT"
+        install -o root -g root -m 644 "$tmp" "$EXP_NFT"
+        cat >"/etc/systemd/system/$EXP_UNIT" <<EOF
+[Unit]
+Description=Gaming exporter guard: only Walter reaches port $EXP_PORT (nft table inet gaming_exporter_guard)
+After=network-pre.target
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f $EXP_NFT
+# The file replaces the table atomically, so a reload has no unguarded gap.
+ExecReload=/usr/sbin/nft -f $EXP_NFT
+ExecStop=/usr/sbin/nft delete table inet gaming_exporter_guard
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        echo "  wrote $EXP_NFT and /etc/systemd/system/$EXP_UNIT"
+    else
+        echo "  would write $EXP_NFT and /etc/systemd/system/$EXP_UNIT"
+    fi
+    rm -f "$tmp"
+    run systemctl daemon-reload
+    run systemctl enable "$EXP_UNIT"
+    run systemctl reload-or-restart "$EXP_UNIT"
+    if [[ -e $CHECK ]] && ! grep -q 'check gaming_exporter_guard' "$CHECK"; then
+        if ((APPLY)); then
+            backup "$CHECK"
+            grep -qx 'exit $rc' "$CHECK" || die "$CHECK has no 'exit \$rc' line to insert before; add the check by hand"
+            sed -i 's/^exit \$rc$/# Gaming exporter guard, once gaming-setup.sh has installed it.\nif [ -e \/etc\/systemd\/system\/gaming-exporter-guard.service ]; then\n    check gaming_exporter_guard "dport 9188" gaming-exporter-guard.service\nfi\nexit $rc/' "$CHECK"
+            grep -q 'check gaming_exporter_guard' "$CHECK" || die "could not add the gaming_exporter_guard check to $CHECK"
+            sh -n "$CHECK" || die "$CHECK no longer parses; restore it from $BK/files$CHECK"
+            echo "  added the gaming_exporter_guard check to $CHECK"
+        else
+            echo "  would add to $CHECK: check gaming_exporter_guard \"dport $EXP_PORT\" $EXP_UNIT (if the unit exists)"
+        fi
+    fi
+    if ((APPLY)); then
+        exporter_loaded || die "table inet gaming_exporter_guard is not loaded after the restart: see journalctl -u $EXP_UNIT"
+        ok "table inet gaming_exporter_guard is loaded"
+        if [[ -e $CHECK ]]; then
+            systemctl start nft-guard-check.service || die "nft-guard-check FAILED: see journalctl -u nft-guard-check"
+            ok "nft-guard-check passes"
+        fi
+    fi
+    note "undo: systemctl disable --now $EXP_UNIT; rm $EXP_NFT /etc/systemd/system/$EXP_UNIT; systemctl daemon-reload"
+    note "      (the check in $CHECK is skipped once the unit file is gone). The exporter's own undo: README, Telemetry"
+}
 
 # ---------------------------------------------------------------------------------------------
 for s in "${STEPS[@]}"; do CUR=$s; "step_$s"; done

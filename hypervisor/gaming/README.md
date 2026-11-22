@@ -1,13 +1,14 @@
 # GPU modes and the gaming VM
 
-The hypervisor can lend Walter's second GPU to a gaming VM (`linux-gaming`, Bazzite), streamed to the workstation with Sunshine (in the VM) and Moonlight (on the host). Two scripts run on the hypervisor:
+The hypervisor can lend Walter's second GPU to a gaming VM (`linux-gaming`, Bazzite), streamed to the workstation with Sunshine (in the VM) and Moonlight (on the host). Three programs run on the hypervisor:
 
 | File | Runs as | What it does |
 |---|---|---|
 | `gpu-mode` (with `game-mode` and `ai-mode` symlinks) | the operator (group `libvirt`), no sudo | switches the GPUs between the two modes below |
-| `gaming-setup.sh` | root (`sudo`), plan by default, `--apply` to change | one-time host prep: guard firewall, NAT network, disk, libvirt hook, VM definitions |
+| `gaming-setup.sh` | root (`sudo`), plan by default, `--apply` to change | one-time host prep: guard firewall, NAT network, disk, libvirt hook, VM definitions, the exporter's firewall |
+| `gaming-exporter` (`gaming-exporter.service`) | the operator, a `systemd --user` unit | telemetry for Walter's Prometheus (see [Telemetry](#telemetry)) |
 
-Both read their site values from `~/.config/deck/site.env` (keys below). Neither script sources it; each line is parsed.
+All three read their site values from `~/.config/deck/site.env` (keys below). None of them sources it; each line is parsed.
 
 ## The two modes
 
@@ -103,7 +104,8 @@ Rules:
      - **packages:** `vainfo`;
      - **guests:** a longer libvirt-guests shutdown timeout;
      - **hook:** the qemu hook;
-     - **vm:** the install variant.
+     - **vm:** the install variant;
+     - **exporter:** the nft guard for the telemetry exporter (see [Telemetry](#telemetry)).
    - Afterwards run `sudo systemctl reload libvirtd`, so libvirt picks up the hooks. Each step prints its undo, and backups go to `/root/gaming-setup-<time>/`.
 5. **Install Bazzite:** start the install variant (no GPU, VNC console, 16 GiB, 8 vCPUs) while Walter runs normally, install, enable sshd and shut it down.
 6. **First boot with the GPU:**
@@ -139,6 +141,69 @@ Rules:
   - **Re-enable updates** once the bug is fixed.
 - **Games:** Steam is preinstalled. If a game hangs the GPU (`Xid 109` in `journalctl -k`), try another Proton version before anything else (see Troubleshooting).
 
+## Telemetry
+
+`gaming-exporter` lets Walter's telemetry page show the GPU mode, the gaming VM and the guest's GPU. It's a small Python (stdlib only) HTTP exporter. It runs on the hypervisor as the operator's `systemd --user` unit `gaming-exporter.service`, and Walter's Prometheus scrapes it as job `hypervisor`, every 5 s.
+
+```
+gaming-exporter (host, operator) --> ${HYPERVISOR_BRIDGE_IP}:9188/metrics <-- Walter's Prometheus <-- telemetry app
+        | ssh (host -> guest only)
+        v
+  linux-gaming: nvidia-smi, pgrep sunshine, ss
+```
+
+**What it exports.** A background thread collects every 5 s. A request only gets the cached text and never runs a command.
+
+| Metrics | Source |
+|---|---|
+| `hv_gpu_mode_state{mode}`, `hv_gpu_mode_phase{phase}`, `hv_gpu_mode_since_seconds` | `~/.local/state/gpu-mode` (absent = AI mode) |
+| `hv_gpu_mode_switch_active{direction}` | the flock on `~/.local/state/gpu-mode.lock`, read passively from `/proc/locks`, and the `/proc/*/cmdline` of a running `game-mode` / `ai-mode` / `gpu-mode game\|ai` |
+| `hv_gaming_vm_running`, `hv_gaming_vm_state{state}`, `hv_gaming_vm_vcpus`, `..._cpu_seconds_total`, `..._memory_bytes`, `..._disk_{read,write}_bytes_total`, `..._net_{rx,tx}_bytes_total` | `virsh -c qemu:///system domstats linux-gaming --raw` |
+| `hv_gaming_guest_up`, `hv_gaming_guest_poll_seconds` | the last guest poll |
+| `hv_gaming_gpu_info{name}`, `hv_gaming_gpu_{utilization,encoder_utilization}_percent`, `..._memory_{used,total}_bytes`, `..._temperature_celsius`, `..._power{,_limit}_watts`, `..._sm_clock_mhz`, `..._fan_percent`, `..._pcie_link_{gen,width}` | the guest's `nvidia-smi --query-gpu` |
+| `hv_gaming_sunshine_running`, `hv_gaming_stream_active` | `pgrep -x sunshine` in the guest. A stream is active while Sunshine's video UDP port (base port + 9, so 47998) is bound: Sunshine opens it when a session starts and closes it when the last one ends |
+| `hv_host_allowed_cpus{slice,cpus}` | `/sys/fs/cgroup/{system.slice,user.slice,init.scope}/cpuset.cpus.effective` |
+| `hv_exporter_build_info`, `hv_exporter_collect_seconds` | the exporter |
+
+**Guest metrics** are present only while the guest answers, so there are no stale values. The guest is polled only while `linux-gaming` runs. Each poll is one ssh command through a persistent master connection, whose control socket is in `$XDG_RUNTIME_DIR/gaming-exporter/`, mode 0700. The ssh options are `IdentitiesOnly`, `BatchMode`, no agent forwarding and no forwardings. **The guest's output is untrusted:**
+- reads are capped at 16 KiB, and the output must have the exact section shape;
+- only numbers, in range, are kept, and `[N/A]` drops that metric;
+- the GPU name is reduced to `[A-Za-z0-9 ._-]`, at most 64 characters.
+
+**Access.** The exporter listens on `${HYPERVISOR_BRIDGE_IP}:9188` only (`IP_FREEBIND`, so it can start before the bridge has its address). The nft table `inet gaming_exporter_guard` lets only `${BACKEND_LAN_IP}` reach that port; loopback is also allowed. `gaming-setup.sh`'s `exporter` step installs the table from `gaming-exporter-guard.nft.tmpl`, and `gaming-exporter-guard.service` loads it at boot. The step also adds the table to `nft-guard-check`. Paths other than `/metrics` and `/healthz` return 404.
+
+**Install:**
+1. Run `sudo ./gaming-setup.sh exporter` (plan), then `sudo ./gaming-setup.sh --apply exporter`.
+2. As the operator, who needs lingering (`loginctl enable-linger`), install the unit:
+   ```bash
+   ln -s <checkout>/hypervisor/gaming/gaming-exporter ~/bin/
+   install -m 644 <checkout>/hypervisor/gaming/gaming-exporter.service ~/.config/systemd/user/
+   # the guest account, if it differs from yours (operator-local, never committed):
+   printf 'GAMING_GUEST_USER=<guest user>\n' > ~/.config/deck/gaming-exporter.env
+   systemctl --user daemon-reload && systemctl --user enable --now gaming-exporter
+   ```
+   The exporter reads `HYPERVISOR_BRIDGE_IP` and `GAMING_SUBNET` from `~/.config/deck/site.env` (parsed, never sourced). Optional overrides go in `~/.config/deck/gaming-exporter.env`:
+   - `GAMING_GUEST_USER`;
+   - `GAMING_GUEST_KEY` (default `~/.ssh/id_linux_gaming`);
+   - `GAMING_SUNSHINE_PORT` (Sunshine's `port`, default 47989);
+   - `GAMING_EXPORTER_BIND` (`ADDR:PORT`, for tests).
+
+   The guest's host key must already be in `~/.ssh/known_hosts`: ssh it once by hand.
+3. Walter's side (the `hypervisor` scrape job) is deployed with `walter/deploy.sh`.
+
+**Verify:**
+```bash
+systemctl --user status gaming-exporter        # active; journal shows "listening on <bridge ip>:9188"
+curl -s http://${HYPERVISOR_BRIDGE_IP}:9188/metrics | grep -v '^#'
+curl -s http://${HYPERVISOR_BRIDGE_IP}:9188/healthz       # ok
+sudo nft list table inet gaming_exporter_guard            # counters: Walter's scrapes accepted
+```
+In AI mode, `hv_gaming_vm_running` is 0 and there are no `hv_gaming_gpu_*` lines. In game mode, `hv_gaming_guest_up` is 1. On Walter, `up{job="hypervisor"}` is 1. From any other machine, the port times out.
+
+**Rollback:**
+- `systemctl --user disable --now gaming-exporter`, then `rm ~/.config/systemd/user/gaming-exporter.service ~/bin/gaming-exporter`, then `systemctl --user daemon-reload`;
+- as root: `systemctl disable --now gaming-exporter-guard.service; rm /etc/gaming-exporter-guard.nft /etc/systemd/system/gaming-exporter-guard.service`, then `systemctl daemon-reload`. The `nft-guard-check` entry is skipped once the unit file is gone.
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
@@ -153,7 +218,7 @@ Rules:
 
 ## Undo
 
-`ai-mode` first. Then, as root:
+`ai-mode` first. Then remove the exporter (see Telemetry, Rollback). Then, as root:
 - `virsh undefine --nvram linux-gaming`;
 - `virsh net-destroy gaming-nat; virsh net-undefine gaming-nat`;
 - `rm /etc/libvirt/hooks/qemu.d/10-linux-gaming /etc/libvirt/hooks/network.d/10-gaming-guard`, then `systemctl reload libvirtd`;

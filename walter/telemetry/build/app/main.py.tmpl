@@ -102,6 +102,40 @@ FAST_QUERIES = {
     "mem_avail": 'node_memory_MemAvailable_bytes{job="node"}',
     "net_rx": 'rate(node_network_receive_bytes_total{job="node",device=~"${BACKEND_LAN_IF}|wg0"}[1m])',
     "net_tx": 'rate(node_network_transmit_bytes_total{job="node",device=~"${BACKEND_LAN_IF}|wg0"}[1m])',
+    # Hypervisor (gaming-exporter on the host, job "hypervisor", scraped every 5 s). Everything here is in
+    # the fast set so a mode change reaches viewers on the next 4 s cycle. See hypervisor_view().
+    **{
+        "hv_up": 'up{job="hypervisor"}',
+        "hv_mode_state": "hv_gpu_mode_state",
+        "hv_mode_phase": "hv_gpu_mode_phase",
+        "hv_mode_since": "hv_gpu_mode_since_seconds",
+        "hv_switch": "hv_gpu_mode_switch_active",
+        "hv_host_cpus": 'hv_host_allowed_cpus{slice="system.slice"}',
+        "hv_vm_running": "hv_gaming_vm_running",
+        "hv_vm_state": "hv_gaming_vm_state",
+        "hv_vm_vcpus": "hv_gaming_vm_vcpus",
+        "hv_vm_cpu": "rate(hv_gaming_vm_cpu_seconds_total[30s])",
+        "hv_vm_mem": "hv_gaming_vm_memory_bytes",
+        "hv_vm_disk_r": "rate(hv_gaming_vm_disk_read_bytes_total[30s])",
+        "hv_vm_disk_w": "rate(hv_gaming_vm_disk_write_bytes_total[30s])",
+        "hv_vm_net_rx": "rate(hv_gaming_vm_net_rx_bytes_total[30s])",
+        "hv_vm_net_tx": "rate(hv_gaming_vm_net_tx_bytes_total[30s])",
+        "hv_guest_up": "hv_gaming_guest_up",
+        "hv_sunshine": "hv_gaming_sunshine_running",
+        "hv_stream": "hv_gaming_stream_active",
+        "hv_gpu_info": "hv_gaming_gpu_info",
+        "hv_gpu_util": "hv_gaming_gpu_utilization_percent",
+        "hv_gpu_enc": "hv_gaming_gpu_encoder_utilization_percent",
+        "hv_gpu_mem_used": "hv_gaming_gpu_memory_used_bytes",
+        "hv_gpu_mem_total": "hv_gaming_gpu_memory_total_bytes",
+        "hv_gpu_temp": "hv_gaming_gpu_temperature_celsius",
+        "hv_gpu_power": "hv_gaming_gpu_power_watts",
+        "hv_gpu_power_limit": "hv_gaming_gpu_power_limit_watts",
+        "hv_gpu_sm_clock": "hv_gaming_gpu_sm_clock_mhz",
+        "hv_gpu_fan": "hv_gaming_gpu_fan_percent",
+        "hv_gpu_pcie_gen": "hv_gaming_gpu_pcie_link_gen",
+        "hv_gpu_pcie_width": "hv_gaming_gpu_pcie_link_width",
+    },
 }
 
 SLOW_QUERIES = {
@@ -132,6 +166,8 @@ HISTORY_QUERIES = {
     "rpm": "sum(rate(litellm_proxy_total_requests_metric_total[2m])) * 60",
     "tps": "sum(rate(llamacpp:tokens_predicted_total[1m]))",
     "cpu": '100 * (1 - avg(rate(node_cpu_seconds_total{job="node",mode="idle"}[1m])))',
+    # the passthrough GPU as the gaming guest reports it (only while the guest is up)
+    "gpu_gaming": "max(hv_gaming_gpu_utilization_percent)",
 }
 
 PROBE_NAMES = {
@@ -426,11 +462,21 @@ class Collector:
         down = []
         tot_up = 0
         for x in s.get("up") or []:
+            # The hypervisor exporter is optional and has its own indicator (snapshot.hypervisor.up,
+            # "HYPERVISOR OFFLINE"): it never counts towards the overall status.
+            if x["metric"].get("job") == "hypervisor":
+                continue
             if _num(x["value"][1]) == 1:
                 tot_up += 1
             else:
                 down.append(f'{x["metric"].get("job")}/{x["metric"].get("instance")}')
         targets = {"up": tot_up, "total": tot_up + len(down), "down": down}
+
+        try:
+            hypervisor = hypervisor_view(f)
+        except Exception:  # noqa: BLE001  (belt and braces: never let the gaming panel break the snapshot)
+            log.exception("hypervisor view failed")
+            hypervisor = hypervisor_view({})
 
         firing = [a for a in self.alerts if a["state"] == "firing"]
         pending = [a for a in self.alerts if a["state"] == "pending"]
@@ -469,8 +515,10 @@ class Collector:
             "targets": targets,
             "alerts": {"firing": firing, "pending": pending},
             "backup": backup,
+            "hypervisor": hypervisor,
             "spark": {
                 **{f"gpu{g['index']}": g["util"] for g in gpus},
+                "gpu_gaming": hypervisor["gpu"]["util"] if hypervisor["gpu"] else None,
                 "rpm": gateway["rpm"],
                 "tps": _r(scalar(f.get("tps_total")), 2),
                 "cpu": host["cpu_pct"],
@@ -592,6 +640,176 @@ def pcie_describe(link: dict | None, expected: int | None = None) -> dict | None
         label += f" · below x{expected}"
         title += f" Width x{w} is below the expected x{expected} (TELEMETRY_GPU_EXPECTED_WIDTH): check the card's seating, riser and slot settings."
     return {**link, "expected_width": expected, "label": label, "level": level, "title": title}
+
+
+# ---------------------------------------------------------------------------------------------
+# Hypervisor / gaming VM (gaming-exporter). Label values originate partly in the gaming guest, so
+# every string is allow-listed or sanitised here; numbers go through _num(). A missing series is
+# None (the exporter omits guest metrics while the guest is down), never 0.
+# ---------------------------------------------------------------------------------------------
+HV_MODES = ("ai", "split", "restoring")   # restoring: ai-mode is (or was, if it failed) putting Walter back
+HV_PHASES = ("none", "judge-paused", "walter-shutdown", "walter-reconfig", "walter-start", "gaming-start", "done")
+HV_DIRECTIONS = ("to-game", "to-ai")
+HV_VM_STATES = ("running", "idle", "paused", "in shutdown", "shut off", "crashed", "pmsuspended", "blocked", "missing")
+HV_GIB = 1024**3
+
+
+def _hv_val(x):
+    try:
+        return _num(x["value"][1])
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _hv_labels(x) -> dict:
+    m = x.get("metric") if isinstance(x, dict) else None
+    return m if isinstance(m, dict) else {}
+
+
+def _hv_series(res) -> list:
+    return [x for x in res if isinstance(x, dict)] if isinstance(res, list) else []
+
+
+def _hv_active_label(res, label: str, allowed) -> str | None:
+    """The single allow-listed label value whose series is 1. None if missing, ambiguous or not allowed."""
+    vals = [_hv_labels(x).get(label) for x in _hv_series(res) if _hv_val(x) == 1]
+    vals = {v for v in vals if isinstance(v, str) and v in allowed}
+    return vals.pop() if len(vals) == 1 else None
+
+
+def _hv_scalar(res):
+    """First sample of a single-series result; None when the series is absent or not a finite number."""
+    s = _hv_series(res)
+    return _hv_val(s[0]) if s else None
+
+
+def _hv_bool(res):
+    v = _hv_scalar(res)
+    return None if v is None else v == 1
+
+
+def _hv_name(v) -> str:
+    v = re.sub(r"[^A-Za-z0-9 ._-]", "", str(v or ""))[:64].strip()
+    return v or "GPU"
+
+
+def _hv_gib(v):
+    return None if v is None else round(v / HV_GIB, 2)
+
+
+def _hv_pcie(gen, width) -> dict | None:
+    """The gaming GPU's link chip, from what the guest reports (gen/width only: no sysfs, no max values,
+    no width expectation since the guest's view of the passthrough link is all we have)."""
+    gen = int(gen) if gen is not None and 1 <= gen <= 7 else None
+    width = int(width) if width is not None and 1 <= width <= 32 else None
+    if width is None:
+        return None
+    d = pcie_describe({"width": width, "max_width": None, "gen": gen, "max_gen": None, "speed": None}, None)
+    level = "muted" if d["level"] == "info" else d["level"]
+    title = f"Link: {f'Gen{gen} ' if gen else ''}x{width}, as reported by the driver inside the gaming VM."
+    return {"label": d["label"], "level": level, "title": title}
+
+
+def hypervisor_view(r: dict) -> dict:
+    """Build snapshot["hypervisor"] from the raw hv_* PromQL results (pure: no I/O, never raises on bad data)."""
+    r = r if isinstance(r, dict) else {}
+    up = _hv_bool(r.get("hv_up")) is True
+    view = {"up": up, "mode": "unknown", "direction": None, "phase": None, "since": None,
+            "label": "MODE UNKNOWN", "host_cpus": None, "vm": None, "gpu": None}
+    if not up:
+        view["label"] = "HYPERVISOR OFFLINE"
+        return view
+
+    state = _hv_active_label(r.get("hv_mode_state"), "mode", HV_MODES)
+    phase = _hv_active_label(r.get("hv_mode_phase"), "phase", HV_PHASES)
+    active = [x for x in _hv_series(r.get("hv_switch")) if _hv_val(x) == 1]
+    direction = _hv_active_label(active, "direction", HV_DIRECTIONS)
+
+    # Rules from the contract; a missing/garbled state series while the exporter is up (partial
+    # Prometheus failure) is reported as "unknown" rather than guessed as "ai".
+    if active or state == "restoring" or (state == "split" and phase != "done"):
+        mode = "switching"
+    elif state is None:
+        mode = "unknown"
+    elif state == "split":
+        mode = "game"
+    else:
+        mode = "ai"
+    view["mode"] = mode
+
+    if mode == "switching":
+        view["direction"] = direction or ("to-ai" if state == "restoring" else None)
+        view["phase"] = phase if phase not in (None, "none", "done") else None
+        arrow = {"to-game": " → GAME", "to-ai": " → AI"}.get(view["direction"], "")
+        view["label"] = f"SWITCHING{arrow}" + (f" · {view['phase']}" if view["phase"] else "")
+    else:
+        view["label"] = {"ai": "AI MODE", "game": "GAME MODE"}.get(mode, "MODE UNKNOWN")
+
+    since = _hv_scalar(r.get("hv_mode_since"))
+    if mode in ("game", "switching") and since is not None and 0 < since < time.time() + 300:
+        view["since"] = round(since, 3)
+
+    for x in _hv_series(r.get("hv_host_cpus")):
+        cpus = str(_hv_labels(x).get("cpus", ""))
+        if _hv_labels(x).get("slice") == "system.slice" and re.fullmatch(r"[0-9,-]{1,64}", cpus):
+            view["host_cpus"] = cpus
+            break
+
+    # VM (libvirt, host side): present while the exporter sees the domain
+    running = _hv_bool(r.get("hv_vm_running"))
+    vm_state = None
+    for x in _hv_series(r.get("hv_vm_state")):
+        if _hv_val(x) == 1:
+            st = _hv_labels(x).get("state")
+            vm_state = st if st in HV_VM_STATES else "unknown"
+            break
+    guest_up = _hv_bool(r.get("hv_guest_up")) is True
+    if running is not None or vm_state is not None:
+        vcpus = _hv_scalar(r.get("hv_vm_vcpus"))
+        vcpus = int(vcpus) if vcpus is not None and 0 < vcpus <= 1024 else None
+        cpu = _hv_scalar(r.get("hv_vm_cpu"))
+        cpu_pct = None
+        if cpu is not None and vcpus:
+            cpu_pct = round(min(100.0, max(0.0, 100.0 * cpu / vcpus)), 1)
+
+        def rate(k):
+            v = _hv_scalar(r.get(k))
+            return None if v is None else round(max(0.0, v))
+
+        view["vm"] = {
+            "state": vm_state or ("running" if running else "unknown"),
+            "running": running is True,
+            "vcpus": vcpus,
+            "cpu_pct": cpu_pct,
+            "mem_gib": _hv_gib(_hv_scalar(r.get("hv_vm_mem"))),
+            "disk_read_bps": rate("hv_vm_disk_r"),
+            "disk_write_bps": rate("hv_vm_disk_w"),
+            "net_rx_bps": rate("hv_vm_net_rx"),
+            "net_tx_bps": rate("hv_vm_net_tx"),
+            "guest_up": guest_up,
+            "sunshine": _hv_bool(r.get("hv_sunshine")) if guest_up else None,
+            "streaming": _hv_bool(r.get("hv_stream")) if guest_up else None,
+        }
+
+    # GPU (reported by the guest): only while the guest is up and the GPU series exist
+    util = _hv_scalar(r.get("hv_gpu_util"))
+    info = [x for x in _hv_series(r.get("hv_gpu_info")) if _hv_val(x) == 1]
+    if guest_up and (info or util is not None):
+        f = lambda k, nd=1: _r(_hv_scalar(r.get(k)), nd)  # noqa: E731
+        view["gpu"] = {
+            "name": _hv_name(_hv_labels(info[0]).get("name") if info else None),
+            "util": _r(util, 1),
+            "enc_util": f("hv_gpu_enc"),
+            "mem_used_gib": _hv_gib(_hv_scalar(r.get("hv_gpu_mem_used"))),
+            "mem_total_gib": _hv_gib(_hv_scalar(r.get("hv_gpu_mem_total"))),
+            "temp": f("hv_gpu_temp"),
+            "power": f("hv_gpu_power"),
+            "power_limit": f("hv_gpu_power_limit"),
+            "sm_clock": f("hv_gpu_sm_clock", 0),
+            "fan": f("hv_gpu_fan"),
+            "pcie": _hv_pcie(_hv_scalar(r.get("hv_gpu_pcie_gen")), _hv_scalar(r.get("hv_gpu_pcie_width"))),
+        }
+    return view
 
 
 EXPECTED_WIDTHS = parse_expected_widths(GPU_EXPECTED_WIDTH)
