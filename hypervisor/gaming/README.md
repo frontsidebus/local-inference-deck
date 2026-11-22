@@ -67,7 +67,8 @@ Rules:
 ## What protects Walter and the host
 
 - **The libvirt qemu hook** (`/etc/libvirt/hooks/qemu.d/10-linux-gaming`) acts only on `linux-gaming`:
-  - **Strict allow-list on its XML:** GPU1's functions only; raw disks under `GAMING_VMS_DIR`; `gaming-nat` with `clean-traffic`; VNC on a unix socket only; no qemu command-line passthrough; no host files or devices.
+  - **Strict allow-list on its XML:** GPU1's functions only; raw disks under `GAMING_VMS_DIR`, plus the one whole drive named in `GAMING_DATA_DISK` (if set); `gaming-nat` with `clean-traffic`; VNC on a unix socket only; no qemu command-line passthrough; no other host files or devices.
+  - **The data disk:** the hook refuses any block device except `GAMING_DATA_DISK`, matched by its exact `/dev/disk/by-id` path. It also refuses that one if the host has anything on it mounted, uses it as swap, or has LVM, RAID or device-mapper on it. `gaming-setup.sh` checks the same, and that no other VM uses the drive, before it writes the hook or the VM definition.
   - **Before start:** GPU1 must be on `vfio-pci` and the guard table loaded. With GPU1, every other VM's threads must already be on `GAMING_HOST_CPUS`.
   - **While it runs**, host processes (`system.slice`, `user.slice`, `init.scope`) are moved onto `GAMING_HOST_CPUS`. On release every online CPU is written back first (systemd 255 keeps the last cpuset when `AllowedCPUs` is only cleared), then the property is cleared.
   - It guards against mistakes. It is not a security boundary: group `libvirt` is root-equivalent.
@@ -140,6 +141,29 @@ Rules:
   - **Order matters:** each image keeps its own `/etc`, so disable the timer *after* booting the image you keep.
   - **Re-enable updates** once the bug is fixed.
 - **Games:** Steam is preinstalled. If a game hangs the GPU (`Xid 109` in `journalctl -k`), try another Proton version before anything else (see Troubleshooting).
+
+### Extra drive for the game library (optional)
+
+A whole spare drive can go to the guest as a second disk (`vdb`), so games don't fill `linux-gaming.raw`. The guest owns the drive: it partitions and formats it.
+
+1. **Empty the drive on the host** and make sure nothing on the host mounts it (no fstab entry).
+2. **Name it in site.env** by its stable path, never `/dev/nvmeN` (those numbers change when drives are added):
+   ```
+   GAMING_DATA_DISK=/dev/disk/by-id/nvme-<model>_<serial>
+   ```
+   `ls -l /dev/disk/by-id/ | grep -v part` lists the names.
+3. **In AI mode, with the VM shut off:** `sudo ./gaming-setup.sh --apply hook`, then `sudo systemctl reload libvirtd`, then `sudo ./gaming-setup.sh --apply vm-final`.
+   - Both steps first check that the drive is a whole disk, that the host doesn't mount it or use it as swap, that no LVM, RAID or device-mapper is on it, and that no other VM uses it.
+   - `vm-final` redefines the VM because its disks changed. The drive is attached raw with `discard='unmap'`, so the guest's TRIM reaches the drive (QLC drives need it to stay fast).
+4. **In the guest**, the drive is `/dev/disk/by-id/virtio-games`:
+   ```
+   sudo mkfs.ext4 -L games /dev/disk/by-id/virtio-games
+   sudo mkdir -p /var/mnt/games
+   echo 'LABEL=games /var/mnt/games ext4 defaults,noatime,nofail 0 2' | sudo tee -a /etc/fstab
+   sudo systemctl daemon-reload && sudo mount /var/mnt/games && sudo chown "$USER:" /var/mnt/games
+   ```
+   Then Steam, Settings, Storage, add `/var/mnt/games`. Enable `fstrim.timer` if it is off (`systemctl is-enabled fstrim.timer`).
+5. **Undo:** remove the key from site.env, run steps 3 again (the hook then refuses the drive, and `vm-final` drops it), and remove the guest's fstab line.
 
 ## Telemetry
 
@@ -214,6 +238,8 @@ In AI mode, `hv_gaming_vm_running` is 0 and there are no `hv_gaming_gpu_*` lines
 | A resolution is missing, or `kscreen-doctor` says "The driver rejected the output configuration" | The guest only gets the plug's EDID modes. Most cheap HDMI "2.1" plugs advertise TMDS 600 MHz and no FRL: 5120x1440 needs about 940 MHz at 120 Hz. For an ultrawide monitor, use a DisplayPort EDID emulator that copies the monitor's EDID. It must store all EDID blocks: high-refresh ultrawide modes are often in a third, DisplayID block (384 bytes in all). DP 1.4 (HBR3) carries 5120x1440 at 120 Hz; 144 Hz needs DSC. |
 | A game closes, with `NVRM: Xid ... 109 ... CTX SWITCH TIMEOUT` in the guest's `journalctl -k` | The GPU hung on the game's work. Seen with ray tracing on Proton Experimental; a stable Proton release fixed it. Check power and temperature during play with `nvidia-smi --query-gpu=temperature.gpu,power.draw,clocks_event_reasons.active --format=csv -l 2`. |
 | `gpu-mode status` shows the host CPUs limited in AI mode | The hook's release did not restore them (fixed in the current hook). Run `for u in system.slice user.slice init.scope; do sudo systemctl set-property --runtime $u AllowedCPUs=0-$(( $(nproc --all) - 1 )) && sudo systemctl set-property --runtime $u AllowedCPUs=; done`, then `sudo ./gaming-setup.sh --apply hook`. |
+| `gaming-setup.sh` stops: "GAMING_DATA_DISK ... has a mounted filesystem", "holds /...", or "is already used by domain ..." | The drive in `GAMING_DATA_DISK` is in use on the host or by another VM. Check the by-id name (`readlink -f` on it), unmount it and remove its fstab line, or pick the right drive. |
+| Starting `linux-gaming` fails: "hook ... block disk ... (only GAMING_DATA_DISK may be a block device)" | The VM definition has a block device that isn't `GAMING_DATA_DISK`, or the key changed and the hook is older. Re-run `gaming-setup.sh --apply hook`, reload libvirtd, then `--apply vm-final`. |
 | `ai-mode` stops: "Walter's config does not match the baseline" | Restore it: `virsh -c qemu:///system define ~/vm-backups/<walter-domain>-baseline.xml`, then re-run `ai-mode`. |
 
 ## Undo
