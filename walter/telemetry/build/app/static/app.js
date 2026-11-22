@@ -9,6 +9,7 @@
 
   const state = {
     snap: null,
+    prev: null, // previous snapshot (mode transitions)
     lastTs: 0, // server snapshot ts (s)
     lastRecv: 0, // client receive time (ms)
     hist: {}, // key -> [[t, v], ...]
@@ -196,12 +197,9 @@
 
   /* ---------------- GPU cards ---------------- */
   const ARC = 270, R = 66, C = 2 * Math.PI * R, ARCLEN = (C * ARC) / 360;
-  function buildGpu(card, idx) {
-    card.innerHTML = "";
-    const h = el("div", { class: "gpu-h" },
-      el("h2", { id: `gpu${idx}-h` }, `GPU${idx}`, el("span", { class: "gpu-name", "data-f": "name" })),
-      el("span", { class: "chip chip-info", "data-f": "pcie", title: "PCIe link" }, "PCIe —"));
-    const gauge = el("div", { class: "gauge", "data-f": "gauge" });
+  // util gauge; `attr` names the data attribute the card looks its fields up by (data-f / data-g)
+  function makeGauge(attr) {
+    const gauge = el("div", { class: "gauge", [attr]: "gauge" });
     const g = svg("svg", { viewBox: "0 0 160 160", "aria-hidden": "true" });
     const common = { cx: 80, cy: 80, r: R, "stroke-dasharray": `${ARCLEN} ${C}` };
     g.append(svg("circle", { ...common, class: "g-track" }));
@@ -209,9 +207,35 @@
     const val = svg("circle", { ...common, class: "g-val", "stroke-dashoffset": ARCLEN });
     g.append(val);
     gauge.append(g, el("div", { class: "gauge-c" },
-      el("div", { class: "num", "data-f": "util" }, "—"),
+      el("div", { class: "num", [attr]: "util" }, "—"),
       el("div", { class: "kpi-l mono" }, "util %")));
     gauge._val = val;
+    return gauge;
+  }
+  function setGauge(gauge, util) {
+    const u = Math.max(0, Math.min(100, util || 0));
+    gauge._val.setAttribute("stroke-dashoffset", (ARCLEN * (1 - u / 100)).toFixed(1));
+    gauge.classList.toggle("hot", u >= 90);
+  }
+  // PCIe chip: label/level/title are decided server-side (main.py pcie_describe); nothing is assumed about the slot here.
+  function setPcie(pc, p) {
+    if (p && typeof p === "object") {
+      setText(pc, p.label || `PCIe ${p.gen ? `Gen${p.gen} ` : ""}x${p.width}`);
+      pc.title = p.title || "PCIe link";
+      pc.classList.toggle("chip-note", p.level === "info" || p.level === "muted");
+      pc.classList.toggle("chip-warn", p.level === "warn");
+    } else {
+      setText(pc, "PCIe n/a");
+      pc.title = "PCIe link: not readable";
+      pc.classList.remove("chip-note", "chip-warn");
+    }
+  }
+  function buildGpu(card, idx) {
+    card.replaceChildren();
+    const h = el("div", { class: "gpu-h" },
+      el("h2", { id: `gpu${idx}-h` }, `GPU${idx}`, el("span", { class: "gpu-name", "data-f": "name" })),
+      el("span", { class: "chip chip-info", "data-f": "pcie", title: "PCIe link" }, "PCIe —"));
+    const gauge = makeGauge("data-f");
     const vram = el("div", {},
       el("div", { class: "meter-l" }, el("span", {}, "VRAM"), el("span", { "data-f": "vramtxt" }, "—")),
       el("div", { class: "meter", "data-f": "vram" }, el("i")));
@@ -222,19 +246,18 @@
     const foot = el("div", { class: "gpu-foot" }, el("span", { class: "lbl" }, "loaded"), el("span", { "data-f": "models" }));
     const spark = el("div", { class: "gpu-spark" }, el("div", { class: "spark-wrap", "data-spark": `gpu${idx}`, "data-unit": "%", "data-color": idx === 0 ? "cyan" : "purple" }));
     card.append(h, main, foot, spark);
+    if (card._lent) card.append(card._lent); // keep the lent/missing placeholder (built once, see setGpuSlot)
+    card._built = true;
   }
 
   function renderGpu(g) {
     const card = $(`#gpu${g.index}`);
     if (!card) return;
-    if (!card.firstChild) buildGpu(card, g.index);
+    if (!card._built) buildGpu(card, g.index); // not firstChild: the lent placeholder may be there first
     const f = (k) => card.querySelector(`[data-f="${k}"]`);
     setText(f("name"), g.name ? "· " + g.name.replace("NVIDIA GeForce ", "") : "");
     setNum(f("util"), g.util, fmt.int);
-    const gauge = f("gauge");
-    const u = Math.max(0, Math.min(100, g.util || 0));
-    gauge._val.setAttribute("stroke-dashoffset", (ARCLEN * (1 - u / 100)).toFixed(1));
-    gauge.classList.toggle("hot", u >= 90);
+    setGauge(f("gauge"), g.util);
 
     const used = g.vram_used_mib, tot = g.vram_total_mib;
     const pct = used != null && tot ? (used / tot) * 100 : 0;
@@ -252,19 +275,7 @@
     tempBox.classList.toggle("crit", g.temp_c >= 85);
     card.classList.toggle("crit", g.temp_c >= 85);
 
-    const p = g.pcie;
-    const pc = f("pcie");
-    // label/level/title are decided server-side (main.py pcie_describe); nothing is assumed about the slot here.
-    if (p) {
-      setText(pc, p.label || `PCIe ${p.gen ? `Gen${p.gen} ` : ""}x${p.width}`);
-      pc.title = p.title || "PCIe link";
-      pc.classList.toggle("chip-note", p.level === "info");
-      pc.classList.toggle("chip-warn", p.level === "warn");
-    } else {
-      setText(pc, "PCIe n/a");
-      pc.title = "PCIe link: not readable";
-      pc.classList.remove("chip-note", "chip-warn");
-    }
+    setPcie(f("pcie"), g.pcie);
 
     const mw = f("models");
     const ids = (g.models || []).map((id) => {
@@ -277,6 +288,195 @@
       mw.replaceChildren(...(ids.length ? ids.map((t, i) => el("span", { class: "chip chip-model", title: g.models[i] }, t)) : [el("span", { class: "muted mono", text: "— idle —" })]));
       mw.style.cssText = "display:inline-flex;flex-wrap:wrap;gap:6px";
     }
+  }
+
+  /* ---------------- hypervisor: GPU mode + gaming VM ---------------- */
+  // snapshot.hypervisor is optional (older backends omit it): without it the mode pill and gaming panel stay hidden.
+  const MODES = ["ai", "game", "switching", "unknown"];
+  const fin = (v) => (typeof v === "number" && isFinite(v) ? v : null);
+  const str = (v) => (typeof v === "string" && v ? v : null);
+  const hvOf = (s) => (s && s.hypervisor && typeof s.hypervisor === "object" ? s.hypervisor : null);
+  const hvMode = (hv) => (hv && MODES.includes(hv.mode) ? hv.mode : "unknown");
+  const lending = (hv) => !!hv && (hv.mode === "game" || hv.mode === "switching");
+  // Walter (which serves this page) restarts during a GPU mode switch; if the stream drops while the last snapshot
+  // said switching or game, the drop is most likely that restart, not an outage.
+  const switchSuspected = () => lending(hvOf(state.snap));
+  // seconds since a server unix ts, measured on the server clock (no client clock skew)
+  const sinceAge = (ts) => (fin(ts) == null || !state.lastRecv ? null : Math.max(0, state.lastTs - ts + (Date.now() - state.lastRecv) / 1000));
+  const dirText = (d) => (d === "to-game" ? "→ game" : d === "to-ai" ? "→ AI" : null);
+
+  function modeTitle(hv) {
+    const age = sinceAge(hv.since);
+    return [
+      `GPU mode: ${hvMode(hv)}${hv.up ? "" : " (hypervisor exporter not reachable)"}`,
+      `phase: ${str(hv.phase) || "—"}`,
+      `direction: ${dirText(hv.direction) || "—"}`,
+      `since: ${age == null ? "—" : fmt.age(age) + " ago · " + new Date(hv.since * 1000).toLocaleTimeString("en-GB", { hour12: false })}`,
+      `host CPUs (system.slice): ${str(hv.host_cpus) || "—"}`,
+    ].join("\n");
+  }
+
+  function renderMode(s) {
+    const p = $("#mode-pill");
+    const hv = hvOf(s);
+    p.hidden = !hv;
+    if (!hv) return;
+    const mode = hvMode(hv);
+    p.className = `pill mode mode-${mode}`;
+    setText($(".pill-text", p), mode === "unknown" ? "HYPERVISOR OFFLINE" : str(hv.label) || `${mode.toUpperCase()} MODE`);
+    p.title = modeTitle(hv);
+  }
+
+  /* Walter GPU slots. index.html has one static section per Walter GPU (gpu0, gpu1). In game mode the hypervisor
+     passes one card through to the gaming VM and Walter's DCGM then reports only the other one. Assumption: a static
+     slot whose index is absent from snapshot.gpus while mode is game/switching is the lent card; which index that is
+     comes from the data, not from here. Absent outside game mode = "not reported" (only when some GPU is reported,
+     so a Prometheus outage keeps the last values like before). */
+  function setGpuSlot(card, kind, s) {
+    const idx = card.dataset.gpu;
+    if (!kind && !card._lent) return;
+    if (!card._lent) {
+      card._lent = el("a", { class: "gpu-lent" },
+        el("div", { class: "gpu-h" },
+          el("h2", { id: `gpu${idx}-lent-h` }, `GPU${idx}`, el("span", { class: "gpu-name", "data-l": "name" })),
+          el("span", { class: "chip chip-lend", "data-l": "chip" })),
+        el("div", { class: "lent-body" },
+          el("div", { class: "lent-big", "data-l": "big" }),
+          el("p", { class: "lent-sub mono", "data-l": "sub" }),
+          el("div", { class: "lent-live mono", "data-l": "live" }),
+          el("span", { class: "lent-cta mono", "data-l": "cta", text: "view gaming VM ↓" })));
+      card.append(card._lent);
+    }
+    const L = (k) => card._lent.querySelector(`[data-l="${k}"]`);
+    card.classList.toggle("is-lent", kind === "lent");
+    card.classList.toggle("is-missing", kind === "missing");
+    card.setAttribute("aria-labelledby", kind ? `gpu${idx}-lent-h` : `gpu${idx}-h`);
+    if (!kind) return;
+    card.classList.remove("crit");
+    const hv = hvOf(s);
+    if (kind === "lent") {
+      card._lent.setAttribute("href", "#gaming");
+      const switching = hv.mode === "switching";
+      setText(L("name"), switching ? "· in transit" : "· lent");
+      setText(L("chip"), "VFIO → gaming VM");
+      setText(L("big"), `GPU${idx} → gaming VM`);
+      setText(L("sub"), switching
+        ? `GPU mode switch in progress (${str(hv.phase) || "—"}${dirText(hv.direction) ? ", " + dirText(hv.direction) : ""}). Walter runs on the remaining GPU until it is back.`
+        : "Passed through to the gaming VM. Walter serves models from the remaining GPU until the switch back to AI mode.");
+      const g = hv.gpu && typeof hv.gpu === "object" ? hv.gpu : null;
+      const vm = hv.vm && typeof hv.vm === "object" ? hv.vm : null;
+      setText(L("live"), g && vm && vm.guest_up
+        ? `in guest · ${fmt.int(fin(g.util))}% util · ${fmt.int(fin(g.temp))} °C · ${fmt.int(fin(g.power))} W`
+        : vm && vm.running ? "guest booting / unreachable" : `VM ${str(vm && vm.state) || "not running"}`);
+      L("cta").hidden = false;
+    } else {
+      card._lent.removeAttribute("href");
+      setText(L("name"), "· not reported");
+      setText(L("chip"), "no data");
+      setText(L("big"), `GPU${idx} not reported`);
+      setText(L("sub"), `DCGM reports ${(s.gpus || []).length} GPU(s) and not this one${hv && hv.mode === "unknown" ? "; GPU mode unknown (hypervisor offline), it may be lent to the gaming VM" : ""}. The card comes back when the GPU does.`);
+      setText(L("live"), "");
+      L("cta").hidden = true;
+    }
+  }
+  function renderGpuSlots(s) {
+    const gpus = s.gpus || [];
+    const seen = new Set(gpus.map((g) => String(g.index)));
+    const lent = lending(hvOf(s));
+    for (const card of $$("section.gpu[data-gpu]")) {
+      const absent = !seen.has(card.dataset.gpu);
+      setGpuSlot(card, absent ? (lent ? "lent" : gpus.length ? "missing" : null) : null, s);
+    }
+  }
+
+  function setChip(node, cls, text, title) {
+    node.className = `chip chip-st ${cls}`;
+    setText(node, text);
+    node.title = title || "";
+  }
+  function setMeter(m, pct, hotAt) {
+    const v = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+    m.firstChild.style.width = v.toFixed(1) + "%";
+    m.classList.toggle("hot", pct != null && pct >= hotAt);
+  }
+
+  function renderGaming(s) {
+    const sec = $("#gaming");
+    const hv = hvOf(s);
+    const vm = hv && hv.vm && typeof hv.vm === "object" ? hv.vm : null;
+    const show = !!hv && (lending(hv) || (!!vm && vm.running === true));
+    sec.hidden = !show;
+    if (!show) return;
+    const G = (k) => sec.querySelector(`[data-g="${k}"]`);
+    if (!sec._gauge) {
+      sec._gauge = makeGauge("data-g");
+      G("gauge-slot").replaceWith(sec._gauge);
+    }
+    const running = !!vm && vm.running === true;
+    const guestUp = running && vm.guest_up === true;
+
+    // header
+    setText(G("tag"), vm ? `${str(vm.state) || "?"} · ${fmt.int(fin(vm.vcpus))} vCPU` : "VM not reported");
+    const sw = G("switch");
+    sw.hidden = hv.mode !== "switching";
+    if (hv.mode === "switching") {
+      const lbl = str(hv.label) || "switching", ph = str(hv.phase);
+      setText(sw, `GPU mode switch in progress · ${lbl}${ph && !lbl.includes(ph) ? " · phase " + ph : ""}`);
+    }
+
+    // VM (host-side virsh stats: valid whenever the VM runs, guest or not)
+    if (!running) setChip(G("guest"), "chip-unk", `VM ${str(vm && vm.state) || "not running"}`);
+    else if (guestUp) setChip(G("guest"), "chip-on", "guest up", "last guest poll succeeded");
+    else setChip(G("guest"), "chip-wait", "guest booting / unreachable", "the VM runs but the guest did not answer the last poll");
+    const tri = (node, v, on, off, unk) => {
+      if (!guestUp || v == null) setChip(node, "chip-unk", unk, guestUp ? "not reported" : "needs the guest");
+      else setChip(node, v ? on[0] : off[0], v ? on[1] : off[1]);
+    };
+    tri(G("sunshine"), vm && vm.sunshine, ["chip-on", "sunshine"], ["chip-off", "sunshine down"], "sunshine —");
+    tri(G("stream"), vm && vm.streaming, ["chip-live", "streaming"], ["chip-idle", "no client"], "stream —");
+    setNum(G("cpu"), running ? fin(vm.cpu_pct) : null, fmt.n1);
+    setText(G("cpu-u"), `% of ${fmt.int(fin(vm && vm.vcpus))} vCPU`);
+    setNum(G("mem"), running ? fin(vm.mem_gib) : null, fmt.n1);
+    setText(G("disk-r"), fmt.rate(running ? fin(vm.disk_read_bps) : null));
+    setText(G("disk-w"), fmt.rate(running ? fin(vm.disk_write_bps) : null));
+    setText(G("net-rx"), fmt.rate(running ? fin(vm.net_rx_bps) : null));
+    setText(G("net-tx"), fmt.rate(running ? fin(vm.net_tx_bps) : null));
+    const age = hv.mode === "game" ? sinceAge(hv.since) : null;
+    setText(G("since"), age == null ? "—" : fmt.age(age));
+
+    // GPU (from inside the guest: only present while the guest is up; no zeros when it is not)
+    const g = guestUp && hv.gpu && typeof hv.gpu === "object" ? hv.gpu : null;
+    G("gpu").classList.toggle("is-off", !g);
+    G("off").hidden = !!g;
+    G("gpu-main").hidden = !g;
+    if (!g) setText(G("off"), !running ? `VM ${str(vm && vm.state) || "not running"}: no GPU telemetry`
+      : !guestUp ? "guest booting / unreachable · GPU telemetry comes from inside the guest"
+      : "guest up, GPU not reported");
+    setText(G("gpu-name"), g && str(g.name) ? "· " + g.name.replace("NVIDIA GeForce ", "") : "");
+    const util = g ? fin(g.util) : null;
+    setNum(G("util"), util, fmt.int);
+    setGauge(sec._gauge, util);
+    const used = g ? fin(g.mem_used_gib) : null, tot = g ? fin(g.mem_total_gib) : null;
+    const vpct = used != null && tot ? (used / tot) * 100 : null;
+    setText(G("vramtxt"), vpct != null ? `${used.toFixed(1)} / ${tot.toFixed(1)} GiB · ${Math.round(vpct)}%` : "—");
+    setMeter(G("vram"), vpct, 95);
+    const enc = g ? fin(g.enc_util) : null;
+    setText(G("enctxt"), enc == null ? "—" : `${Math.round(enc)}%`);
+    setMeter(G("enc"), enc, 90);
+    const temp = g ? fin(g.temp) : null;
+    setNum(G("temp"), temp, fmt.int);
+    setNum(G("power"), g ? fin(g.power) : null, fmt.int);
+    const lim = g ? fin(g.power_limit) : null;
+    setText(G("power-u"), lim == null ? "W" : ` / ${Math.round(lim)} W`);
+    setNum(G("fan"), g ? fin(g.fan) : null, fmt.int);
+    setNum(G("clock"), g ? fin(g.sm_clock) : null, fmt.int);
+    const tb = sec.querySelector('[data-s="temp"]');
+    tb.classList.toggle("hot", temp != null && temp >= 78 && temp < 85);
+    tb.classList.toggle("crit", temp != null && temp >= 85);
+    setPcie(G("pcie"), g ? g.pcie : null);
+    if (!g) G("pcie").title = "PCIe link: needs the guest";
+    sec.classList.toggle("crit", temp != null && temp >= 85);
+    sec.classList.toggle("warn", running && !guestUp && !(temp != null && temp >= 85));
   }
 
   /* ---------------- models ---------------- */
@@ -422,6 +622,7 @@
     setText($(".pill-text", p), label);
     p.title = s.status.reasons.join("\n") || "all checks passing";
     const ban = $("#banner");
+    if (!document.body.classList.contains("stale")) ban.classList.remove("banner-switch");
     if (lvl !== "ok" && s.status.reasons.length && !document.body.classList.contains("stale")) {
       ban.hidden = false;
       setText(ban, s.status.reasons.join(" · "));
@@ -439,29 +640,54 @@
     f.classList.toggle("stale", stale);
     document.body.classList.toggle("stale", stale);
     const at = new Date(state.lastTs * 1000).toLocaleTimeString("en-GB", { hour12: false });
+    const hv = hvOf(state.snap);
+    const mp = $("#mode-pill");
     if (stale) {
       setText(t, `${state.connected ? "STALE" : "RECONNECTING"} · last ${at} (${fmt.age(age)} ago)`);
       const ban = $("#banner");
       ban.hidden = false;
       ban.style.color = ban.style.borderColor = "";
-      setText(ban, `Live stream ${state.connected ? "stalled" : "disconnected"}; reconnecting. Values shown are from ${at} and may be out of date.`);
+      const sw = switchSuspected();
+      ban.classList.toggle("banner-switch", sw);
+      if (sw) {
+        const last = str(hv.phase) || (hv.mode === "game" ? "game mode" : "—");
+        const dir = dirText(hv.direction);
+        setText(ban, `Walter restarting — GPU mode switch in progress (last phase: ${last}${dir ? ", " + dir : ""}). This takes a few minutes; reconnecting automatically. Values shown are from ${at}.`);
+        mp.className = "pill mode mode-switching";
+        setText($(".pill-text", mp), "WALTER RESTARTING");
+      } else {
+        setText(ban, `Live stream ${state.connected ? "stalled" : "disconnected"}; reconnecting. Values shown are from ${at} and may be out of date.`);
+      }
       const p = $("#status-pill");
       p.className = "pill pill-wait";
       setText($(".pill-text", p), "STALE DATA");
     } else {
       setText(t, `live · updated ${age < 1.5 ? "just now" : Math.round(age) + "s ago"}`);
     }
+    // relative "since" times keep counting between snapshots
+    if (hv && !mp.hidden) mp.title = modeTitle(hv);
+    const gs = $('#gaming [data-g="since"]');
+    if (hv && gs) { const a = hv.mode === "game" ? sinceAge(hv.since) : null; setText(gs, a == null ? "—" : fmt.age(a)); }
   }
 
   /* ---------------- main render ---------------- */
   function render(s, fromStream) {
+    state.prev = state.snap;
     state.snap = s;
     state.lastTs = s.ts;
     state.lastRecv = Date.now();
     if (fromStream) for (const [k, v] of Object.entries(s.spark || {})) pushHist(k, Math.floor(s.ts), v);
+    // gaming GPU util is not in snapshot.spark; extend history.gpu_gaming from the live value (pushHist dedupes by ts)
+    const hv = hvOf(s), prevMode = hvOf(state.prev) && state.prev.hypervisor.mode;
+    // entering game mode without a reload: fetch the gaming GPU's 30 min history once
+    if (fromStream && hv && hv.mode === "game" && prevMode && prevMode !== "game") refreshHistory();
+    if (fromStream && hv && hv.gpu && hv.vm && hv.vm.guest_up) pushHist("gpu_gaming", Math.floor(s.ts), fin(hv.gpu.util));
     document.body.classList.remove("stale");
     renderStatus(s);
+    renderMode(s);
     (s.gpus || []).forEach(renderGpu);
+    renderGpuSlots(s);
+    renderGaming(s);
     renderModels(s);
     renderGateway(s);
     renderHost(s);
@@ -476,6 +702,31 @@
   }
 
   /* ---------------- data ---------------- */
+  function applyHistory(h) {
+    if (!h || !h.series) return;
+    state.window = h.window_s || state.window;
+    for (const [k, arr] of Object.entries(h.series)) if (Array.isArray(arr)) state.hist[k] = arr.filter((p) => p[1] != null);
+  }
+  // after a long outage (e.g. Walter restarted for a GPU mode switch) refill the sparkline gaps from Prometheus
+  async function refreshHistory() {
+    try {
+      const r = await fetch("/api/v1/telemetry", { cache: "no-store", credentials: "same-origin" });
+      if (!r.ok) return;
+      const d = await r.json();
+      const live = { ...state.hist };
+      applyHistory(d.history);
+      // keep live points newer than the fetched history
+      for (const [k, arr] of Object.entries(live)) {
+        const h = state.hist[k];
+        if (h === arr) continue;
+        const lastT = h.length ? h[h.length - 1][0] : -Infinity;
+        for (const p of arr) if (p[0] > lastT) h.push(p);
+      }
+    } catch (e) {
+      console.warn("history refresh failed:", e.message);
+    }
+  }
+
   async function loadInitial() {
     try {
       const r = await fetch("/api/v1/telemetry", { cache: "no-store", credentials: "same-origin" });
@@ -487,33 +738,41 @@
         v.textContent = d.viewer.email || d.viewer.user;
         v.title = "signed in via Pocket-ID";
       }
-      if (d.history && d.history.series) {
-        state.window = d.history.window_s || state.window;
-        for (const [k, arr] of Object.entries(d.history.series)) state.hist[k] = arr.filter((p) => p[1] != null);
-      }
+      applyHistory(d.history);
       if (d.snapshot && d.snapshot.ts) render(d.snapshot, true);
     } catch (e) {
       console.warn("initial load failed:", e.message);
     }
   }
 
-  let backoff = 1000;
+  let backoff = 1000, retryTimer = 0, downSince = 0;
   function connect() {
+    clearTimeout(retryTimer);
+    retryTimer = 0;
     if (state.es) state.es.close();
     const es = new EventSource("/api/v1/stream");
     state.es = es;
-    es.addEventListener("open", () => { state.connected = true; backoff = 1000; tickFresh(); });
+    es.addEventListener("open", () => {
+      state.connected = true;
+      backoff = 1000;
+      if (downSince && Date.now() - downSince > 60000) refreshHistory();
+      downSince = 0;
+      tickFresh();
+    });
     es.addEventListener("snapshot", (ev) => {
       state.connected = true;
       try { render(JSON.parse(ev.data), true); } catch (e) { console.warn("bad snapshot", e); }
     });
     es.addEventListener("error", () => {
+      if (es !== state.es) return;
       state.connected = false;
+      if (!downSince) downSince = Date.now();
       tickFresh();
-      if (es.readyState === EventSource.CLOSED) {
-        // browser gave up (e.g. edge returned non-2xx): retry ourselves with backoff
-        setTimeout(connect, backoff);
-        backoff = Math.min(backoff * 2, 30000);
+      if (es.readyState === EventSource.CLOSED && !retryTimer) {
+        // browser gave up (e.g. edge returned non-2xx): retry ourselves with backoff. During a GPU mode switch
+        // Walter is expected back within minutes, so poll more eagerly (cap 5 s instead of 30 s).
+        retryTimer = setTimeout(connect, backoff);
+        backoff = Math.min(backoff * 2, switchSuspected() ? 5000 : 30000);
       }
     });
   }

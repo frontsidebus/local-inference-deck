@@ -44,6 +44,8 @@ jobs:
         run: python3 -m pytest walter/tests walter/firewall/tests -q -p no:cacheprovider
       - name: gateway tests
         run: python3 -m pytest walter/gateway/tests -q -p no:cacheprovider
+      - name: gaming exporter tests (hypervisor/gaming)
+        run: python3 -m pytest hypervisor/gaming/tests -q -p no:cacheprovider
       - name: sanitizer tests (scripts/ shims and tools/deck-tools engines)
         run: python3 -m pytest scripts/tests -q -p no:cacheprovider
       # tools/tests also covers bin/deck evals / install evals / check against a fake sec-evals checkout, and C1

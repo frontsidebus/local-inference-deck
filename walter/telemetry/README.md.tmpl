@@ -25,7 +25,7 @@ Tests live in the repo only (`walter/telemetry/tests`, not deployed): `python3 -
 They need starlette, httpx and uvicorn installed locally; otherwise they are skipped.
 
 ## How it works
-- One collector loop. llama-swap `/running` is polled every 2 s, the fast PromQL set every 4 s (Prometheus scrapes every 15 s),
+- One collector loop. llama-swap `/running` is polled every 2 s, the fast PromQL set every 4 s (Prometheus scrapes every 15 s, the `hypervisor` job every 5 s),
   the slow set (latency, 1 h totals, per-key today, probes, up, alerts) every 15 s, and range queries every 30 s.
   The JSON is serialised once per cycle and every HTTP/SSE client gets the same bytes, so N viewers add no Prometheus load.
 - Host networking is used because Prometheus listens only on 127.0.0.1:9090 (host network). There is no monitoring docker
@@ -42,6 +42,36 @@ They need starlette, httpx and uvicorn installed locally; otherwise they are ski
   - `· below x8` (yellow): the width is below `TELEMETRY_GPU_EXPECTED_WIDTH` (see Configuration). This is the only warning,
     and with the setting unset there is none.
 - X-Forwarded-User/Email are only displayed, after being sanitised. They are never used for authorisation.
+
+## Hypervisor and gaming VM
+The host runs a `gaming-exporter` user service (see `hypervisor/gaming/`) on `${HYPERVISOR_BRIDGE_IP}:9188`. Walter's Prometheus
+scrapes it as job `hypervisor` every 5 s; only Walter can reach that port. Walter never contacts the gaming guest: the
+exporter polls the guest over ssh and parses the output strictly as numbers.
+- Source: the `hv_*` series. The GPU mode and switch phase come from the host's gpu-mode state file and lock, the VM
+  numbers from libvirt, and the passthrough GPU numbers (utilisation, encoder, VRAM, temperature, power, clocks, fan,
+  PCIe gen/width), Sunshine and streaming from the guest. Guest and GPU series exist only while the guest answers, so
+  a missing series shows as "no data", never as 0. VM disk/network/CPU rates are `rate(...[30s])`.
+- Cadence: all `hv_*` queries are in the fast set (4 s) and every published snapshot goes to every SSE client. A mode
+  change therefore reaches open dashboards within about 10 s (5 s scrape + 4 s query + 2 s publish).
+- The server builds `snapshot.hypervisor` (`up`, `mode` = `ai`/`game`/`switching`/`unknown`, `direction`, `phase`,
+  `since`, `label`, `host_cpus`, `vm`, `gpu`) and the 30 min history series `gpu_gaming`; the browser only displays them.
+  Viewers see an AI MODE / GAME MODE / `SWITCHING → GAME · <phase>` chip and, in game mode, the gaming VM and its GPU.
+  `mode` is `unknown` (label HYPERVISOR OFFLINE) whenever `up{job="hypervisor"}` isn't 1, and then no VM or GPU data is
+  shown, so a stopped exporter never leaves stale numbers on screen. Walter's own GPU list is unchanged: in game mode
+  it simply reports only the GPU Walter still has.
+- Label values partly originate in the gaming guest, so the app treats them as untrusted: mode, phase, direction and VM
+  state are allow-listed (anything else becomes `unknown`/null), the GPU name is cut to 64 characters of `[A-Za-z0-9 ._-]`,
+  and non-numeric values become null.
+- During a switch, Walter itself is shut down, reconfigured and restarted (phases `walter-shutdown` to `walter-start`),
+  so this dashboard is unreachable for part of it. The page reconnects by itself once Walter is back, then shows the
+  remaining phases and the final mode. That gap is expected and needs no fix.
+- If the exporter isn't installed, the `hypervisor` target is down: the app shows HYPERVISOR OFFLINE and the target
+  counts in the "scrape target down" status reason like any other.
+
+**Privacy.** Every telemetry viewer (all `SPARK_USERS`, behind OIDC) can see whether the owner's machine is in game mode,
+since when, whether a switch is running, and whether a Moonlight client is streaming right now, plus the game's GPU load.
+That is information about the owner's activity, not just the stack's health. If that shouldn't be visible to everyone with
+telemetry access, don't install the gaming exporter (or remove the `hypervisor` scrape job); the panel then shows offline.
 
 ## Configuration
 Environment of the `app` service in `compose.yaml` (change it there, then `sudo docker compose up -d`):
@@ -89,6 +119,7 @@ or with `--rebuild`; otherwise it runs a plain `up -d`. Each run prints `rebuild
 |---|---|
 | dashboard shows no model state, or `llama-swap` errors in the app log | the key copy is stale after a rotation: re-copy it (above) |
 | GPU / request panels empty | Prometheus down or targets missing: see `/srv/monitoring/README.md` |
+| gaming panel says HYPERVISOR OFFLINE | `up{job="hypervisor"}` is 0: on the host, `systemctl --user status gaming-exporter`; from Walter, `curl -fsS http://${HYPERVISOR_BRIDGE_IP}:9188/metrics` (the host nft guard admits only Walter) |
 | backup tile stale | `sudo docker compose ps backup-status` (healthy?) and `${MODELS_DIR}/backups/LAST_OK` |
 | 502 / 504 at `https://${SPARK_TELEMETRY_HOST}` | the app or the tunnel is down: `curl http://${BACKEND_WG_IP}:3200/healthz` from Covenant, `sudo wg show` on both sides |
 

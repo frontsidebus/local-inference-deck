@@ -1,0 +1,17 @@
+#!/usr/sbin/nft -f
+# Gaming exporter guard (rendered and installed by gaming-setup.sh, step exporter, as
+# /etc/gaming-exporter-guard.nft and loaded at boot by gaming-exporter-guard.service). Only the backend
+# VM (${BACKEND_LAN_IP}) may reach the gaming exporter (${HYPERVISOR_BRIDGE_IP}:9188); the host itself
+# may use loopback. A standalone table with policy accept and one drop rule: no forward hook, no other
+# port, never a ruleset flush, so libvirt NAT, Docker and the other guard tables are unaffected.
+# The first two lines make a reload replace the table atomically instead of adding duplicate rules.
+table inet gaming_exporter_guard
+delete table inet gaming_exporter_guard
+table inet gaming_exporter_guard {
+  chain input {
+    type filter hook input priority 0; policy accept;
+    iifname "lo" tcp dport 9188 accept
+    ip saddr ${BACKEND_LAN_IP} ip daddr ${HYPERVISOR_BRIDGE_IP} tcp dport 9188 counter accept
+    tcp dport 9188 counter drop
+  }
+}

@@ -64,6 +64,16 @@ scrape_configs:
       - targets: ["${BACKEND_WG_IP}:4000"]
         labels: { instance: walter }
 
+  # Host (hypervisor) gaming-exporter: GPU mode (AI/split, switch phase) + gaming VM/guest GPU (hv_*).
+  # Fixed port 9188, reachable only from Walter (host nft table gaming_exporter_guard). Down when the
+  # exporter isn't installed on the host, which is fine. 5 s so the telemetry app sees mode switches quickly.
+  - job_name: hypervisor
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    static_configs:
+      - targets: ["${HYPERVISOR_BRIDGE_IP}:9188"]
+        labels: { instance: hypervisor }
+
   # Blackbox HTTP probes. External ones go Walter -> internet -> Covenant nginx -> wg0 -> Walter,
   # so they test the whole public path, TLS included.
   - job_name: blackbox-http
