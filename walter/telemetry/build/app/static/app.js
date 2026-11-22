@@ -67,31 +67,57 @@
     return n;
   };
 
+  /* ---------------- DOM writes ----------------
+     Render cost: every write below is skipped when the value is unchanged, so a snapshot that changes nothing
+     restyles / relayouts / repaints nothing and never restarts a CSS transition or animation. */
+  function setText(node, text) {
+    if (node && node.textContent !== text) node.textContent = text;
+  }
+  function setClass(node, cls) {
+    if (node && node.className !== cls) node.className = cls;
+  }
+  function setAttr(node, k, v) {
+    if (!node) return;
+    if (v == null) { if (node.hasAttribute(k)) node.removeAttribute(k); }
+    else if (node.getAttribute(k) !== String(v)) node.setAttribute(k, v);
+  }
+  function setTitle(node, t) {
+    if (node && node.title !== t) node.title = t;
+  }
+  function setStyle(node, prop, v) {
+    if (node && node.style[prop] !== v) node.style[prop] = v;
+  }
+  // rebuild a container's children only when the data they show changed (key = serialised inputs)
+  function swap(node, key, build) {
+    if (!node || node._key === key) return;
+    node._key = key;
+    node.replaceChildren(...build());
+  }
+
   /* ---------------- animated numbers ---------------- */
   const tweens = new WeakMap();
   function setNum(node, value, formatter) {
     if (!node) return;
     const prev = node._v;
     node._v = value;
-    if (value == null || prev == null || reduced || typeof value !== "number" || prev === value) {
-      node.textContent = formatter(value);
-      if (prev != null && value != null && prev !== value && !reduced) pulse(node);
+    const old = tweens.get(node);
+    if (old) { cancelAnimationFrame(old); tweens.delete(node); }
+    const to = formatter(value);
+    // no tween (and no rAF frames) when nothing visible would move
+    if (value == null || prev == null || reduced || document.hidden || typeof value !== "number" || typeof prev !== "number" || formatter(prev) === to) {
+      if (node.textContent !== to && prev != null && value != null && typeof value !== "number" && !reduced) pulse(node);
+      setText(node, to);
       return;
     }
-    const start = performance.now(), dur = 700, from = prev;
-    const old = tweens.get(node);
-    if (old) cancelAnimationFrame(old);
+    const start = performance.now(), dur = 600, from = prev;
     const step = (t) => {
       const k = Math.min(1, (t - start) / dur);
       const e = 1 - Math.pow(1 - k, 3);
-      node.textContent = formatter(from + (value - from) * e);
+      setText(node, k < 1 ? formatter(from + (value - from) * e) : to);
       if (k < 1) tweens.set(node, requestAnimationFrame(step));
-      else node.textContent = formatter(value);
+      else tweens.delete(node);
     };
     tweens.set(node, requestAnimationFrame(step));
-  }
-  function setText(node, text) {
-    if (node && node.textContent !== text) node.textContent = text;
   }
   function pulse(node) {
     node.classList.remove("flash");
@@ -204,30 +230,32 @@
     const common = { cx: 80, cy: 80, r: R, "stroke-dasharray": `${ARCLEN} ${C}` };
     g.append(svg("circle", { ...common, class: "g-track" }));
     g.append(svg("circle", { cx: 80, cy: 80, r: R, class: "g-tick", "stroke-dasharray": `1 ${(ARCLEN / 27 - 1).toFixed(2)}` }));
+    const glow2 = svg("circle", { ...common, class: "g-glow g-glow2", "stroke-dashoffset": ARCLEN });
+    const glow = svg("circle", { ...common, class: "g-glow", "stroke-dashoffset": ARCLEN });
     const val = svg("circle", { ...common, class: "g-val", "stroke-dashoffset": ARCLEN });
-    g.append(val);
+    g.append(glow2, glow, val);
     gauge.append(g, el("div", { class: "gauge-c" },
       el("div", { class: "num", [attr]: "util" }, "—"),
       el("div", { class: "kpi-l mono" }, "util %")));
-    gauge._val = val;
+    gauge._arcs = [glow2, glow, val];
     return gauge;
   }
   function setGauge(gauge, util) {
     const u = Math.max(0, Math.min(100, util || 0));
-    gauge._val.setAttribute("stroke-dashoffset", (ARCLEN * (1 - u / 100)).toFixed(1));
-    gauge.classList.toggle("hot", u >= 90);
+    const off = (ARCLEN * (1 - u / 100)).toFixed(1);
+    for (const a of gauge._arcs) setAttr(a, "stroke-dashoffset", off);
+    if (gauge.classList.contains("hot") !== u >= 90) gauge.classList.toggle("hot", u >= 90);
   }
   // PCIe chip: label/level/title are decided server-side (main.py pcie_describe); nothing is assumed about the slot here.
   function setPcie(pc, p) {
     if (p && typeof p === "object") {
       setText(pc, p.label || `PCIe ${p.gen ? `Gen${p.gen} ` : ""}x${p.width}`);
-      pc.title = p.title || "PCIe link";
-      pc.classList.toggle("chip-note", p.level === "info" || p.level === "muted");
-      pc.classList.toggle("chip-warn", p.level === "warn");
+      setTitle(pc, p.title || "PCIe link");
+      setClass(pc, "chip chip-info" + (p.level === "info" || p.level === "muted" ? " chip-note" : "") + (p.level === "warn" ? " chip-warn" : ""));
     } else {
       setText(pc, "PCIe n/a");
-      pc.title = "PCIe link: not readable";
-      pc.classList.remove("chip-note", "chip-warn");
+      setTitle(pc, "PCIe link: not readable");
+      setClass(pc, "chip chip-info");
     }
   }
   function buildGpu(card, idx) {
@@ -250,6 +278,18 @@
     card._built = true;
   }
 
+  // meter fill: scaleX on the bar (compositor-animated transition, no relayout); written only when it changes
+  function setFill(m, pct) {
+    setStyle(m.firstChild, "transform", `scaleX(${(Math.max(0, Math.min(100, pct || 0)) / 100).toFixed(3)})`);
+  }
+  // crit pulse lives on a child layer (opacity animation) instead of an animated box-shadow on the panel
+  function setCrit(panel, on) {
+    if (panel.classList.contains("crit") === on) return;
+    if (on && !panel.querySelector(":scope > .panel-glow")) panel.append(el("i", { class: "panel-glow", "aria-hidden": "true" }));
+    panel.classList.toggle("crit", on);
+  }
+  const toggle = (node, cls, on) => { if (node.classList.contains(cls) !== on) node.classList.toggle(cls, on); };
+
   function renderGpu(g) {
     const card = $(`#gpu${g.index}`);
     if (!card) return;
@@ -263,17 +303,17 @@
     const pct = used != null && tot ? (used / tot) * 100 : 0;
     setText(f("vramtxt"), used != null && tot ? `${(used / 1024).toFixed(1)} / ${(tot / 1024).toFixed(1)} GiB · ${Math.round(pct)}%` : "—");
     const m = f("vram");
-    m.firstChild.style.width = pct.toFixed(1) + "%";
-    m.classList.toggle("hot", pct >= 95);
+    setFill(m, pct);
+    toggle(m, "hot", pct >= 95);
 
     setNum(f("temp"), g.temp_c, fmt.int);
     setNum(f("power"), g.power_w, fmt.int);
     setNum(f("fan"), g.fan_pct, fmt.int);
     setNum(f("clock"), g.sm_clock_mhz, fmt.int);
     const tempBox = card.querySelector('[data-s="temp"]');
-    tempBox.classList.toggle("hot", g.temp_c >= 78 && g.temp_c < 85);
-    tempBox.classList.toggle("crit", g.temp_c >= 85);
-    card.classList.toggle("crit", g.temp_c >= 85);
+    toggle(tempBox, "hot", g.temp_c >= 78 && g.temp_c < 85);
+    toggle(tempBox, "crit", g.temp_c >= 85);
+    setCrit(card, g.temp_c >= 85);
 
     setPcie(f("pcie"), g.pcie);
 
@@ -319,12 +359,12 @@
   function renderMode(s) {
     const p = $("#mode-pill");
     const hv = hvOf(s);
-    p.hidden = !hv;
+    if (p.hidden !== !hv) p.hidden = !hv;
     if (!hv) return;
     const mode = hvMode(hv);
-    p.className = `pill mode mode-${mode}`;
+    setClass(p, `pill mode mode-${mode}`);
     setText($(".pill-text", p), mode === "unknown" ? "HYPERVISOR OFFLINE" : str(hv.label) || `${mode.toUpperCase()} MODE`);
-    p.title = modeTitle(hv);
+    setTitle(p, modeTitle(hv));
   }
 
   /* Walter GPU slots. index.html has one static section per Walter GPU (gpu0, gpu1). In game mode the hypervisor
@@ -348,14 +388,14 @@
       card.append(card._lent);
     }
     const L = (k) => card._lent.querySelector(`[data-l="${k}"]`);
-    card.classList.toggle("is-lent", kind === "lent");
-    card.classList.toggle("is-missing", kind === "missing");
-    card.setAttribute("aria-labelledby", kind ? `gpu${idx}-lent-h` : `gpu${idx}-h`);
+    toggle(card, "is-lent", kind === "lent");
+    toggle(card, "is-missing", kind === "missing");
+    setAttr(card, "aria-labelledby", kind ? `gpu${idx}-lent-h` : `gpu${idx}-h`);
     if (!kind) return;
-    card.classList.remove("crit");
+    setCrit(card, false);
     const hv = hvOf(s);
     if (kind === "lent") {
-      card._lent.setAttribute("href", "#gaming");
+      setAttr(card._lent, "href", "#gaming");
       const switching = hv.mode === "switching";
       setText(L("name"), switching ? "· in transit" : "· lent");
       setText(L("chip"), "VFIO → gaming VM");
@@ -368,15 +408,15 @@
       setText(L("live"), g && vm && vm.guest_up
         ? `in guest · ${fmt.int(fin(g.util))}% util · ${fmt.int(fin(g.temp))} °C · ${fmt.int(fin(g.power))} W`
         : vm && vm.running ? "guest booting / unreachable" : `VM ${str(vm && vm.state) || "not running"}`);
-      L("cta").hidden = false;
+      if (L("cta").hidden) L("cta").hidden = false;
     } else {
-      card._lent.removeAttribute("href");
+      setAttr(card._lent, "href", null);
       setText(L("name"), "· not reported");
       setText(L("chip"), "no data");
       setText(L("big"), `GPU${idx} not reported`);
       setText(L("sub"), `DCGM reports ${(s.gpus || []).length} GPU(s) and not this one${hv && hv.mode === "unknown" ? "; GPU mode unknown (hypervisor offline), it may be lent to the gaming VM" : ""}. The card comes back when the GPU does.`);
       setText(L("live"), "");
-      L("cta").hidden = true;
+      if (!L("cta").hidden) L("cta").hidden = true;
     }
   }
   function renderGpuSlots(s) {
@@ -390,14 +430,13 @@
   }
 
   function setChip(node, cls, text, title) {
-    node.className = `chip chip-st ${cls}`;
+    setClass(node, `chip chip-st ${cls}`);
     setText(node, text);
-    node.title = title || "";
+    setTitle(node, title || "");
   }
   function setMeter(m, pct, hotAt) {
-    const v = pct == null ? 0 : Math.max(0, Math.min(100, pct));
-    m.firstChild.style.width = v.toFixed(1) + "%";
-    m.classList.toggle("hot", pct != null && pct >= hotAt);
+    setFill(m, pct == null ? 0 : pct);
+    toggle(m, "hot", pct != null && pct >= hotAt);
   }
 
   function renderGaming(s) {
@@ -405,7 +444,7 @@
     const hv = hvOf(s);
     const vm = hv && hv.vm && typeof hv.vm === "object" ? hv.vm : null;
     const show = !!hv && (lending(hv) || (!!vm && vm.running === true));
-    sec.hidden = !show;
+    if (sec.hidden !== !show) sec.hidden = !show;
     if (!show) return;
     const G = (k) => sec.querySelector(`[data-g="${k}"]`);
     if (!sec._gauge) {
@@ -418,7 +457,7 @@
     // header
     setText(G("tag"), vm ? `${str(vm.state) || "?"} · ${fmt.int(fin(vm.vcpus))} vCPU` : "VM not reported");
     const sw = G("switch");
-    sw.hidden = hv.mode !== "switching";
+    if (sw.hidden !== (hv.mode !== "switching")) sw.hidden = hv.mode !== "switching";
     if (hv.mode === "switching") {
       const lbl = str(hv.label) || "switching", ph = str(hv.phase);
       setText(sw, `GPU mode switch in progress · ${lbl}${ph && !lbl.includes(ph) ? " · phase " + ph : ""}`);
@@ -446,9 +485,9 @@
 
     // GPU (from inside the guest: only present while the guest is up; no zeros when it is not)
     const g = guestUp && hv.gpu && typeof hv.gpu === "object" ? hv.gpu : null;
-    G("gpu").classList.toggle("is-off", !g);
-    G("off").hidden = !!g;
-    G("gpu-main").hidden = !g;
+    toggle(G("gpu"), "is-off", !g);
+    if (G("off").hidden !== !!g) G("off").hidden = !!g;
+    if (G("gpu-main").hidden !== !g) G("gpu-main").hidden = !g;
     if (!g) setText(G("off"), !running ? `VM ${str(vm && vm.state) || "not running"}: no GPU telemetry`
       : !guestUp ? "guest booting / unreachable · GPU telemetry comes from inside the guest"
       : "guest up, GPU not reported");
@@ -471,17 +510,22 @@
     setNum(G("fan"), g ? fin(g.fan) : null, fmt.int);
     setNum(G("clock"), g ? fin(g.sm_clock) : null, fmt.int);
     const tb = sec.querySelector('[data-s="temp"]');
-    tb.classList.toggle("hot", temp != null && temp >= 78 && temp < 85);
-    tb.classList.toggle("crit", temp != null && temp >= 85);
+    toggle(tb, "hot", temp != null && temp >= 78 && temp < 85);
+    toggle(tb, "crit", temp != null && temp >= 85);
     setPcie(G("pcie"), g ? g.pcie : null);
-    if (!g) G("pcie").title = "PCIe link: needs the guest";
-    sec.classList.toggle("crit", temp != null && temp >= 85);
-    sec.classList.toggle("warn", running && !guestUp && !(temp != null && temp >= 85));
+    if (!g) setTitle(G("pcie"), "PCIe link: needs the guest");
+    setCrit(sec, temp != null && temp >= 85);
+    toggle(sec, "warn", running && !guestUp && !(temp != null && temp >= 85));
   }
 
   /* ---------------- models ---------------- */
   function renderModels(s) {
-    const tb = $("#models-tbl tbody");
+    swap($("#models-tbl tbody"), JSON.stringify(s.models || []), () => modelRows(s));
+    const ready = (s.models || []).filter((m) => m.state === "ready").length;
+    setText($("#models-tag"), `${ready} loaded · tok/s over 10m`);
+    setNum($('[data-k="tps"]'), s.spark.tps, fmt.n1);
+  }
+  function modelRows(s) {
     const rows = (s.models || []).map((m) => {
       const loaded = m.state !== "unloaded";
       const busy = (m.processing || 0) > 0;
@@ -498,10 +542,7 @@
             busy && m.decode_calls_s ? el("span", { class: "sts", text: ` · ${fmt.n1(m.decode_calls_s)} st/s` }) : null) : "—"));
     });
     if (!rows.length) rows.push(el("tr", { class: "empty-row" }, el("td", { colspan: 6, text: "no models reported" })));
-    tb.replaceChildren(...rows);
-    const ready = (s.models || []).filter((m) => m.state === "ready").length;
-    setText($("#models-tag"), `${ready} loaded · tok/s over 10m`);
-    setNum($('[data-k="tps"]'), s.spark.tps, fmt.n1);
+    return rows;
   }
 
   /* ---------------- gateway ---------------- */
@@ -514,12 +555,12 @@
     setText($('[data-k="ttft"]'), fmt.secs(g.ttft_p50_s));
     setNum($('[data-k="req1h"]'), g.requests_1h, fmt.int);
     setNum($('[data-k="err1h"]'), g.errors_1h, fmt.int);
-    $('[data-k="err1h"]').parentElement.classList.toggle("bad", (g.errors_1h || 0) > 0);
+    toggle($('[data-k="err1h"]').parentElement, "bad", (g.errors_1h || 0) > 0);
     setText($('[data-k="tin"]'), fmt.si(g.tokens_in_1h));
     setText($('[data-k="tout"]'), fmt.si(g.tokens_out_1h));
     const since = g.today_since ? new Date(g.today_since) : null;
     setText($("#today-since"), since ? `· since ${since.toISOString().slice(11, 16)} UTC` : "");
-    const tb = $("#keys-tbl tbody");
+    swap($("#keys-tbl tbody"), JSON.stringify(g.keys_today || []), () => {
     const rows = (g.keys_today || []).map((k) => el("tr", {},
       el("td", { text: k.alias }),
       el("td", { class: "r", text: fmt.int(k.requests) }),
@@ -527,14 +568,15 @@
       el("td", { class: "r", text: fmt.si(k.tokens_in) }),
       el("td", { class: "r", text: fmt.si(k.tokens_out) })));
     if (!rows.length) rows.push(el("tr", { class: "empty-row" }, el("td", { colspan: 5, text: "no requests today" })));
-    tb.replaceChildren(...rows);
+    return rows;
+    });
   }
 
   /* ---------------- host ---------------- */
   function bar(label, used, total, extra) {
     const pct = total ? (used / total) * 100 : 0;
     const m = el("div", { class: "meter" + (pct >= 90 ? " crit" : pct >= 80 ? " hot" : "") }, el("i"));
-    m.firstChild.style.width = pct.toFixed(1) + "%";
+    setFill(m, pct);
     return el("div", {},
       el("div", { class: "meter-l" }, el("span", { text: label }), el("span", {}, el("b", { text: `${fmt.bytes(used)}` }), ` / ${fmt.bytes(total)} · ${Math.round(pct)}%${extra || ""}`)),
       m);
@@ -542,54 +584,61 @@
   function renderHost(s) {
     const h = s.host || {};
     setNum($('[data-k="cpu"]'), h.cpu_pct, fmt.n1);
-    const bars = [];
-    if (h.mem_total) bars.push(bar("RAM", h.mem_used, h.mem_total));
-    for (const d of h.disks || []) bars.push(bar(`disk ${d.mount}`, d.used, d.size));
-    // update widths in place to keep the transition
     const wrap = $("#host-bars");
-    if (wrap.children.length === bars.length) {
-      bars.forEach((b, i) => {
-        const old = wrap.children[i];
-        old.querySelector(".meter-l").replaceWith(b.querySelector(".meter-l"));
-        const om = old.querySelector(".meter"), nm = b.querySelector(".meter");
-        om.className = nm.className;
-        om.firstChild.style.width = nm.firstChild.style.width;
-      });
-    } else wrap.replaceChildren(...bars);
-    const net = $("#host-net");
+    const bkey = JSON.stringify([h.mem_total, h.mem_used, h.disks || []]);
+    if (wrap._key !== bkey) {
+      wrap._key = bkey;
+      const bars = [];
+      if (h.mem_total) bars.push(bar("RAM", h.mem_used, h.mem_total));
+      for (const d of h.disks || []) bars.push(bar(`disk ${d.mount}`, d.used, d.size));
+      // update fills in place to keep the transition
+      if (wrap.children.length === bars.length) {
+        bars.forEach((b, i) => {
+          const old = wrap.children[i];
+          old.querySelector(".meter-l").replaceWith(b.querySelector(".meter-l"));
+          const om = old.querySelector(".meter"), nm = b.querySelector(".meter");
+          setClass(om, nm.className);
+          setStyle(om.firstChild, "transform", nm.firstChild.style.transform);
+        });
+      } else wrap.replaceChildren(...bars);
+    }
+    swap($("#host-net"), JSON.stringify([h.load1, h.net || []]), () => {
     const cells = [el("div", {}, el("dt", { text: "load 1m" }), el("dd", { class: "num-s", text: h.load1 != null ? h.load1.toFixed(2) : "—" }))];
     for (const n of h.net || []) {
       cells.push(el("div", { title: `${n.dev}: receive / transmit` }, el("dt", { text: `${n.dev} ↓ / ↑` }),
         el("dd", { class: "num-s net" }, el("span", { text: fmt.rate(n.rx_bps) }), el("span", { class: "muted", text: fmt.rate(n.tx_bps) }))));
     }
-    net.replaceChildren(...cells);
+    return cells;
+    });
   }
 
   /* ---------------- services, alerts ---------------- */
   function renderServices(s) {
-    const list = $("#svc-list");
+    swap($("#svc-list"), JSON.stringify(s.services || []), () => {
     const items = (s.services || []).map((v) => el("li", { class: "svc" + (v.up ? "" : " down"), title: v.cert_days != null ? `TLS cert: ${Math.round(v.cert_days)} days left` : null },
       el("span", { class: "ic", "aria-hidden": "true", text: v.up ? "▲" : "✕" }),
       el("span", { class: "nm" }, `${v.name}`, el("small", { text: v.scope })),
       el("span", { class: "lat", text: v.up ? `${v.latency_ms < 10 ? v.latency_ms.toFixed(1) : Math.round(v.latency_ms)} ms` : `DOWN${v.status ? " " + v.status : ""}` }),
       el("span", { class: "sr-only", hidden: "", text: v.up ? "up" : "down" })));
     if (!items.length) items.push(el("li", { class: "muted mono", text: "no probe data" }));
-    list.replaceChildren(...items);
+    return items;
+    });
     const t = s.targets || {};
     setText($("#targets-tag"), `${t.up ?? "—"}/${t.total ?? "—"} targets up`);
-    $("#targets-tag").style.color = t.down && t.down.length ? "var(--cp-red)" : "";
-    $("#targets-tag").title = (t.down || []).join(", ");
+    setStyle($("#targets-tag"), "color", t.down && t.down.length ? "var(--cp-red)" : "");
+    setTitle($("#targets-tag"), (t.down || []).join(", "));
 
-    const al = $("#alert-list");
     const firing = (s.alerts && s.alerts.firing) || [];
     const pending = (s.alerts && s.alerts.pending) || [];
+    swap($("#alert-list"), JSON.stringify([firing, pending]), () => {
     const rows = [...firing, ...pending].map((a) => el("li", { class: `alert ${a.state === "pending" ? "pending" : a.severity === "critical" ? "" : "warning"}` },
       el("span", { class: "ic", "aria-hidden": "true", text: a.state === "pending" ? "◷" : "⚠" }),
       el("div", {}, el("b", { text: a.name }), el("span", { class: "sev", text: `${a.severity} · ${a.state}` })),
       el("p", { text: a.summary || "" })));
     if (!rows.length) rows.push(el("li", { class: "all-clear", text: "no alerts firing or pending" }));
-    al.replaceChildren(...rows);
-    $(".services").classList.toggle("crit", firing.length > 0 || (s.services || []).some((v) => !v.up));
+    return rows;
+    });
+    setCrit($(".services"), firing.length > 0 || (s.services || []).some((v) => !v.up));
   }
 
   /* ---------------- backup + sources ---------------- */
@@ -600,16 +649,15 @@
       setText($("#bk-name"), b.name);
       setText($("#bk-age"), fmt.age(b.age_s));
       const cls = b.age_s < 36 * 3600 ? "bk-ok" : b.age_s < 72 * 3600 ? "bk-old" : "bk-bad";
-      tag.className = "tag mono " + cls;
+      setClass(tag, "tag mono " + cls);
       setText(tag, cls === "bk-ok" ? "✓ fresh" : cls === "bk-old" ? "⚠ aging" : "✕ overdue");
     } else {
       setText($("#bk-name"), "unavailable");
       setText($("#bk-age"), "—");
-      tag.className = "tag mono bk-bad";
+      setClass(tag, "tag mono bk-bad");
       setText(tag, "✕ unknown");
     }
-    const src = $("#sources");
-    src.replaceChildren(...Object.entries(s.sources || {}).map(([k, v]) =>
+    swap($("#sources"), JSON.stringify(s.sources || {}), () => Object.entries(s.sources || {}).map(([k, v]) =>
       el("span", { class: "src" + (v.ok ? "" : " bad"), title: v.ok ? (v.latency_ms != null ? `${v.latency_ms} ms` : "ok") : v.error || "error", text: k.replace("_", "-") })));
   }
 
@@ -618,17 +666,18 @@
     const p = $("#status-pill");
     const lvl = s.status.level;
     const label = { ok: "ALL SYSTEMS NOMINAL", degraded: "DEGRADED", alert: "ALERTS FIRING" }[lvl] || lvl.toUpperCase();
-    p.className = `pill pill-${lvl}`;
+    setClass(p, `pill pill-${lvl}`);
     setText($(".pill-text", p), label);
-    p.title = s.status.reasons.join("\n") || "all checks passing";
+    setTitle(p, s.status.reasons.join("\n") || "all checks passing");
     const ban = $("#banner");
-    if (!document.body.classList.contains("stale")) ban.classList.remove("banner-switch");
-    if (lvl !== "ok" && s.status.reasons.length && !document.body.classList.contains("stale")) {
-      ban.hidden = false;
+    const stale = document.body.classList.contains("stale");
+    if (!stale) toggle(ban, "banner-switch", false);
+    if (lvl !== "ok" && s.status.reasons.length && !stale) {
+      if (ban.hidden) ban.hidden = false;
       setText(ban, s.status.reasons.join(" · "));
-      ban.style.color = lvl === "alert" ? "var(--cp-red)" : "";
-      ban.style.borderColor = lvl === "alert" ? "var(--cp-red)" : "";
-    } else if (!document.body.classList.contains("stale")) ban.hidden = true;
+      setStyle(ban, "color", lvl === "alert" ? "var(--cp-red)" : "");
+      setStyle(ban, "borderColor", lvl === "alert" ? "var(--cp-red)" : "");
+    } else if (!stale && !ban.hidden) ban.hidden = true;
   }
 
   function tickFresh() {
@@ -636,36 +685,37 @@
     if (!state.lastRecv) return;
     const age = (Date.now() - state.lastRecv) / 1000;
     const stale = age * 1000 > STALE_MS || !state.connected;
-    f.classList.toggle("live", !stale);
-    f.classList.toggle("stale", stale);
-    document.body.classList.toggle("stale", stale);
+    toggle(f, "live", !stale);
+    toggle(f, "stale", stale);
+    toggle(document.body, "stale", stale);
     const at = new Date(state.lastTs * 1000).toLocaleTimeString("en-GB", { hour12: false });
     const hv = hvOf(state.snap);
     const mp = $("#mode-pill");
     if (stale) {
       setText(t, `${state.connected ? "STALE" : "RECONNECTING"} · last ${at} (${fmt.age(age)} ago)`);
       const ban = $("#banner");
-      ban.hidden = false;
-      ban.style.color = ban.style.borderColor = "";
+      if (ban.hidden) ban.hidden = false;
+      setStyle(ban, "color", "");
+      setStyle(ban, "borderColor", "");
       const sw = switchSuspected();
-      ban.classList.toggle("banner-switch", sw);
+      toggle(ban, "banner-switch", sw);
       if (sw) {
         const last = str(hv.phase) || (hv.mode === "game" ? "game mode" : "—");
         const dir = dirText(hv.direction);
         setText(ban, `Walter restarting — GPU mode switch in progress (last phase: ${last}${dir ? ", " + dir : ""}). This takes a few minutes; reconnecting automatically. Values shown are from ${at}.`);
-        mp.className = "pill mode mode-switching";
+        setClass(mp, "pill mode mode-switching");
         setText($(".pill-text", mp), "WALTER RESTARTING");
       } else {
         setText(ban, `Live stream ${state.connected ? "stalled" : "disconnected"}; reconnecting. Values shown are from ${at} and may be out of date.`);
       }
       const p = $("#status-pill");
-      p.className = "pill pill-wait";
+      setClass(p, "pill pill-wait");
       setText($(".pill-text", p), "STALE DATA");
     } else {
       setText(t, `live · updated ${age < 1.5 ? "just now" : Math.round(age) + "s ago"}`);
     }
     // relative "since" times keep counting between snapshots
-    if (hv && !mp.hidden) mp.title = modeTitle(hv);
+    if (hv && !mp.hidden) setTitle(mp, modeTitle(hv));
     const gs = $('#gaming [data-g="since"]');
     if (hv && gs) { const a = hv.mode === "game" ? sinceAge(hv.since) : null; setText(gs, a == null ? "—" : fmt.age(a)); }
   }
@@ -682,7 +732,7 @@
     // entering game mode without a reload: fetch the gaming GPU's 30 min history once
     if (fromStream && hv && hv.mode === "game" && prevMode && prevMode !== "game") refreshHistory();
     if (fromStream && hv && hv.gpu && hv.vm && hv.vm.guest_up) pushHist("gpu_gaming", Math.floor(s.ts), fin(hv.gpu.util));
-    document.body.classList.remove("stale");
+    toggle(document.body, "stale", false);
     renderStatus(s);
     renderMode(s);
     (s.gpus || []).forEach(renderGpu);
@@ -777,7 +827,12 @@
     });
   }
 
+  // pause decorative CSS animations while the tab is hidden (body.page-hidden -> animation-play-state: paused)
+  const onVis = () => toggle(document.body, "page-hidden", document.hidden);
+  document.addEventListener("visibilitychange", onVis);
+
   document.addEventListener("DOMContentLoaded", async () => {
+    onVis();
     await loadInitial();
     connect();
     setInterval(tickFresh, 1000);

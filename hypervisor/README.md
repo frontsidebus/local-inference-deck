@@ -14,7 +14,7 @@ The host that runs Walter is managed outside this repo, by a separate (private) 
 | A whole NVMe passed raw as virtio `vdb` (`cache=none`, `io=native`, `discard=unmap`) with a fixed `<serial>` | Appears in the guest as `/dev/disk/by-id/virtio-<serial>`, which `walter/deploy.sh` formats/mounts as `${MODELS_DIR}` (by UUID, `nofail`). |
 | Disks referenced by `/dev/disk/by-id/...`, never `/dev/nvmeXn1` | NVMe device names swap between boots. |
 | `nvidia-cdi-refresh.{path,service}` masked on the host while every NVIDIA GPU is on `vfio-pci` | Otherwise they fail every boot and leave systemd "degraded". Unmask if a GPU is returned to the host. |
-| `/etc/environment.d/90-host-no-nvidia.conf` pinning the desktop to Mesa (`__EGL_VENDOR_LIBRARY_FILENAMES=.../50_mesa.json`, `VK_ICD_FILENAMES=.../radeon_icd.json`) while every NVIDIA GPU is on `vfio-pci` | The NVIDIA userspace stays installed and its EGL vendor file sorts before Mesa's, so GPU-drawn desktop apps (Spotify, App Center) otherwise crash with `GPU process isn't usable`. Delete it if a GPU is returned to the host. |
+| `/etc/environment.d/90-host-no-nvidia.conf` pinning the desktop to Mesa (`__EGL_VENDOR_LIBRARY_DIRS=/etc/glvnd/egl_vendor.d-host`, a directory holding only a copy of `50_mesa.json`; `VK_ICD_FILENAMES=.../radeon_icd.json`) while every NVIDIA GPU is on `vfio-pci` | The NVIDIA userspace stays installed and its EGL vendor file sorts before Mesa's, so GPU-drawn desktop apps (Spotify, App Center) otherwise crash with `GPU process isn't usable`. Use a vendor **directory**, not `__EGL_VENDOR_LIBRARY_FILENAMES`: that variable overrides every directory, including the one snap GPU wrappers append for their bundled Mesa, so snaps (Firefox, Spotify) find no EGL driver and fall back to CPU rendering (Firefox `about:support`: "WebRender (Software)"). Delete the pin if a GPU is returned to the host. |
 | BIOS set to power on after AC loss | Unattended recovery; see [power-loss runbook](../docs/runbooks/power-loss-recovery.md). |
 | BIOS bifurcation x8/x8 on the riser slot | Both GPUs share one x16 CPU slot through the riser. |
 | A libvirt NAT bridge (`${HYPERVISOR_BRIDGE_IP}`) | Walter's LAN path, and where the optional workstation `hermes-gateway` listens. |
@@ -72,6 +72,7 @@ Gaming VM and GPU-mode problems: [gaming/README.md](gaming/README.md#troubleshoo
 | A GPU function shows a host driver (`nvidia`, `nouveau`, `snd_hda_intel`) instead of `vfio-pci` | The `vfio-pci ids=` / softdep config is missing or not applied at boot. Fix it in the host IaC and reboot. |
 | `nvidia-smi` in Walter shows `x1`, or Gen1 under load | Check the riser seating and the BIOS bifurcation setting for that slot. Gen1/2 **at idle** is normal. |
 | The telemetry dashboard shows "PCIe Gen1 x8 · power-save" on an idle GPU | Normal: an idle GPU drops its link generation and returns to Gen4 under load. Only a "below xN" warning means a narrower link than expected (set `TELEMETRY_GPU_EXPECTED_WIDTH`; see [walter/telemetry](../walter/telemetry/README.md.tmpl)). |
+| Firefox (or another snap) is slow and `about:support` shows software WebRender | The Mesa pin uses `__EGL_VENDOR_LIBRARY_FILENAMES`; switch it to the vendor-directory form above and log in again. |
 | Host `systemctl --failed` lists `nvidia-cdi-refresh` | It was unmasked; mask it again while both GPUs are on vfio-pci. |
 
 ## Rollback
